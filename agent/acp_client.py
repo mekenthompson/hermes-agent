@@ -36,6 +36,7 @@ from openai.types.chat.chat_completion_message_tool_call import (
 
 from agent.acp_agent_registry import (
     agent_display_name,
+    agent_env_unset,
     agent_install_hint,
     normalize_agent_name,
     resolve_agent_launch,
@@ -124,7 +125,7 @@ def _resolve_home_dir() -> str:
     return "/tmp"
 
 
-def _build_subprocess_env() -> dict[str, str]:
+def _build_subprocess_env(env_unset: tuple[str, ...] = ()) -> dict[str, str]:
     # ACP agents are model-driving CLI executors: they legitimately need LLM
     # provider credentials. Route through the central helper so Tier-1 secrets
     # (gateway bot tokens, GitHub auth, infra) are still stripped (#29157).
@@ -133,6 +134,11 @@ def _build_subprocess_env() -> dict[str, str]:
     env["HOME"] = home
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(env)
+    # Per-agent session markers to strip (e.g. the Claude Code bridge won't
+    # launch inside a parent Claude Code session) — declared on the registry
+    # entry so this stays agent-agnostic.
+    for marker in env_unset:
+        env.pop(marker, None)
     return env
 
 
@@ -575,7 +581,7 @@ class ACPClient:
                 errors="replace",
                 bufsize=1,
                 cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
+                env=_build_subprocess_env(env_unset=agent_env_unset(self.agent_name)),
                 creationflags=windows_hide_flags(),
             )
         except FileNotFoundError as exc:
