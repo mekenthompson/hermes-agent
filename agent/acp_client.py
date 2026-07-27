@@ -659,6 +659,8 @@ class ACPClient:
                 "Install an ACP-capable CLI or configure a working ACP command and args."
             )
         try:
+            # Hide the console the CLI child would otherwise flash on Windows
+            # (#56747). Hide-only — stdio pipes stay intact for the ACP wire.
             from hermes_cli._subprocess_compat import windows_hide_flags
 
             proc = subprocess.Popen(
