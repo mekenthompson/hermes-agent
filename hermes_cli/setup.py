@@ -77,18 +77,6 @@ _DEFAULT_PROVIDER_MODELS = {
     "copilot-acp": [
         "copilot-acp",
     ],
-    "claude-acp": [
-        "claude-acp",
-    ],
-    "codex-acp": [
-        "codex-acp",
-    ],
-    "gemini-acp": [
-        "gemini-acp",
-    ],
-    "qwen-acp": [
-        "qwen-acp",
-    ],
     "copilot": [
         "gpt-5.4",
         "gpt-5.4-mini",
