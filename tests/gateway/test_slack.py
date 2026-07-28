@@ -2284,6 +2284,733 @@ class TestMessageRouting:
         assert msg_event.message_id == "1234567890.000001"
 
 
+    @pytest.mark.asyncio
+    async def test_stale_message_changed_metadata_update_ignored(self, adapter):
+        """A parent metadata update must not replay an old user edit as new input."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "hidden": True,
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": {
+                "type": "message",
+                "text": "old thread parent",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "edited": {"user": "U_USER", "ts": "150.000001"},
+                "reply_count": 2,
+                "latest_reply": "200.000001",
+            },
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_thread_metadata_only_parent_update_ignored(self, adapter):
+        """Reply bookkeeping must not replay an unchanged thread parent."""
+        parent = {
+            "type": "message",
+            "text": "old thread parent",
+            "files": [],
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+            "thread_ts": "100.000001",
+            "reply_count": 2,
+        }
+        previous = {
+            "type": "message",
+            "text": "old thread parent",
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+        }
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "hidden": True,
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "200.000002",
+            "event_ts": "200.000002",
+            "message": parent,
+            "previous_message": previous,
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("previous_message", [None, "malformed"])
+    async def test_unedited_parent_reply_update_without_previous_ignored(
+        self, adapter, previous_message
+    ):
+        """Reply metadata ordering identifies updates without previous_message."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "hidden": True,
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "1726133701.028300",
+            "event_ts": "1726133701.028300",
+            "message": {
+                "type": "message",
+                "text": "old unedited thread parent",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "1726133698.626339",
+                "thread_ts": "1726133698.626339",
+                "reply_count": 2,
+                "latest_reply": "1726133700.887259",
+            },
+        }
+        if previous_message is not None:
+            event["previous_message"] = previous_message
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "previous_message",
+        [
+            None,
+            "malformed",
+            {},
+            {"reply_count": 1},
+            {"text": None},
+            {"files": "malformed"},
+        ],
+    )
+    @pytest.mark.parametrize("latest_reply", [None, "malformed", 150])
+    async def test_ambiguous_reply_order_without_visible_snapshot_ignored(
+        self, adapter, previous_message, latest_reply
+    ):
+        """Ambiguous reply ordering must fail closed after a cold restart."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "hidden": True,
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": {
+                "type": "message",
+                "text": "old parent instruction with side effects",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "edited": {"user": "U_USER", "ts": "150.000001"},
+                "reply_count": 2,
+            },
+        }
+        if latest_reply is not None:
+            event["message"]["latest_reply"] = latest_reply
+        if previous_message is not None:
+            event["previous_message"] = previous_message
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reply_fields,previous_message,edited_ts",
+        [
+            ({"reply_count": 0}, {}, None),
+            ({"reply_users_count": 0}, {}, None),
+            ({"reply_users": []}, {}, None),
+            ({"replies": []}, {}, None),
+            (
+                {
+                    "reply_count": 0,
+                    "reply_users_count": 0,
+                    "reply_users": [],
+                    "replies": [],
+                },
+                {},
+                None,
+            ),
+            (
+                {},
+                {"reply_count": 1, "latest_reply": "150.000001"},
+                "200.000001",
+            ),
+            (
+                {"reply_count": 1, "latest_reply": "150.000001"},
+                {"reply_count": 2, "latest_reply": "300.000001"},
+                "200.000001",
+            ),
+            (
+                {"reply_count": 0},
+                {
+                    "text": "old parent instruction with side effects",
+                    "files": [],
+                    "reply_count": 1,
+                },
+                None,
+            ),
+            (
+                {"files": {}, "reply_count": 0},
+                {
+                    "text": "old parent instruction with side effects",
+                    "files": [],
+                    "reply_count": 1,
+                },
+                None,
+            ),
+            (
+                {"files": "", "reply_count": 0},
+                {
+                    "text": "old parent instruction with side effects",
+                    "files": [{"id": "F_PREVIOUS"}],
+                    "reply_count": 1,
+                },
+                None,
+            ),
+        ],
+    )
+    async def test_reply_metadata_transition_ignored(
+        self, adapter, reply_fields, previous_message, edited_ts
+    ):
+        """Reply metadata transitions must not replay a thread parent."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "hidden": True,
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": {
+                "type": "message",
+                "text": "old parent instruction with side effects",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                **reply_fields,
+            },
+            "previous_message": previous_message,
+        }
+        if edited_ts is not None:
+            event["message"]["edited"] = {"user": "U_USER", "ts": edited_ts}
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_message_changed_visible_text_update_processed(self, adapter):
+        """A genuine edit routes when event_ts follows edited.ts by milliseconds."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "1665102362.013600",
+            "event_ts": "1665102362.013600",
+            "message": {
+                "type": "message",
+                "text": "corrected text",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "1665102338.901939",
+                "edited": {"user": "U_USER", "ts": "1665102362.000000"},
+            },
+            "previous_message": {
+                "type": "message",
+                "text": "original text",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "1665102338.901939",
+            },
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "corrected text"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "edited_ts,latest_reply",
+        [(None, "malformed"), ("200.000001", "300.000001")],
+    )
+    async def test_visible_edit_with_ambiguous_reply_order_processed(
+        self, adapter, edited_ts, latest_reply
+    ):
+        """A proven visible edit wins over incomplete or older edit ordering."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "301.000002",
+            "event_ts": "301.000002",
+            "message": {
+                "type": "message",
+                "text": "corrected despite malformed metadata",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "reply_count": 2,
+                "latest_reply": latest_reply,
+            },
+            "previous_message": {
+                "type": "message",
+                "text": "original text",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "reply_count": 2,
+                "latest_reply": latest_reply,
+            },
+        }
+        if edited_ts is not None:
+            event["message"]["edited"] = {"user": "U_USER", "ts": edited_ts}
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "corrected despite malformed metadata"
+
+    @pytest.mark.asyncio
+    async def test_thread_parent_edit_after_latest_reply_processed(self, adapter):
+        """A newer parent edit must route even without previous_message."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "301.000001",
+            "event_ts": "301.000001",
+            "message": {
+                "type": "message",
+                "text": "parent corrected after replies",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "edited": {"user": "U_USER", "ts": "300.000001"},
+                "reply_count": 2,
+                "latest_reply": "200.000001",
+            },
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "parent corrected after replies"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("field", "previous_value"),
+        [
+            ("attachments", [{"fallback": "removed attachment"}]),
+            ("files", [{"id": "F_REMOVED"}]),
+            ("blocks", [{"type": "section"}]),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "explicit_null", [False, True], ids=("omitted", "explicit-null")
+    )
+    async def test_visible_payload_removal_with_reply_metadata_processed(
+        self, adapter, field, previous_value, explicit_null
+    ):
+        """Removing visible payload must win over reply metadata transitions."""
+        parent = {
+            "type": "message",
+            "text": "unchanged parent text",
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+            "thread_ts": "100.000001",
+            "reply_count": 2,
+            "latest_reply": "200.000001",
+        }
+        if explicit_null:
+            parent[field] = None
+        previous = {
+            "type": "message",
+            "text": "unchanged parent text",
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+            "thread_ts": "100.000001",
+            "reply_count": 1,
+            "latest_reply": "150.000001",
+            field: previous_value,
+        }
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": parent,
+            "previous_message": previous,
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "unchanged parent text"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("edited_ts", "latest_reply"),
+        [
+            ("150.000001", "²"),
+            ("150.000001", "150.²"),
+            ("150.000001", "150.000001"),
+            ("150.000001", "9" * 5_000),
+        ],
+        ids=("unicode-seconds", "unicode-fraction", "equal-order", "oversized"),
+    )
+    async def test_malformed_slack_timestamp_reply_update_ignored(
+        self, adapter, edited_ts, latest_reply
+    ):
+        """Non-protocol timestamps must fail closed instead of replaying a parent."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": {
+                "type": "message",
+                "text": "stale parent text",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "edited": {"user": "U_USER", "ts": edited_ts},
+                "reply_count": 2,
+                "latest_reply": latest_reply,
+            },
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("edited_ts", "latest_reply"),
+        [
+            ("200.100000", "200.1"),
+            ("200.000000", "200"),
+        ],
+    )
+    async def test_equivalent_slack_timestamp_reply_update_ignored(
+        self, adapter, edited_ts, latest_reply
+    ):
+        """Different encodings of the same timestamp are numerically equal."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": {
+                "type": "message",
+                "text": "stale parent text",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "edited": {"user": "U_USER", "ts": edited_ts},
+                "reply_count": 2,
+                "latest_reply": latest_reply,
+            },
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("current_visible", "previous_visible"),
+        [
+            (
+                {"text": "stale parent text", "files": {}},
+                {"text": "stale parent text", "files": []},
+            ),
+            (
+                {"text": "stale parent text", "files": ["malformed"]},
+                {"text": "stale parent text", "files": []},
+            ),
+            (
+                {"files": []},
+                {"text": "stale parent text", "files": []},
+            ),
+        ],
+        ids=("wrong-typed-list", "wrong-typed-list-item", "omitted-text"),
+    )
+    async def test_unknown_visible_evidence_with_newer_edit_ignored(
+        self, adapter, current_visible, previous_visible
+    ):
+        """A newer edit timestamp cannot turn unknown visible evidence into input."""
+        common = {
+            "type": "message",
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+            "thread_ts": "100.000001",
+            "reply_count": 2,
+            "latest_reply": "200.000001",
+        }
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "301.000001",
+            "event_ts": "301.000001",
+            "message": {
+                **common,
+                **current_visible,
+                "edited": {"user": "U_USER", "ts": "300.000001"},
+            },
+            "previous_message": {**common, **previous_visible},
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("field", ["blocks", "attachments", "files"])
+    @pytest.mark.parametrize(
+        "malformed_value",
+        [{"unexpected": "value"}, ["malformed"]],
+        ids=("wrong-container", "wrong-item"),
+    )
+    async def test_visible_text_update_with_malformed_list_field_processed(
+        self, adapter, field, malformed_value
+    ):
+        """A proven text edit routes without iterating malformed list payloads."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "301.000001",
+            "event_ts": "301.000001",
+            "message": {
+                "type": "message",
+                "text": "corrected parent text",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "edited": {"user": "U_USER", "ts": "300.000001"},
+                field: malformed_value,
+            },
+            "previous_message": {
+                "type": "message",
+                "text": "original parent text",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                field: [],
+            },
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "corrected parent text"
+        assert delivered.raw_message[field] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("malformed_text", [None, {}, 123])
+    async def test_visible_collection_addition_with_malformed_text_processed(
+        self, adapter, malformed_text
+    ):
+        """A proven collection addition routes with type-safe normalized text."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": {
+                "type": "message",
+                "text": malformed_text,
+                "attachments": [{"fallback": "added attachment"}],
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+            },
+            "previous_message": {
+                "type": "message",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+            },
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "📎 added attachment"
+        assert delivered.raw_message["text"] == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("field", "current_value"),
+        [
+            ("attachments", [{"fallback": "added attachment"}]),
+            ("files", [{"id": "F_ADDED"}]),
+            ("blocks", [{"type": "section"}]),
+        ],
+    )
+    async def test_visible_payload_addition_with_reply_metadata_processed(
+        self, adapter, field, current_value
+    ):
+        """Adding visible payload must win over reply metadata transitions."""
+        parent = {
+            "type": "message",
+            "text": "unchanged parent text",
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+            "thread_ts": "100.000001",
+            "reply_count": 2,
+            "latest_reply": "200.000001",
+            field: current_value,
+        }
+        previous = {
+            "type": "message",
+            "text": "unchanged parent text",
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+            "thread_ts": "100.000001",
+            "reply_count": 1,
+            "latest_reply": "150.000001",
+        }
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": parent,
+            "previous_message": previous,
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text.startswith("unchanged parent text")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("field", "current_value"),
+        [
+            ("attachments", [{"fallback": "added attachment"}]),
+            ("files", [{"id": "F_ADDED"}]),
+            (
+                "blocks",
+                [
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": "added block"},
+                    }
+                ],
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "explicit_null", [False, True], ids=("omitted", "explicit-null")
+    )
+    async def test_visible_payload_addition_without_typed_previous_processed(
+        self, adapter, field, current_value, explicit_null
+    ):
+        """A proven list addition does not require another typed prior field."""
+        previous = {
+            "type": "message",
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+            "thread_ts": "100.000001",
+            "reply_count": 1,
+            "latest_reply": "150.000001",
+        }
+        if explicit_null:
+            previous[field] = None
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": {
+                "type": "message",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "reply_count": 2,
+                "latest_reply": "200.000001",
+                field: current_value,
+            },
+            "previous_message": previous,
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+
 # ---------------------------------------------------------------------------
 # TestSendTyping — assistant.threads.setStatus
 # ---------------------------------------------------------------------------

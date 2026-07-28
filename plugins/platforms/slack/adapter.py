@@ -1348,6 +1348,24 @@ class SlackAdapter(BasePlatformAdapter):
             fraction_int = 0
         return seconds_int, fraction_int, str(ts)
 
+    @staticmethod
+    def _is_valid_slack_timestamp(ts: Any) -> bool:
+        """Return whether *ts* has Slack's numeric seconds[.fraction] shape."""
+        if not isinstance(ts, str):
+            return False
+        seconds, separator, fraction = ts.partition(".")
+        if (
+            not 1 <= len(seconds) <= 20
+            or not seconds.isascii()
+            or not seconds.isdigit()
+        ):
+            return False
+        return not separator or (
+            1 <= len(fraction) <= 6
+            and fraction.isascii()
+            and fraction.isdigit()
+        )
+
     @classmethod
     def _discard_oldest_slack_timestamps(
         cls, timestamps: set[str], count: int
@@ -6060,6 +6078,71 @@ class SlackAdapter(BasePlatformAdapter):
             if not isinstance(updated_message, dict):
                 return
 
+            previous_message = event.get("previous_message")
+            visible_payload_changed = None
+            if isinstance(previous_message, dict):
+                visible_fields = ("text", "blocks", "attachments", "files")
+                has_previous_typed_field = False
+                has_proven_list_change = False
+                has_unknown_field = False
+                comparable_fields = []
+                for field in visible_fields:
+                    previous_value = previous_message.get(field)
+                    current_value = updated_message.get(field)
+                    if field == "text":
+                        previous_valid = isinstance(previous_value, str)
+                        current_valid = isinstance(current_value, str)
+                    else:
+                        previous_valid = isinstance(previous_value, list) and all(
+                            isinstance(item, dict) for item in previous_value
+                        )
+                        current_valid = isinstance(current_value, list) and all(
+                            isinstance(item, dict) for item in current_value
+                        )
+                    has_previous_typed_field |= previous_valid
+                    previous_empty = previous_value is None or previous_value in ("", [])
+                    current_empty = current_value is None or current_value in ("", [])
+                    if field != "text" and (
+                        (
+                            previous_valid
+                            and not previous_empty
+                            and (current_value is None or current_value == [])
+                        )
+                        or (
+                            previous_value is None
+                            and current_valid
+                            and not current_empty
+                        )
+                    ):
+                        has_proven_list_change = True
+                        continue
+                    if previous_valid and current_valid:
+                        comparable_fields.append(field)
+                        continue
+
+                    if not (previous_empty and current_empty):
+                        has_unknown_field = True
+
+                if has_proven_list_change or any(
+                    updated_message[field] != previous_message[field]
+                    for field in comparable_fields
+                ):
+                    visible_payload_changed = True
+                elif has_previous_typed_field and not has_unknown_field:
+                    visible_payload_changed = False
+                if visible_payload_changed is not True:
+                    logger.debug(
+                        "[Slack] Ignoring message_changed with %s visible payload "
+                        "evidence for message %s",
+                        (
+                            "unchanged"
+                            if visible_payload_changed is False
+                            else "unknown"
+                        ),
+                        updated_message.get("ts", ""),
+                    )
+                    return
+
             original_message_ts = str(updated_message.get("ts") or "")
             if (
                 original_message_ts
@@ -6067,11 +6150,59 @@ class SlackAdapter(BasePlatformAdapter):
             ):
                 return
             edited = updated_message.get("edited")
-            edited_ts = ""
-            if isinstance(edited, dict):
-                edited_ts = str(edited.get("ts") or "")
+            edited_ts = edited.get("ts") if isinstance(edited, dict) else None
             outer_event_ts = str(event.get("ts") or "")
-            changed_event_ts = str(event.get("event_ts") or edited_ts or "")
+            previous_latest_reply = (
+                previous_message.get("latest_reply")
+                if isinstance(previous_message, dict)
+                else None
+            )
+            updated_latest_reply = updated_message.get("latest_reply")
+            latest_reply_ts = (
+                updated_latest_reply
+                if updated_latest_reply not in (None, "")
+                else previous_latest_reply
+            )
+            reply_metadata_fields = (
+                "latest_reply",
+                "reply_count",
+                "reply_users_count",
+                "reply_users",
+                "replies",
+            )
+            has_reply_metadata = any(
+                field in updated_message for field in reply_metadata_fields
+            ) or (
+                isinstance(previous_message, dict)
+                and any(field in previous_message for field in reply_metadata_fields)
+            )
+            latest_reply_valid = self._is_valid_slack_timestamp(latest_reply_ts)
+            edited_ts_valid = self._is_valid_slack_timestamp(edited_ts)
+            latest_reply_at_or_after_edit = bool(
+                latest_reply_valid
+                and edited_ts_valid
+                and self._slack_timestamp_sort_key(latest_reply_ts)[:2]
+                >= self._slack_timestamp_sort_key(edited_ts)[:2]
+            )
+            ambiguous_reply_order = bool(
+                has_reply_metadata
+                and not (latest_reply_valid and edited_ts_valid)
+                and visible_payload_changed is not True
+            )
+            if visible_payload_changed is not True and has_reply_metadata and (
+                latest_reply_at_or_after_edit or ambiguous_reply_order
+            ):
+                logger.debug(
+                    "[Slack] Ignoring thread parent reply metadata update "
+                    "for message %s: edited_ts=%s latest_reply=%s",
+                    original_message_ts,
+                    edited_ts,
+                    latest_reply_ts,
+                )
+                return
+            changed_event_ts = str(
+                event.get("event_ts") or (edited_ts if edited_ts_valid else "") or ""
+            )
             if (
                 not changed_event_ts
                 and outer_event_ts
@@ -6082,6 +6213,21 @@ class SlackAdapter(BasePlatformAdapter):
                 changed_event_ts = f"{original_message_ts}:changed"
 
             normalized_event = dict(updated_message)
+            if "text" in normalized_event and not isinstance(
+                normalized_event["text"], str
+            ):
+                normalized_event["text"] = ""
+            for field in ("blocks", "attachments", "files"):
+                if field not in normalized_event:
+                    continue
+                if not isinstance(normalized_event[field], list):
+                    normalized_event[field] = []
+                else:
+                    normalized_event[field] = [
+                        item
+                        for item in normalized_event[field]
+                        if isinstance(item, dict)
+                    ]
             for key in ("channel", "channel_type", "team", "team_id"):
                 if not normalized_event.get(key) and event.get(key):
                     normalized_event[key] = event.get(key)
