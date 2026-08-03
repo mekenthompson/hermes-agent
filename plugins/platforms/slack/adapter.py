@@ -424,6 +424,59 @@ def _collect_slack_block_mentions(blocks: list) -> list:
     return mentions
 
 
+def _slack_block_tree_trusted(blocks: Any) -> bool:
+    """Return whether every node ``_collect_slack_block_mentions`` walks is typed.
+
+    The mention walker skips whatever it cannot parse, so "no mention found"
+    in a malformed tree is silence, not proof of absence. This validator
+    checks exactly the fields that walker reads — ``type``, the ``elements`` /
+    ``element`` children it recurses into, and a ``user`` node's ``user_id`` —
+    so callers that need absence *proof* can tell a trustworthy snapshot from
+    one that merely failed to parse.
+    """
+
+    def _verbatim_label(value: Any) -> bool:
+        """Whether *value* is a label Slack sends verbatim.
+
+        Slack emits bare identifiers and the walker compares them
+        literally, so a blank or whitespace-padded value matches none of
+        its branches and names nobody.
+        """
+        return isinstance(value, str) and bool(value.strip()) and value == value.strip()
+
+    def _trusted(node: Any) -> bool:
+        if isinstance(node, list):
+            return all(_trusted(item) for item in node)
+        if not isinstance(node, dict):
+            return False
+        # Every Block Kit node Slack sends is typed. A node whose ``type``
+        # is missing, blank, padded, or non-string silently matches none of
+        # the walker's branches, so a mention node that lost its label reads
+        # as ordinary content and cannot witness a mention's absence.
+        node_type = node.get("type")
+        if not _verbatim_label(node_type):
+            return False
+        # A blank or padded ``user_id`` identifies nobody: the walker either
+        # drops the mention outright or emits ``<@ U123 >``, which matches no
+        # bot uid. Either way the node cannot witness a mention's absence.
+        if node_type == "user" and not _verbatim_label(node.get("user_id")):
+            return False
+        for key in ("elements", "element"):
+            if key in node and not _trusted(node[key]):
+                return False
+        return True
+
+    # Slack's top-level ``blocks`` container is a list; the walker iterates
+    # it directly. Anything else (a bare block dict, a mapping, a string) is
+    # a payload it never traverses, so it proves nothing about mentions.
+    if not isinstance(blocks, list):
+        return False
+    try:
+        return _trusted(blocks)
+    except Exception:  # pragma: no cover - defensive, mirrors the walker
+        return False
+
+
 def _slack_mention_detection_text(event: dict) -> str:
     """Return the text used for @mention detection on a Slack message event.
 
@@ -5908,6 +5961,108 @@ class SlackAdapter(BasePlatformAdapter):
             fallback_event["thread_ts"] = thread_ts
         await self._handle_slack_message(fallback_event)
 
+    @classmethod
+    def _slack_message_has_thread_replies(cls, *messages: Any) -> bool:
+        """Return True when a snapshot proves the message already has replies.
+
+        Slack only decorates a thread *parent* with reply bookkeeping, so a
+        positive answer means "this is a thread root that has already been
+        answered" — the precondition for treating a later edit of it as a
+        replay of settled instructions rather than a fresh request. Every
+        field is treated as untrusted input.
+        """
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            # ``latest_reply`` is a Slack message ts. Any other string is
+            # noise Slack never sends, and treating it as proof of a reply
+            # would suppress a genuine edit on an unanswered message.
+            if cls._is_valid_slack_timestamp(message.get("latest_reply")):
+                return True
+            # ``replies`` is a list of reply stubs; only an entry carrying a
+            # real Slack ts witnesses a reply. A non-empty list of unparsable
+            # members is the same silence as an empty one.
+            replies = message.get("replies")
+            if isinstance(replies, list) and any(
+                isinstance(entry, dict)
+                and cls._is_valid_slack_timestamp(entry.get("ts"))
+                for entry in replies
+            ):
+                return True
+            # ``reply_users`` holds Slack user IDs. Their exact shape is
+            # Slack's business, but a non-string / blank member identifies
+            # nobody, so it cannot witness that somebody replied.
+            reply_users = message.get("reply_users")
+            if isinstance(reply_users, list) and any(
+                isinstance(uid, str) and uid.strip() for uid in reply_users
+            ):
+                return True
+            for field in ("reply_count", "reply_users_count"):
+                value = message.get(field)
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, int) and value > 0:
+                    return True
+                if isinstance(value, str):
+                    digits = value.strip()
+                    # ``strip("0")`` keeps this allocation-free for absurd
+                    # digit strings that int() would refuse to parse.
+                    if digits.isascii() and digits.isdigit() and digits.strip("0"):
+                        return True
+        return False
+
+    def _slack_message_addresses_bot(self, message: Any, self_uids: set) -> bool:
+        """Return True when *message* @-mentions this bot or hits a wake word.
+
+        Best-effort on purpose: a malformed ``text``/``blocks`` field is
+        skipped rather than trusted, so a Block-Kit-only mention still counts
+        even when the flat text field carries garbage.
+        """
+        if not isinstance(message, dict):
+            return False
+        text = message.get("text")
+        blocks = message.get("blocks")
+        detection_text = _slack_mention_detection_text(
+            {
+                "text": text if isinstance(text, str) else "",
+                "blocks": blocks if isinstance(blocks, list) else None,
+            }
+        )
+        if not detection_text:
+            return False
+        return bool(
+            self._slack_message_mentions_self(detection_text, self_uids)
+            or self._slack_message_matches_mention_patterns(detection_text)
+        )
+
+    def _slack_previous_addressed_bot(
+        self, previous_message: Any, self_uids: set
+    ) -> Optional[bool]:
+        """Tri-state view of a ``previous_message`` snapshot's addressing.
+
+        ``True``/``False`` mean the pre-edit snapshot provably did / did not
+        address this bot. ``None`` means Slack sent nothing we can trust
+        (absent, wrong type, a non-string ``text``, or a ``blocks`` tree the
+        mention walker cannot fully parse), so callers must fail closed
+        instead of assuming an edit newly added the mention.
+        """
+        if not isinstance(previous_message, dict):
+            return None
+        if self._slack_message_addresses_bot(previous_message, self_uids):
+            return True
+        # Proving the ABSENCE of a mention needs a trustworthy snapshot. The
+        # mention walker reads exactly two fields, so both must carry the
+        # types Slack documents — the same typed-payload bar the visible
+        # payload comparison above applies. A malformed node anywhere in the
+        # walked block tree is silence, not proof: the walker skips what it
+        # cannot parse, so a mention may be hiding behind it.
+        if not isinstance(previous_message.get("text"), str):
+            return None
+        blocks = previous_message.get("blocks")
+        if blocks is not None and not _slack_block_tree_trusted(blocks):
+            return None
+        return False
+
     def _register_mentioned_thread(self, thread_ts: str, team_id: str = "") -> None:
         """Record a thread as bot-mentioned so future replies auto-trigger.
 
@@ -6241,6 +6396,50 @@ class SlackAdapter(BasePlatformAdapter):
                     latest_reply_ts,
                 )
                 return
+
+            # A thread parent that ALREADY addressed the bot has been answered
+            # in that thread. Re-delivering its edited text opens a brand-new
+            # turn from instructions the agent acted on hours ago — the
+            # "phantom turn" the in-memory ``_processed_message_ts`` set misses
+            # whenever the original ts is not in this process's state (that set
+            # is per-process and is not a durable record of past deliveries).
+            # Route such an edit only when the event itself proves the mention
+            # is new; a user who wants the edited wording acted on can post an
+            # ordinary reply, which we must never synthesize on their behalf.
+            #
+            # Bot identity is workspace-local: resolve exactly ONE uid for the
+            # event's team, because the primary workspace's bot uid can belong
+            # to an ordinary member of a secondary workspace. The outer event
+            # normally carries the team, but fall back to the edited message
+            # when it doesn't — never letting the inner value override an
+            # authoritative outer one.
+            team_id = self._event_team_id(event, payload) or self._event_team_id(
+                updated_message
+            )
+            bot_uid = self._team_bot_user_ids.get(team_id) or self._bot_user_id
+            self_uids = {bot_uid} if bot_uid else set()
+            if self._slack_message_has_thread_replies(
+                updated_message, previous_message
+            ):
+                previously_addressed = self._slack_previous_addressed_bot(
+                    previous_message, self_uids
+                )
+                # The pre-edit snapshot is what proves the thread was already
+                # answered, so a proven prior mention suppresses the edit even
+                # when the edited payload no longer addresses the bot (or is
+                # malformed). When the snapshot is untrustworthy, fail closed
+                # only if the edit itself still addresses the bot.
+                if previously_addressed is True or (
+                    previously_addressed is None
+                    and self._slack_message_addresses_bot(updated_message, self_uids)
+                ):
+                    logger.debug(
+                        "[Slack] Ignoring edit of already-addressed thread "
+                        "parent %s: previous mention evidence=%s",
+                        original_message_ts,
+                        "present" if previously_addressed else "unknown",
+                    )
+                    return
             changed_event_ts = str(
                 event.get("event_ts") or (edited_ts if edited_ts_valid else "") or ""
             )
