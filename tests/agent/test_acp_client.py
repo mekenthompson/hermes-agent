@@ -12,6 +12,7 @@ hardcoding third-party agents into core.
 
 from __future__ import annotations
 
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -315,3 +316,101 @@ def test_acp_permission_mode_env_override_wins(monkeypatch):
     monkeypatch.setenv("HERMES_ACP_PERMISSION_MODE", "allow")
     with patch("tools.approval._get_approval_config", return_value={"acp_mode": "deny"}):
         assert _acp_permission_mode() == "allow"
+
+
+# ── --acp support probe (ported from the Copilot client: #87308 / #87309) ──
+
+
+@pytest.fixture(autouse=True)
+def _clear_probe_cache():
+    from agent.acp_client import _ACP_PROBE_CACHE
+
+    _ACP_PROBE_CACHE.clear()
+    yield
+    _ACP_PROBE_CACHE.clear()
+
+
+def _completed(returncode=0, stdout=""):
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+
+
+def test_probe_true_when_help_advertises_acp():
+    from agent.acp_client import _acp_supported
+
+    with patch(
+        "agent.acp_client.subprocess.run",
+        return_value=_completed(stdout="Usage: copilot [--acp] [--stdio]"),
+    ):
+        assert _acp_supported("copilot", ["--acp", "--stdio"]) is True
+
+
+def test_probe_false_when_help_lacks_acp():
+    from agent.acp_client import _acp_supported
+
+    with patch(
+        "agent.acp_client.subprocess.run",
+        return_value=_completed(stdout="Usage: claude [--print] [--model]"),
+    ):
+        assert _acp_supported("claude", ["--acp", "--stdio"]) is False
+
+
+def test_run_prompt_fast_fails_when_probe_says_unsupported():
+    client = ACPClient(agent_name="copilot", api_key="k", base_url=marker_base_url("copilot"))
+    with patch(
+        "agent.acp_client.subprocess.run",
+        return_value=_completed(stdout="Usage: copilot [--print]"),
+    ):
+        with patch("agent.acp_client.subprocess.Popen") as popen:
+            with pytest.raises(RuntimeError, match="ACP transport not supported"):
+                client._run_prompt("hello", timeout_seconds=1)
+    popen.assert_not_called()
+
+
+def test_probe_inconclusive_falls_through_to_spawn_error():
+    """Missing binary: the probe must NOT mask the established spawn error."""
+    client = ACPClient(agent_name="copilot", api_key="k", base_url=marker_base_url("copilot"))
+    with patch("agent.acp_client.subprocess.run", side_effect=FileNotFoundError):
+        with patch("agent.acp_client.subprocess.Popen", side_effect=FileNotFoundError):
+            with pytest.raises(RuntimeError, match="Could not start"):
+                client._run_prompt("hello", timeout_seconds=1)
+
+
+def test_probe_result_cached_per_binary_path():
+    from agent.acp_client import _acp_supported
+
+    with patch(
+        "agent.acp_client.subprocess.run",
+        return_value=_completed(stdout="Usage: copilot [--acp]"),
+    ) as run_mock:
+        assert _acp_supported("copilot", ["--acp"]) is True
+        assert _acp_supported("copilot", ["--acp"]) is True
+    assert run_mock.call_count == 1
+
+
+def test_probe_inconclusive_not_cached():
+    from agent.acp_client import _acp_supported
+
+    with patch("agent.acp_client.subprocess.run", side_effect=FileNotFoundError) as run_mock:
+        assert _acp_supported("copilot", ["--acp"]) is None
+        assert _acp_supported("copilot", ["--acp"]) is None
+    assert run_mock.call_count == 2  # inconclusive verdicts retry
+
+
+@pytest.mark.parametrize("agent,args", [
+    ("claude", []),                      # claude-agent-acp: dedicated binary
+    ("codex", []),                       # codex-acp: dedicated binary
+    ("cursor", ["acp"]),                 # cursor-agent acp: subcommand
+    ("gemini", ["--experimental-acp"]),  # gemini: its own flag
+])
+def test_probe_skipped_for_agents_that_never_pass_acp_flag(agent, args):
+    """The generalization that keeps plugin agents working.
+
+    Only ``--acp`` launchers are probed. Every other adapter speaks ACP
+    through a dedicated binary or its own subcommand/flag, has no ``--acp``
+    to advertise in ``--help``, and must not be gated on one.
+    """
+    from agent.acp_client import _acp_supported
+
+    with patch("agent.acp_client.subprocess.run") as run_mock:
+        assert _acp_supported(f"{agent}-acp-bin", args) is True
+    run_mock.assert_not_called()
