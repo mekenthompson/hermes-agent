@@ -651,12 +651,21 @@ class ACPClient:
 
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
         display = self.agent_display_name
+        # Fast-fail a CLI that doesn't speak the transport we're about to
+        # hand it. Without this, such a CLI exits immediately and the loop
+        # below waits ``child_timeout_seconds`` (default 600s) for stdout
+        # that never arrives. ``None`` (inconclusive) falls through to the
+        # spawn, which raises the established "Could not start" error.
         if _acp_supported(self._acp_command, self._acp_args) is False:
             preview = " ".join(self._acp_args[:3]) if self._acp_args else "(none)"
             raise RuntimeError(
                 f"ACP transport not supported by '{self._acp_command}': "
-                f"`{preview}` is rejected as an unknown option. "
-                "Install an ACP-capable CLI or configure a working ACP command and args."
+                f"`{preview}` is rejected as an unknown option. This usually "
+                f"means the CLI is an older release, or a different tool than "
+                f"expected. " + agent_install_hint(self.agent_name)
+                + f" You can also override the pair with "
+                f"HERMES_ACP_{self.agent_name.upper()}_COMMAND / "
+                f"HERMES_ACP_{self.agent_name.upper()}_ARGS."
             )
         try:
             # Hide the console the CLI child would otherwise flash on Windows
@@ -952,6 +961,9 @@ class ACPClient:
                 denied = get_write_denied_error(str(path))
                 if denied:
                     raise PermissionError(denied)
+                # Approval-gated paths (e.g. ~/.ssh/config) are not hard-denied
+                # for interactive tools, but the ACP bridge has no human channel
+                # to confirm the write — fail closed here.
                 if is_write_approval_required(str(path)):
                     raise PermissionError(
                         f"Write denied: '{path}' requires interactive approval "
