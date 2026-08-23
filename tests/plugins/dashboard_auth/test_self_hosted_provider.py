@@ -571,6 +571,17 @@ class TestVerifySession:
         with pytest.raises(ProviderError, match="JWKS"):
             provider.verify_session(access_token=token)
 
+    def test_foreign_opaque_token_returns_none(self, provider):
+        # A non-JWT token (e.g. a session minted by a different provider, or a
+        # stale cookie) must read as "not my token" → None, NOT a ProviderError
+        # that the middleware would surface as a bogus 503 "provider
+        # unreachable". ``get_signing_key_from_jwt`` raises ``jwt.DecodeError``
+        # (an InvalidTokenError, not a PyJWKClientError) for such a token.
+        provider._jwks_client.get_signing_key_from_jwt.side_effect = (
+            jwt.DecodeError("Not enough segments")
+        )
+        assert provider.verify_session(access_token="foreign-opaque-token") is None
+
     def test_jwks_client_sends_explicit_http_headers(self):
         provider = oidc_plugin.SelfHostedOIDCProvider(
             issuer=_ISSUER, client_id=_CLIENT_ID
