@@ -156,7 +156,8 @@ import {
   gatewayFilePath,
   isNotFoundError,
   parseDataUrlToBuffer,
-  pumpStreamToFile
+  pumpStreamToFile,
+  saveDialogDefaultPath
 } from './gateway-file-download'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { registerGitIpc } from './git-ipc'
@@ -186,6 +187,7 @@ import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
+import { decideLocalFileOpenAction } from './local-file-open'
 import { ensureMainWindow } from './main-window-lifecycle'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
@@ -1569,6 +1571,18 @@ function openExternalUrl(rawUrl) {
       localPath = resolveRequestedPathForIpc(parsed.toString(), { purpose: 'Open external file' })
     } catch {
       return false
+    }
+
+    // Windows + archive: skip openPath. Electron reports success even when
+    // Chromium starts an infinite .tmp download loop (#53170).
+    if (decideLocalFileOpenAction(localPath) === 'reveal') {
+      try {
+        shell.showItemInFolder(localPath)
+      } catch (revealError) {
+        rememberLog(`[file] showItemInFolder failed: ${revealError.message}`)
+      }
+
+      return true
     }
 
     void shell
@@ -7407,9 +7421,16 @@ async function finalizeGatewayDownload(res, statusCode, headers, ctx: any = {}) 
 
   const disposition = headers['content-disposition'] || headers['Content-Disposition']
   const filename = filenameFromContentDisposition(disposition) || ctx.suggested || ctx.fallbackName
+  let downloadsDir = ''
+
+  try {
+    downloadsDir = app.getPath('downloads')
+  } catch {
+    // Leave the dialog at its last-used location when the OS has no Downloads directory.
+  }
 
   const result = await dialog.showSaveDialog(mainWindow, {
-    defaultPath: filename,
+    defaultPath: saveDialogDefaultPath(filename, downloadsDir),
     title: 'Save File'
   })
 
@@ -7536,9 +7557,16 @@ async function saveGatewayFileViaDataUrl(connection, profile, filePath, ctx: any
 
   const buffer = parseDataUrlToBuffer(dataUrl)
   const filename = ctx.suggested || ctx.fallbackName
+  let downloadsDir = ''
+
+  try {
+    downloadsDir = app.getPath('downloads')
+  } catch {
+    // Leave the dialog at its last-used location when the OS has no Downloads directory.
+  }
 
   const result = await dialog.showSaveDialog(mainWindow, {
-    defaultPath: filename,
+    defaultPath: saveDialogDefaultPath(filename, downloadsDir),
     title: 'Save File'
   })
 

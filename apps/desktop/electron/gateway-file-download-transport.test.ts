@@ -50,6 +50,8 @@ test('finalizeGatewayDownload prompts a save dialog then streams the response', 
   const fn = extract('async function finalizeGatewayDownload', '\nfunction readGatewayErrorText')
 
   assert.match(fn, /dialog\.showSaveDialog/)
+  assert.match(fn, /saveDialogDefaultPath\(/)
+  assert.match(fn, /app\.getPath\('downloads'\)/)
   assert.match(fn, /pumpStreamToFile\(/)
   // HTTP errors carry their status so a 404 can trigger the fallback.
   assert.match(fn, /error\.statusCode = statusCode/)
@@ -68,4 +70,14 @@ test('data-url fallback reads the capped route and decodes it', () => {
 
   assert.match(fn, /\/api\/fs\/read-data-url\?path=/)
   assert.match(fn, /parseDataUrlToBuffer\(/)
+  assert.match(fn, /saveDialogDefaultPath\(/)
+  assert.match(fn, /app\.getPath\('downloads'\)/)
+})
+
+test('openExternalUrl reveals Windows archives instead of shell.openPath', () => {
+  const fn = extract('function openExternalUrl', '\nasync function openPreviewInBrowser')
+
+  assert.match(fn, /decideLocalFileOpenAction\(/)
+  assert.match(fn, /showItemInFolder/)
+  assert.doesNotMatch(fn, /OPEN_EXTERNAL_DEBOUNCE/)
 })

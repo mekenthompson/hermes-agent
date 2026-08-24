@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import path from 'node:path'
 
 import { test } from 'vitest'
 
@@ -8,7 +9,8 @@ import {
   gatewayFilePath,
   isNotFoundError,
   parseDataUrlToBuffer,
-  pumpStreamToFile
+  pumpStreamToFile,
+  saveDialogDefaultPath
 } from './gateway-file-download'
 
 // A Readable-like response driven manually in tests.
@@ -187,4 +189,21 @@ test('isNotFoundError matches only HTTP 404', () => {
   assert.equal(isNotFoundError(forbidden), false)
   assert.equal(isNotFoundError(new Error('plain')), false)
   assert.equal(isNotFoundError(null), false)
+})
+
+test('saveDialogDefaultPath joins the basename onto Downloads (Windows cwd trap)', () => {
+  assert.equal(
+    saveDialogDefaultPath('report.md', String.raw`C:\Users\kenth\Downloads`, path.win32),
+    String.raw`C:\Users\kenth\Downloads\report.md`
+  )
+  assert.equal(saveDialogDefaultPath('report.md', '/Users/me/Downloads', path.posix), '/Users/me/Downloads/report.md')
+})
+
+test('saveDialogDefaultPath strips a traversal filename to a basename', () => {
+  assert.equal(saveDialogDefaultPath('../../etc/passwd', '/home/me/Downloads', path.posix), '/home/me/Downloads/passwd')
+})
+
+test('saveDialogDefaultPath falls back to a filename when Downloads is missing', () => {
+  assert.equal(saveDialogDefaultPath('report.md', '', path.posix), 'report.md')
+  assert.equal(saveDialogDefaultPath('', '/home/me/Downloads', path.posix), '/home/me/Downloads/download')
 })

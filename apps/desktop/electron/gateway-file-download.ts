@@ -160,6 +160,22 @@ export function gatewayFilePath(rawPath: unknown): string {
   }
 }
 
+export interface PathApi {
+  basename(p: string): string
+  join(...parts: string[]): string
+}
+
+// Electron's save dialog on Windows treats a bare filename as relative to the
+// process cwd (win-unpacked in packaged installs). Always offer Downloads when
+// the OS has one. `pathMod` is injectable so Linux CI can assert the win32 join.
+export function saveDialogDefaultPath(filename: string, downloadsDir: string, pathMod: PathApi = path): string {
+  const raw = String(filename || '').trim()
+  const name = pathMod.basename(raw || 'download') || 'download'
+  const dir = String(downloadsDir || '').trim()
+
+  return dir ? pathMod.join(dir, name) : name
+}
+
 // True when an error thrown by a transport wrapper represents an HTTP 404, used
 // to trigger the data-URL compatibility fallback (and nothing else).
 export function isNotFoundError(error: unknown): boolean {
