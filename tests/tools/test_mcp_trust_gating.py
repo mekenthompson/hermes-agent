@@ -246,6 +246,12 @@ class TestAnnotationCaptureAtDiscovery:
             SimpleNamespace()
         ) is False
 
+    def test_dict_annotations_accept_snake_case_read_only_hint(self):
+        """MCP 2.x-style cached annotation dictionaries retain read-only status."""
+        assert mcp_tool._annotation_read_only_hint(
+            SimpleNamespace(annotations={"read_only_hint": True})
+        ) is True
+
     def test_real_sdk_annotations_read_only_hint_survives_2x_rename(self):
         """mcp 2.0 renamed ``readOnlyHint`` -> ``read_only_hint`` on the SDK
         model; camelCase survives only as a pydantic serialization alias,
