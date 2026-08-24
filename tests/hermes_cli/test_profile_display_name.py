@@ -46,6 +46,17 @@ class TestMetaAndValidation:
     def test_missing_file_defaults_empty(self, profile_env):
         assert read_profile_meta(profile_env)["display_name"] == ""
 
+    @pytest.mark.parametrize(
+        "yaml_value",
+        ["[Marko]", "{name: Marko}", "42", "true"],
+    )
+    def test_non_string_display_name_defaults_empty(self, profile_env, yaml_value):
+        (profile_env / "profile.yaml").write_text(
+            f"display_name: {yaml_value}\n", encoding="utf-8"
+        )
+
+        assert read_profile_meta(profile_env)["display_name"] == ""
+
     def test_empty_clears_key_from_file(self, profile_env):
         write_profile_meta(profile_env, display_name="Harumesu")
         write_profile_meta(profile_env, display_name="")

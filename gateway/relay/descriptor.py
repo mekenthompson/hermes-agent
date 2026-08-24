@@ -35,7 +35,7 @@ from dataclasses import asdict, dataclass
 
 # Bump additively (never reinterpret an existing field) during the experimental
 # phase; a breaking change requires updating both repos in lockstep.
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 
 
 @dataclass(frozen=True)

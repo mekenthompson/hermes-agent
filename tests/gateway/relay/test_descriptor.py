@@ -3,6 +3,10 @@
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
 
 
+def test_contract_version_includes_task_card_identity_fields():
+    assert CONTRACT_VERSION >= 2
+
+
 def _telegram_descriptor(**overrides) -> CapabilityDescriptor:
     base = dict(
         contract_version=CONTRACT_VERSION,

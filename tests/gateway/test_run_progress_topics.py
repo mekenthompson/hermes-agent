@@ -252,6 +252,7 @@ class NativeTaskCardAdapter(ProgressCaptureAdapter):
             {
                 "chat_id": chat_id,
                 "tasks": [dict(task) for task in tasks],
+                "title": title,
                 "metadata": dict(metadata or {}),
                 "fallback_text": fallback_text,
             }
@@ -1133,9 +1134,15 @@ async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
         scope_id="T1",
     )
 
+    assert isinstance(adapter, FailingNativeTaskCardAdapter)
     assert result["final_response"] == "done"
     assert len(adapter.native_updates) == 1
+    assert adapter.native_updates[0]["title"] == "Hermes is working"
+    assert adapter.native_updates[0]["fallback_text"].startswith(
+        "Hermes is working\n"
+    )
     assert len(adapter.sent) == 1
+    assert adapter.sent[0]["content"].startswith("Hermes is working\n")
     assert adapter.sent[0]["content"].endswith("web_search - alpha - running")
     assert len(adapter.edits) >= 2
     assert {edit["message_id"] for edit in adapter.edits} == {"progress-1"}
@@ -1147,6 +1154,165 @@ async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
         "stop_native",
         "send_fallback",
     ]
+
+
+@pytest.mark.asyncio
+async def test_slack_native_card_uses_profile_title_for_card_and_fallback(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "profile.yaml").write_text(
+        "display_name: Marko\n", encoding="utf-8"
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DuplicateNativeToolsAgent,
+        session_id="sess-native-profile-title",
+        platform=Platform.SLACK,
+        chat_id="C1",
+        thread_id="thread-1",
+        adapter_cls=NativeTaskCardAdapter,
+        user_id="U1",
+        scope_id="T1",
+    )
+
+    assert isinstance(adapter, NativeTaskCardAdapter)
+    assert result["final_response"] == "done"
+    assert {update["title"] for update in adapter.native_updates} == {
+        "Marko is working"
+    }
+    assert all(
+        update["fallback_text"].startswith("Marko is working\n")
+        for update in adapter.native_updates
+    )
+
+
+@pytest.mark.asyncio
+async def test_slack_native_card_does_not_derive_title_from_typing_status(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "profile.yaml").write_text(
+        "display_name: Marko\n", encoding="utf-8"
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DuplicateNativeToolsAgent,
+        session_id="sess-native-typing-independent",
+        config_data={
+            "platforms": {"slack": {"typing_status_text": "Definitely not Marko"}}
+        },
+        platform=Platform.SLACK,
+        chat_id="C1",
+        thread_id="thread-1",
+        adapter_cls=NativeTaskCardAdapter,
+        user_id="U1",
+        scope_id="T1",
+    )
+
+    assert isinstance(adapter, NativeTaskCardAdapter)
+    assert result["final_response"] == "done"
+    assert {update["title"] for update in adapter.native_updates} == {
+        "Marko is working"
+    }
+
+
+@pytest.mark.asyncio
+async def test_non_slack_platform_does_not_use_native_task_card_lane(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "profile.yaml").write_text(
+        "display_name: Marko\n", encoding="utf-8"
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FakeAgent,
+        session_id="sess-native-non-slack",
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        adapter_cls=NativeTaskCardAdapter,
+    )
+
+    assert isinstance(adapter, NativeTaskCardAdapter)
+    assert result["final_response"] == "done"
+    assert adapter.native_updates == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_multiplex_task_card_titles_are_profile_isolated(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for profile, display_name in (("marko", "Marko"), ("other", "Other Agent")):
+        profile_home = tmp_path / "profiles" / profile
+        profile_home.mkdir(parents=True)
+        (profile_home / "profile.yaml").write_text(
+            f"display_name: {display_name}\n", encoding="utf-8"
+        )
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_module = types.ModuleType("run_agent")
+    fake_module.AIAgent = DuplicateNativeToolsAgent  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "run_agent", fake_module)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    marko_adapter = NativeTaskCardAdapter()
+    other_adapter = NativeTaskCardAdapter()
+    runner = _make_runner(marko_adapter)
+    runner.config.multiplex_profiles = True
+    runner._profile_adapters = {
+        "marko": {Platform.SLACK: marko_adapter},
+        "other": {Platform.SLACK: other_adapter},
+    }
+
+    async def run_turn(profile, chat_id, adapter):
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id=chat_id,
+            chat_type="group",
+            thread_id=f"thread-{chat_id}",
+            user_id=f"user-{chat_id}",
+            scope_id=f"team-{chat_id}",
+            profile=profile,
+        )
+        source._transport_adapter_ref = lambda: adapter  # type: ignore[attr-defined]
+        return await runner._run_agent(
+            message="hello",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id=f"sess-{profile}",
+            session_key=f"agent:{profile}:slack:group:{chat_id}",
+        )
+
+    results = await asyncio.gather(
+        run_turn("marko", "C-MARKO", marko_adapter),
+        run_turn("other", "C-OTHER", other_adapter),
+    )
+
+    assert [result["final_response"] for result in results] == ["done", "done"]
+    assert {update["title"] for update in marko_adapter.native_updates} == {
+        "Marko is working"
+    }
+    assert {update["title"] for update in other_adapter.native_updates} == {
+        "Other Agent is working"
+    }
+    assert all(
+        "Marko" not in update["fallback_text"]
+        for update in other_adapter.native_updates
+    )
 
 
 @pytest.mark.asyncio

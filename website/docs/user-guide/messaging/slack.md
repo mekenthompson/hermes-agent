@@ -568,6 +568,9 @@ platforms:
   is `tool_progress: off` (text bubbles spam channels; native cards don't).
 - Concurrent calls to the same tool are correlated by real tool-call ID, so
   parallel `web_search` calls each get their own row with the right status.
+- The card heading uses the active profile's presentation-only `display_name`
+  from `profile.yaml`. Profiles without one keep the backward-compatible
+  `Hermes is working` heading.
 - If the native stream can't start or update, Hermes falls back to a single
   continuously edited text message so progress stays live for the turn.
 - The card stream is stopped exactly once when the turn finalizes, including
