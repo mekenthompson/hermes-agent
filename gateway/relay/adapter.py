@@ -721,9 +721,9 @@ class RelayAdapter(BasePlatformAdapter):
         reply_to/metadata/fallback_text) — not a card_id. The card stream
         key is derived per (chat, reply_to-thread): one card per turn
         thread, matching the connector's (channel, card_id) keying.
-        ``fallback_text``/``title`` are accepted for contract parity; the
-        connector's plan-mode stream renders task chunks, so they are not
-        forwarded.
+        Contract v2 forwards ``title`` and ``fallback_text`` so connector-side
+        task cards use the same profile-scoped identity as native Slack cards.
+        Contract v1 keeps its original payload byte-for-byte.
 
         ``tasks`` are the TurnRunner's normalized task dicts (id/title/
         status/details/output); the connector maps them onto its
@@ -748,15 +748,25 @@ class RelayAdapter(BasePlatformAdapter):
             # Slack card streams are thread replies (same rule as draft):
             # anchor on the triggering message when the runner gave us one.
             merged_meta["thread_ts"] = str(reply_to)
+        frame = {
+            "op": "task_card",
+            "chat_id": chat_id,
+            "card_id": card_id,
+            "chunks": [dict(t) for t in tasks],
+            "metadata": self._with_scope(chat_id, merged_meta),
+        }
+        descriptor = self._descriptor_for_chat(str(chat_id))
+        raw_contract_version = getattr(descriptor, "contract_version", 1)
+        contract_version = (
+            raw_contract_version if type(raw_contract_version) is int else 1
+        )
+        if contract_version >= 2:
+            frame["title"] = title
+            if fallback_text is not None:
+                frame["fallback_text"] = fallback_text
         try:
             result = await self._transport.send_outbound(
-                {
-                    "op": "task_card",
-                    "chat_id": chat_id,
-                    "card_id": card_id,
-                    "chunks": [dict(t) for t in tasks],
-                    "metadata": self._with_scope(chat_id, merged_meta),
-                },
+                frame,
                 platform=self._platform_by_chat.get(str(chat_id)),
             )
         except Exception as e:

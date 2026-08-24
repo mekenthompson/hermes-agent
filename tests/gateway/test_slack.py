@@ -5286,6 +5286,30 @@ class TestNativeTaskCardProgress:
         ).native_task_cards_enabled() is False
 
     @pytest.mark.asyncio
+    async def test_native_payload_preserves_supplied_title_and_fallback(self, adapter):
+        client = adapter._app.client
+        client.api_call.side_effect = [{"ts": "stream-1"}, {"ok": True}]
+        title = "小助手 is working"
+        fallback = f"{title}\n- terminal - running"
+
+        result = await adapter.send_native_task_card_progress(
+            "C1",
+            [{"id": "call-1", "title": "terminal", "status": "in_progress"}],
+            title=title,
+            fallback_text=fallback,
+            metadata={"thread_id": "thread-1"},
+        )
+
+        assert result.success
+        append = client.api_call.await_args_list[1]
+        assert append.args[0] == "chat.appendStream"
+        assert append.kwargs["json"]["chunks"][0] == {
+            "type": "plan_update",
+            "title": title,
+        }
+        assert append.kwargs["json"]["markdown_text"] == fallback
+
+    @pytest.mark.asyncio
     async def test_native_updates_are_serialized_and_workspace_scoped(self, adapter):
         team_client = AsyncMock()
         start_count = 0
