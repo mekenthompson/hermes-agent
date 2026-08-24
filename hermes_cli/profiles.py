@@ -894,10 +894,13 @@ def read_profile_meta(profile_dir: Path) -> dict:
         return empty
     if not isinstance(data, dict):
         return empty
+    raw_display_name = data.get("display_name")
     return {
         "description": str(data.get("description") or "").strip(),
         "description_auto": bool(data.get("description_auto", False)),
-        "display_name": str(data.get("display_name") or "").strip(),
+        "display_name": (
+            raw_display_name.strip() if isinstance(raw_display_name, str) else ""
+        ),
     }
 
 
