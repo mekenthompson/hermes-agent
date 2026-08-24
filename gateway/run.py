@@ -4584,6 +4584,9 @@ class TurnRunner:
         message so progress stays live for the rest of the turn.
         """
         ctx = self._ctx
+        from gateway.task_card_identity import GENERIC_TASK_CARD_TITLE
+
+        task_card_title = ctx.native_task_card_title or GENERIC_TASK_CARD_TITLE
         tasks: Dict[str, Dict[str, str]] = {}
         task_order: List[str] = []
         fallback_msg_id: Optional[str] = None
@@ -4610,7 +4613,7 @@ class TurnRunner:
                 f"- {task['title']} - {labels.get(task['status'], task['status'])}"
                 for task in _visible_tasks()
             ]
-            return "Hermes is working\n" + "\n".join(lines)
+            return task_card_title + "\n" + "\n".join(lines)
 
         def _apply_native_event(raw: Any) -> bool:
             nonlocal anonymous_seq
@@ -4708,7 +4711,7 @@ class TurnRunner:
                 result = await adapter.send_native_task_card_progress(
                     chat_id=ctx.source.chat_id,
                     tasks=_visible_tasks(),
-                    title="Hermes is working",
+                    title=task_card_title,
                     reply_to=ctx._progress_reply_to,
                     metadata=ctx._progress_metadata,
                     fallback_text=_fallback_text(),
@@ -28831,6 +28834,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # flags would silently leave the native feature inactive).
         _progress_adapter_for_native = self._adapter_for_source(source)
         _native_slack_task_cards = False
+        _native_task_card_title = None
         if (
             source.platform == Platform.SLACK
             and _progress_adapter_for_native is not None
@@ -28842,6 +28846,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception:
                 logger.debug("Slack native task-card config check failed", exc_info=True)
+        if _native_slack_task_cards:
+            from gateway.task_card_identity import resolve_task_card_title
+            from hermes_constants import get_hermes_home
+
+            _native_task_card_title = resolve_task_card_title(get_hermes_home())
         needs_progress_queue = (
             tool_progress_enabled or _thinking_enabled or _native_slack_task_cards
         )
@@ -28937,6 +28946,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
             needs_progress_queue=needs_progress_queue,
             _native_slack_task_cards=_native_slack_task_cards,
+            native_task_card_title=_native_task_card_title,
             _voice_ack_fired=_voice_ack_fired,
             _voice_ack_guild=_voice_ack_guild,
             _voice_ack_loop=_voice_ack_loop,

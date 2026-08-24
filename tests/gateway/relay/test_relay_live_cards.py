@@ -227,6 +227,84 @@ def _tasks():
 
 
 class TestTaskCardOps:
+    def test_v1_task_card_frame_remains_byte_compatible(self, loop):
+        adapter, stub = _connected_adapter(contract_version=1)
+        result = loop.run_until_complete(
+            adapter.send_native_task_card_progress(
+                chat_id="C1",
+                tasks=_tasks(),
+                title="Marko is working",
+                fallback_text="Marko is working\n- terminal - running",
+                reply_to="1700.100",
+            )
+        )
+
+        assert result.success
+        frame = next(s for s in stub.sent if s.get("op") == "task_card")
+        assert set(frame) == {"op", "chat_id", "card_id", "chunks", "metadata"}
+        assert "title" not in frame
+        assert "fallback_text" not in frame
+
+    def test_v2_task_card_frame_forwards_title_and_fallback(self, loop):
+        adapter, stub = _connected_adapter(contract_version=2)
+        result = loop.run_until_complete(
+            adapter.send_native_task_card_progress(
+                chat_id="C1",
+                tasks=_tasks(),
+                title="小助手 is working",
+                fallback_text="小助手 is working\n- terminal - running",
+                reply_to="1700.100",
+            )
+        )
+
+        assert result.success
+        frame = next(s for s in stub.sent if s.get("op") == "task_card")
+        assert frame["title"] == "小助手 is working"
+        assert frame["fallback_text"].startswith("小助手 is working\n")
+
+    def test_task_card_contract_version_is_resolved_per_chat(self, loop):
+        adapter, stub = _connected_adapter(contract_version=1)
+        v2 = make_desc(contract_version=2)
+        stub.descriptor_for_platform = lambda platform: v2  # type: ignore[attr-defined]
+        adapter._platform_by_chat["C-V2"] = "slack"
+
+        result = loop.run_until_complete(
+            adapter.send_native_task_card_progress(
+                chat_id="C-V2",
+                tasks=_tasks(),
+                title="Profile Two is working",
+                fallback_text="Profile Two is working\n- terminal - running",
+                reply_to="1700.200",
+            )
+        )
+
+        assert result.success
+        frame = next(s for s in stub.sent if s.get("op") == "task_card")
+        assert frame["title"] == "Profile Two is working"
+        assert frame["fallback_text"].startswith("Profile Two is working\n")
+
+    @pytest.mark.parametrize(
+        "malformed_version", [None, "not-a-number", "2", 2.0, 2.9, True, False, [], {}]
+    )
+    def test_malformed_contract_version_safely_uses_v1_frame(
+        self, loop, malformed_version
+    ):
+        adapter, stub = _connected_adapter(contract_version=malformed_version)
+
+        result = loop.run_until_complete(
+            adapter.send_native_task_card_progress(
+                chat_id="C1",
+                tasks=_tasks(),
+                title="Marko is working",
+                fallback_text="Marko is working\n- terminal - running",
+                reply_to="1700.100",
+            )
+        )
+
+        assert result.success
+        frame = next(s for s in stub.sent if s.get("op") == "task_card")
+        assert set(frame) == {"op", "chat_id", "card_id", "chunks", "metadata"}
+
     def test_progress_emits_task_card_op(self, loop):
         adapter, stub = _connected_adapter()
         result = loop.run_until_complete(
