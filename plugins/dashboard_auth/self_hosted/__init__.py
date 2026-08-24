@@ -645,27 +645,9 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             # verify_session() catches this and returns None per protocol.
             raise InvalidCodeError(f"ID token expired: {exc}") from exc
         except jwt.InvalidTokenError as exc:
-            # Surface the actual iss/aud the token carried so operators can
-            # debug config drift between the configured issuer/client_id and
-            # what the IDP emits. Decoding-without-verification is safe here:
-            # we already failed verification and never trust these values.
-            details = ""
-            try:
-                unverified = jwt.decode(
-                    id_token,
-                    options={"verify_signature": False, "verify_exp": False},
-                )
-                details = (
-                    f" [token iss={unverified.get('iss')!r} "
-                    f"aud={unverified.get('aud')!r}; "
-                    f"expected iss={disco['issuer']!r} "
-                    f"aud={self._client_id!r}]"
-                )
-            except Exception:
-                pass
-            raise ProviderError(
-                f"ID token verification failed: {exc}{details}"
-            ) from exc
+            # Signature and claim validation failures are invalid caller state,
+            # not a provider outage. Do not decode or log the raw bearer.
+            raise InvalidCodeError(f"ID token verification failed: {exc}") from exc
 
         return claims
 

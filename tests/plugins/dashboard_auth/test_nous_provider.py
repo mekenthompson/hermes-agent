@@ -549,24 +549,25 @@ class TestVerifySession:
         token = _mint_token(rsa_keypair, ttl_seconds=-1)
         assert provider.verify_session(access_token=token) is None
 
-    def test_wrong_audience_raises_provider_error(self, provider, rsa_keypair):
-        token = _mint_token(rsa_keypair, aud="agent:other-instance")
-        with pytest.raises(ProviderError, match="verification failed"):
-            provider.verify_session(access_token=token)
-
-
-    def test_verification_failure_message_surfaces_token_claims(
-        self, provider, rsa_keypair
+    def test_wrong_audience_returns_none_through_invalid_code(
+        self, provider, rsa_keypair, caplog
     ):
-        """Operators need to see the actual iss/aud the token carries to debug
-        config drift between HERMES_DASHBOARD_PORTAL_URL/CLIENT_ID and Portal."""
-        token = _mint_token(rsa_keypair, iss="https://evil.example")
-        with pytest.raises(ProviderError) as excinfo:
-            provider.verify_session(access_token=token)
-        msg = str(excinfo.value)
-        # Both the observed (token) and expected (configured) values appear.
-        assert "'https://evil.example'" in msg
-        assert "'https://portal.example.com'" in msg  # configured portal URL
+        token = _mint_token(rsa_keypair, aud="agent:other-instance")
+        with pytest.raises(InvalidCodeError, match="verification failed"):
+            provider._verify_jwt(token)
+        assert provider.verify_session(access_token=token) is None
+        assert token not in caplog.text
+
+
+    def test_bad_signature_returns_none_through_invalid_code(
+        self, provider, rsa_keypair, caplog
+    ):
+        valid_token = _mint_token(rsa_keypair)
+        token = valid_token.rsplit(".", 1)[0] + ".AAAA"
+        with pytest.raises(InvalidCodeError, match="verification failed"):
+            provider._verify_jwt(token)
+        assert provider.verify_session(access_token=token) is None
+        assert token not in caplog.text
 
 
     def test_agent_instance_id_mismatch_rejected(self, provider, rsa_keypair):
