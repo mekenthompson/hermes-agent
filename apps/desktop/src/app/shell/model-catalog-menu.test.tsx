@@ -106,3 +106,27 @@ describe('the catalog owns model curation', () => {
     expect($modelVisibilityOpen.get()).toBe(true)
   })
 })
+
+describe('provider ordering', () => {
+  it('leads with direct subscriptions and leaves aggregators last', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        { models: ['nous-model'], name: 'Nous Portal', slug: 'nous' },
+        { models: ['openrouter-model'], name: 'OpenRouter', slug: 'openrouter' },
+        { models: ['grok-4.6'], name: 'xAI Grok OAuth', slug: 'xai-oauth' },
+        { models: ['gpt-5.6-sol'], name: 'ChatGPT or Codex Subscription', slug: 'openai-codex' }
+      ]
+    })
+
+    renderMenu()
+
+    const chatgpt = await screen.findByText('ChatGPT or Codex Subscription')
+    const xai = screen.getByText('xAI Grok OAuth')
+    const openrouter = screen.getByText('OpenRouter')
+    const nous = screen.getByText('Nous Portal')
+
+    expect(chatgpt.compareDocumentPosition(xai) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(xai.compareDocumentPosition(openrouter) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(openrouter.compareDocumentPosition(nous) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+})

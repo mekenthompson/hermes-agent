@@ -585,9 +585,23 @@ function groupModels(
     }
   }
 
-  // Stable, logical group order: alphabetical by provider name. (The backend
-  // floats the current provider first, which would reshuffle on every switch.)
-  groups.sort((a, b) => a.provider.name.localeCompare(b.provider.name))
+  // Stable, user-oriented group order. Direct subscription providers lead,
+  // followed by aggregators; every other provider stays deterministic after
+  // those preferred lanes. Never float the current provider — switching a
+  // model must not reshuffle the menu under the pointer.
+  const preferredProviderOrder = ['openai-codex', 'xai-oauth', 'openrouter', 'nous']
+
+  const providerRank = (slug: string) => {
+    const rank = preferredProviderOrder.indexOf(slug.toLowerCase())
+
+    return rank === -1 ? preferredProviderOrder.length : rank
+  }
+
+  groups.sort(
+    (a, b) =>
+      providerRank(a.provider.slug) - providerRank(b.provider.slug) ||
+      a.provider.name.localeCompare(b.provider.name)
+  )
 
   return groups
 }
