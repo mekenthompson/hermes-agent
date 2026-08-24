@@ -207,13 +207,13 @@ def build_auto_tts_output_path(platform) -> str:
     from tools.tts_tool import OPUS_VOICE_PLATFORMS
 
     ext = "ogg" if _platform_name(platform) in OPUS_VOICE_PLATFORMS else "mp3"
-    audio_path = os.path.join(
-        tempfile.gettempdir(),
-        "hermes_voice",
-        f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}",
-    )
-    os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-    return audio_path
+    # Use Hermes' normal per-profile audio cache. Passing a /tmp path back
+    # into the public TTS tool triggers its protected-path guard, which made
+    # /voice tts silently fall back to text-only delivery. The cache is both
+    # user-writable and cleaned up by the normal gateway maintenance task.
+    audio_dir = get_hermes_dir("cache/audio", "audio_cache")
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    return str(audio_dir / f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}")
 
 
 def utf16_len(s: str) -> int:

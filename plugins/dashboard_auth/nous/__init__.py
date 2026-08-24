@@ -436,6 +436,11 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
             signing_key = self._get_jwks_client().get_signing_key_from_jwt(
                 access_token
             )
+        except jwt.InvalidTokenError as exc:
+            # A malformed bearer is invalid caller state, not an IDP outage.
+            # verify_session() converts InvalidCodeError to None so middleware
+            # returns 401 and Desktop starts a clean OAuth login.
+            raise InvalidCodeError(f"access token invalid: {exc}") from exc
         except jwt.PyJWKClientError as exc:
             raise ProviderError(f"JWKS lookup failed: {exc}") from exc
         except Exception as exc:  # pragma: no cover - defensive
@@ -476,7 +481,7 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
                 )
             except Exception:
                 pass
-            raise ProviderError(
+            raise InvalidCodeError(
                 f"access token verification failed: {exc}{details}"
             ) from exc
 

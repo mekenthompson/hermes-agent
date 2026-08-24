@@ -4631,6 +4631,27 @@ class TestNativeTaskCardProgress:
         assert adapter._native_task_card_streams == {}
 
     @pytest.mark.asyncio
+    async def test_native_task_card_append_uses_chunks_without_markdown_text(self, adapter):
+        client = adapter._app.client
+        client.api_call.side_effect = [
+            {"ts": "stream-1"},
+            {"ok": True},
+        ]
+
+        result = await adapter.send_native_task_card_progress(
+            "C1",
+            [{"id": "call-1", "title": "terminal", "status": "in_progress"}],
+            metadata={"thread_id": "thread-1"},
+            fallback_text="terminal - running",
+        )
+
+        assert result.success is True
+        append_call = client.api_call.await_args_list[1]
+        assert append_call.args[0] == "chat.appendStream"
+        assert append_call.kwargs["json"]["chunks"]
+        assert "markdown_text" not in append_call.kwargs["json"]
+
+    @pytest.mark.asyncio
     async def test_same_channel_thread_isolated_between_workspaces(self, adapter):
         clients = {"T1": AsyncMock(), "T2": AsyncMock()}
 

@@ -4375,6 +4375,9 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
         hint = annotations.get("readOnlyHint")
     else:
         hint = getattr(annotations, "readOnlyHint", None)
+        # MCP SDK ToolAnnotations uses snake_case Pydantic attributes.
+        if hint is None:
+            hint = getattr(annotations, "read_only_hint", None)
     return hint is True
 
 

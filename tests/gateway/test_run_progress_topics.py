@@ -278,9 +278,22 @@ class NativeTaskCardAdapter(ProgressCaptureAdapter):
 
 
 class FailingNativeTaskCardAdapter(NativeTaskCardAdapter):
+    def __init__(self, platform=Platform.SLACK):
+        super().__init__(platform=platform)
+        self.failure_sequence = []
+
     async def send_native_task_card_progress(self, *args, **kwargs) -> SendResult:
         await super().send_native_task_card_progress(*args, **kwargs)
+        self.failure_sequence.append("native_failure")
         return SendResult(success=False, error="native stream unavailable", retryable=True)
+
+    async def stop_native_task_card_progress(self, *args, **kwargs):
+        self.failure_sequence.append("stop_native")
+        await super().stop_native_task_card_progress(*args, **kwargs)
+
+    async def send(self, *args, **kwargs) -> SendResult:
+        self.failure_sequence.append("send_fallback")
+        return await super().send(*args, **kwargs)
 
 
 class DuplicateNativeToolsAgent:
@@ -1129,6 +1142,11 @@ async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
     assert adapter.edits[-1]["content"].endswith("web_search - beta - error")
     assert "web_search - alpha - complete" in adapter.edits[-1]["content"]
     assert adapter.native_stops == 1
+    assert adapter.failure_sequence[:3] == [
+        "native_failure",
+        "stop_native",
+        "send_fallback",
+    ]
 
 
 @pytest.mark.asyncio
