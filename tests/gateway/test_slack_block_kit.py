@@ -26,6 +26,23 @@ class TestRenderBlocksBasics:
         assert blocks[0]["text"]["text"] == "Title"
 
 
+class TestSectionFolding:
+    def test_paragraph_section_expands_in_slack_client(self):
+        """Slack clients must not fold renderer-generated long answers."""
+        blocks = render_blocks("A detailed answer that should remain expanded.")
+
+        assert blocks == [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "A detailed answer that should remain expanded.",
+                },
+                "expand": True,
+            }
+        ]
+
+
 class TestNestedLists:
     def test_nested_bullets_produce_increasing_indent(self):
         md = "- a\n  - b\n    - c"
