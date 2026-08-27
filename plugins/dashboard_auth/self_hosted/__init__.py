@@ -653,7 +653,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
                 )
             except Exception:
                 pass
-            raise ProviderError(
+            raise InvalidCodeError(
                 f"ID token verification failed: {exc}{details}"
             ) from exc
 
