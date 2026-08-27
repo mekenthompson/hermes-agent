@@ -16176,6 +16176,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return self._make_default_profile_message_handler()
         return self._handle_message
 
+    async def dispatch_internal_plugin_event(
+        self, event: MessageEvent
+    ) -> Optional[str]:
+        """Run one profile-local plugin event through the normal gateway turn.
+
+        This is deliberately narrower than adapter ingress. Plugins may start an
+        agent turn and receive its final text, but they may not impersonate a
+        messaging transport, bypass profile selection, execute gateway commands,
+        or inject media. The normal scoped message handler still owns session
+        lookup, persistence, model execution, and response normalization.
+        """
+        if not isinstance(event, MessageEvent):
+            raise TypeError("internal plugin dispatch requires a MessageEvent")
+        if event.internal is not True:
+            raise PermissionError("internal plugin events must set internal=True")
+        if event.allow_gateway_control is not False:
+            raise PermissionError(
+                "internal plugin events must set allow_gateway_control=False"
+            )
+        if event.message_type is not MessageType.TEXT:
+            raise ValueError("internal plugin dispatch accepts text events only")
+
+        source = event.source
+        if source is None:
+            raise ValueError("internal plugin events require a SessionSource")
+        if source.platform is not Platform.LOCAL:
+            raise PermissionError(
+                "internal plugin events must use the local platform"
+            )
+        if not str(getattr(source, "profile", "") or "").strip():
+            raise ValueError("internal plugin events require an explicit profile")
+        if not str(getattr(source, "chat_id", "") or "").strip():
+            raise ValueError("internal plugin events require a session chat_id")
+
+        handler = self._primary_message_handler()
+        return await handler(event)
+
     async def _handle_gateway_platform_event(self, event: dict, source) -> None:
         """Authorize and publish one normalized adapter event to plugin hooks."""
         try:
