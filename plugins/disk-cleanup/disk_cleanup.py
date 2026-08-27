@@ -147,7 +147,7 @@ ALLOWED_CATEGORIES = {
 _EMPTY_DIR_PROTECTED_TOP_LEVEL = frozenset({
     "logs", "memories", "sessions", "cron", "cronjobs",
     "cache", "skills", "plugins", "disk-cleanup", "optional-skills",
-    "hermes-agent", "backups", "profiles", ".worktrees",
+    "hermes-agent", "backups", "profiles", ".worktrees", "workspace",
     # User-authored project trees — never sweep empty directories
     # inside these (#75403).
     "patches", "projects", "skins", "themes", "contributors",
@@ -584,7 +584,7 @@ def guess_category(path: Path) -> Optional[str]:
             # User-authored and project trees — never auto-delete files
             # inside these just because they happen to be named test_* or
             # tmp_* (#75403, also #32164, #37721).
-            "patches", "projects", "skins", "themes", "contributors",
+            "patches", "projects", "workspace", "skins", "themes", "contributors",
             "profiles", "backups", "optional-skills",
         }:
             return None
