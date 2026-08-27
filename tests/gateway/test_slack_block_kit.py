@@ -234,3 +234,12 @@ class TestSplitTextFenceBalanced:
             )
 
 
+class TestSectionExpand:
+    def test_section_requests_expand(self):
+        from plugins.platforms.slack.block_kit import _section_block
+
+        block = _section_block("hello")
+        assert block["type"] == "section"
+        assert block.get("expand") is True
+
+
