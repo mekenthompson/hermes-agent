@@ -1459,6 +1459,16 @@ class PluginContext:
             return value
         return _nested_plugin_value(entry.get("config"), segments, default)
 
+    def register_profile_service(self, name: str, factory) -> None:
+        """Register a long-running per-profile async service.
+
+        The gateway starts *factory(runtime)* after it is running. *runtime*
+        has ``profile_home``, ``profile_name``, ``stop_event``, and ``gateway``.
+        """
+        if not name or not callable(factory):
+            raise ValueError("profile service requires a name and callable factory")
+        self._manager._profile_services.append((str(name), factory))
+
     def set_config(self, key: str, value: Any) -> None:
         """Atomically write one value in this plugin's ``settings`` subtree."""
         try:
@@ -3513,6 +3523,7 @@ class PluginManager:
             maxsize=_EVENT_PENDING_CAP
         )
         self._event_worker: Optional[threading.Thread] = None
+        self._profile_services: list[tuple[str, Any]] = []
         # Per-worker chain depth caps mutually-emitting plugins even though each
         # re-entrant emit is queued rather than invoked recursively.
         self._emit_depth = threading.local()

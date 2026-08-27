@@ -6935,6 +6935,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._async_session_store = AsyncSessionStore(self.session_store)
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
+        self._profile_service_stop = asyncio.Event()
+        self._profile_service_tasks: list[asyncio.Task] = []
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
@@ -13409,6 +13411,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running = True
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
+        self._start_plugin_profile_services()
 
         self._start_loop_heartbeat_task()
 
@@ -14940,6 +14943,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
         if callable(_stop_guards):
             _stop_guards()
+        stop_services = getattr(self, "_stop_plugin_profile_services", None)
+        if callable(stop_services):
+            try:
+                await stop_services()
+            except Exception:
+                logger.debug("plugin profile service stop failed", exc_info=True)
         if restart:
             self._restart_requested = True
             self._restart_detached = detached_restart
@@ -19225,6 +19234,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     delattr(event, attr)
                 except AttributeError:
                     pass
+
+    def _start_plugin_profile_services(self) -> None:
+        """Start plugin profile services against this live gateway."""
+        from types import SimpleNamespace
+
+        from hermes_cli.plugins import get_plugin_manager
+        from hermes_constants import get_hermes_home
+
+        stop_event = getattr(self, "_profile_service_stop", None)
+        if stop_event is None:
+            stop_event = asyncio.Event()
+            self._profile_service_stop = stop_event
+        self._profile_service_tasks = []
+        profile_name = (
+            os.getenv("HERMES_PROFILE")
+            or os.getenv("HERMES_AGENT_PROFILE")
+            or "default"
+        ).strip() or "default"
+        runtime = SimpleNamespace(
+            profile_home=str(get_hermes_home()),
+            profile_name=profile_name,
+            stop_event=stop_event,
+            gateway=self,
+        )
+        try:
+            services = list(get_plugin_manager()._profile_services)
+        except Exception:
+            services = []
+        for name, factory in services:
+            try:
+                task = asyncio.create_task(factory(runtime), name=f"profile-service:{name}")
+            except Exception:
+                logger.exception("Failed to start plugin profile service %s", name)
+                continue
+            self._profile_service_tasks.append(task)
+            logger.info("Started plugin profile service %s", name)
+
+    async def _stop_plugin_profile_services(self) -> None:
+        stop_event = getattr(self, "_profile_service_stop", None)
+        if stop_event is not None and not stop_event.is_set():
+            stop_event.set()
+        tasks = list(getattr(self, "_profile_service_tasks", []) or [])
+        self._profile_service_tasks = []
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     def _install_plugin_message_injector(self) -> None:
         """Publish this live gateway's plugin message scheduler."""
