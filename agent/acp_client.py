@@ -226,6 +226,7 @@ def _acp_permission_mode() -> str:
 
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]],
+    model: str | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
 ) -> str:
@@ -233,7 +234,9 @@ def _format_messages_as_prompt(
     # _run_prompt owns it, gated on the config-option path not running:
     # once session/set_config_option succeeds, a hint naming the requested
     # id would be a contradictory instruction alongside the model the
-    # session is actually serving.
+    # session is actually serving. `model` is accepted for call-site
+    # compatibility with the old Copilot helper.
+    del model
     sections: list[str] = [
         "You are being used as the active ACP agent backend for Hermes.",
         "Use ACP capabilities to complete tasks.",
