@@ -245,3 +245,18 @@ class TestAnnotationCaptureAtDiscovery:
         assert mcp_tool._annotation_read_only_hint(
             SimpleNamespace()
         ) is False
+
+    def test_snake_case_object_annotation(self):
+        assert mcp_tool._annotation_read_only_hint(
+            SimpleNamespace(annotations=SimpleNamespace(read_only_hint=True))
+        ) is True
+
+    def test_snake_case_dict_annotation(self):
+        assert mcp_tool._annotation_read_only_hint(
+            SimpleNamespace(annotations={"read_only_hint": True})
+        ) is True
+
+    def test_snake_case_dict_preferred_over_camel_false(self):
+        assert mcp_tool._annotation_read_only_hint(
+            SimpleNamespace(annotations={"read_only_hint": True, "readOnlyHint": False})
+        ) is True
