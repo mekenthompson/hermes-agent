@@ -2901,8 +2901,9 @@ class SlackAdapter(BasePlatformAdapter):
                     "ts": stream.stream_ts,
                     "chunks": chunks,
                 }
-                if fallback_text:
-                    append_payload["markdown_text"] = fallback_text
+                # Slack rejects appendStream requests that provide both task-card
+                # chunks and markdown_text. fallback_text remains accepted by
+                # this method for callers that need a separate text fallback.
                 await client.api_call("chat.appendStream", json=append_payload)
                 return SendResult(success=True, message_id=stream.stream_ts)
             except Exception as exc:  # pragma: no cover - defensive logging
