@@ -546,16 +546,15 @@ class TestVerifySession:
         token = _mint_id_token(rsa_keypair, ttl_seconds=-1)
         assert provider.verify_session(access_token=token) is None
 
-    def test_wrong_audience_raises(self, provider, rsa_keypair):
+    def test_wrong_audience_returns_none(self, provider, rsa_keypair):
         token = _mint_id_token(rsa_keypair, aud="some-other-client")
-        with pytest.raises(ProviderError, match="verification failed"):
-            provider.verify_session(access_token=token)
+        assert provider.verify_session(access_token=token) is None
 
 
     def test_failure_message_surfaces_claims(self, provider, rsa_keypair):
         token = _mint_id_token(rsa_keypair, iss="https://evil.example")
-        with pytest.raises(ProviderError) as excinfo:
-            provider.verify_session(access_token=token)
+        with pytest.raises(InvalidCodeError) as excinfo:
+            provider._verify_id_token(token)
         msg = str(excinfo.value)
         assert "'https://evil.example'" in msg
         assert f"'{_ISSUER}'" in msg
