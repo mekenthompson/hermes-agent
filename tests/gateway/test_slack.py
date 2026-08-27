@@ -5248,6 +5248,39 @@ class TestNativeTaskCardProgress:
         assert adapter._native_task_card_streams == {}
 
     @pytest.mark.asyncio
+    async def test_append_stream_omits_markdown_text_when_sending_chunks(self, adapter):
+        team_client = AsyncMock()
+
+        async def api_call(method, *, json):
+            if method == "chat.startStream":
+                return {"ts": "stream-1"}
+            return {"ok": True}
+
+        team_client.api_call.side_effect = api_call
+        adapter._team_clients["T1"] = team_client
+        metadata = {
+            "thread_id": "thread-1",
+            "slack_team_id": "T1",
+            "recipient_team_id": "T1",
+            "recipient_user_id": "U1",
+        }
+        result = await adapter.send_native_task_card_progress(
+            "C1",
+            [{"id": "call-1", "title": "terminal", "status": "in_progress"}],
+            metadata=metadata,
+            fallback_text="working",
+        )
+        assert result.success
+        append = [
+            call.kwargs["json"]
+            for call in team_client.api_call.await_args_list
+            if call.args[0] == "chat.appendStream"
+        ]
+        assert append
+        assert "chunks" in append[0]
+        assert "markdown_text" not in append[0]
+
+    @pytest.mark.asyncio
     async def test_same_channel_thread_isolated_between_workspaces(self, adapter):
         clients = {"T1": AsyncMock(), "T2": AsyncMock()}
 
