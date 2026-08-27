@@ -4588,6 +4588,7 @@ class TurnRunner:
         task_order: List[str] = []
         fallback_msg_id: Optional[str] = None
         native_failed = False
+        native_stop_requested = False
         anonymous_seq = 0
 
         def _compact(value: Any, limit: int = 120) -> str:
@@ -4678,6 +4679,27 @@ class TurnRunner:
                 if ctx._cleanup_progress:
                     ctx._cleanup_msg_ids.append(fallback_msg_id)
 
+        async def _stop_native_progress() -> None:
+            nonlocal native_stop_requested
+            if native_stop_requested or not hasattr(
+                adapter, "stop_native_task_card_progress"
+            ):
+                return
+            native_stop_requested = True
+            try:
+                await adapter.stop_native_task_card_progress(
+                    ctx.source.chat_id,
+                    reply_to=ctx._progress_reply_to,
+                    metadata=ctx._progress_metadata,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "task-card stop failed during turn cleanup",
+                    exc_info=True,
+                )
+
         async def _publish_native_progress() -> None:
             nonlocal native_failed
             if not tasks:
@@ -4699,6 +4721,9 @@ class TurnRunner:
                     "to an editable text update: %s",
                     getattr(result, "error", "unknown error"),
                 )
+                # Close the failed native stream before posting a text fallback,
+                # otherwise Slack can leave both visible in the thread.
+                await _stop_native_progress()
             # Once the native rail fails, every later lifecycle event
             # edits the same fallback message so progress remains live.
             await _send_or_edit_fallback()
@@ -4749,26 +4774,7 @@ class TurnRunner:
                     await _publish_native_progress()
             return
         finally:
-            if hasattr(adapter, "stop_native_task_card_progress"):
-                # Best-effort: this finally runs on the turn-cleanup path.
-                # An escaping transport exception here propagated through
-                # the cleanup awaits (which caught only CancelledError) and
-                # skipped final-delivery logic (review B7). Adapters now
-                # return failed SendResults, but defend the seam anyway —
-                # any adapter, any transport.
-                try:
-                    await adapter.stop_native_task_card_progress(
-                        ctx.source.chat_id,
-                        reply_to=ctx._progress_reply_to,
-                        metadata=ctx._progress_metadata,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.debug(
-                        "task-card stop failed during turn cleanup",
-                        exc_info=True,
-                    )
+            await _stop_native_progress()
 
     async def send_progress_messages(self):
         ctx = self._ctx
