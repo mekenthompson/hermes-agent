@@ -5307,7 +5307,7 @@ class TestNativeTaskCardProgress:
             "type": "plan_update",
             "title": title,
         }
-        assert append.kwargs["json"]["markdown_text"] == fallback
+        assert "markdown_text" not in append.kwargs["json"]
 
     @pytest.mark.asyncio
     async def test_native_updates_are_serialized_and_workspace_scoped(self, adapter):
