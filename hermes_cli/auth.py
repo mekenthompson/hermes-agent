@@ -2266,6 +2266,13 @@ def resolve_provider(
     if normalized in PROVIDER_REGISTRY:
         return normalized
     if normalized != "auto":
+        try:
+            from providers import get_provider_profile
+
+            if get_provider_profile(normalized) is not None:
+                return normalized
+        except Exception:
+            pass
         # Check for common config.yaml issues that cause this error
         _config_hint = _get_config_hint_for_unknown_provider(normalized)
         msg = f"Unknown provider '{normalized}'."
@@ -7260,28 +7267,49 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def _external_process_provider_details(provider_id: str) -> tuple[str, str] | None:
+    """Return display name and ACP base URL from static or plugin provider metadata."""
+    pconfig = PROVIDER_REGISTRY.get(provider_id)
+    if pconfig and pconfig.auth_type == "external_process":
+        base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+        return pconfig.name, base_url or pconfig.inference_base_url
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider_id)
+    except Exception:
+        profile = None
+    if profile and profile.auth_type == "external_process":
+        return profile.display_name or provider_id, profile.base_url
+    return None
+
+
+def is_external_process_provider(provider_id: str) -> bool:
+    """Whether a built-in or plugin provider is backed by an ACP subprocess."""
+    return _external_process_provider_details(provider_id) is not None
+
+
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
-    pconfig = PROVIDER_REGISTRY.get(provider_id)
-    if not pconfig or pconfig.auth_type != "external_process":
+    details = _external_process_provider_details(provider_id)
+    if not details:
         return {"configured": False}
+    name, base_url = details
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
+    from agent.acp_agent_registry import resolve_agent_launch
+    from agent.copilot_acp_client import extract_acp_agent_name
+
+    agent_name = extract_acp_agent_name(base_url) or provider_id.removesuffix("-acp")
+    try:
+        command, args = resolve_agent_launch(agent_name)
+    except ValueError:
+        return {"configured": False, "provider": provider_id, "name": name}
 
     resolved_command = shutil.which(command) if command else None
     return {
         "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
         "provider": provider_id,
-        "name": pconfig.name,
+        "name": name,
         "command": command,
         "args": args,
         "resolved_command": resolved_command,
@@ -7307,7 +7335,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target == "copilot-acp":
+    if is_external_process_provider(target):
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -7484,38 +7512,34 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
 
 def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str, Any]:
-    """Resolve runtime details for local subprocess-backed providers."""
-    pconfig = PROVIDER_REGISTRY.get(provider_id)
-    if not pconfig or pconfig.auth_type != "external_process":
+    """Resolve runtime details for static or plugin-backed ACP providers."""
+    details = _external_process_provider_details(provider_id)
+    if not details:
         raise AuthError(
             f"Provider '{provider_id}' is not an external-process provider.",
             provider=provider_id,
             code="invalid_provider",
         )
+    _name, base_url = details
+    from agent.acp_agent_registry import agent_install_hint, resolve_agent_launch
+    from agent.copilot_acp_client import extract_acp_agent_name
 
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
-
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    agent_name = extract_acp_agent_name(base_url) or provider_id.removesuffix("-acp")
+    try:
+        command, args = resolve_agent_launch(agent_name)
+    except ValueError as exc:
+        raise AuthError(str(exc), provider=provider_id, code="unknown_acp_agent") from exc
     resolved_command = shutil.which(command) if command else None
     if not resolved_command and not base_url.startswith("acp+tcp://"):
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            f"Could not find the ACP command '{command}' for agent '{agent_name}'. "
+            f"{agent_install_hint(agent_name)}",
             provider=provider_id,
-            code="missing_copilot_cli",
+            code="missing_acp_command",
         )
-
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": f"{agent_name}-acp",
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,

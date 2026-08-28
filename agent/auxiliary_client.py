@@ -6864,6 +6864,13 @@ def resolve_provider_client(
 
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig is None:
+        try:
+            from providers import get_provider_profile
+
+            pconfig = get_provider_profile(provider)
+        except Exception:
+            pconfig = None
+    if pconfig is None:
         # Demoted from logger.warning to debug; dedup keyed by provider name
         # so the first occurrence surfaces but repeated retries stay silent.
         if provider not in _LOGGED_UNKNOWN_PROVIDER_KEYS:
@@ -7014,7 +7021,7 @@ def resolve_provider_client(
             or _read_main_model_for_aux(),
             provider,
         )
-        if provider == "copilot-acp":
+        if str(creds.get("base_url", "")).lower().startswith("acp://"):
             api_key = str(creds.get("api_key", "")).strip()
             base_url = str(creds.get("base_url", "")).strip()
             command = str(creds.get("command", "")).strip() or None
@@ -7031,9 +7038,9 @@ def resolve_provider_client(
                     "process credentials are incomplete"
                 )
                 return None, None
-            from agent.copilot_acp_client import CopilotACPClient
+            from agent.copilot_acp_client import ACPClient
 
-            client = CopilotACPClient(
+            client = ACPClient(
                 api_key=api_key,
                 base_url=base_url,
                 command=command,

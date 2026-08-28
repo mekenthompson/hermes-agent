@@ -30,8 +30,17 @@ from agent.file_safety import get_read_block_error, get_write_denied_error, is_w
 from agent.redact import redact_sensitive_text
 from tools.environments.local import hermes_subprocess_env
 
+ACP_MARKER_PREFIX = "acp://"
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
+
+
+def extract_acp_agent_name(base_url: object) -> str:
+    # Return the normalized agent segment from acp://<agent>.
+    text = str(base_url or "").strip()
+    if not text.lower().startswith(ACP_MARKER_PREFIX):
+        return ""
+    return text[len(ACP_MARKER_PREFIX):].split("/", 1)[0].strip().lower()
 
 # Stderr fingerprint of the deprecated `gh copilot` CLI extension
 # (https://github.blog/changelog/2025-09-25-upcoming-deprecation-of-gh-copilot-cli-extension).
@@ -285,8 +294,8 @@ class _ACPChatNamespace:
         self.completions = _ACPChatCompletions(client)
 
 
-class CopilotACPClient:
-    """Minimal OpenAI-client-compatible facade for Copilot ACP."""
+class ACPClient:
+    """OpenAI-client-compatible facade for a plugin-registered ACP agent."""
 
     def __init__(
         self,
@@ -299,13 +308,55 @@ class CopilotACPClient:
         acp_cwd: str | None = None,
         command: str | None = None,
         args: list[str] | None = None,
+        agent_name: str | None = None,
+        acp_env_unset: tuple[str, ...] | None = None,
         **_: Any,
     ):
-        self.api_key = api_key or "copilot-acp"
         self.base_url = base_url or ACP_MARKER_BASE_URL
+        self.agent_name = (agent_name or extract_acp_agent_name(self.base_url) or "copilot").strip().lower()
+        self.api_key = api_key or f"{self.agent_name}-acp"
         self._default_headers = dict(default_headers or {})
-        self._acp_command = acp_command or command or _resolve_command()
-        self._acp_args = list(acp_args or args or _resolve_args())
+        explicit_command = acp_command or command
+        explicit_args = acp_args if acp_args is not None else args
+        self._registry_error: ValueError | None = None
+        if explicit_command and self.agent_name != "copilot":
+            from agent.acp_agent_registry import get_agent_entry, known_agents
+
+            if get_agent_entry(self.agent_name) is None:
+                self._registry_error = ValueError(
+                    f"Unknown ACP agent '{self.agent_name}'. Known agents: "
+                    f"{', '.join(known_agents())}. Register the agent through a "
+                    "model-provider plugin before supplying launch arguments."
+                )
+        if self._registry_error is not None:
+            self._acp_command, self._acp_args = "", []
+            self._acp_env_unset = tuple(acp_env_unset or ())
+        elif explicit_command:
+            self._acp_command = explicit_command
+            self._acp_args = list(explicit_args or [])
+            if acp_env_unset is not None:
+                self._acp_env_unset = tuple(acp_env_unset)
+            elif self.agent_name == "copilot":
+                self._acp_env_unset = ()
+            else:
+                from agent.acp_agent_registry import agent_env_unset
+
+                self._acp_env_unset = tuple(agent_env_unset(self.agent_name))
+        elif self.agent_name == "copilot":
+            self._acp_command = _resolve_command()
+            self._acp_args = list(_resolve_args())
+            self._acp_env_unset = tuple(acp_env_unset or ())
+        else:
+            from agent.acp_agent_registry import agent_env_unset, resolve_agent_launch
+
+            try:
+                self._acp_command, self._acp_args = resolve_agent_launch(self.agent_name)
+            except ValueError as exc:
+                # Constructing an arbitrary acp:// marker must not spawn or resolve a binary.
+                # The first prompt fails closed with this preserved error.
+                self._registry_error = exc
+                self._acp_command, self._acp_args = "", []
+            self._acp_env_unset = tuple(acp_env_unset or agent_env_unset(self.agent_name))
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
@@ -387,13 +438,21 @@ class CopilotACPClient:
         completion = SimpleNamespace(
             choices=[choice],
             usage=usage,
-            model=model or "copilot-acp",
+            model=model or f"{self.agent_name}-acp",
         )
         if stream:
             return _completion_to_stream_chunks(completion)
         return completion
 
+    def _subprocess_env(self) -> dict[str, str]:
+        env = _build_subprocess_env()
+        for marker in self._acp_env_unset:
+            env.pop(marker, None)
+        return env
+
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+        if self._registry_error is not None:
+            raise RuntimeError(str(self._registry_error)) from self._registry_error
         # Fast-fail when the CLI doesn't support the ACP args we'd pass.
         # Without this guard, a CLI like Claude Code v2.x exits with
         # ``error: unknown option '--acp'`` immediately, then the parent
@@ -429,18 +488,18 @@ class CopilotACPClient:
                 text=True, encoding='utf-8', errors='replace',
                 bufsize=1,
                 cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
+                env=self._subprocess_env(),
                 creationflags=windows_hide_flags(),
             )
         except FileNotFoundError as exc:
+            label = "Copilot" if self.agent_name == "copilot" else self.agent_name
             raise RuntimeError(
-                f"Could not start Copilot ACP command '{self._acp_command}'. "
-                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+                f"Could not start {label} ACP command '{self._acp_command}'."
             ) from exc
 
         if proc.stdin is None or proc.stdout is None:
             proc.kill()
-            raise RuntimeError("Copilot ACP process did not expose stdin/stdout pipes.")
+            raise RuntimeError(f"{self.agent_name} ACP process did not expose stdin/stdout pipes.")
 
         self.is_closed = False
         with self._active_process_lock:
@@ -507,7 +566,7 @@ class CopilotACPClient:
                 if "error" in msg:
                     err = msg.get("error") or {}
                     raise RuntimeError(
-                        f"Copilot ACP {method} failed: {err.get('message') or err}"
+                        f"{self.agent_name} ACP {method} failed: {err.get('message') or err}"
                     )
                 return msg.get("result")
 
@@ -528,8 +587,8 @@ class CopilotACPClient:
                         "directly with a Copilot subscription token) via `hermes setup`.\n\n"
                         f"Original error:\n{stderr_text}"
                     )
-                raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}")
-            raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
+                raise RuntimeError(f"{self.agent_name} ACP process exited early: {stderr_text}")
+            raise TimeoutError(f"Timed out waiting for {self.agent_name} ACP response to {method}.")
 
         try:
             _request(
@@ -676,3 +735,11 @@ class CopilotACPClient:
         process.stdin.write(json.dumps(response) + "\n")
         process.stdin.flush()
         return True
+
+
+class CopilotACPClient(ACPClient):
+    """Backward-compatible Copilot specialization of :class:`ACPClient`."""
+
+    def __init__(self, **kwargs: Any):
+        kwargs.setdefault("agent_name", "copilot")
+        super().__init__(**kwargs)
