@@ -1132,6 +1132,9 @@ async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
         tmp_path,
         DuplicateNativeToolsAgent,
         session_id="sess-native-fallback",
+        config_data={
+            "display": {"platforms": {"slack": {"tool_progress": "all"}}}
+        },
         platform=Platform.SLACK,
         chat_id="C1",
         thread_id="thread-1",
@@ -1156,6 +1159,34 @@ async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
     assert "web_search - alpha - complete" in adapter.edits[-1]["content"]
     assert adapter.native_stops == 1
     assert adapter.call_order[:3] == ["native", "stop", "send"]
+
+
+@pytest.mark.asyncio
+async def test_slack_native_failure_with_tool_progress_off_does_not_send_text_fallback(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DuplicateNativeToolsAgent,
+        session_id="sess-native-fallback-off",
+        config_data={
+            "display": {"platforms": {"slack": {"tool_progress": "off"}}}
+        },
+        platform=Platform.SLACK,
+        chat_id="C1",
+        thread_id="thread-1",
+        adapter_cls=FailingNativeTaskCardAdapter,
+        user_id="U1",
+        scope_id="T1",
+    )
+
+    assert isinstance(adapter, FailingNativeTaskCardAdapter)
+    assert result["final_response"] == "done"
+    assert adapter.native_stops == 1
+    assert adapter.sent == []
+    assert adapter.edits == []
+    assert "send_fallback" not in adapter.failure_sequence
 
 
 @pytest.mark.asyncio

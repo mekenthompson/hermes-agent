@@ -5286,6 +5286,38 @@ class TestNativeTaskCardProgress:
         ).native_task_cards_enabled() is False
 
     @pytest.mark.asyncio
+    async def test_first_progress_starts_stream_with_chunks_and_no_append(self, adapter):
+        client = adapter._app.client
+        client.api_call.side_effect = [{"ts": "stream-1"}, {"ok": True}]
+        title = "Overlord is working"
+        tasks = [{"id": "call-1", "title": "terminal - ls", "status": "in_progress"}]
+
+        result = await adapter.send_native_task_card_progress(
+            "C1",
+            tasks,
+            title=title,
+            metadata={"thread_id": "thread-1"},
+        )
+
+        assert result.success is True
+        assert result.message_id == "stream-1"
+        assert [call.args[0] for call in client.api_call.await_args_list] == [
+            "chat.startStream"
+        ]
+        payload = client.api_call.await_args_list[0].kwargs["json"]
+        assert payload["channel"] == "C1"
+        assert payload["thread_ts"] == "thread-1"
+        assert payload["task_display_mode"] == "plan"
+        assert "markdown_text" not in payload
+        assert payload["chunks"][0] == {"type": "plan_update", "title": title}
+        assert payload["chunks"][1] == {
+            "type": "task_update",
+            "id": "call-1",
+            "title": "terminal - ls",
+            "status": "in_progress",
+        }
+
+    @pytest.mark.asyncio
     async def test_native_payload_preserves_supplied_title_and_fallback(self, adapter):
         client = adapter._app.client
         client.api_call.side_effect = [{"ts": "stream-1"}, {"ok": True}]
@@ -5301,13 +5333,14 @@ class TestNativeTaskCardProgress:
         )
 
         assert result.success
-        append = client.api_call.await_args_list[1]
-        assert append.args[0] == "chat.appendStream"
-        assert append.kwargs["json"]["chunks"][0] == {
+        start = client.api_call.await_args_list[0]
+        assert start.args[0] == "chat.startStream"
+        assert start.kwargs["json"]["chunks"][0] == {
             "type": "plan_update",
             "title": title,
         }
-        assert "markdown_text" not in append.kwargs["json"]
+        assert "markdown_text" not in start.kwargs["json"]
+        assert len(client.api_call.await_args_list) == 1
 
     @pytest.mark.asyncio
     async def test_native_updates_are_serialized_and_workspace_scoped(self, adapter):
@@ -5344,15 +5377,16 @@ class TestNativeTaskCardProgress:
         assert [call.args[0] for call in calls] == [
             "chat.startStream",
             "chat.appendStream",
-            "chat.appendStream",
         ]
-        assert calls[0].kwargs["json"] == {
-            "channel": "C1",
-            "thread_ts": "thread-1",
-            "task_display_mode": "plan",
-            "recipient_team_id": "T1",
-            "recipient_user_id": "U1",
-        }
+        start_payload = calls[0].kwargs["json"]
+        assert start_payload["channel"] == "C1"
+        assert start_payload["thread_ts"] == "thread-1"
+        assert start_payload["task_display_mode"] == "plan"
+        assert start_payload["recipient_team_id"] == "T1"
+        assert start_payload["recipient_user_id"] == "U1"
+        assert start_payload["chunks"]
+        assert "markdown_text" not in start_payload
+        assert "markdown_text" not in calls[1].kwargs["json"]
         adapter._app.client.api_call.assert_not_awaited()
 
         await adapter.stop_native_task_card_progress("C1", metadata=metadata)
@@ -5377,20 +5411,35 @@ class TestNativeTaskCardProgress:
             "recipient_team_id": "T1",
             "recipient_user_id": "U1",
         }
-        result = await adapter.send_native_task_card_progress(
+        first = await adapter.send_native_task_card_progress(
             "C1",
             [{"id": "call-1", "title": "terminal", "status": "in_progress"}],
             metadata=metadata,
             fallback_text="working",
         )
-        assert result.success
+        second = await adapter.send_native_task_card_progress(
+            "C1",
+            [{"id": "call-1", "title": "terminal", "status": "complete"}],
+            metadata=metadata,
+            fallback_text="working",
+        )
+        assert first.success is True
+        assert second.success is True
+        start = [
+            call.kwargs["json"]
+            for call in team_client.api_call.await_args_list
+            if call.args[0] == "chat.startStream"
+        ]
         append = [
             call.kwargs["json"]
             for call in team_client.api_call.await_args_list
             if call.args[0] == "chat.appendStream"
         ]
+        assert start
         assert append
+        assert "chunks" in start[0]
         assert "chunks" in append[0]
+        assert "markdown_text" not in start[0]
         assert "markdown_text" not in append[0]
 
     @pytest.mark.asyncio
@@ -5434,7 +5483,6 @@ class TestNativeTaskCardProgress:
         client.api_call.side_effect = [
             {"ts": "stream-1"},
             {"ok": True},
-            {"ok": True},
         ]
         await adapter.send_native_task_card_progress(
             "C1",
@@ -5446,7 +5494,6 @@ class TestNativeTaskCardProgress:
 
         assert [call.args[0] for call in client.api_call.await_args_list] == [
             "chat.startStream",
-            "chat.appendStream",
             "chat.stopStream",
         ]
         assert adapter._native_task_card_streams == {}
