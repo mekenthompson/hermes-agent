@@ -4731,6 +4731,10 @@ class TurnRunner:
                 # Close the failed native stream before posting a text fallback,
                 # otherwise Slack can leave both visible in the thread.
                 await _stop_native_progress()
+            if not ctx.tool_progress_enabled:
+                # Slack keeps ordinary text tool_progress off. Native cards
+                # are the progress surface; do not post a second bullet list.
+                return
             # Once the native rail fails, every later lifecycle event
             # edits the same fallback message so progress remains live.
             await _send_or_edit_fallback()
