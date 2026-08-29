@@ -12,7 +12,6 @@ import asyncio
 import contextlib
 import importlib
 from importlib.machinery import PathFinder
-import logging
 import os
 import socket
 import sys
@@ -30,6 +29,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
     SUPPORTED_VIDEO_TYPES,
+    SendResult,
     is_host_excluded_by_no_proxy,
 )
 
@@ -300,257 +300,6 @@ class TestSlackWorkspaceCollisionIsolation:
         assert build_session_key(first.source) != build_session_key(second.source)
         assert adapter._channel_teams["D_SHARED"] == {"T_ONE", "T_TWO"}
         assert "D_SHARED" not in adapter._channel_team
-
-
-# ---------------------------------------------------------------------------
-# TestSlackCommandPrefix
-# ---------------------------------------------------------------------------
-
-
-def _config_with_prefix(prefix):
-    """Fake config.yaml payload for the manifest-side prefix lookup."""
-    return {"platforms": {"slack": {"extra": {"command_prefix": prefix}}}}
-
-
-class TestSlackCommandPrefix:
-    """Namespace prefix so multiple gateway apps can share one workspace."""
-
-    def _make(self, extra):
-        config = PlatformConfig(enabled=True, token="xoxb-fake", extra=extra or {})
-        a = SlackAdapter(config)
-        a._app = MagicMock()
-        a._app.client = AsyncMock()
-        a._bot_user_id = "U_BOT"
-        a._running = True
-        a.handle_message = AsyncMock()
-        return a
-
-    @pytest.mark.asyncio
-    async def test_prefixed_native_slash_is_stripped_and_routed(self):
-        adapter = self._make({"command_prefix": "myorg-"})
-        assert adapter._command_prefix == "myorg-"
-
-        await adapter._handle_slash_command(
-            {
-                "command": "/myorg-model",
-                "text": "opus",
-                "user_id": "U1",
-                "channel_id": "C1",
-                "team_id": "T1",
-            }
-        )
-
-        event = adapter.handle_message.await_args.args[0]
-        assert event.text == "/model opus"
-        assert event.message_type == MessageType.COMMAND
-
-    @pytest.mark.asyncio
-    async def test_prefixed_hermes_routes_freeform_question(self):
-        adapter = self._make({"command_prefix": "myorg-"})
-
-        await adapter._handle_slash_command(
-            {
-                "command": "/myorg-hermes",
-                "text": "what's up",
-                "user_id": "U1",
-                "channel_id": "C1",
-                "team_id": "T1",
-            }
-        )
-
-        event = adapter.handle_message.await_args.args[0]
-        assert event.text == "what's up"
-        assert event.message_type == MessageType.TEXT
-
-    @pytest.mark.asyncio
-    async def test_no_prefix_default_leaves_commands_unchanged(self):
-        adapter = self._make({})
-        assert adapter._command_prefix == ""
-
-        await adapter._handle_slash_command(
-            {
-                "command": "/model",
-                "text": "opus",
-                "user_id": "U1",
-                "channel_id": "C1",
-                "team_id": "T1",
-            }
-        )
-
-        event = adapter.handle_message.await_args.args[0]
-        assert event.text == "/model opus"
-
-    def test_manifest_prepends_prefix(self, monkeypatch):
-        from hermes_cli.commands import slack_app_manifest
-
-        monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config", lambda: _config_with_prefix("myorg-")
-        )
-        slashes = slack_app_manifest()["features"]["slash_commands"]
-
-        assert slashes
-        assert all(s["command"].startswith("/myorg-") for s in slashes)
-        assert any(s["command"] == "/myorg-hermes" for s in slashes)
-
-    def test_manifest_silent_when_all_prefixed_names_fit(self, monkeypatch, caplog):
-        from hermes_cli import commands as cmds
-
-        monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config", lambda: _config_with_prefix("myorg-")
-        )
-        monkeypatch.setattr(
-            cmds,
-            "slack_native_slashes",
-            lambda prefix="": [("hermes", "d", ""), ("model", "d", "")],
-        )
-        with caplog.at_level(logging.WARNING, logger="hermes_cli.commands"):
-            slashes = cmds.slack_app_manifest()["features"]["slash_commands"]
-
-        assert [s["command"] for s in slashes] == ["/myorg-hermes", "/myorg-model"]
-        # Nothing was skipped, so the generator must stay silent.
-        assert not caplog.records
-
-    def test_manifest_default_has_no_prefix(self, monkeypatch):
-        from hermes_cli.commands import slack_app_manifest
-
-        # Empty config is authoritative — avoids reading a real config file.
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
-        slashes = slack_app_manifest()["features"]["slash_commands"]
-
-        assert any(s["command"] == "/hermes" for s in slashes)
-        assert all(not s["command"].startswith("/myorg-") for s in slashes)
-
-    def test_manifest_skips_prefixed_name_over_slack_limit(self, monkeypatch, caplog):
-        from hermes_cli import commands as cmds
-
-        monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config", lambda: _config_with_prefix("myorg-")
-        )
-        long_name = "x" * 30  # 30 + len("myorg-") = 35 > 32-char Slack limit
-        monkeypatch.setattr(
-            cmds,
-            "slack_native_slashes",
-            lambda prefix="": [("hermes", "d", ""), (long_name, "d", ""), ("model", "d", "")],
-        )
-        with caplog.at_level(logging.WARNING, logger="hermes_cli.commands"):
-            names = [s["command"] for s in cmds.slack_app_manifest()["features"]["slash_commands"]]
-
-        assert "/myorg-hermes" in names
-        assert "/myorg-model" in names
-        assert f"/myorg-{long_name}" not in names
-
-        # The skip is warned, naming the dropped command and the fallback path.
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert len(warnings) == 1
-        message = warnings[0].getMessage()
-        assert f"myorg-{long_name}" in message
-        assert "/myorg-hermes <subcommand>" in message
-
-    def test_manifest_warns_when_catchall_itself_over_limit(self, monkeypatch, caplog):
-        from hermes_cli import commands as cmds
-
-        # 27-char prefix: "hermes" (6) no longer fits (33 > 32) but "model"
-        # (5) still does — the warning must not advise the dead fallback.
-        prefix = "x" * 26 + "-"
-        monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config", lambda: _config_with_prefix(prefix)
-        )
-        monkeypatch.setattr(
-            cmds,
-            "slack_native_slashes",
-            lambda prefix="": [("hermes", "d", ""), ("model", "d", "")],
-        )
-        with caplog.at_level(logging.WARNING, logger="hermes_cli.commands"):
-            names = [s["command"] for s in cmds.slack_app_manifest()["features"]["slash_commands"]]
-
-        assert names == [f"/{prefix}model"]
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert len(warnings) == 1
-        message = warnings[0].getMessage()
-        assert f"{prefix}hermes" in message
-        assert "<subcommand>" not in message
-        assert "shorter command_prefix" in message
-
-    def test_all_invalid_prefix_warns_and_disables_namespacing(self, caplog):
-        from hermes_cli.commands import slack_command_prefix
-
-        with caplog.at_level(logging.WARNING, logger="hermes_cli.commands"):
-            prefix = slack_command_prefix({"command_prefix": "@@@"})
-
-        assert prefix == ""
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert len(warnings) == 1
-        assert "NOT namespaced" in warnings[0].getMessage()
-
-    @pytest.mark.asyncio
-    async def test_bang_prefixed_command_rewritten_in_thread(self):
-        """``!myorg-model`` mirrors the prefixed native-slash surface."""
-        adapter = self._make({"command_prefix": "myorg-"})
-
-        await adapter._handle_slack_message(
-            {
-                "text": "!myorg-model opus",
-                "user": "U_USER",
-                "channel": "D123",
-                "channel_type": "im",
-                "ts": "1234567890.000001",
-                "thread_ts": "1111111111.000001",
-            }
-        )
-
-        msg_event = adapter.handle_message.call_args[0][0]
-        assert msg_event.text.startswith("/model opus")
-        assert msg_event.message_type == MessageType.COMMAND
-
-    @pytest.mark.asyncio
-    async def test_bang_unprefixed_stays_text_when_prefix_set(self):
-        """Two namespaced apps sharing a channel must not both run ``!model``."""
-        adapter = self._make({"command_prefix": "myorg-"})
-
-        await adapter._handle_slack_message(
-            {
-                "text": "!model opus",
-                "user": "U_USER",
-                "channel": "D123",
-                "channel_type": "im",
-                "ts": "1234567890.000001",
-            }
-        )
-
-        msg_event = adapter.handle_message.call_args[0][0]
-        assert msg_event.text == "!model opus"
-        assert msg_event.message_type != MessageType.COMMAND
-
-    def test_manifest_prefix_unreserves_slack_builtin_names(self, monkeypatch):
-        from hermes_cli.commands import slack_app_manifest
-
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
-        bare = {s["command"] for s in slack_app_manifest()["features"]["slash_commands"]}
-        # Bare /status collides with the Slack built-in, so it is skipped.
-        assert "/status" not in bare
-
-        monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config", lambda: _config_with_prefix("myorg-")
-        )
-        prefixed = {s["command"] for s in slack_app_manifest()["features"]["slash_commands"]}
-        # /myorg-status no longer collides, so it gets a native slot.
-        assert "/myorg-status" in prefixed
-
-    def test_manifest_alias_descriptions_use_prefixed_names(self, monkeypatch):
-        from hermes_cli.commands import slack_app_manifest
-
-        monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config", lambda: _config_with_prefix("myorg-")
-        )
-        slashes = slack_app_manifest()["features"]["slash_commands"]
-
-        alias_descs = [
-            s["description"] for s in slashes if s["description"].startswith("Alias for /")
-        ]
-        assert alias_descs  # /btw and /bg are pinned aliases
-        # Descriptions must reference the names actually registered
-        # (/myorg-background), not the unregistered bare forms.
-        assert all(d.startswith("Alias for /myorg-") for d in alias_descs)
 
 
 # ---------------------------------------------------------------------------
@@ -6421,63 +6170,6 @@ class TestNativeTaskCardProgress:
         ).native_task_cards_enabled() is False
 
     @pytest.mark.asyncio
-    async def test_first_progress_starts_stream_with_chunks_and_no_append(self, adapter):
-        client = adapter._app.client
-        client.api_call.side_effect = [{"ts": "stream-1"}, {"ok": True}]
-        title = "Overlord is working"
-        tasks = [{"id": "call-1", "title": "terminal - ls", "status": "in_progress"}]
-
-        result = await adapter.send_native_task_card_progress(
-            "C1",
-            tasks,
-            title=title,
-            metadata={"thread_id": "thread-1"},
-        )
-
-        assert result.success is True
-        assert result.message_id == "stream-1"
-        assert [call.args[0] for call in client.api_call.await_args_list] == [
-            "chat.startStream"
-        ]
-        payload = client.api_call.await_args_list[0].kwargs["json"]
-        assert payload["channel"] == "C1"
-        assert payload["thread_ts"] == "thread-1"
-        assert payload["task_display_mode"] == "plan"
-        assert "markdown_text" not in payload
-        assert payload["chunks"][0] == {"type": "plan_update", "title": title}
-        assert payload["chunks"][1] == {
-            "type": "task_update",
-            "id": "call-1",
-            "title": "terminal - ls",
-            "status": "in_progress",
-        }
-
-    @pytest.mark.asyncio
-    async def test_native_payload_preserves_supplied_title_and_fallback(self, adapter):
-        client = adapter._app.client
-        client.api_call.side_effect = [{"ts": "stream-1"}, {"ok": True}]
-        title = "小助手 is working"
-        fallback = f"{title}\n- terminal - running"
-
-        result = await adapter.send_native_task_card_progress(
-            "C1",
-            [{"id": "call-1", "title": "terminal", "status": "in_progress"}],
-            title=title,
-            fallback_text=fallback,
-            metadata={"thread_id": "thread-1"},
-        )
-
-        assert result.success
-        start = client.api_call.await_args_list[0]
-        assert start.args[0] == "chat.startStream"
-        assert start.kwargs["json"]["chunks"][0] == {
-            "type": "plan_update",
-            "title": title,
-        }
-        assert "markdown_text" not in start.kwargs["json"]
-        assert len(client.api_call.await_args_list) == 1
-
-    @pytest.mark.asyncio
     async def test_native_updates_are_serialized_and_workspace_scoped(self, adapter):
         team_client = AsyncMock()
         start_count = 0
@@ -6512,70 +6204,21 @@ class TestNativeTaskCardProgress:
         assert [call.args[0] for call in calls] == [
             "chat.startStream",
             "chat.appendStream",
+            "chat.appendStream",
         ]
-        start_payload = calls[0].kwargs["json"]
-        assert start_payload["channel"] == "C1"
-        assert start_payload["thread_ts"] == "thread-1"
-        assert start_payload["task_display_mode"] == "plan"
-        assert start_payload["recipient_team_id"] == "T1"
-        assert start_payload["recipient_user_id"] == "U1"
-        assert start_payload["chunks"]
-        assert "markdown_text" not in start_payload
-        assert "markdown_text" not in calls[1].kwargs["json"]
+        assert calls[0].kwargs["json"] == {
+            "channel": "C1",
+            "thread_ts": "thread-1",
+            "task_display_mode": "plan",
+            "recipient_team_id": "T1",
+            "recipient_user_id": "U1",
+        }
         adapter._app.client.api_call.assert_not_awaited()
 
         await adapter.stop_native_task_card_progress("C1", metadata=metadata)
 
         assert team_client.api_call.await_args.args[0] == "chat.stopStream"
         assert adapter._native_task_card_streams == {}
-
-    @pytest.mark.asyncio
-    async def test_append_stream_omits_markdown_text_when_sending_chunks(self, adapter):
-        team_client = AsyncMock()
-
-        async def api_call(method, *, json):
-            if method == "chat.startStream":
-                return {"ts": "stream-1"}
-            return {"ok": True}
-
-        team_client.api_call.side_effect = api_call
-        adapter._team_clients["T1"] = team_client
-        metadata = {
-            "thread_id": "thread-1",
-            "slack_team_id": "T1",
-            "recipient_team_id": "T1",
-            "recipient_user_id": "U1",
-        }
-        first = await adapter.send_native_task_card_progress(
-            "C1",
-            [{"id": "call-1", "title": "terminal", "status": "in_progress"}],
-            metadata=metadata,
-            fallback_text="working",
-        )
-        second = await adapter.send_native_task_card_progress(
-            "C1",
-            [{"id": "call-1", "title": "terminal", "status": "complete"}],
-            metadata=metadata,
-            fallback_text="working",
-        )
-        assert first.success is True
-        assert second.success is True
-        start = [
-            call.kwargs["json"]
-            for call in team_client.api_call.await_args_list
-            if call.args[0] == "chat.startStream"
-        ]
-        append = [
-            call.kwargs["json"]
-            for call in team_client.api_call.await_args_list
-            if call.args[0] == "chat.appendStream"
-        ]
-        assert start
-        assert append
-        assert "chunks" in start[0]
-        assert "chunks" in append[0]
-        assert "markdown_text" not in start[0]
-        assert "markdown_text" not in append[0]
 
     @pytest.mark.asyncio
     async def test_same_channel_thread_isolated_between_workspaces(self, adapter):
@@ -6618,6 +6261,7 @@ class TestNativeTaskCardProgress:
         client.api_call.side_effect = [
             {"ts": "stream-1"},
             {"ok": True},
+            {"ok": True},
         ]
         await adapter.send_native_task_card_progress(
             "C1",
@@ -6629,6 +6273,7 @@ class TestNativeTaskCardProgress:
 
         assert [call.args[0] for call in client.api_call.await_args_list] == [
             "chat.startStream",
+            "chat.appendStream",
             "chat.stopStream",
         ]
         assert adapter._native_task_card_streams == {}

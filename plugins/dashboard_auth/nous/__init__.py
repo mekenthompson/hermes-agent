@@ -476,7 +476,7 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
                 )
             except Exception:
                 pass
-            raise InvalidCodeError(
+            raise ProviderError(
                 f"access token verification failed: {exc}{details}"
             ) from exc
 

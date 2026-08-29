@@ -1517,16 +1517,6 @@ class PluginContext:
             return value
         return _nested_plugin_value(entry.get("config"), segments, default)
 
-    def register_profile_service(self, name: str, factory) -> None:
-        """Register a long-running per-profile async service.
-
-        The gateway starts *factory(runtime)* after it is running. *runtime*
-        has ``profile_home``, ``profile_name``, ``stop_event``, and ``gateway``.
-        """
-        if not name or not callable(factory):
-            raise ValueError("profile service requires a name and callable factory")
-        self._manager._profile_services.append((str(name), factory))
-
     def set_config(self, key: str, value: Any) -> None:
         """Atomically write one value in this plugin's ``settings`` subtree."""
         try:
@@ -2192,6 +2182,7 @@ class PluginContext:
         handler: Callable,
         description: str = "",
         args_hint: str = "",
+        argument_mode: str | None = None,
     ) -> Optional[PluginRegistration]:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
@@ -2208,6 +2199,10 @@ class PluginContext:
         command picker. Plugin commands without ``args_hint`` register as
         parameterless in Discord and still accept trailing text when invoked
         as free-form chat.
+
+        ``argument_mode`` tells the desktop composer how text after the command
+        name behaves (``options``, ``text``, or ``mixed``). Omit it to infer
+        ``text`` whenever ``args_hint`` is set, so ``/myplugin `` stays typeable.
 
         Names conflicting with built-in commands are rejected with a warning.
         """
@@ -2233,12 +2228,17 @@ class PluginContext:
             pass  # If commands module isn't available, skip the check
 
         previous = self._manager._plugin_commands.get(clean)
+        hint = (args_hint or "").strip()
+        mode = argument_mode if argument_mode in {"options", "text", "mixed"} else (
+            "text" if hint else None
+        )
         entry = {
             "handler": handler,
             "description": description or "Plugin command",
             "plugin": self.manifest.name,
             "plugin_key": self.manifest.key or self.manifest.name,
-            "args_hint": (args_hint or "").strip(),
+            "args_hint": hint,
+            "argument_mode": mode,
         }
         self._manager._plugin_commands[clean] = entry
         handle = self._track_replacement(
@@ -3777,7 +3777,6 @@ class PluginManager:
             maxsize=_EVENT_PENDING_CAP
         )
         self._event_worker: Optional[threading.Thread] = None
-        self._profile_services: list[tuple[str, Any]] = []
         # Per-worker chain depth caps mutually-emitting plugins even though each
         # re-entrant emit is queued rather than invoked recursively.
         self._emit_depth = threading.local()

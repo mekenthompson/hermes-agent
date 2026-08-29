@@ -4630,24 +4630,17 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
     """Return True only when the tool's annotations carry readOnlyHint=True.
 
     Accepts both SDK annotation objects (attribute access) and plain dicts
-    (schema-cache JSON). Prefer snake_case ``read_only_hint`` (mcp 2.x) with
-    camelCase ``readOnlyHint`` fallback. Anything else — missing annotations,
-    missing key, non-bool truthy values — is False: unknown metadata means
-    the tool must be treated as write-capable.
+    (schema-cache JSON). Anything else — missing annotations, missing key,
+    non-bool truthy values — is False: unknown metadata means the tool must
+    be treated as write-capable.
     """
     annotations = getattr(mcp_tool, "annotations", None)
     if annotations is None:
         return False
     if isinstance(annotations, dict):
-        hint = annotations.get("read_only_hint", _MISSING)
-        if hint is _MISSING:
-            hint = annotations.get("readOnlyHint", _MISSING)
-        if hint is _MISSING:
-            return False
-        return hint is True
-    hint = mcp_field(annotations, "read_only_hint", "readOnlyHint", default=_MISSING)
-    if hint is _MISSING:
-        return False
+        hint = annotations.get("readOnlyHint")
+    else:
+        hint = getattr(annotations, "readOnlyHint", None)
     return hint is True
 
 
@@ -8150,6 +8143,7 @@ def refresh_agent_mcp_tools(
     enabled_override=None,
     disabled_override=None,
     quiet_mode: bool = True,
+    content_aware: bool = False,
 ) -> set:
     """Re-derive an already-built agent's tool snapshot from the live registry.
 
@@ -8251,10 +8245,31 @@ def refresh_agent_mcp_tools(
             for t in (getattr(agent, "tools", None) or [])
         }
         if new_names == current:
-            # No change → leave the live snapshot untouched (no churn), but
-            # record the generation so an in-flight older caller can't clobber.
-            agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
-            return set()
+            # Same NAME set. For MCP-reload callers that is "no change" —
+            # leave the live snapshot untouched (no churn). Content-aware
+            # callers (the compaction boundary) also diff the serialized
+            # bytes: dynamic schemas (image_generate capabilities,
+            # delegate_task limits, execute_code stubs) change CONTENT
+            # under stable names when config changes between compactions.
+            content_changed = False
+            if content_aware:
+                try:
+                    _stable = json.dumps(
+                        (getattr(agent, "tools", None) or []),
+                        sort_keys=True, separators=(",", ":"), default=str,
+                    )
+                    _new = json.dumps(
+                        new_defs, sort_keys=True, separators=(",", ":"),
+                        default=str,
+                    )
+                    content_changed = _stable != _new
+                except Exception:  # noqa: BLE001
+                    content_changed = False
+            if not content_changed:
+                # Record the generation so an in-flight older caller can't
+                # clobber.
+                agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
+                return set()
         agent.tools = new_defs
         agent.valid_tool_names = new_names
         # Publish context-engine routing names atomically with the snapshot.

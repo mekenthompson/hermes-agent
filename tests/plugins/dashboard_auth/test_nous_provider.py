@@ -549,21 +549,20 @@ class TestVerifySession:
         token = _mint_token(rsa_keypair, ttl_seconds=-1)
         assert provider.verify_session(access_token=token) is None
 
-    def test_wrong_audience_returns_none(self, provider, rsa_keypair):
+    def test_wrong_audience_raises_provider_error(self, provider, rsa_keypair):
         token = _mint_token(rsa_keypair, aud="agent:other-instance")
-        assert provider.verify_session(access_token=token) is None
+        with pytest.raises(ProviderError, match="verification failed"):
+            provider.verify_session(access_token=token)
 
 
     def test_verification_failure_message_surfaces_token_claims(
         self, provider, rsa_keypair
     ):
         """Operators need to see the actual iss/aud the token carries to debug
-        config drift between HERMES_DASHBOARD_PORTAL_URL/CLIENT_ID and Portal.
-        Caller-token failures must be InvalidCodeError, not an IdP outage.
-        """
+        config drift between HERMES_DASHBOARD_PORTAL_URL/CLIENT_ID and Portal."""
         token = _mint_token(rsa_keypair, iss="https://evil.example")
-        with pytest.raises(InvalidCodeError) as excinfo:
-            provider._verify_jwt(token)
+        with pytest.raises(ProviderError) as excinfo:
+            provider.verify_session(access_token=token)
         msg = str(excinfo.value)
         # Both the observed (token) and expected (configured) values appear.
         assert "'https://evil.example'" in msg
