@@ -16331,17 +16331,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return self._make_default_profile_message_handler()
         return self._handle_message
 
-    async def dispatch_internal_plugin_event(
-        self, event: MessageEvent
-    ) -> Optional[str]:
-        """Run one profile-local plugin event through the normal gateway turn.
-
-        This is deliberately narrower than adapter ingress. Plugins may start an
-        agent turn and receive its final text, but they may not impersonate a
-        messaging transport, bypass profile selection, execute gateway commands,
-        or inject media. The normal scoped message handler still owns session
-        lookup, persistence, model execution, and response normalization.
-        """
+    @staticmethod
+    def _validate_internal_plugin_event(event: MessageEvent) -> SessionSource:
+        """Validate the narrow event shape allowed for profile-local plugins."""
         if not isinstance(event, MessageEvent):
             raise TypeError("internal plugin dispatch requires a MessageEvent")
         if event.internal is not True:
@@ -16364,7 +16356,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise ValueError("internal plugin events require an explicit profile")
         if not str(getattr(source, "chat_id", "") or "").strip():
             raise ValueError("internal plugin events require a session chat_id")
+        return source
 
+    async def prepare_internal_plugin_session(self, event: MessageEvent) -> str:
+        """Persist a plugin-owned Hermes session without starting its agent turn.
+
+        Queue-backed plugins use this before acknowledging external work. The
+        eventual dispatch resolves the same source and starts the queued turn;
+        this method only makes the session durable and discoverable immediately.
+        """
+        source = self._validate_internal_plugin_event(event)
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                session_entry = (
+                    await self.async_session_store.get_or_create_session(
+                        source,
+                        touch_activity=False,
+                    )
+                )
+        else:
+            session_entry = await self.async_session_store.get_or_create_session(
+                source,
+                touch_activity=False,
+            )
+        return str(session_entry.session_id)
+
+    async def dispatch_internal_plugin_event(
+        self, event: MessageEvent
+    ) -> Optional[str]:
+        """Run one profile-local plugin event through the normal gateway turn.
+
+        This is deliberately narrower than adapter ingress. Plugins may start an
+        agent turn and receive its final text, but they may not impersonate a
+        messaging transport, bypass profile selection, execute gateway commands,
+        or inject media. The normal scoped message handler still owns session
+        lookup, persistence, model execution, and response normalization.
+        """
+        self._validate_internal_plugin_event(event)
         handler = self._primary_message_handler()
         return await handler(event)
 
