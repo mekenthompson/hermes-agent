@@ -15,7 +15,6 @@ import re
 import socket as _socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -208,8 +207,7 @@ def build_auto_tts_output_path(platform) -> str:
 
     ext = "ogg" if _platform_name(platform) in OPUS_VOICE_PLATFORMS else "mp3"
     audio_path = os.path.join(
-        tempfile.gettempdir(),
-        "hermes_voice",
+        str(get_audio_cache_dir()),
         f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}",
     )
     os.makedirs(os.path.dirname(audio_path), exist_ok=True)

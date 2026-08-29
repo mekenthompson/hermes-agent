@@ -424,6 +424,59 @@ def _collect_slack_block_mentions(blocks: list) -> list:
     return mentions
 
 
+def _slack_block_tree_trusted(blocks: Any) -> bool:
+    """Return whether every node ``_collect_slack_block_mentions`` walks is typed.
+
+    The mention walker skips whatever it cannot parse, so "no mention found"
+    in a malformed tree is silence, not proof of absence. This validator
+    checks exactly the fields that walker reads — ``type``, the ``elements`` /
+    ``element`` children it recurses into, and a ``user`` node's ``user_id`` —
+    so callers that need absence *proof* can tell a trustworthy snapshot from
+    one that merely failed to parse.
+    """
+
+    def _verbatim_label(value: Any) -> bool:
+        """Whether *value* is a label Slack sends verbatim.
+
+        Slack emits bare identifiers and the walker compares them
+        literally, so a blank or whitespace-padded value matches none of
+        its branches and names nobody.
+        """
+        return isinstance(value, str) and bool(value.strip()) and value == value.strip()
+
+    def _trusted(node: Any) -> bool:
+        if isinstance(node, list):
+            return all(_trusted(item) for item in node)
+        if not isinstance(node, dict):
+            return False
+        # Every Block Kit node Slack sends is typed. A node whose ``type``
+        # is missing, blank, padded, or non-string silently matches none of
+        # the walker's branches, so a mention node that lost its label reads
+        # as ordinary content and cannot witness a mention's absence.
+        node_type = node.get("type")
+        if not _verbatim_label(node_type):
+            return False
+        # A blank or padded ``user_id`` identifies nobody: the walker either
+        # drops the mention outright or emits ``<@ U123 >``, which matches no
+        # bot uid. Either way the node cannot witness a mention's absence.
+        if node_type == "user" and not _verbatim_label(node.get("user_id")):
+            return False
+        for key in ("elements", "element"):
+            if key in node and not _trusted(node[key]):
+                return False
+        return True
+
+    # Slack's top-level ``blocks`` container is a list; the walker iterates
+    # it directly. Anything else (a bare block dict, a mapping, a string) is
+    # a payload it never traverses, so it proves nothing about mentions.
+    if not isinstance(blocks, list):
+        return False
+    try:
+        return _trusted(blocks)
+    except Exception:  # pragma: no cover - defensive, mirrors the walker
+        return False
+
+
 def _slack_mention_detection_text(event: dict) -> str:
     """Return the text used for @mention detection on a Slack message event.
 
@@ -1347,6 +1400,24 @@ class SlackAdapter(BasePlatformAdapter):
         except ValueError:
             fraction_int = 0
         return seconds_int, fraction_int, str(ts)
+
+    @staticmethod
+    def _is_valid_slack_timestamp(ts: Any) -> bool:
+        """Return whether *ts* has Slack's numeric seconds[.fraction] shape."""
+        if not isinstance(ts, str):
+            return False
+        seconds, separator, fraction = ts.partition(".")
+        if (
+            not 1 <= len(seconds) <= 20
+            or not seconds.isascii()
+            or not seconds.isdigit()
+        ):
+            return False
+        return not separator or (
+            1 <= len(fraction) <= 6
+            and fraction.isascii()
+            and fraction.isdigit()
+        )
 
     @classmethod
     def _discard_oldest_slack_timestamps(
@@ -5849,6 +5920,108 @@ class SlackAdapter(BasePlatformAdapter):
             fallback_event["thread_ts"] = thread_ts
         await self._handle_slack_message(fallback_event)
 
+    @classmethod
+    def _slack_message_has_thread_replies(cls, *messages: Any) -> bool:
+        """Return True when a snapshot proves the message already has replies.
+
+        Slack only decorates a thread *parent* with reply bookkeeping, so a
+        positive answer means "this is a thread root that has already been
+        answered" — the precondition for treating a later edit of it as a
+        replay of settled instructions rather than a fresh request. Every
+        field is treated as untrusted input.
+        """
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            # ``latest_reply`` is a Slack message ts. Any other string is
+            # noise Slack never sends, and treating it as proof of a reply
+            # would suppress a genuine edit on an unanswered message.
+            if cls._is_valid_slack_timestamp(message.get("latest_reply")):
+                return True
+            # ``replies`` is a list of reply stubs; only an entry carrying a
+            # real Slack ts witnesses a reply. A non-empty list of unparsable
+            # members is the same silence as an empty one.
+            replies = message.get("replies")
+            if isinstance(replies, list) and any(
+                isinstance(entry, dict)
+                and cls._is_valid_slack_timestamp(entry.get("ts"))
+                for entry in replies
+            ):
+                return True
+            # ``reply_users`` holds Slack user IDs. Their exact shape is
+            # Slack's business, but a non-string / blank member identifies
+            # nobody, so it cannot witness that somebody replied.
+            reply_users = message.get("reply_users")
+            if isinstance(reply_users, list) and any(
+                isinstance(uid, str) and uid.strip() for uid in reply_users
+            ):
+                return True
+            for field in ("reply_count", "reply_users_count"):
+                value = message.get(field)
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, int) and value > 0:
+                    return True
+                if isinstance(value, str):
+                    digits = value.strip()
+                    # ``strip("0")`` keeps this allocation-free for absurd
+                    # digit strings that int() would refuse to parse.
+                    if digits.isascii() and digits.isdigit() and digits.strip("0"):
+                        return True
+        return False
+
+    def _slack_message_addresses_bot(self, message: Any, self_uids: set) -> bool:
+        """Return True when *message* @-mentions this bot or hits a wake word.
+
+        Best-effort on purpose: a malformed ``text``/``blocks`` field is
+        skipped rather than trusted, so a Block-Kit-only mention still counts
+        even when the flat text field carries garbage.
+        """
+        if not isinstance(message, dict):
+            return False
+        text = message.get("text")
+        blocks = message.get("blocks")
+        detection_text = _slack_mention_detection_text(
+            {
+                "text": text if isinstance(text, str) else "",
+                "blocks": blocks if isinstance(blocks, list) else None,
+            }
+        )
+        if not detection_text:
+            return False
+        return bool(
+            self._slack_message_mentions_self(detection_text, self_uids)
+            or self._slack_message_matches_mention_patterns(detection_text)
+        )
+
+    def _slack_previous_addressed_bot(
+        self, previous_message: Any, self_uids: set
+    ) -> Optional[bool]:
+        """Tri-state view of a ``previous_message`` snapshot's addressing.
+
+        ``True``/``False`` mean the pre-edit snapshot provably did / did not
+        address this bot. ``None`` means Slack sent nothing we can trust
+        (absent, wrong type, a non-string ``text``, or a ``blocks`` tree the
+        mention walker cannot fully parse), so callers must fail closed
+        instead of assuming an edit newly added the mention.
+        """
+        if not isinstance(previous_message, dict):
+            return None
+        if self._slack_message_addresses_bot(previous_message, self_uids):
+            return True
+        # Proving the ABSENCE of a mention needs a trustworthy snapshot. The
+        # mention walker reads exactly two fields, so both must carry the
+        # types Slack documents — the same typed-payload bar the visible
+        # payload comparison above applies. A malformed node anywhere in the
+        # walked block tree is silence, not proof: the walker skips what it
+        # cannot parse, so a mention may be hiding behind it.
+        if not isinstance(previous_message.get("text"), str):
+            return None
+        blocks = previous_message.get("blocks")
+        if blocks is not None and not _slack_block_tree_trusted(blocks):
+            return None
+        return False
+
     def _register_mentioned_thread(self, thread_ts: str, team_id: str = "") -> None:
         """Record a thread as bot-mentioned so future replies auto-trigger.
 
@@ -6060,6 +6233,71 @@ class SlackAdapter(BasePlatformAdapter):
             if not isinstance(updated_message, dict):
                 return
 
+            previous_message = event.get("previous_message")
+            visible_payload_changed = None
+            if isinstance(previous_message, dict):
+                visible_fields = ("text", "blocks", "attachments", "files")
+                has_previous_typed_field = False
+                has_proven_list_change = False
+                has_unknown_field = False
+                comparable_fields = []
+                for field in visible_fields:
+                    previous_value = previous_message.get(field)
+                    current_value = updated_message.get(field)
+                    if field == "text":
+                        previous_valid = isinstance(previous_value, str)
+                        current_valid = isinstance(current_value, str)
+                    else:
+                        previous_valid = isinstance(previous_value, list) and all(
+                            isinstance(item, dict) for item in previous_value
+                        )
+                        current_valid = isinstance(current_value, list) and all(
+                            isinstance(item, dict) for item in current_value
+                        )
+                    has_previous_typed_field |= previous_valid
+                    previous_empty = previous_value is None or previous_value in ("", [])
+                    current_empty = current_value is None or current_value in ("", [])
+                    if field != "text" and (
+                        (
+                            previous_valid
+                            and not previous_empty
+                            and (current_value is None or current_value == [])
+                        )
+                        or (
+                            previous_value is None
+                            and current_valid
+                            and not current_empty
+                        )
+                    ):
+                        has_proven_list_change = True
+                        continue
+                    if previous_valid and current_valid:
+                        comparable_fields.append(field)
+                        continue
+
+                    if not (previous_empty and current_empty):
+                        has_unknown_field = True
+
+                if has_proven_list_change or any(
+                    updated_message[field] != previous_message[field]
+                    for field in comparable_fields
+                ):
+                    visible_payload_changed = True
+                elif has_previous_typed_field and not has_unknown_field:
+                    visible_payload_changed = False
+                if visible_payload_changed is not True:
+                    logger.debug(
+                        "[Slack] Ignoring message_changed with %s visible payload "
+                        "evidence for message %s",
+                        (
+                            "unchanged"
+                            if visible_payload_changed is False
+                            else "unknown"
+                        ),
+                        updated_message.get("ts", ""),
+                    )
+                    return
+
             original_message_ts = str(updated_message.get("ts") or "")
             if (
                 original_message_ts
@@ -6067,11 +6305,103 @@ class SlackAdapter(BasePlatformAdapter):
             ):
                 return
             edited = updated_message.get("edited")
-            edited_ts = ""
-            if isinstance(edited, dict):
-                edited_ts = str(edited.get("ts") or "")
+            edited_ts = edited.get("ts") if isinstance(edited, dict) else None
             outer_event_ts = str(event.get("ts") or "")
-            changed_event_ts = str(event.get("event_ts") or edited_ts or "")
+            previous_latest_reply = (
+                previous_message.get("latest_reply")
+                if isinstance(previous_message, dict)
+                else None
+            )
+            updated_latest_reply = updated_message.get("latest_reply")
+            latest_reply_ts = (
+                updated_latest_reply
+                if updated_latest_reply not in (None, "")
+                else previous_latest_reply
+            )
+            reply_metadata_fields = (
+                "latest_reply",
+                "reply_count",
+                "reply_users_count",
+                "reply_users",
+                "replies",
+            )
+            has_reply_metadata = any(
+                field in updated_message for field in reply_metadata_fields
+            ) or (
+                isinstance(previous_message, dict)
+                and any(field in previous_message for field in reply_metadata_fields)
+            )
+            latest_reply_valid = self._is_valid_slack_timestamp(latest_reply_ts)
+            edited_ts_valid = self._is_valid_slack_timestamp(edited_ts)
+            latest_reply_at_or_after_edit = bool(
+                latest_reply_valid
+                and edited_ts_valid
+                and self._slack_timestamp_sort_key(latest_reply_ts)[:2]
+                >= self._slack_timestamp_sort_key(edited_ts)[:2]
+            )
+            ambiguous_reply_order = bool(
+                has_reply_metadata
+                and not (latest_reply_valid and edited_ts_valid)
+                and visible_payload_changed is not True
+            )
+            if visible_payload_changed is not True and has_reply_metadata and (
+                latest_reply_at_or_after_edit or ambiguous_reply_order
+            ):
+                logger.debug(
+                    "[Slack] Ignoring thread parent reply metadata update "
+                    "for message %s: edited_ts=%s latest_reply=%s",
+                    original_message_ts,
+                    edited_ts,
+                    latest_reply_ts,
+                )
+                return
+
+            # A thread parent that ALREADY addressed the bot has been answered
+            # in that thread. Re-delivering its edited text opens a brand-new
+            # turn from instructions the agent acted on hours ago — the
+            # "phantom turn" the in-memory ``_processed_message_ts`` set misses
+            # whenever the original ts is not in this process's state (that set
+            # is per-process and is not a durable record of past deliveries).
+            # Route such an edit only when the event itself proves the mention
+            # is new; a user who wants the edited wording acted on can post an
+            # ordinary reply, which we must never synthesize on their behalf.
+            #
+            # Bot identity is workspace-local: resolve exactly ONE uid for the
+            # event's team, because the primary workspace's bot uid can belong
+            # to an ordinary member of a secondary workspace. The outer event
+            # normally carries the team, but fall back to the edited message
+            # when it doesn't — never letting the inner value override an
+            # authoritative outer one.
+            team_id = self._event_team_id(event, payload) or self._event_team_id(
+                updated_message
+            )
+            bot_uid = self._team_bot_user_ids.get(team_id) or self._bot_user_id
+            self_uids = {bot_uid} if bot_uid else set()
+            if self._slack_message_has_thread_replies(
+                updated_message, previous_message
+            ):
+                previously_addressed = self._slack_previous_addressed_bot(
+                    previous_message, self_uids
+                )
+                # The pre-edit snapshot is what proves the thread was already
+                # answered, so a proven prior mention suppresses the edit even
+                # when the edited payload no longer addresses the bot (or is
+                # malformed). When the snapshot is untrustworthy, fail closed
+                # only if the edit itself still addresses the bot.
+                if previously_addressed is True or (
+                    previously_addressed is None
+                    and self._slack_message_addresses_bot(updated_message, self_uids)
+                ):
+                    logger.debug(
+                        "[Slack] Ignoring edit of already-addressed thread "
+                        "parent %s: previous mention evidence=%s",
+                        original_message_ts,
+                        "present" if previously_addressed else "unknown",
+                    )
+                    return
+            changed_event_ts = str(
+                event.get("event_ts") or (edited_ts if edited_ts_valid else "") or ""
+            )
             if (
                 not changed_event_ts
                 and outer_event_ts
@@ -6082,6 +6412,21 @@ class SlackAdapter(BasePlatformAdapter):
                 changed_event_ts = f"{original_message_ts}:changed"
 
             normalized_event = dict(updated_message)
+            if "text" in normalized_event and not isinstance(
+                normalized_event["text"], str
+            ):
+                normalized_event["text"] = ""
+            for field in ("blocks", "attachments", "files"):
+                if field not in normalized_event:
+                    continue
+                if not isinstance(normalized_event[field], list):
+                    normalized_event[field] = []
+                else:
+                    normalized_event[field] = [
+                        item
+                        for item in normalized_event[field]
+                        if isinstance(item, dict)
+                    ]
             for key in ("channel", "channel_type", "team", "team_id"):
                 if not normalized_event.get(key) and event.get(key):
                     normalized_event[key] = event.get(key)
@@ -7386,27 +7731,62 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             thread_ts = self._resolve_thread_ts(None, metadata)
 
-            # Escape the Slack mrkdwn control chars (&, <, >) so a question
-            # containing them renders literally instead of as markup/mentions.
-            # Section text caps at 3000 chars — budget the question so the
-            # wrapper never pushes the block over the limit (overflow →
-            # invalid_blocks → no buttons).
-            q = (question or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            body = f"❓ {q}"
-            budget = 3000 - len("...")
-            if len(body) > budget:
-                body = body[:budget] + "..."
+            # Escape Slack mrkdwn control characters so the prompt renders
+            # literally instead of creating links or mentions. Slack clients
+            # visually clip button labels well below the 75-character API cap,
+            # so the message body is the authoritative numbered choice list.
+            def _escape_mrkdwn_char(char: str) -> str:
+                return {"&": "&amp;", "<": "&lt;", ">": "&gt;"}.get(char, char)
 
-            # One button per choice + a free-text "Other" button.  Slack caps
-            # an actions block at 5 elements; the clarify tool caps choices at
-            # 4 (+ Other = 5) so this is normally one block, but chunk anyway
-            # so a larger choice list degrades gracefully instead of 400ing.
+            choice_labels = [
+                str(choice).strip() or f"Option {idx + 1}"
+                for idx, choice in enumerate(choices)
+            ]
+            prompt_parts = ["❓ "]
+            prompt_parts.extend(_escape_mrkdwn_char(char) for char in (question or ""))
+            prompt_parts.append("\n\n")
+            for idx, label in enumerate(choice_labels, start=1):
+                if idx > 1:
+                    prompt_parts.append("\n")
+                prompt_parts.append(f"{idx}. ")
+                prompt_parts.extend(_escape_mrkdwn_char(char) for char in label)
+
+            # Build sections from atomic source-character renderings. Escaped
+            # entities therefore never straddle Slack's 3000-character section
+            # boundary and every option remains readable without truncation.
+            section_texts: list[str] = []
+            section = ""
+            for part in prompt_parts:
+                if section and len(section) + len(part) > 3000:
+                    section_texts.append(section)
+                    section = ""
+                section += part
+            if section:
+                section_texts.append(section)
+            body = "".join(section_texts)
+
+            # Slack truncates top-level text above 40,000 characters and caps a
+            # message at 50 blocks. Preserve unusually large choices by using
+            # the existing typed-answer fallback instead of silently losing
+            # text or posting invalid Block Kit.
+            action_block_count = (len(choice_labels) + 5) // 5
+            if len(body) > 40000 or len(section_texts) + action_block_count > 50:
+                return await super().send_clarify(
+                    chat_id=chat_id,
+                    question=question,
+                    choices=choices,
+                    clarify_id=clarify_id,
+                    session_key=session_key,
+                    metadata=metadata,
+                )
+
+            # One compact numbered button per choice plus a free-text Other
+            # button. Values retain the canonical clarify_id|idx mapping.
             elements = []
-            for idx, choice in enumerate(choices):
-                label = str(choice).strip() or f"Option {idx + 1}"
+            for idx, _label in enumerate(choice_labels):
                 elements.append({
                     "type": "button",
-                    "text": {"type": "plain_text", "text": label[:75], "emoji": True},
+                    "text": {"type": "plain_text", "text": str(idx + 1), "emoji": True},
                     "action_id": f"hermes_clarify_choice_{idx}",
                     "value": f"{clarify_id}|{idx}",
                 })
@@ -7418,7 +7798,12 @@ class SlackAdapter(BasePlatformAdapter):
             })
 
             blocks: list = [
-                {"type": "section", "text": {"type": "mrkdwn", "text": body}},
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": text},
+                    "expand": True,
+                }
+                for text in section_texts
             ]
             for start in range(0, len(elements), 5):
                 blocks.append({"type": "actions", "elements": elements[start:start + 5]})

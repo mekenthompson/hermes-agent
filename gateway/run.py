@@ -4692,10 +4692,14 @@ class TurnRunner:
         message so progress stays live for the rest of the turn.
         """
         ctx = self._ctx
+        from gateway.task_card_identity import GENERIC_TASK_CARD_TITLE
+
+        task_card_title = ctx.native_task_card_title or GENERIC_TASK_CARD_TITLE
         tasks: Dict[str, Dict[str, str]] = {}
         task_order: List[str] = []
         fallback_msg_id: Optional[str] = None
         native_failed = False
+        native_stop_requested = False
         anonymous_seq = 0
 
         def _compact(value: Any, limit: int = 120) -> str:
@@ -4717,7 +4721,7 @@ class TurnRunner:
                 f"- {task['title']} - {labels.get(task['status'], task['status'])}"
                 for task in _visible_tasks()
             ]
-            return "Hermes is working\n" + "\n".join(lines)
+            return task_card_title + "\n" + "\n".join(lines)
 
         def _apply_native_event(raw: Any) -> bool:
             nonlocal anonymous_seq
@@ -4786,6 +4790,27 @@ class TurnRunner:
                 if ctx._cleanup_progress:
                     ctx._cleanup_msg_ids.append(fallback_msg_id)
 
+        async def _stop_native_progress() -> None:
+            nonlocal native_stop_requested
+            if native_stop_requested or not hasattr(
+                adapter, "stop_native_task_card_progress"
+            ):
+                return
+            native_stop_requested = True
+            try:
+                await adapter.stop_native_task_card_progress(
+                    ctx.source.chat_id,
+                    reply_to=ctx._progress_reply_to,
+                    metadata=ctx._progress_metadata,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "task-card stop failed during turn cleanup",
+                    exc_info=True,
+                )
+
         async def _publish_native_progress() -> None:
             nonlocal native_failed
             if not tasks:
@@ -4794,7 +4819,7 @@ class TurnRunner:
                 result = await adapter.send_native_task_card_progress(
                     chat_id=ctx.source.chat_id,
                     tasks=_visible_tasks(),
-                    title="Hermes is working",
+                    title=task_card_title,
                     reply_to=ctx._progress_reply_to,
                     metadata=ctx._progress_metadata,
                     fallback_text=_fallback_text(),
@@ -4807,6 +4832,13 @@ class TurnRunner:
                     "to an editable text update: %s",
                     getattr(result, "error", "unknown error"),
                 )
+                # Close the failed native stream before posting a text fallback,
+                # otherwise Slack can leave both visible in the thread.
+                await _stop_native_progress()
+            if not ctx.tool_progress_enabled:
+                # Slack keeps ordinary text tool_progress off. Native cards
+                # are the progress surface; do not post a second bullet list.
+                return
             # Once the native rail fails, every later lifecycle event
             # edits the same fallback message so progress remains live.
             await _send_or_edit_fallback()
@@ -4857,26 +4889,7 @@ class TurnRunner:
                     await _publish_native_progress()
             return
         finally:
-            if hasattr(adapter, "stop_native_task_card_progress"):
-                # Best-effort: this finally runs on the turn-cleanup path.
-                # An escaping transport exception here propagated through
-                # the cleanup awaits (which caught only CancelledError) and
-                # skipped final-delivery logic (review B7). Adapters now
-                # return failed SendResults, but defend the seam anyway —
-                # any adapter, any transport.
-                try:
-                    await adapter.stop_native_task_card_progress(
-                        ctx.source.chat_id,
-                        reply_to=ctx._progress_reply_to,
-                        metadata=ctx._progress_metadata,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.debug(
-                        "task-card stop failed during turn cleanup",
-                        exc_info=True,
-                    )
+            await _stop_native_progress()
 
     async def send_progress_messages(self):
         ctx = self._ctx
@@ -7137,6 +7150,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._async_session_store = AsyncSessionStore(self.session_store)
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
+        self._profile_service_stop = asyncio.Event()
+        self._profile_service_tasks: list[asyncio.Task] = []
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
@@ -13632,6 +13647,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running = True
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
+        self._start_plugin_profile_services()
 
         self._start_loop_heartbeat_task()
 
@@ -15350,6 +15366,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
         if callable(_stop_guards):
             _stop_guards()
+        stop_services = getattr(self, "_stop_plugin_profile_services", None)
+        if callable(stop_services):
+            try:
+                await stop_services()
+            except Exception:
+                logger.debug("plugin profile service stop failed", exc_info=True)
         if restart:
             self._restart_requested = True
             self._restart_detached = detached_restart
@@ -16585,6 +16607,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(self.config, "multiplex_profiles", False):
             return self._make_default_profile_message_handler()
         return self._handle_message
+
+    async def dispatch_internal_plugin_event(
+        self, event: MessageEvent
+    ) -> Optional[str]:
+        """Run one profile-local plugin event through the normal gateway turn.
+
+        This is deliberately narrower than adapter ingress. Plugins may start an
+        agent turn and receive its final text, but they may not impersonate a
+        messaging transport, bypass profile selection, execute gateway commands,
+        or inject media. The normal scoped message handler still owns session
+        lookup, persistence, model execution, and response normalization.
+        """
+        if not isinstance(event, MessageEvent):
+            raise TypeError("internal plugin dispatch requires a MessageEvent")
+        if event.internal is not True:
+            raise PermissionError("internal plugin events must set internal=True")
+        if event.allow_gateway_control is not False:
+            raise PermissionError(
+                "internal plugin events must set allow_gateway_control=False"
+            )
+        if event.message_type is not MessageType.TEXT:
+            raise ValueError("internal plugin dispatch accepts text events only")
+
+        source = event.source
+        if source is None:
+            raise ValueError("internal plugin events require a SessionSource")
+        if source.platform is not Platform.LOCAL:
+            raise PermissionError(
+                "internal plugin events must use the local platform"
+            )
+        if not str(getattr(source, "profile", "") or "").strip():
+            raise ValueError("internal plugin events require an explicit profile")
+        if not str(getattr(source, "chat_id", "") or "").strip():
+            raise ValueError("internal plugin events require a session chat_id")
+
+        handler = self._primary_message_handler()
+        return await handler(event)
 
     async def _handle_gateway_platform_event(self, event: dict, source) -> None:
         """Authorize and publish one normalized adapter event to plugin hooks."""
@@ -19598,6 +19657,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     delattr(event, attr)
                 except AttributeError:
                     pass
+
+    def _start_plugin_profile_services(self) -> None:
+        """Start plugin profile services against this live gateway."""
+        from types import SimpleNamespace
+
+        from hermes_cli.plugins import get_plugin_manager
+        from hermes_constants import get_hermes_home
+
+        stop_event = getattr(self, "_profile_service_stop", None)
+        if stop_event is None:
+            stop_event = asyncio.Event()
+            self._profile_service_stop = stop_event
+        self._profile_service_tasks = []
+        profile_name = (
+            os.getenv("HERMES_PROFILE")
+            or os.getenv("HERMES_AGENT_PROFILE")
+            or "default"
+        ).strip() or "default"
+        runtime = SimpleNamespace(
+            profile_home=str(get_hermes_home()),
+            profile_name=profile_name,
+            stop_event=stop_event,
+            gateway=self,
+        )
+        try:
+            services = list(get_plugin_manager()._profile_services)
+        except Exception:
+            services = []
+        for name, factory in services:
+            try:
+                task = asyncio.create_task(factory(runtime), name=f"profile-service:{name}")
+            except Exception:
+                logger.exception("Failed to start plugin profile service %s", name)
+                continue
+            self._profile_service_tasks.append(task)
+            logger.info("Started plugin profile service %s", name)
+
+    async def _stop_plugin_profile_services(self) -> None:
+        stop_event = getattr(self, "_profile_service_stop", None)
+        if stop_event is not None and not stop_event.is_set():
+            stop_event.set()
+        tasks = list(getattr(self, "_profile_service_tasks", []) or [])
+        self._profile_service_tasks = []
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     def _install_plugin_message_injector(self) -> None:
         """Publish this live gateway's plugin message scheduler."""
@@ -29417,6 +29524,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # flags would silently leave the native feature inactive).
         _progress_adapter_for_native = self._adapter_for_source(source)
         _native_slack_task_cards = False
+        _native_task_card_title = None
         if (
             source.platform == Platform.SLACK
             and _progress_adapter_for_native is not None
@@ -29428,6 +29536,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception:
                 logger.debug("Slack native task-card config check failed", exc_info=True)
+        if _native_slack_task_cards:
+            from gateway.task_card_identity import resolve_task_card_title
+            from hermes_constants import get_hermes_home
+
+            _native_task_card_title = resolve_task_card_title(get_hermes_home())
         needs_progress_queue = (
             tool_progress_enabled or _thinking_enabled or _native_slack_task_cards
         )
@@ -29523,6 +29636,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
             needs_progress_queue=needs_progress_queue,
             _native_slack_task_cards=_native_slack_task_cards,
+            native_task_card_title=_native_task_card_title,
             _voice_ack_fired=_voice_ack_fired,
             _voice_ack_guild=_voice_ack_guild,
             _voice_ack_loop=_voice_ack_loop,
