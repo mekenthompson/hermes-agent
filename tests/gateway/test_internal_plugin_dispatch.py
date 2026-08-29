@@ -1,0 +1,168 @@
+"""Contract tests for profile-local plugin turns through GatewayRunner."""
+
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform
+from gateway.platforms.base import MessageEvent, MessageType
+from gateway.run import GatewayRunner
+from gateway.session import SessionSource
+from hermes_constants import get_hermes_home
+
+
+def _event(**overrides) -> MessageEvent:
+    source = overrides.pop(
+        "source",
+        SessionSource(
+            platform=Platform.LOCAL,
+            chat_id="linear-session-1",
+            chat_name="Linear Agent Session",
+            chat_type="dm",
+            user_id="linear-agent",
+            user_name="Linear Agent",
+            scope_id="workspace-1",
+            profile="aggie",
+        ),
+    )
+    values = {
+        "text": "untrusted payload",
+        "message_type": MessageType.TEXT,
+        "source": source,
+        "internal": True,
+        "allow_gateway_control": False,
+        "metadata": {"linear_agent": True},
+    }
+    values.update(overrides)
+    return MessageEvent(**values)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_internal_plugin_event_uses_normal_scoped_handler():
+    runner = object.__new__(GatewayRunner)
+    handler = AsyncMock(return_value="agent response")
+    runner._primary_message_handler = lambda: handler
+    event = _event()
+
+    result = await runner.dispatch_internal_plugin_event(event)
+
+    assert result == "agent response"
+    handler.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+async def test_prepare_internal_plugin_session_persists_session_without_starting_turn():
+    runner = object.__new__(GatewayRunner)
+    entry = SimpleNamespace(session_id="hermes-session-1")
+    store = object()
+    get_or_create = AsyncMock(return_value=entry)
+    facade = SimpleNamespace(
+        _store=store,
+        get_or_create_session=get_or_create,
+    )
+    object.__setattr__(runner, "session_store", store)
+    object.__setattr__(runner, "_async_session_store", facade)
+    handler = AsyncMock(return_value="must not run")
+    runner._primary_message_handler = lambda: handler
+    event = _event()
+
+    result = await runner.prepare_internal_plugin_session(event)
+
+    assert result == "hermes-session-1"
+    get_or_create.assert_awaited_once_with(
+        event.source,
+        touch_activity=False,
+    )
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_prepare_internal_plugin_session_uses_explicit_multiplex_profile_scope(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "root"
+    profile = root / "profiles" / "aggie"
+    root.mkdir(parents=True)
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._resolve_profile_home_for_source = lambda source: profile
+    seen = []
+
+    async def get_or_create(_source, *, touch_activity):
+        seen.append((Path(get_hermes_home()), touch_activity))
+        return SimpleNamespace(session_id="hermes-session-1")
+
+    store = object()
+    facade = SimpleNamespace(_store=store, get_or_create_session=get_or_create)
+    object.__setattr__(runner, "session_store", store)
+    object.__setattr__(runner, "_async_session_store", facade)
+
+    result = await runner.prepare_internal_plugin_session(_event())
+
+    assert result == "hermes-session-1"
+    assert seen == [(profile, False)]
+    assert Path(get_hermes_home()) == root
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "error"),
+    [
+        (object(), TypeError),
+        (_event(internal=False), PermissionError),
+        (_event(allow_gateway_control=True), PermissionError),
+        (_event(message_type=MessageType.PHOTO), ValueError),
+        (_event(source=None), ValueError),
+        (
+            _event(
+                source=SessionSource(
+                    platform=Platform.SLACK,
+                    chat_id="C123",
+                    chat_type="dm",
+                    profile="aggie",
+                )
+            ),
+            PermissionError,
+        ),
+        (
+            _event(
+                source=SessionSource(
+                    platform=Platform.LOCAL,
+                    chat_id="local-1",
+                    chat_type="dm",
+                    profile=None,
+                )
+            ),
+            ValueError,
+        ),
+    ],
+)
+async def test_dispatch_internal_plugin_event_rejects_unsafe_shapes(event, error):
+    runner = object.__new__(GatewayRunner)
+    handler = AsyncMock(return_value="must not run")
+    runner._primary_message_handler = lambda: handler
+
+    with pytest.raises(error):
+        await runner.dispatch_internal_plugin_event(event)
+
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_internal_plugin_event_keeps_slash_payload_as_text():
+    runner = object.__new__(GatewayRunner)
+    handler = AsyncMock(return_value="treated as conversation")
+    runner._primary_message_handler = lambda: handler
+    event = _event(text="/restart")
+
+    result = await runner.dispatch_internal_plugin_event(event)
+
+    assert result == "treated as conversation"
+    assert event.is_command() is False
+    handler.assert_awaited_once_with(event)
