@@ -1,4 +1,4 @@
-# Relay ↔ Connector Contract (v2, EXPERIMENTAL)
+# Relay ↔ Connector Contract (v1, EXPERIMENTAL)
 
 > **Status:** EXPERIMENTAL. This contract MAY CHANGE without a deprecation
 > cycle until at least two real Class-1 platforms (Discord + Telegram) have
@@ -27,7 +27,7 @@ connector owns all platform-specific socket/identity logic.
    draft/edit/thread/markdown capabilities) and registers an inbound handler.
 4. Connector then streams inbound events and accepts outbound actions.
 
-`contract_version` (currently `2`) is carried in the descriptor. The gateway
+`contract_version` (currently `1`) is carried in the descriptor. The gateway
 ignores unknown descriptor fields (forward-compat) and fills missing optional
 fields from defaults.
 
@@ -401,12 +401,6 @@ The gateway calls the transport with action dicts. Source of truth:
 | `react` | `chat_id`, `message_id`, `emoji`, `remove?`, `metadata?` | `{success: bool, error?}` |
 | `thread_create` | `chat_id` (parent), `thread_name`, `message_id?` (anchor), `metadata?` | `{success: bool, thread_id?, error?}` |
 | `thread_rename` | `chat_id` (parent), `message_id` (the THREAD id), `thread_name`, `only_if_current_name?`, `metadata?` | `{success: bool, error?}` |
-| `task_card` | `chat_id`, `card_id`, `chunks`, `metadata`, `title?`, `fallback_text?` | `{success: bool, error?}` |
-| `task_card_stop` | `chat_id`, `card_id`, `metadata?` | `{success: bool, error?}` |
-
-`task_card` identity fields are contract v2. A gateway sends `title` and
-`fallback_text` only when the descriptor selected for that chat advertises
-`contract_version >= 2`; v1 connectors receive the original task-card payload.
 
 `get_chat_info(chat_id)` is a separate proxied call returning at least
 `{name, type}`.

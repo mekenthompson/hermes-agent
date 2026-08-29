@@ -141,6 +141,5 @@ class TurnContext:
     # published by TurnRunner (like voice_ack_callback above) so tool starts
     # and completions correlate by real tool-call ID instead of tool name.
     _native_slack_task_cards: bool = False
-    native_task_card_title: Optional[str] = None
     native_tool_start_callback: Optional[Callable] = None
     native_tool_complete_callback: Optional[Callable] = None

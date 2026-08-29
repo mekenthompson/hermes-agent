@@ -86,15 +86,6 @@ def test_output_path_is_mp3_for_non_opus_platforms(platform):
     assert path.endswith(".mp3"), path
 
 
-def test_output_path_is_inside_hermes_audio_cache():
-    from gateway.platforms.base import get_audio_cache_dir
-
-    path = build_auto_tts_output_path(Platform.TELEGRAM)
-    cache = str(get_audio_cache_dir())
-    assert path.startswith(cache + "/"), path
-    assert "hermes_voice" not in path
-
-
 # ---------------------------------------------------------------------------
 # Base-adapter auto-TTS block: explicit output_path, no contextvar reliance
 # ---------------------------------------------------------------------------

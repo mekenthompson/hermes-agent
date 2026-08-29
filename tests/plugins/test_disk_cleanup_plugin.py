@@ -115,15 +115,6 @@ class TestGuessCategory:
         # Even though it matches test_* pattern, logs/ is excluded.
         assert dg.guess_category(p) is None
 
-    def test_skips_canonical_workspace_project_tree(self, _isolate_env):
-        dg = _load_lib()
-        project = _isolate_env / "workspace" / "repos" / "example" / "tests"
-        project.mkdir(parents=True)
-        p = project / "test_feature.py"
-        p.write_text("assert True")
-
-        assert dg.guess_category(p) is None
-
     def test_cron_subtree_categorised(self, _isolate_env):
         dg = _load_lib()
         # Only files under ``cron/output/`` are disposable run artifacts.

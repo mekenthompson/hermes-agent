@@ -52,9 +52,6 @@ def _agent(monkeypatch, base_url: str, **kwargs):
 
     client = _FakeClient()
     monkeypatch.setattr("run_agent.OpenAI", lambda **_kw: client)
-    # ACP URLs are now built through the generic ACP transport rather than
-    # the OpenAI SDK. Keep this rail test hermetic at that construction seam.
-    monkeypatch.setattr("agent.copilot_acp_client.ACPClient", lambda **_kw: client)
     monkeypatch.setattr("run_agent.get_tool_definitions", lambda *a, **k: [])
     agent = AIAgent(
         model="gpt-5",  # a model that would normally trigger the Responses upgrade

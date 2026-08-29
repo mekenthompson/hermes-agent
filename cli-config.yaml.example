@@ -1227,23 +1227,6 @@ platform_toolsets:
 #       # Omit either key to preserve Slack's default for that preview type.
 #       unfurl_links: false
 #       unfurl_media: false
-#       # Namespace prefix for every generated Slack slash command. Slack
-#       # slash commands are workspace-global and NOT namespaced, so two
-#       # gateway apps in one workspace fight over generic names like
-#       # /model or /new. Setting a prefix registers /myorg-model,
-#       # /myorg-hermes, ... instead; the gateway strips it again on the way
-#       # in, so behaviour is unchanged.
-#       #
-#       # Empty (the default) keeps the historical unprefixed names.
-#       # Sanitized to Slack's charset (a-z, 0-9, -, _); a trailing - or _
-#       # is preserved, so "myorg-" gives /myorg-model rather than
-#       # /myorgmodel. Keep it short: prefix + command must stay within
-#       # Slack's 32-character limit, and names that overflow are dropped
-#       # from the manifest (still reachable via /<prefix>hermes <command>).
-#       #
-#       # Changing this requires reinstalling/updating the Slack app with a
-#       # regenerated manifest (`hermes slack manifest`).
-#       command_prefix: ""
 #   webhook:
 #     extra:
 #       # Route scripts default to a 30 second timeout. Scripts must live under
@@ -1534,16 +1517,15 @@ stt:
 code_execution:
   timeout: 300         # Max seconds per script before kill (default: 300 = 5 min)
   max_tool_calls: 50   # Max RPC tool calls per execution (default: 50)
-  # kernel_mode: per-call | session (default: per-call)
-  #   per-call — fresh child process per execute_code call; no state carries over.
-  #   session  — one persistent kernel per (task, mode, interpreter, cwd, tool-set):
-  #              variables, imports, and loaded data survive across calls, so
-  #              multi-step data work stops re-loading its inputs every call.
-  #              A timed-out/interrupted cell kills the kernel (state lost; the
-  #              next call starts fresh). Pass reset=true on a call to discard
-  #              state deliberately. Security scrubbing, tool whitelist, and
-  #              output redaction are identical in both modes.
-  # kernel_mode: per-call
+  # Local execution uses a persistent session kernel: variables, imports, and
+  # loaded data survive across execute_code calls in one conversation, so
+  # multi-step data work stops re-loading its inputs every call. Pass
+  # reset=true on a call to discard state; a timed-out/interrupted cell kills
+  # the kernel (next call starts fresh). Remote terminal backends currently
+  # run per-call (remote kernel host is tracked follow-up work). Security
+  # scrubbing, tool whitelist, and output redaction are identical either way.
+  # kernel_idle_timeout: 1800   # Reap kernels idle longer than this (seconds)
+  # max_session_kernels: 4      # Process-wide LRU cap on live kernels
 
 # =============================================================================
 # Subagent Delegation
