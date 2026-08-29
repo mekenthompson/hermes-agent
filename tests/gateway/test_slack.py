@@ -2409,7 +2409,7 @@ _EDITED_PLAIN_TEXT = "ship the release notes, revised"
 _REPLIED_PARENT_FIELDS = {"reply_count": 2, "latest_reply": "200.000001"}
 
 
-def _rich_text_blocks(*elements):
+def _thread_parent_rich_text_blocks(*elements):
     """Wrap *elements* in the ``rich_text``/``rich_text_section`` tree Slack sends."""
     return [
         {
@@ -3457,7 +3457,7 @@ class TestMessageRouting:
         """A Block-Kit-authored mention counts as already addressing the bot."""
 
         def _blocks(body: str) -> list:
-            return _rich_text_blocks(
+            return _thread_parent_rich_text_blocks(
                 {"type": "user", "user_id": "U_BOT"},
                 {"type": "text", "text": f" {body}"},
             )
@@ -3529,29 +3529,35 @@ class TestMessageRouting:
         "previous_blocks",
         [
             [{"type": "rich_text", "elements": "malformed"}],
-            _rich_text_blocks({"type": "user", "user_id": ""}),
-            _rich_text_blocks({"type": ""}),
+            _thread_parent_rich_text_blocks({"type": "user", "user_id": ""}),
+            _thread_parent_rich_text_blocks({"type": ""}),
             # Slack sends bare identifiers: a blank or padded label names
             # nobody and matches none of the walker's branches, so it is
             # silence rather than proof the mention was absent.
             pytest.param(
-                _rich_text_blocks({"type": "user", "user_id": "   "}),
+                _thread_parent_rich_text_blocks({"type": "user", "user_id": "   "}),
                 id="blank-user-id",
             ),
             pytest.param(
-                _rich_text_blocks({"type": "user", "user_id": " U123 "}),
+                _thread_parent_rich_text_blocks(
+                    {"type": "user", "user_id": " U123 "}
+                ),
                 id="padded-user-id",
             ),
-            pytest.param(_rich_text_blocks({"type": "   "}), id="blank-type"),
             pytest.param(
-                _rich_text_blocks({"type": " user ", "user_id": "U123"}),
+                _thread_parent_rich_text_blocks({"type": "   "}), id="blank-type"
+            ),
+            pytest.param(
+                _thread_parent_rich_text_blocks(
+                    {"type": " user ", "user_id": "U123"}
+                ),
                 id="padded-type",
             ),
             # Every Block Kit node Slack sends is typed. A node missing
             # ``type`` is a partial payload the walker reads as ordinary
             # content, so it cannot witness that the mention was absent.
             pytest.param(
-                _rich_text_blocks({"user_id": "U_BOT"}),
+                _thread_parent_rich_text_blocks({"user_id": "U_BOT"}),
                 id="missing-type",
             ),
             # Slack's ``blocks`` container is a list. A bare dict is not the
@@ -3581,12 +3587,12 @@ class TestMessageRouting:
         """A well-formed mention-free block tree still proves the mention is new."""
         event = _replied_parent_edit_event(
             text=_PARENT_MENTION_TEXT,
-            blocks=_rich_text_blocks(
+            blocks=_thread_parent_rich_text_blocks(
                 {"type": "user", "user_id": "U_BOT"},
                 {"type": "text", "text": f" {_PARENT_PLAIN_TEXT}"},
             ),
             previous_text=_PARENT_PLAIN_TEXT,
-            previous_blocks=_rich_text_blocks(
+            previous_blocks=_thread_parent_rich_text_blocks(
                 {"type": "text", "text": _PARENT_PLAIN_TEXT}
             ),
         )
