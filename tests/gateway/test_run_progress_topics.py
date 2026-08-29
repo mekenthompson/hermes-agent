@@ -282,6 +282,7 @@ class FailingNativeTaskCardAdapter(NativeTaskCardAdapter):
     def __init__(self, platform=Platform.SLACK):
         super().__init__(platform=platform)
         self.call_order = []
+        self.failure_sequence = []
 
     async def send_native_task_card_progress(self, *args, **kwargs) -> SendResult:
         self.call_order.append("native")
