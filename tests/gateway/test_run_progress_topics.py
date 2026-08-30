@@ -1112,6 +1112,9 @@ async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
         tmp_path,
         DuplicateNativeToolsAgent,
         session_id="sess-native-fallback",
+        config_data={
+            "display": {"platforms": {"slack": {"tool_progress": "all"}}}
+        },
         platform=Platform.SLACK,
         chat_id="C1",
         thread_id="thread-1",

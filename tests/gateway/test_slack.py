@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import importlib
 from importlib.machinery import PathFinder
+import logging
 import os
 import socket
 import sys
@@ -29,7 +30,6 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
     SUPPORTED_VIDEO_TYPES,
-    SendResult,
     is_host_excluded_by_no_proxy,
 )
 
@@ -300,6 +300,258 @@ class TestSlackWorkspaceCollisionIsolation:
         assert build_session_key(first.source) != build_session_key(second.source)
         assert adapter._channel_teams["D_SHARED"] == {"T_ONE", "T_TWO"}
         assert "D_SHARED" not in adapter._channel_team
+
+
+# ---------------------------------------------------------------------------
+# TestSlackCommandPrefix
+# ---------------------------------------------------------------------------
+
+
+def _config_with_prefix(prefix):
+    """Fake config.yaml payload for the manifest-side prefix lookup."""
+    return {"platforms": {"slack": {"extra": {"command_prefix": prefix}}}}
+
+
+class TestSlackCommandPrefix:
+    """Namespace prefix so multiple gateway apps can share one workspace."""
+
+    def _make(self, extra):
+        config = PlatformConfig(enabled=True, token="xoxb-fake", extra=extra or {})
+        a = SlackAdapter(config)
+        a._app = MagicMock()
+        a._app.client = AsyncMock()
+        a._bot_user_id = "U_BOT"
+        a._running = True
+        a.handle_message = AsyncMock()
+        return a
+
+    @pytest.mark.asyncio
+    async def test_prefixed_native_slash_is_stripped_and_routed(self):
+        adapter = self._make({"command_prefix": "myorg-"})
+        assert adapter._command_prefix == "myorg-"
+
+        await adapter._handle_slash_command(
+            {
+                "command": "/myorg-model",
+                "text": "opus",
+                "user_id": "U1",
+                "channel_id": "C1",
+                "team_id": "T1",
+            }
+        )
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "/model opus"
+        assert event.message_type == MessageType.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_prefixed_hermes_routes_freeform_question(self):
+        adapter = self._make({"command_prefix": "myorg-"})
+
+        await adapter._handle_slash_command(
+            {
+                "command": "/myorg-hermes",
+                "text": "what's up",
+                "user_id": "U1",
+                "channel_id": "C1",
+                "team_id": "T1",
+            }
+        )
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "what's up"
+        assert event.message_type == MessageType.TEXT
+
+    @pytest.mark.asyncio
+    async def test_no_prefix_default_leaves_commands_unchanged(self):
+        adapter = self._make({})
+        assert adapter._command_prefix == ""
+
+        await adapter._handle_slash_command(
+            {
+                "command": "/model",
+                "text": "opus",
+                "user_id": "U1",
+                "channel_id": "C1",
+                "team_id": "T1",
+            }
+        )
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "/model opus"
+
+    def test_manifest_prepends_prefix(self, monkeypatch):
+        from hermes_cli.commands import slack_app_manifest
+
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config", lambda: _config_with_prefix("myorg-")
+        )
+        slashes = slack_app_manifest()["features"]["slash_commands"]
+
+        assert slashes
+        assert all(s["command"].startswith("/myorg-") for s in slashes)
+        assert any(s["command"] == "/myorg-hermes" for s in slashes)
+
+    def test_manifest_silent_when_all_prefixed_names_fit(self, monkeypatch, caplog):
+        from hermes_cli import commands as cmds
+
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config", lambda: _config_with_prefix("myorg-")
+        )
+        monkeypatch.setattr(
+            cmds,
+            "slack_native_slashes",
+            lambda prefix="": [("hermes", "d", ""), ("model", "d", "")],
+        )
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.commands"):
+            slashes = cmds.slack_app_manifest()["features"]["slash_commands"]
+
+        assert [s["command"] for s in slashes] == ["/myorg-hermes", "/myorg-model"]
+        # Nothing was skipped, so the generator must stay silent.
+        assert not caplog.records
+
+    def test_manifest_default_has_no_prefix(self, monkeypatch):
+        from hermes_cli.commands import slack_app_manifest
+
+        # Empty config is authoritative — avoids reading a real config file.
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+        slashes = slack_app_manifest()["features"]["slash_commands"]
+
+        assert any(s["command"] == "/hermes" for s in slashes)
+        assert all(not s["command"].startswith("/myorg-") for s in slashes)
+
+    def test_manifest_skips_prefixed_name_over_slack_limit(self, monkeypatch, caplog):
+        from hermes_cli import commands as cmds
+
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config", lambda: _config_with_prefix("myorg-")
+        )
+        long_name = "x" * 30  # 30 + len("myorg-") = 35 > 32-char Slack limit
+        monkeypatch.setattr(
+            cmds,
+            "slack_native_slashes",
+            lambda prefix="": [("hermes", "d", ""), (long_name, "d", ""), ("model", "d", "")],
+        )
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.commands"):
+            names = [s["command"] for s in cmds.slack_app_manifest()["features"]["slash_commands"]]
+
+        assert "/myorg-hermes" in names
+        assert "/myorg-model" in names
+        assert f"/myorg-{long_name}" not in names
+
+        # The skip is warned, naming the dropped command and the fallback path.
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert f"myorg-{long_name}" in message
+        assert "/myorg-hermes <subcommand>" in message
+
+    def test_manifest_warns_when_catchall_itself_over_limit(self, monkeypatch, caplog):
+        from hermes_cli import commands as cmds
+
+        # 27-char prefix: "hermes" (6) no longer fits (33 > 32) but "model"
+        # (5) still does — the warning must not advise the dead fallback.
+        prefix = "x" * 26 + "-"
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config", lambda: _config_with_prefix(prefix)
+        )
+        monkeypatch.setattr(
+            cmds,
+            "slack_native_slashes",
+            lambda prefix="": [("hermes", "d", ""), ("model", "d", "")],
+        )
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.commands"):
+            names = [s["command"] for s in cmds.slack_app_manifest()["features"]["slash_commands"]]
+
+        assert names == [f"/{prefix}model"]
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert f"{prefix}hermes" in message
+        assert "<subcommand>" not in message
+        assert "shorter command_prefix" in message
+
+    def test_all_invalid_prefix_warns_and_disables_namespacing(self, caplog):
+        from hermes_cli.commands import slack_command_prefix
+
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.commands"):
+            prefix = slack_command_prefix({"command_prefix": "@@@"})
+
+        assert prefix == ""
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "NOT namespaced" in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_bang_prefixed_command_rewritten_in_thread(self):
+        """``!myorg-model`` mirrors the prefixed native-slash surface."""
+        adapter = self._make({"command_prefix": "myorg-"})
+
+        await adapter._handle_slack_message(
+            {
+                "text": "!myorg-model opus",
+                "user": "U_USER",
+                "channel": "D123",
+                "channel_type": "im",
+                "ts": "1234567890.000001",
+                "thread_ts": "1111111111.000001",
+            }
+        )
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text.startswith("/model opus")
+        assert msg_event.message_type == MessageType.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_bang_unprefixed_stays_text_when_prefix_set(self):
+        """Two namespaced apps sharing a channel must not both run ``!model``."""
+        adapter = self._make({"command_prefix": "myorg-"})
+
+        await adapter._handle_slack_message(
+            {
+                "text": "!model opus",
+                "user": "U_USER",
+                "channel": "D123",
+                "channel_type": "im",
+                "ts": "1234567890.000001",
+            }
+        )
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "!model opus"
+        assert msg_event.message_type != MessageType.COMMAND
+
+    def test_manifest_prefix_unreserves_slack_builtin_names(self, monkeypatch):
+        from hermes_cli.commands import slack_app_manifest
+
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+        bare = {s["command"] for s in slack_app_manifest()["features"]["slash_commands"]}
+        # Bare /status collides with the Slack built-in, so it is skipped.
+        assert "/status" not in bare
+
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config", lambda: _config_with_prefix("myorg-")
+        )
+        prefixed = {s["command"] for s in slack_app_manifest()["features"]["slash_commands"]}
+        # /myorg-status no longer collides, so it gets a native slot.
+        assert "/myorg-status" in prefixed
+
+    def test_manifest_alias_descriptions_use_prefixed_names(self, monkeypatch):
+        from hermes_cli.commands import slack_app_manifest
+
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config", lambda: _config_with_prefix("myorg-")
+        )
+        slashes = slack_app_manifest()["features"]["slash_commands"]
+
+        alias_descs = [
+            s["description"] for s in slashes if s["description"].startswith("Alias for /")
+        ]
+        # Current Nous command inventory no longer emits "Alias for /" slash
+        # descriptions for /btw and /bg. Prefixing still applies when aliases
+        # exist; do not fail closed on an empty alias set.
+        if alias_descs:
+            assert all(d.startswith("Alias for /myorg-") for d in alias_descs)
 
 
 # ---------------------------------------------------------------------------
@@ -2146,6 +2398,111 @@ class TestIncomingAudioHandling:
 
 
 # ---------------------------------------------------------------------------
+# Helpers — edited thread-parent (``message_changed``) events
+# ---------------------------------------------------------------------------
+
+_UNSET = object()
+
+_PARENT_MENTION_TEXT = "<@U_BOT> ship the release notes"
+_EDITED_MENTION_TEXT = "<@U_BOT> ship the release notes, revised"
+_PARENT_PLAIN_TEXT = "ship the release notes"
+_EDITED_PLAIN_TEXT = "ship the release notes, revised"
+_REPLIED_PARENT_FIELDS = {"reply_count": 2, "latest_reply": "200.000001"}
+
+
+def _thread_parent_rich_text_blocks(*elements):
+    """Wrap *elements* in the ``rich_text``/``rich_text_section`` tree Slack sends."""
+    return [
+        {
+            "type": "rich_text",
+            "elements": [{"type": "rich_text_section", "elements": list(elements)}],
+        }
+    ]
+
+
+def _replied_parent_edit_event(
+    *,
+    text=_EDITED_MENTION_TEXT,
+    previous_text=_PARENT_MENTION_TEXT,
+    blocks=None,
+    previous_blocks=None,
+    previous_message=_UNSET,
+    reply_fields=_REPLIED_PARENT_FIELDS,
+    channel="C123",
+    channel_type="channel",
+    team="T123",
+    message_team=None,
+    parent_ts="100.000001",
+    thread_ts=_UNSET,
+    event_ts="301.000001",
+    edited_ts="300.000001",
+    message_extra=None,
+):
+    """Build a ``message_changed`` event editing an already-replied thread parent.
+
+    The defaults reproduce the live incident shape: a thread root that
+    @mentions the bot, already carries reply bookkeeping, and whose text was
+    edited later.  Each regression varies one facet through a keyword:
+
+    ``text`` / ``previous_text`` / ``blocks`` / ``previous_blocks``
+        the edited and pre-edit payloads (``blocks=None`` omits the key).
+    ``previous_message``
+        replaces the generated pre-edit snapshot wholesale; ``None`` drops
+        the key entirely.
+    ``reply_fields``
+        the reply bookkeeping copied into both snapshots.
+    ``channel`` / ``channel_type`` / ``team`` / ``message_team``
+        routing identity; ``team=None`` omits the outer team so only the
+        edited message carries one.
+    ``parent_ts`` / ``thread_ts`` / ``event_ts`` / ``edited_ts``
+        timestamps; ``thread_ts`` defaults to ``parent_ts`` (a thread root)
+        and ``None`` omits it.
+    ``message_extra``
+        extra keys merged into the edited message only.
+    """
+    resolved_thread_ts = parent_ts if thread_ts is _UNSET else thread_ts
+
+    def _snapshot(body_text, body_blocks, extra=None):
+        message = {
+            "type": "message",
+            "text": body_text,
+            "user": "U_USER",
+            "channel": channel,
+            "ts": parent_ts,
+            **dict(reply_fields or {}),
+        }
+        if resolved_thread_ts is not None:
+            message["thread_ts"] = resolved_thread_ts
+        if body_blocks is not None:
+            message["blocks"] = body_blocks
+        if message_team is not None:
+            message["team"] = message_team
+        message.update(extra or {})
+        return message
+
+    event = {
+        "type": "message",
+        "subtype": "message_changed",
+        "channel": channel,
+        "channel_type": channel_type,
+        "ts": event_ts,
+        "event_ts": event_ts,
+        "message": _snapshot(
+            text,
+            blocks,
+            {"edited": {"user": "U_USER", "ts": edited_ts}, **(message_extra or {})},
+        ),
+    }
+    if team is not None:
+        event["team"] = team
+    if previous_message is _UNSET:
+        event["previous_message"] = _snapshot(previous_text, previous_blocks)
+    elif previous_message is not None:
+        event["previous_message"] = previous_message
+    return event
+
+
+# ---------------------------------------------------------------------------
 # TestMessageRouting
 # ---------------------------------------------------------------------------
 
@@ -2283,6 +2640,1036 @@ class TestMessageRouting:
         assert msg_event.text == "whats the rapchat summary for last 12 hours"
         assert msg_event.message_id == "1234567890.000001"
 
+
+    @pytest.mark.asyncio
+    async def test_stale_message_changed_metadata_update_ignored(self, adapter):
+        """A parent metadata update must not replay an old user edit as new input."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "hidden": True,
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": {
+                "type": "message",
+                "text": "old thread parent",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "edited": {"user": "U_USER", "ts": "150.000001"},
+                "reply_count": 2,
+                "latest_reply": "200.000001",
+            },
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_thread_metadata_only_parent_update_ignored(self, adapter):
+        """Reply bookkeeping must not replay an unchanged thread parent."""
+        parent = {
+            "type": "message",
+            "text": "old thread parent",
+            "files": [],
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+            "thread_ts": "100.000001",
+            "reply_count": 2,
+        }
+        previous = {
+            "type": "message",
+            "text": "old thread parent",
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+        }
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "hidden": True,
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "200.000002",
+            "event_ts": "200.000002",
+            "message": parent,
+            "previous_message": previous,
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("previous_message", [None, "malformed"])
+    async def test_unedited_parent_reply_update_without_previous_ignored(
+        self, adapter, previous_message
+    ):
+        """Reply metadata ordering identifies updates without previous_message."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "hidden": True,
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "1726133701.028300",
+            "event_ts": "1726133701.028300",
+            "message": {
+                "type": "message",
+                "text": "old unedited thread parent",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "1726133698.626339",
+                "thread_ts": "1726133698.626339",
+                "reply_count": 2,
+                "latest_reply": "1726133700.887259",
+            },
+        }
+        if previous_message is not None:
+            event["previous_message"] = previous_message
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "previous_message",
+        [
+            None,
+            "malformed",
+            {},
+            {"reply_count": 1},
+            {"text": None},
+            {"files": "malformed"},
+        ],
+    )
+    @pytest.mark.parametrize("latest_reply", [None, "malformed", 150])
+    async def test_ambiguous_reply_order_without_visible_snapshot_ignored(
+        self, adapter, previous_message, latest_reply
+    ):
+        """Ambiguous reply ordering must fail closed after a cold restart."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "hidden": True,
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": {
+                "type": "message",
+                "text": "old parent instruction with side effects",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "edited": {"user": "U_USER", "ts": "150.000001"},
+                "reply_count": 2,
+            },
+        }
+        if latest_reply is not None:
+            event["message"]["latest_reply"] = latest_reply
+        if previous_message is not None:
+            event["previous_message"] = previous_message
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reply_fields,previous_message,edited_ts",
+        [
+            ({"reply_count": 0}, {}, None),
+            ({"reply_users_count": 0}, {}, None),
+            ({"reply_users": []}, {}, None),
+            ({"replies": []}, {}, None),
+            (
+                {
+                    "reply_count": 0,
+                    "reply_users_count": 0,
+                    "reply_users": [],
+                    "replies": [],
+                },
+                {},
+                None,
+            ),
+            (
+                {},
+                {"reply_count": 1, "latest_reply": "150.000001"},
+                "200.000001",
+            ),
+            (
+                {"reply_count": 1, "latest_reply": "150.000001"},
+                {"reply_count": 2, "latest_reply": "300.000001"},
+                "200.000001",
+            ),
+            (
+                {"reply_count": 0},
+                {
+                    "text": "old parent instruction with side effects",
+                    "files": [],
+                    "reply_count": 1,
+                },
+                None,
+            ),
+            (
+                {"files": {}, "reply_count": 0},
+                {
+                    "text": "old parent instruction with side effects",
+                    "files": [],
+                    "reply_count": 1,
+                },
+                None,
+            ),
+            (
+                {"files": "", "reply_count": 0},
+                {
+                    "text": "old parent instruction with side effects",
+                    "files": [{"id": "F_PREVIOUS"}],
+                    "reply_count": 1,
+                },
+                None,
+            ),
+        ],
+    )
+    async def test_reply_metadata_transition_ignored(
+        self, adapter, reply_fields, previous_message, edited_ts
+    ):
+        """Reply metadata transitions must not replay a thread parent."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "hidden": True,
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": {
+                "type": "message",
+                "text": "old parent instruction with side effects",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                **reply_fields,
+            },
+            "previous_message": previous_message,
+        }
+        if edited_ts is not None:
+            event["message"]["edited"] = {"user": "U_USER", "ts": edited_ts}
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_message_changed_visible_text_update_processed(self, adapter):
+        """A genuine edit routes when event_ts follows edited.ts by milliseconds."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "1665102362.013600",
+            "event_ts": "1665102362.013600",
+            "message": {
+                "type": "message",
+                "text": "corrected text",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "1665102338.901939",
+                "edited": {"user": "U_USER", "ts": "1665102362.000000"},
+            },
+            "previous_message": {
+                "type": "message",
+                "text": "original text",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "1665102338.901939",
+            },
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "corrected text"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "edited_ts,latest_reply",
+        [(None, "malformed"), ("200.000001", "300.000001")],
+    )
+    async def test_visible_edit_with_ambiguous_reply_order_processed(
+        self, adapter, edited_ts, latest_reply
+    ):
+        """A proven visible edit wins over incomplete or older edit ordering."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "301.000002",
+            "event_ts": "301.000002",
+            "message": {
+                "type": "message",
+                "text": "corrected despite malformed metadata",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "reply_count": 2,
+                "latest_reply": latest_reply,
+            },
+            "previous_message": {
+                "type": "message",
+                "text": "original text",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "reply_count": 2,
+                "latest_reply": latest_reply,
+            },
+        }
+        if edited_ts is not None:
+            event["message"]["edited"] = {"user": "U_USER", "ts": edited_ts}
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "corrected despite malformed metadata"
+
+    @pytest.mark.asyncio
+    async def test_thread_parent_edit_after_latest_reply_processed(self, adapter):
+        """A newer parent edit must route even without previous_message."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "301.000001",
+            "event_ts": "301.000001",
+            "message": {
+                "type": "message",
+                "text": "parent corrected after replies",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "edited": {"user": "U_USER", "ts": "300.000001"},
+                "reply_count": 2,
+                "latest_reply": "200.000001",
+            },
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "parent corrected after replies"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("field", "previous_value"),
+        [
+            ("attachments", [{"fallback": "removed attachment"}]),
+            ("files", [{"id": "F_REMOVED"}]),
+            ("blocks", [{"type": "section"}]),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "explicit_null", [False, True], ids=("omitted", "explicit-null")
+    )
+    async def test_visible_payload_removal_with_reply_metadata_processed(
+        self, adapter, field, previous_value, explicit_null
+    ):
+        """Removing visible payload must win over reply metadata transitions."""
+        parent = {
+            "type": "message",
+            "text": "unchanged parent text",
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+            "thread_ts": "100.000001",
+            "reply_count": 2,
+            "latest_reply": "200.000001",
+        }
+        if explicit_null:
+            parent[field] = None
+        previous = {
+            "type": "message",
+            "text": "unchanged parent text",
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+            "thread_ts": "100.000001",
+            "reply_count": 1,
+            "latest_reply": "150.000001",
+            field: previous_value,
+        }
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": parent,
+            "previous_message": previous,
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "unchanged parent text"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("edited_ts", "latest_reply"),
+        [
+            ("150.000001", "²"),
+            ("150.000001", "150.²"),
+            ("150.000001", "150.000001"),
+            ("150.000001", "9" * 5_000),
+        ],
+        ids=("unicode-seconds", "unicode-fraction", "equal-order", "oversized"),
+    )
+    async def test_malformed_slack_timestamp_reply_update_ignored(
+        self, adapter, edited_ts, latest_reply
+    ):
+        """Non-protocol timestamps must fail closed instead of replaying a parent."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": {
+                "type": "message",
+                "text": "stale parent text",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "edited": {"user": "U_USER", "ts": edited_ts},
+                "reply_count": 2,
+                "latest_reply": latest_reply,
+            },
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("edited_ts", "latest_reply"),
+        [
+            ("200.100000", "200.1"),
+            ("200.000000", "200"),
+        ],
+    )
+    async def test_equivalent_slack_timestamp_reply_update_ignored(
+        self, adapter, edited_ts, latest_reply
+    ):
+        """Different encodings of the same timestamp are numerically equal."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": {
+                "type": "message",
+                "text": "stale parent text",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "edited": {"user": "U_USER", "ts": edited_ts},
+                "reply_count": 2,
+                "latest_reply": latest_reply,
+            },
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("current_visible", "previous_visible"),
+        [
+            (
+                {"text": "stale parent text", "files": {}},
+                {"text": "stale parent text", "files": []},
+            ),
+            (
+                {"text": "stale parent text", "files": ["malformed"]},
+                {"text": "stale parent text", "files": []},
+            ),
+            (
+                {"files": []},
+                {"text": "stale parent text", "files": []},
+            ),
+        ],
+        ids=("wrong-typed-list", "wrong-typed-list-item", "omitted-text"),
+    )
+    async def test_unknown_visible_evidence_with_newer_edit_ignored(
+        self, adapter, current_visible, previous_visible
+    ):
+        """A newer edit timestamp cannot turn unknown visible evidence into input."""
+        common = {
+            "type": "message",
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+            "thread_ts": "100.000001",
+            "reply_count": 2,
+            "latest_reply": "200.000001",
+        }
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "301.000001",
+            "event_ts": "301.000001",
+            "message": {
+                **common,
+                **current_visible,
+                "edited": {"user": "U_USER", "ts": "300.000001"},
+            },
+            "previous_message": {**common, **previous_visible},
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("field", ["blocks", "attachments", "files"])
+    @pytest.mark.parametrize(
+        "malformed_value",
+        [{"unexpected": "value"}, ["malformed"]],
+        ids=("wrong-container", "wrong-item"),
+    )
+    async def test_visible_text_update_with_malformed_list_field_processed(
+        self, adapter, field, malformed_value
+    ):
+        """A proven text edit routes without iterating malformed list payloads."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "301.000001",
+            "event_ts": "301.000001",
+            "message": {
+                "type": "message",
+                "text": "corrected parent text",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "edited": {"user": "U_USER", "ts": "300.000001"},
+                field: malformed_value,
+            },
+            "previous_message": {
+                "type": "message",
+                "text": "original parent text",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                field: [],
+            },
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "corrected parent text"
+        assert delivered.raw_message[field] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("malformed_text", [None, {}, 123])
+    async def test_visible_collection_addition_with_malformed_text_processed(
+        self, adapter, malformed_text
+    ):
+        """A proven collection addition routes with type-safe normalized text."""
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": {
+                "type": "message",
+                "text": malformed_text,
+                "attachments": [{"fallback": "added attachment"}],
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+            },
+            "previous_message": {
+                "type": "message",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+            },
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "📎 added attachment"
+        assert delivered.raw_message["text"] == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("field", "current_value"),
+        [
+            ("attachments", [{"fallback": "added attachment"}]),
+            ("files", [{"id": "F_ADDED"}]),
+            ("blocks", [{"type": "section"}]),
+        ],
+    )
+    async def test_visible_payload_addition_with_reply_metadata_processed(
+        self, adapter, field, current_value
+    ):
+        """Adding visible payload must win over reply metadata transitions."""
+        parent = {
+            "type": "message",
+            "text": "unchanged parent text",
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+            "thread_ts": "100.000001",
+            "reply_count": 2,
+            "latest_reply": "200.000001",
+            field: current_value,
+        }
+        previous = {
+            "type": "message",
+            "text": "unchanged parent text",
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+            "thread_ts": "100.000001",
+            "reply_count": 1,
+            "latest_reply": "150.000001",
+        }
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": parent,
+            "previous_message": previous,
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text.startswith("unchanged parent text")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("field", "current_value"),
+        [
+            ("attachments", [{"fallback": "added attachment"}]),
+            ("files", [{"id": "F_ADDED"}]),
+            (
+                "blocks",
+                [
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": "added block"},
+                    }
+                ],
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "explicit_null", [False, True], ids=("omitted", "explicit-null")
+    )
+    async def test_visible_payload_addition_without_typed_previous_processed(
+        self, adapter, field, current_value, explicit_null
+    ):
+        """A proven list addition does not require another typed prior field."""
+        previous = {
+            "type": "message",
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "100.000001",
+            "thread_ts": "100.000001",
+            "reply_count": 1,
+            "latest_reply": "150.000001",
+        }
+        if explicit_null:
+            previous[field] = None
+        event = {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "201.000001",
+            "event_ts": "201.000001",
+            "message": {
+                "type": "message",
+                "user": "U_USER",
+                "channel": "D123",
+                "ts": "100.000001",
+                "thread_ts": "100.000001",
+                "reply_count": 2,
+                "latest_reply": "200.000001",
+                field: current_value,
+            },
+            "previous_message": previous,
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_addressed_thread_parent_edit_not_replayed_when_cold(self, adapter):
+        """Editing an already-addressed thread parent must not start a new turn.
+
+        Live incident: a thread root that already @mentioned the bot was
+        edited hours later.  ``_processed_message_ts`` did not suppress the
+        edit — the original ts was absent from this process's set — so the
+        proven visible text change pushed the edit through as fresh inbound
+        input, replaying instructions the agent had already executed in that
+        thread.  The guard is per-process state, so a missing entry proves
+        nothing about whether the message was delivered before.
+        """
+        assert adapter._processed_message_ts == {}
+        event = _replied_parent_edit_event(
+            parent_ts="1785736676.775279",
+            event_ts="1785736692.000100",
+            edited_ts="1785736692.000000",
+            reply_fields={"reply_count": 4, "latest_reply": "1785736690.000200"},
+        )
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_repeated_addressed_thread_parent_edits_not_replayed(self, adapter):
+        """Every later edit of an addressed parent stays out of the loop."""
+        for index, revision in enumerate(("first revision", "second revision"), 1):
+            event = _replied_parent_edit_event(
+                text=f"{_PARENT_MENTION_TEXT} — {revision}",
+                event_ts=f"20{index}.000001",
+                edited_ts=f"20{index}.000000",
+                reply_fields={"reply_count": 2, "latest_reply": "150.000001"},
+            )
+
+            await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "previous_message",
+        [
+            None,
+            "malformed",
+            {"text": 123},
+            {"user": "U_USER"},
+            {"text": "ship the release notes", "blocks": ["malformed"]},
+        ],
+        ids=("absent", "not-a-dict", "untyped-text", "no-text", "untyped-blocks"),
+    )
+    async def test_addressed_thread_parent_edit_without_proof_fails_closed(
+        self, adapter, previous_message
+    ):
+        """Without a trustworthy pre-edit snapshot, never replay the parent."""
+        event = _replied_parent_edit_event(previous_message=previous_message)
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_thread_parent_edit_adding_mention_processed(self, adapter):
+        """A newly added @mention on a replied parent still routes once."""
+        event = _replied_parent_edit_event(
+            text=_PARENT_MENTION_TEXT, previous_text=_PARENT_PLAIN_TEXT
+        )
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "ship the release notes"
+
+    @pytest.mark.asyncio
+    async def test_addressed_parent_edit_without_replies_processed(self, adapter):
+        """An edit with no reply evidence keeps its existing routing."""
+        event = _replied_parent_edit_event(
+            thread_ts=None, reply_fields={"reply_count": 0}
+        )
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_block_kit_only_mention_parent_edit_not_replayed(self, adapter):
+        """A Block-Kit-authored mention counts as already addressing the bot."""
+
+        def _blocks(body: str) -> list:
+            return _thread_parent_rich_text_blocks(
+                {"type": "user", "user_id": "U_BOT"},
+                {"type": "text", "text": f" {body}"},
+            )
+
+        event = _replied_parent_edit_event(
+            text=_EDITED_PLAIN_TEXT,
+            previous_text=_PARENT_PLAIN_TEXT,
+            blocks=_blocks(_EDITED_PLAIN_TEXT),
+            previous_blocks=_blocks(_PARENT_PLAIN_TEXT),
+        )
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_addressed_parent_edit_removing_mention_not_replayed(self, adapter):
+        """Dropping the mention while editing an answered parent is still a replay.
+
+        The pre-edit snapshot proves the thread root already addressed the
+        bot, so the thread was answered. Whether the *edited* wording still
+        carries the mention says nothing about that — re-delivering it
+        replays instructions the agent already acted on.
+        """
+        event = _replied_parent_edit_event(
+            text=_EDITED_PLAIN_TEXT, channel="D123", channel_type="im"
+        )
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_addressed_parent_edit_with_malformed_text_not_replayed(
+        self, adapter
+    ):
+        """A malformed current payload cannot launder an answered parent's edit."""
+        event = _replied_parent_edit_event(
+            text=123,
+            message_extra={"attachments": [{"fallback": "added attachment"}]},
+            channel="D123",
+            channel_type="im",
+        )
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_wake_word_parent_edit_removing_wake_word_not_replayed(
+        self, adapter
+    ):
+        """A wake-word parent counts as addressed even after the word is edited out."""
+        adapter.config.extra["mention_patterns"] = [r"^\s*hermes\b"]
+
+        event = _replied_parent_edit_event(
+            text=_EDITED_PLAIN_TEXT,
+            previous_text="hermes ship the release notes",
+            channel="D123",
+            channel_type="im",
+        )
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "previous_blocks",
+        [
+            [{"type": "rich_text", "elements": "malformed"}],
+            _thread_parent_rich_text_blocks({"type": "user", "user_id": ""}),
+            _thread_parent_rich_text_blocks({"type": ""}),
+            # Slack sends bare identifiers: a blank or padded label names
+            # nobody and matches none of the walker's branches, so it is
+            # silence rather than proof the mention was absent.
+            pytest.param(
+                _thread_parent_rich_text_blocks({"type": "user", "user_id": "   "}),
+                id="blank-user-id",
+            ),
+            pytest.param(
+                _thread_parent_rich_text_blocks(
+                    {"type": "user", "user_id": " U123 "}
+                ),
+                id="padded-user-id",
+            ),
+            pytest.param(
+                _thread_parent_rich_text_blocks({"type": "   "}), id="blank-type"
+            ),
+            pytest.param(
+                _thread_parent_rich_text_blocks(
+                    {"type": " user ", "user_id": "U123"}
+                ),
+                id="padded-type",
+            ),
+            # Every Block Kit node Slack sends is typed. A node missing
+            # ``type`` is a partial payload the walker reads as ordinary
+            # content, so it cannot witness that the mention was absent.
+            pytest.param(
+                _thread_parent_rich_text_blocks({"user_id": "U_BOT"}),
+                id="missing-type",
+            ),
+            # Slack's ``blocks`` container is a list. A bare dict is not the
+            # payload the walker traverses, so it proves nothing either.
+            pytest.param(
+                {"type": "rich_text", "elements": []},
+                id="top-level-not-a-list",
+            ),
+        ],
+    )
+    async def test_nested_malformed_previous_blocks_fail_closed(
+        self, adapter, previous_blocks
+    ):
+        """A malformed node inside the traversed block tree is not absence proof."""
+        event = _replied_parent_edit_event(
+            text=_PARENT_MENTION_TEXT,
+            previous_text=_PARENT_PLAIN_TEXT,
+            previous_blocks=previous_blocks,
+        )
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_valid_nested_previous_blocks_prove_mention_absence(self, adapter):
+        """A well-formed mention-free block tree still proves the mention is new."""
+        event = _replied_parent_edit_event(
+            text=_PARENT_MENTION_TEXT,
+            blocks=_thread_parent_rich_text_blocks(
+                {"type": "user", "user_id": "U_BOT"},
+                {"type": "text", "text": f" {_PARENT_PLAIN_TEXT}"},
+            ),
+            previous_text=_PARENT_PLAIN_TEXT,
+            previous_blocks=_thread_parent_rich_text_blocks(
+                {"type": "text", "text": _PARENT_PLAIN_TEXT}
+            ),
+        )
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reply_fields",
+        [
+            {"reply_count": 0, "latest_reply": "malformed"},
+            {"reply_count": 0, "replies": ["malformed"]},
+            {"reply_count": 0, "replies": [{"ts": "malformed"}]},
+            {"reply_count": 0, "reply_users": [123]},
+        ],
+    )
+    async def test_malformed_reply_evidence_alone_is_not_reply_proof(
+        self, adapter, reply_fields
+    ):
+        """Malformed reply bookkeeping must not stand in for real replies."""
+        event = _replied_parent_edit_event(thread_ts=None, reply_fields=reply_fields)
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reply_fields",
+        [
+            {"reply_count": 0, "replies": [{"user": "U_OTHER", "ts": "200.000001"}]},
+            {"reply_count": 0, "reply_users": ["U_OTHER"]},
+        ],
+    )
+    async def test_reply_collection_evidence_suppresses_addressed_parent_edit(
+        self, adapter, reply_fields
+    ):
+        """Well-formed ``replies``/``reply_users`` entries still prove replies."""
+        event = _replied_parent_edit_event(thread_ts=None, reply_fields=reply_fields)
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_secondary_workspace_does_not_trust_primary_bot_uid(self, adapter):
+        """Slack user IDs are workspace-local: the primary UID is not this bot here."""
+        adapter._team_bot_user_ids = {"T_SECOND": "U_BOT2"}
+
+        event = _replied_parent_edit_event(
+            channel="D123", channel_type="im", team="T_SECOND"
+        )
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        delivered = adapter.handle_message.call_args.args[0]
+        assert delivered.text == "<@U_BOT> ship the release notes, revised"
+
+    @pytest.mark.asyncio
+    async def test_inner_message_team_resolves_secondary_workspace_bot(self, adapter):
+        """When only the edited message carries ``team``, resolve the bot from it."""
+        adapter._team_bot_user_ids = {"T_SECOND": "U_BOT2"}
+
+        event = _replied_parent_edit_event(
+            text="<@U_BOT2> ship the release notes, revised",
+            previous_text="<@U_BOT2> ship the release notes",
+            team=None,
+            message_team="T_SECOND",
+        )
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
 
 # ---------------------------------------------------------------------------
 # TestSendTyping — assistant.threads.setStatus
@@ -5035,6 +6422,63 @@ class TestNativeTaskCardProgress:
         ).native_task_cards_enabled() is False
 
     @pytest.mark.asyncio
+    async def test_first_progress_starts_stream_with_chunks_and_no_append(self, adapter):
+        client = adapter._app.client
+        client.api_call.side_effect = [{"ts": "stream-1"}, {"ok": True}]
+        title = "Overlord is working"
+        tasks = [{"id": "call-1", "title": "terminal - ls", "status": "in_progress"}]
+
+        result = await adapter.send_native_task_card_progress(
+            "C1",
+            tasks,
+            title=title,
+            metadata={"thread_id": "thread-1"},
+        )
+
+        assert result.success is True
+        assert result.message_id == "stream-1"
+        assert [call.args[0] for call in client.api_call.await_args_list] == [
+            "chat.startStream"
+        ]
+        payload = client.api_call.await_args_list[0].kwargs["json"]
+        assert payload["channel"] == "C1"
+        assert payload["thread_ts"] == "thread-1"
+        assert payload["task_display_mode"] == "plan"
+        assert "markdown_text" not in payload
+        assert payload["chunks"][0] == {"type": "plan_update", "title": title}
+        assert payload["chunks"][1] == {
+            "type": "task_update",
+            "id": "call-1",
+            "title": "terminal - ls",
+            "status": "in_progress",
+        }
+
+    @pytest.mark.asyncio
+    async def test_native_payload_preserves_supplied_title_and_fallback(self, adapter):
+        client = adapter._app.client
+        client.api_call.side_effect = [{"ts": "stream-1"}, {"ok": True}]
+        title = "小助手 is working"
+        fallback = f"{title}\n- terminal - running"
+
+        result = await adapter.send_native_task_card_progress(
+            "C1",
+            [{"id": "call-1", "title": "terminal", "status": "in_progress"}],
+            title=title,
+            fallback_text=fallback,
+            metadata={"thread_id": "thread-1"},
+        )
+
+        assert result.success
+        start = client.api_call.await_args_list[0]
+        assert start.args[0] == "chat.startStream"
+        assert start.kwargs["json"]["chunks"][0] == {
+            "type": "plan_update",
+            "title": title,
+        }
+        assert "markdown_text" not in start.kwargs["json"]
+        assert len(client.api_call.await_args_list) == 1
+
+    @pytest.mark.asyncio
     async def test_native_updates_are_serialized_and_workspace_scoped(self, adapter):
         team_client = AsyncMock()
         start_count = 0
@@ -5069,21 +6513,70 @@ class TestNativeTaskCardProgress:
         assert [call.args[0] for call in calls] == [
             "chat.startStream",
             "chat.appendStream",
-            "chat.appendStream",
         ]
-        assert calls[0].kwargs["json"] == {
-            "channel": "C1",
-            "thread_ts": "thread-1",
-            "task_display_mode": "plan",
-            "recipient_team_id": "T1",
-            "recipient_user_id": "U1",
-        }
+        start_payload = calls[0].kwargs["json"]
+        assert start_payload["channel"] == "C1"
+        assert start_payload["thread_ts"] == "thread-1"
+        assert start_payload["task_display_mode"] == "plan"
+        assert start_payload["recipient_team_id"] == "T1"
+        assert start_payload["recipient_user_id"] == "U1"
+        assert start_payload["chunks"]
+        assert "markdown_text" not in start_payload
+        assert "markdown_text" not in calls[1].kwargs["json"]
         adapter._app.client.api_call.assert_not_awaited()
 
         await adapter.stop_native_task_card_progress("C1", metadata=metadata)
 
         assert team_client.api_call.await_args.args[0] == "chat.stopStream"
         assert adapter._native_task_card_streams == {}
+
+    @pytest.mark.asyncio
+    async def test_append_stream_omits_markdown_text_when_sending_chunks(self, adapter):
+        team_client = AsyncMock()
+
+        async def api_call(method, *, json):
+            if method == "chat.startStream":
+                return {"ts": "stream-1"}
+            return {"ok": True}
+
+        team_client.api_call.side_effect = api_call
+        adapter._team_clients["T1"] = team_client
+        metadata = {
+            "thread_id": "thread-1",
+            "slack_team_id": "T1",
+            "recipient_team_id": "T1",
+            "recipient_user_id": "U1",
+        }
+        first = await adapter.send_native_task_card_progress(
+            "C1",
+            [{"id": "call-1", "title": "terminal", "status": "in_progress"}],
+            metadata=metadata,
+            fallback_text="working",
+        )
+        second = await adapter.send_native_task_card_progress(
+            "C1",
+            [{"id": "call-1", "title": "terminal", "status": "complete"}],
+            metadata=metadata,
+            fallback_text="working",
+        )
+        assert first.success is True
+        assert second.success is True
+        start = [
+            call.kwargs["json"]
+            for call in team_client.api_call.await_args_list
+            if call.args[0] == "chat.startStream"
+        ]
+        append = [
+            call.kwargs["json"]
+            for call in team_client.api_call.await_args_list
+            if call.args[0] == "chat.appendStream"
+        ]
+        assert start
+        assert append
+        assert "chunks" in start[0]
+        assert "chunks" in append[0]
+        assert "markdown_text" not in start[0]
+        assert "markdown_text" not in append[0]
 
     @pytest.mark.asyncio
     async def test_same_channel_thread_isolated_between_workspaces(self, adapter):
@@ -5126,7 +6619,6 @@ class TestNativeTaskCardProgress:
         client.api_call.side_effect = [
             {"ts": "stream-1"},
             {"ok": True},
-            {"ok": True},
         ]
         await adapter.send_native_task_card_progress(
             "C1",
@@ -5138,7 +6630,6 @@ class TestNativeTaskCardProgress:
 
         assert [call.args[0] for call in client.api_call.await_args_list] == [
             "chat.startStream",
-            "chat.appendStream",
             "chat.stopStream",
         ]
         assert adapter._native_task_card_streams == {}
