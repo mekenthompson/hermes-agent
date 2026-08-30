@@ -7386,27 +7386,62 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             thread_ts = self._resolve_thread_ts(None, metadata)
 
-            # Escape the Slack mrkdwn control chars (&, <, >) so a question
-            # containing them renders literally instead of as markup/mentions.
-            # Section text caps at 3000 chars — budget the question so the
-            # wrapper never pushes the block over the limit (overflow →
-            # invalid_blocks → no buttons).
-            q = (question or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            body = f"❓ {q}"
-            budget = 3000 - len("...")
-            if len(body) > budget:
-                body = body[:budget] + "..."
+            # Escape Slack mrkdwn control characters so the prompt renders
+            # literally instead of creating links or mentions. Slack clients
+            # visually clip button labels well below the 75-character API cap,
+            # so the message body is the authoritative numbered choice list.
+            def _escape_mrkdwn_char(char: str) -> str:
+                return {"&": "&amp;", "<": "&lt;", ">": "&gt;"}.get(char, char)
 
-            # One button per choice + a free-text "Other" button.  Slack caps
-            # an actions block at 5 elements; the clarify tool caps choices at
-            # 4 (+ Other = 5) so this is normally one block, but chunk anyway
-            # so a larger choice list degrades gracefully instead of 400ing.
+            choice_labels = [
+                str(choice).strip() or f"Option {idx + 1}"
+                for idx, choice in enumerate(choices)
+            ]
+            prompt_parts = ["❓ "]
+            prompt_parts.extend(_escape_mrkdwn_char(char) for char in (question or ""))
+            prompt_parts.append("\n\n")
+            for idx, label in enumerate(choice_labels, start=1):
+                if idx > 1:
+                    prompt_parts.append("\n")
+                prompt_parts.append(f"{idx}. ")
+                prompt_parts.extend(_escape_mrkdwn_char(char) for char in label)
+
+            # Build sections from atomic source-character renderings. Escaped
+            # entities therefore never straddle Slack's 3000-character section
+            # boundary and every option remains readable without truncation.
+            section_texts: list[str] = []
+            section = ""
+            for part in prompt_parts:
+                if section and len(section) + len(part) > 3000:
+                    section_texts.append(section)
+                    section = ""
+                section += part
+            if section:
+                section_texts.append(section)
+            body = "".join(section_texts)
+
+            # Slack truncates top-level text above 40,000 characters and caps a
+            # message at 50 blocks. Preserve unusually large choices by using
+            # the existing typed-answer fallback instead of silently losing
+            # text or posting invalid Block Kit.
+            action_block_count = (len(choice_labels) + 5) // 5
+            if len(body) > 40000 or len(section_texts) + action_block_count > 50:
+                return await super().send_clarify(
+                    chat_id=chat_id,
+                    question=question,
+                    choices=choices,
+                    clarify_id=clarify_id,
+                    session_key=session_key,
+                    metadata=metadata,
+                )
+
+            # One compact numbered button per choice plus a free-text Other
+            # button. Values retain the canonical clarify_id|idx mapping.
             elements = []
-            for idx, choice in enumerate(choices):
-                label = str(choice).strip() or f"Option {idx + 1}"
+            for idx, _label in enumerate(choice_labels):
                 elements.append({
                     "type": "button",
-                    "text": {"type": "plain_text", "text": label[:75], "emoji": True},
+                    "text": {"type": "plain_text", "text": str(idx + 1), "emoji": True},
                     "action_id": f"hermes_clarify_choice_{idx}",
                     "value": f"{clarify_id}|{idx}",
                 })
@@ -7418,7 +7453,12 @@ class SlackAdapter(BasePlatformAdapter):
             })
 
             blocks: list = [
-                {"type": "section", "text": {"type": "mrkdwn", "text": body}},
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": text},
+                    "expand": True,
+                }
+                for text in section_texts
             ]
             for start in range(0, len(elements), 5):
                 blocks.append({"type": "actions", "elements": elements[start:start + 5]})

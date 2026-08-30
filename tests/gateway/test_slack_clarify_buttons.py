@@ -6,6 +6,7 @@ and the indexed ``hermes_clarify_choice_<idx>`` /
 ``hermes_clarify_other`` action dispatch.
 """
 
+import re
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -124,7 +125,10 @@ class TestSlackSendClarify:
         assert elements[0]["value"] == "cid1|0"
         assert elements[1]["action_id"] == "hermes_clarify_choice_1"
         assert elements[1]["value"] == "cid1|1"
-        assert elements[0]["text"]["text"] == "staging"
+        assert elements[0]["text"]["text"] == "1"
+        assert elements[1]["text"]["text"] == "2"
+        assert "1. staging" in blocks[0]["text"]["text"]
+        assert "2. production" in blocks[0]["text"]["text"]
         # Final button is the free-text "Other"
         assert elements[2]["action_id"] == "hermes_clarify_other"
         assert elements[2]["value"] == "cid1|other"
@@ -133,6 +137,109 @@ class TestSlackSendClarify:
                 action_ids = [element["action_id"] for element in block["elements"]]
                 assert len(action_ids) == len(set(action_ids))
 
+    @pytest.mark.asyncio
+    async def test_choices_remain_readable_when_slack_clips_button_labels(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5679"})
+        choices = [
+            "GitHub Actions source-check daily; Klanker runs the host builder",
+            "Self-hosted runner on pixsoul builds after green CI",
+            "GitHub-hosted runner builds the image using the weaker path",
+        ]
+
+        result = await adapter.send_clarify(
+            chat_id="C1",
+            question="Who builds the staging image?",
+            choices=choices,
+            clarify_id="cid-readable",
+            session_key="sk-readable",
+        )
+
+        assert result.success is True
+        kwargs = mock_client.chat_postMessage.call_args.kwargs
+        blocks = kwargs["blocks"]
+        section_text = "\n".join(
+            block["text"]["text"]
+            for block in blocks
+            if block["type"] == "section"
+        )
+        for index, choice in enumerate(choices, start=1):
+            assert f"{index}. {choice}" in section_text
+        assert all(
+            block.get("expand") is True
+            for block in blocks
+            if block["type"] == "section"
+        )
+
+        actions = next(block for block in blocks if block["type"] == "actions")
+        choice_buttons = actions["elements"][:-1]
+        assert [button["text"]["text"] for button in choice_buttons] == ["1", "2", "3"]
+        assert [button["value"] for button in choice_buttons] == [
+            "cid-readable|0",
+            "cid-readable|1",
+            "cid-readable|2",
+        ]
+        assert kwargs["text"] == section_text
+
+    @pytest.mark.asyncio
+    async def test_oversized_choices_split_without_losing_text_or_entities(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5680"})
+        choice = "A&B<C>" * 700
+
+        result = await adapter.send_clarify(
+            chat_id="C1",
+            question="Pick one",
+            choices=[choice],
+            clarify_id="cid-oversized",
+            session_key="sk-oversized",
+        )
+
+        assert result.success is True
+        blocks = mock_client.chat_postMessage.call_args.kwargs["blocks"]
+        sections = [block for block in blocks if block["type"] == "section"]
+        assert len(sections) > 1
+        assert all(len(block["text"]["text"]) <= 3000 for block in sections)
+        assert all(block.get("expand") is True for block in sections)
+        rendered = "".join(block["text"]["text"] for block in sections)
+        escaped_choice = choice.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        assert rendered == f"❓ Pick one\n\n1. {escaped_choice}"
+        incomplete_entities = ("&", "&a", "&am", "&amp", "&l", "&lt", "&g", "&gt")
+        assert all(
+            not block["text"]["text"].endswith(incomplete_entities)
+            for block in sections[:-1]
+        )
+
+    @pytest.mark.asyncio
+    async def test_extreme_choice_uses_lossless_typed_reply_fallback(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "fallback"})
+        choice = "x" * 40001
+
+        result = await adapter.send_clarify(
+            chat_id="C1",
+            question="Pick one",
+            choices=[choice],
+            clarify_id="cid-extreme",
+            session_key="sk-extreme",
+        )
+
+        assert result.success is True
+        assert mock_client.chat_postMessage.await_count >= 2
+        posted = "".join(
+            call.kwargs["text"]
+            for call in mock_client.chat_postMessage.await_args_list
+        )
+        posted_without_chunk_markers = re.sub(r" ?\(\d+/\d+\)", "", posted)
+        assert choice in posted_without_chunk_markers
+        assert "Reply with the number" in posted_without_chunk_markers
+        assert all(
+            "blocks" not in call.kwargs
+            for call in mock_client.chat_postMessage.await_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_mrkdwn_escapes_question(self):
