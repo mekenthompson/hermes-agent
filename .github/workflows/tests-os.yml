@@ -38,7 +38,10 @@ concurrency:
 jobs:
   os-tests:
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+    # Keep the upstream 32-core Windows runner only for trusted upstream
+    # events. Fork repositories and untrusted fork PR heads use GitHub's
+    # standard Windows runner; macOS continues to use matrix.runner directly.
+    runs-on: ${{ matrix.name == 'Windows-only tests' && github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'windows-latest-32-core' || matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -48,7 +51,7 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            runner: windows-latest
             marker: windows_only
     steps:
       - name: Checkout code
