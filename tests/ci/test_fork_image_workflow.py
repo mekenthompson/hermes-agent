@@ -123,7 +123,16 @@ class ForkImageWorkflowTests(unittest.TestCase):
             "spdxVersion": "SPDX-2.3",
             "SPDXID": "SPDXRef-DOCUMENT",
             "packages": [
-                {"name": "alpha", "SPDXID": "SPDXRef-Package-alpha"},
+                {
+                    "name": "alpha",
+                    "SPDXID": "SPDXRef-Package-alpha",
+                    "filesAnalyzed": True,
+                    "hasFiles": ["SPDXRef-File-a"],
+                    "packageVerificationCode": {
+                        "packageVerificationCodeValue": "abc123"
+                    },
+                    "licenseInfoFromFiles": ["MIT"],
+                },
                 {"name": "beta", "SPDXID": "SPDXRef-Package-beta"},
             ],
             "files": [{"fileName": "/bin/a", "SPDXID": "SPDXRef-File-a"}],
@@ -167,7 +176,13 @@ class ForkImageWorkflowTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             compact = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(compact["packages"], document["packages"])
+            self.assertEqual(len(compact["packages"]), 2)
+            alpha = compact["packages"][0]
+            self.assertEqual(alpha["SPDXID"], "SPDXRef-Package-alpha")
+            self.assertFalse(alpha["filesAnalyzed"])
+            self.assertNotIn("hasFiles", alpha)
+            self.assertNotIn("packageVerificationCode", alpha)
+            self.assertNotIn("licenseInfoFromFiles", alpha)
             self.assertEqual(compact["files"], [])
             self.assertEqual(compact["relationships"], document["relationships"][:2])
             self.assertLessEqual(output.stat().st_size, 16_777_216)

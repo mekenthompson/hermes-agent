@@ -9,6 +9,11 @@ from pathlib import Path
 
 DEFAULT_MAX_BYTES = 16_777_216
 SPECIAL_REFERENCES = {"NONE", "NOASSERTION"}
+FILE_DERIVED_PACKAGE_FIELDS = {
+    "hasFiles",
+    "licenseInfoFromFiles",
+    "packageVerificationCode",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,7 +41,17 @@ def main() -> int:
     if not isinstance(document_id, str) or not document_id:
         raise SystemExit("SPDX document must have an SPDXID")
 
-    package_ids = {package.get("SPDXID") for package in packages}
+    compact_packages = []
+    for package in packages:
+        if not isinstance(package, dict):
+            raise SystemExit("SPDX packages must be objects")
+        compact_package = dict(package)
+        for field in FILE_DERIVED_PACKAGE_FIELDS:
+            compact_package.pop(field, None)
+        compact_package["filesAnalyzed"] = False
+        compact_packages.append(compact_package)
+
+    package_ids = {package.get("SPDXID") for package in compact_packages}
     file_ids = {entry.get("SPDXID") for entry in files}
     if None in package_ids or len(package_ids) != len(packages):
         raise SystemExit("package SPDXIDs must be present and unique")
@@ -57,6 +72,7 @@ def main() -> int:
                 raise SystemExit(f"dangling SPDX relationship reference: {field}={reference!r}")
 
     compact = dict(document)
+    compact["packages"] = compact_packages
     compact["files"] = []
     compact["relationships"] = compact_relationships
     payload = (json.dumps(compact, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
