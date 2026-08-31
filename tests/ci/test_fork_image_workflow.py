@@ -122,6 +122,7 @@ class ForkImageWorkflowTests(unittest.TestCase):
         document = {
             "spdxVersion": "SPDX-2.3",
             "SPDXID": "SPDXRef-DOCUMENT",
+            "documentDescribes": ["SPDXRef-Package-alpha", "SPDXRef-File-a"],
             "packages": [
                 {
                     "name": "alpha",
@@ -136,6 +137,14 @@ class ForkImageWorkflowTests(unittest.TestCase):
                 {"name": "beta", "SPDXID": "SPDXRef-Package-beta"},
             ],
             "files": [{"fileName": "/bin/a", "SPDXID": "SPDXRef-File-a"}],
+            "snippets": [
+                {
+                    "name": "snippet-a",
+                    "SPDXID": "SPDXRef-Snippet-a",
+                    "snippetFromFile": "SPDXRef-File-a",
+                    "ranges": [],
+                }
+            ],
             "relationships": [
                 {
                     "spdxElementId": "SPDXRef-DOCUMENT",
@@ -151,6 +160,11 @@ class ForkImageWorkflowTests(unittest.TestCase):
                     "spdxElementId": "SPDXRef-Package-alpha",
                     "relationshipType": "CONTAINS",
                     "relatedSpdxElement": "SPDXRef-File-a",
+                },
+                {
+                    "spdxElementId": "SPDXRef-Package-alpha",
+                    "relationshipType": "CONTAINS",
+                    "relatedSpdxElement": "SPDXRef-Snippet-a",
                 },
             ],
         }
@@ -184,6 +198,8 @@ class ForkImageWorkflowTests(unittest.TestCase):
             self.assertNotIn("packageVerificationCode", alpha)
             self.assertNotIn("licenseInfoFromFiles", alpha)
             self.assertEqual(compact["files"], [])
+            self.assertEqual(compact["snippets"], [])
+            self.assertEqual(compact["documentDescribes"], ["SPDXRef-Package-alpha"])
             self.assertEqual(compact["relationships"], document["relationships"][:2])
             self.assertLessEqual(output.stat().st_size, 16_777_216)
 
