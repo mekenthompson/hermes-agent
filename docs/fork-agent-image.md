@@ -13,9 +13,9 @@ This fork packages the complete Hermes Agent runtime from its existing root `Doc
 
 ## Evidence and provenance
 
-The preflight job builds the complete image, verifies `/etc/hermes/image-provenance.json` contains the workflow commit, fork image identity, and installed runtime version, runs the Hermes version command, emits an SPDX JSON image SBOM, and fails on fixable critical vulnerabilities. The evidence artifact is retained for review.
+The preflight job builds the complete image, verifies `/etc/hermes/image-provenance.json` contains the workflow commit, fork image identity, and installed runtime version, runs the Hermes version command, emits a full file-level SPDX JSON image SBOM, derives a bounded package-level SPDX document for GitHub attestation, and fails on fixable critical vulnerabilities. The evidence artifact retains both SPDX documents for review. The package-level document preserves every package and package relationship while omitting file records so it remains within GitHub's 16 MiB attestation limit.
 
-The protected publish job downloads and re-verifies that same scanned `linux/amd64` candidate, pushes it without rebuilding, and emits GitHub-signed build-provenance and SBOM attestations for the resulting registry digest. Multi-architecture publication is intentionally deferred until it can preserve this same build-once promotion guarantee.
+The protected publish job downloads and re-verifies that same scanned `linux/amd64` candidate, pushes it without rebuilding, and emits GitHub-signed build-provenance and package-SBOM attestations for the resulting registry digest. Multi-architecture publication is intentionally deferred until it can preserve this same build-once promotion guarantee.
 
 Review the SBOM for dependency and license anomalies and review the vulnerability report before granting environment approval. The environment approval is the human release gate; it is not replaced by a successful build.
 

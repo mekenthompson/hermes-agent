@@ -75,6 +75,14 @@ jobs:
           output-file: agent-image.spdx.json
           upload-artifact: false
 
+      - name: Create bounded package SBOM for attestation
+        run: |
+          set -euo pipefail
+          python3 scripts/compact-spdx-sbom.py \
+            --input agent-image.spdx.json \
+            --output agent-image.attestation.spdx.json \
+            --max-bytes 16777216
+
       - name: Scan critical image vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -106,6 +114,7 @@ jobs:
           path: |
             agent-image.tar.gz
             agent-image.spdx.json
+            agent-image.attestation.spdx.json
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -117,6 +126,7 @@ jobs:
           name: fork-agent-image-evidence-${{ github.sha }}
           path: |
             agent-image.spdx.json
+            agent-image.attestation.spdx.json
             trivy-image.json
           if-no-files-found: error
           retention-days: 30
@@ -194,7 +204,7 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE_REPOSITORY }}
           subject-digest: ${{ steps.publish.outputs.digest }}
-          sbom-path: agent-image.spdx.json
+          sbom-path: agent-image.attestation.spdx.json
           push-to-registry: true
 
       - name: Upload Fleet handoff manifest
