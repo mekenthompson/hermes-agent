@@ -3233,6 +3233,7 @@ def run_conversation(
                 # upgrade (lines ~1083-1085).
                 elif (
                     agent.provider in {"copilot-acp"}
+                    or str(agent.provider or "").endswith("-acp")
                     or str(agent.base_url or "").lower().startswith("acp://")
                     or str(agent.base_url or "").lower().startswith("acp+tcp://")
                 ):

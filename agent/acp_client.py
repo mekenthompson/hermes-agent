@@ -25,6 +25,7 @@ approval policy; see :meth:`ACPClient._decide_permission` and the
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import queue
@@ -356,6 +357,38 @@ def _extract_mcp_tool_name(tool_call: Any) -> str | None:
 
 
 _ERROR_DATA_LIMIT = 600
+_ERROR_MESSAGE_LIMIT = 600
+_STDERR_LIMIT = 2000
+
+
+def _safe_diagnostic_text(value: Any, limit: int) -> str:
+    """Return a bounded fingerprint for adapter-controlled diagnostic text.
+
+    ACP adapters commonly include upstream HTTP errors, headers, and auth
+    material in JSON-RPC errors or stderr. Diagnostics are useful, but they
+    cross a trust boundary and must never become an unbounded secret-bearing
+    exception. Pattern redaction cannot prove arbitrary prose safe, so no
+    adapter-supplied bytes are returned. Redaction still runs as defense in
+    depth before fingerprinting; failure is itself fail-closed.
+    """
+    text = str(value or "")
+    if not text:
+        return ""
+    # Bound work handed to the redactor while retaining enough context for it
+    # to recognize a token that straddles the final display limit.
+    input_limit = max(limit * 4, limit)
+    if len(text) > input_limit:
+        text = text[:input_limit] + "…"
+    try:
+        redacted = redact_sensitive_text(
+            text,
+            force=True,
+            redact_url_credentials=True,
+        )
+    except Exception:
+        return "[REDACTED - diagnostic unavailable]"
+    digest = hashlib.sha256(str(redacted).encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"[REDACTED adapter diagnostic sha256:{digest} chars:{len(text)}]"
 
 
 def _error_detail(err: Any) -> str:
@@ -383,11 +416,9 @@ def _error_detail(err: Any) -> str:
             text = str(detail)
     else:
         text = str(detail)
-    text = " ".join(text.split()).strip()
+    text = _safe_diagnostic_text(text, _ERROR_DATA_LIMIT)
     if not text:
         return ""
-    if len(text) > _ERROR_DATA_LIMIT:
-        text = text[:_ERROR_DATA_LIMIT] + "… (truncated)"
     return f" ({text})"
 
 
@@ -922,15 +953,21 @@ class ACPClient:
                     continue
                 if "error" in msg:
                     err = msg.get("error") or {}
+                    raw_message = err.get("message") if isinstance(err, dict) else err
+                    safe_message = _safe_diagnostic_text(
+                        raw_message or "unknown adapter error",
+                        _ERROR_MESSAGE_LIMIT,
+                    )
                     raise RuntimeError(
                         f"{display} ACP {method} failed: "
-                        f"{err.get('message') or err}{_error_detail(err)}"
+                        f"{safe_message}{_error_detail(err)}"
                     )
                 return msg.get("result")
 
-            stderr_text = "\n".join(stderr_tail).strip()
+            raw_stderr = "\n".join(stderr_tail)
+            stderr_text = _safe_diagnostic_text(raw_stderr, _STDERR_LIMIT)
             if proc.poll() is not None and stderr_text:
-                custom = self._early_exit_error(stderr_text)
+                custom = self._early_exit_error(raw_stderr)
                 if custom:
                     raise RuntimeError(custom)
                 raise RuntimeError(f"{display} ACP process exited early: {stderr_text}")
@@ -1024,14 +1061,6 @@ class ACPClient:
             if mode == "deny":
                 return _permission_denied(message_id)
 
-            if mode == "allow":
-                option_id = _select_option(options, allow=True)
-                return (
-                    _permission_selected(message_id, option_id)
-                    if option_id
-                    else _permission_denied(message_id)
-                )
-
             tool_call = params.get("toolCall")
 
             # MCP tool calls are not shell commands. Routing them through
@@ -1054,6 +1083,14 @@ class ACPClient:
                     sorted(self._forwarded_mcp_servers) or "(none)",
                 )
                 option_id = _select_option(options, allow=approved)
+                return (
+                    _permission_selected(message_id, option_id)
+                    if option_id
+                    else _permission_denied(message_id)
+                )
+
+            if mode == "allow":
+                option_id = _select_option(options, allow=True)
                 return (
                     _permission_selected(message_id, option_id)
                     if option_id
