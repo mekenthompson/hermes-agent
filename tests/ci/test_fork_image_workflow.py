@@ -231,6 +231,64 @@ class ForkImageWorkflowTests(unittest.TestCase):
             self.assertIn("dangling SPDX relationship", result.stderr)
             self.assertFalse(output.exists())
 
+    def test_compact_sbom_rejects_malformed_element_ids(self) -> None:
+        valid = {
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "packages": [{"name": "alpha", "SPDXID": "SPDXRef-Package-alpha"}],
+            "files": [{"fileName": "/bin/a", "SPDXID": "SPDXRef-File-a"}],
+            "snippets": [{"SPDXID": "SPDXRef-Snippet-a"}],
+            "relationships": [],
+        }
+        malformed_ids = {
+            "document": ("SPDXID", None, "not-an-spdx-id"),
+            "package": ("packages", 0, 123),
+            "file": ("files", 0, "SPDXRef-File bad"),
+            "snippet": ("snippets", 0, "SPDXRef-Snippet_bad"),
+        }
+        for label, (field, index, malformed_id) in malformed_ids.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                document = json.loads(json.dumps(valid))
+                if index is None:
+                    document[field] = malformed_id
+                else:
+                    document[field][index]["SPDXID"] = malformed_id
+                source = Path(directory) / "full.json"
+                output = Path(directory) / "attestation.json"
+                source.write_text(json.dumps(document), encoding="utf-8")
+                result = subprocess.run(
+                    ["python3", str(COMPACT_SBOM), "--input", str(source), "--output", str(output)],
+                    cwd=ROOT,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid SPDXID", result.stderr)
+                self.assertFalse(output.exists())
+
+    def test_compact_sbom_rejects_non_object_relationships(self) -> None:
+        document = {
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "packages": [{"name": "alpha", "SPDXID": "SPDXRef-Package-alpha"}],
+            "files": [],
+            "relationships": ["not-an-object"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "full.json"
+            output = Path(directory) / "attestation.json"
+            source.write_text(json.dumps(document), encoding="utf-8")
+            result = subprocess.run(
+                ["python3", str(COMPACT_SBOM), "--input", str(source), "--output", str(output)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("SPDX relationships must be objects", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertFalse(output.exists())
+
     def test_manifest_generator_emits_immutable_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "manifest.json"

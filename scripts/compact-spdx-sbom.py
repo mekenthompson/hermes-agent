@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 DEFAULT_MAX_BYTES = 16_777_216
+SPDX_ID_PATTERN = re.compile(r"SPDXRef-[A-Za-z0-9.-]+\Z")
 SPECIAL_REFERENCES = {"NONE", "NOASSERTION"}
 FILE_DERIVED_PACKAGE_FIELDS = {
     "hasFiles",
@@ -22,6 +24,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
     return parser.parse_args()
+
+
+def validate_spdx_id(value: object, label: str) -> str:
+    if not isinstance(value, str) or SPDX_ID_PATTERN.fullmatch(value) is None:
+        raise SystemExit(f"invalid SPDXID for {label}: {value!r}")
+    return value
 
 
 def find_removed_reference(value: object, removed_ids: set[str], path: str = "$") -> str | None:
@@ -57,31 +65,43 @@ def main() -> int:
         raise SystemExit("SPDX files and relationships must be arrays")
     if not isinstance(snippets, list):
         raise SystemExit("SPDX snippets must be an array")
-    if not isinstance(document_id, str) or not document_id:
-        raise SystemExit("SPDX document must have an SPDXID")
+    document_id = validate_spdx_id(document_id, "document")
+    if not all(isinstance(relationship, dict) for relationship in relationships):
+        raise SystemExit("SPDX relationships must be objects")
 
     compact_packages = []
-    for package in packages:
+    package_ids: set[str] = set()
+    for index, package in enumerate(packages):
         if not isinstance(package, dict):
             raise SystemExit("SPDX packages must be objects")
+        package_id = validate_spdx_id(package.get("SPDXID"), f"package {index}")
+        if package_id in package_ids:
+            raise SystemExit("package SPDXIDs must be present and unique")
+        package_ids.add(package_id)
         compact_package = dict(package)
         for field in FILE_DERIVED_PACKAGE_FIELDS:
             compact_package.pop(field, None)
         compact_package["filesAnalyzed"] = False
         compact_packages.append(compact_package)
 
-    package_ids = {package.get("SPDXID") for package in compact_packages}
-    file_ids = {entry.get("SPDXID") for entry in files if isinstance(entry, dict)}
-    snippet_ids = {entry.get("SPDXID") for entry in snippets if isinstance(entry, dict)}
-    if None in package_ids or len(package_ids) != len(packages):
-        raise SystemExit("package SPDXIDs must be present and unique")
-    if len(file_ids) != len(files) or None in file_ids:
-        raise SystemExit("file SPDXIDs must be present and unique")
-    if len(snippet_ids) != len(snippets) or None in snippet_ids:
-        raise SystemExit("snippet SPDXIDs must be present and unique")
-    package_ids = {item for item in package_ids if isinstance(item, str)}
-    file_ids = {item for item in file_ids if isinstance(item, str)}
-    snippet_ids = {item for item in snippet_ids if isinstance(item, str)}
+    file_ids: set[str] = set()
+    for index, entry in enumerate(files):
+        if not isinstance(entry, dict):
+            raise SystemExit("SPDX files must be objects")
+        file_id = validate_spdx_id(entry.get("SPDXID"), f"file {index}")
+        if file_id in file_ids:
+            raise SystemExit("file SPDXIDs must be present and unique")
+        file_ids.add(file_id)
+
+    snippet_ids: set[str] = set()
+    for index, entry in enumerate(snippets):
+        if not isinstance(entry, dict):
+            raise SystemExit("SPDX snippets must be objects")
+        snippet_id = validate_spdx_id(entry.get("SPDXID"), f"snippet {index}")
+        if snippet_id in snippet_ids:
+            raise SystemExit("snippet SPDXIDs must be present and unique")
+        snippet_ids.add(snippet_id)
+
     all_element_ids = package_ids | file_ids | snippet_ids | {document_id}
     if len(all_element_ids) != len(package_ids) + len(file_ids) + len(snippet_ids) + 1:
         raise SystemExit("SPDX element IDs must be globally unique")
