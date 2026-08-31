@@ -37,6 +37,30 @@ class ForkRunnerFallbackTests(unittest.TestCase):
         self.assertIn(expected_workers, tests_lines)
         self.assertIn("    timeout-minutes: 60", tests_lines)
 
+    def test_windows_large_runner_has_standard_fork_fallback(self) -> None:
+        trust_guard = (
+            "github.repository == 'NousResearch/hermes-agent' && "
+            "(github.event_name != 'pull_request' || "
+            "github.event.pull_request.head.repo.full_name == github.repository)"
+        )
+        lines = (ROOT / ".github/workflows/tests-os.yml").read_text(encoding="utf-8").splitlines()
+        expected = (
+            "    runs-on: ${{ matrix.name == 'Windows-only tests' && "
+            f"{trust_guard} && 'windows-latest-32-core' || matrix.runner }}}}"
+        )
+        self.assertIn(expected, lines)
+        self.assertIn("            runner: windows-latest", lines)
+
+    def test_docker_large_runners_reject_untrusted_fork_prs(self) -> None:
+        trust_guard = (
+            "github.repository == 'NousResearch/hermes-agent' && "
+            "(github.event_name != 'pull_request' || "
+            "github.event.pull_request.head.repo.full_name == github.repository)"
+        )
+        lines = (ROOT / ".github/workflows/docker.yml").read_text(encoding="utf-8").splitlines()
+        expected = f"    if: {trust_guard} && needs.detect.outputs.build == 'true'"
+        self.assertIn(expected, lines)
+
 
 if __name__ == "__main__":
     unittest.main()
