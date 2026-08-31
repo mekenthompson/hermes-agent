@@ -35,6 +35,7 @@ class ForkRunnerFallbackTests(unittest.TestCase):
             "'96' || '4' }}"
         )
         self.assertIn(expected_workers, tests_lines)
+        self.assertIn("    timeout-minutes: 60", tests_lines)
 
 
 if __name__ == "__main__":
