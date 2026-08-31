@@ -253,6 +253,30 @@ def test_permission_allow_mode_selects_allow_option():
     assert _outcome(response) == {"outcome": "selected", "optionId": "allow_once"}
 
 
+def test_permission_allow_mode_still_denies_unforwarded_mcp_server():
+    client = _client()
+    assert client._forwarded_mcp_servers == set()
+    params = {
+        "toolCall": {"toolName": "mcp__unforwarded__exfiltrate"},
+        "options": _permission_params()["options"],
+    }
+    with patch("agent.acp_client._acp_permission_mode", return_value="allow"):
+        response = client._decide_permission(1, params)
+    assert _outcome(response) == {"outcome": "selected", "optionId": "deny"}
+
+
+def test_permission_allow_mode_allows_forwarded_mcp_server():
+    client = _client()
+    client._forwarded_mcp_servers = {"github"}
+    params = {
+        "toolCall": {"toolName": "mcp__github__create_issue"},
+        "options": _permission_params()["options"],
+    }
+    with patch("agent.acp_client._acp_permission_mode", return_value="allow"):
+        response = client._decide_permission(1, params)
+    assert _outcome(response) == {"outcome": "selected", "optionId": "allow_once"}
+
+
 def test_permission_bridge_mode_approves_via_hermes_policy():
     with patch("agent.acp_client._acp_permission_mode", return_value="bridge"), patch(
         "tools.approval.check_dangerous_command", return_value={"approved": True}
@@ -448,20 +472,65 @@ def test_normalize_command_joins_argv_lists():
     assert "[" not in command
 
 
-def test_error_detail_is_surfaced_and_bounded():
+def test_error_detail_is_fingerprinted_and_bounded():
     from agent.acp_client import _ERROR_DATA_LIMIT, _error_detail
 
     assert _error_detail({"message": "boom"}) == ""
-    assert _error_detail({"data": {"message": "tool X failed: ENOENT"}}) == (
-        " (tool X failed: ENOENT)"
-    )
-    assert _error_detail({"data": "plain detail"}) == " (plain detail)"
-    # Structured payloads without a message key still surface something usable.
-    assert "status" in _error_detail({"data": {"status": 503}})
-    # Adapter-controlled payloads are unbounded; the exception text is not.
+    for payload in (
+        {"message": "tool X failed: ENOENT"},
+        "plain detail",
+        {"status": 503},
+    ):
+        detail = _error_detail({"data": payload})
+        assert detail.startswith(" ([REDACTED adapter diagnostic sha256:")
+        assert str(payload) not in detail
     long = _error_detail({"data": "x" * 5000})
     assert len(long) < _ERROR_DATA_LIMIT + 40
-    assert long.endswith("… (truncated))")
+    assert long.startswith(" ([REDACTED adapter diagnostic sha256:")
+
+
+def test_adapter_diagnostics_are_redacted_and_bounded():
+    from agent.acp_client import (
+        _ERROR_DATA_LIMIT,
+        _ERROR_MESSAGE_LIMIT,
+        _STDERR_LIMIT,
+        _error_detail,
+        _safe_diagnostic_text,
+    )
+
+    secrets = (
+        "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890",
+        "opaqueCredentialValue987654321",
+        "hunter2",
+    )
+    detail = _error_detail(
+        {"data": {"message": f"upstream token={secrets[1]} password={secrets[2]}"}}
+    )
+    message = _safe_diagnostic_text(
+        f"authentication failed: {secrets[0]}",
+        _ERROR_MESSAGE_LIMIT,
+    )
+    stderr = _safe_diagnostic_text(
+        (f"url=https://x.invalid/?token={secrets[1]} password={secrets[2]}\n" * 200),
+        _STDERR_LIMIT,
+    )
+
+    for rendered in (detail, message, stderr):
+        for secret in secrets:
+            assert secret not in rendered
+        assert "[REDACTED adapter diagnostic sha256:" in rendered
+    assert len(detail) < _ERROR_DATA_LIMIT + 40
+    assert len(message) < _ERROR_MESSAGE_LIMIT + 40
+    assert len(stderr) < _STDERR_LIMIT + 40
+
+
+def test_adapter_diagnostic_redaction_failure_is_fail_closed():
+    from agent.acp_client import _safe_diagnostic_text
+
+    with patch("agent.acp_client.redact_sensitive_text", side_effect=RuntimeError("boom")):
+        assert _safe_diagnostic_text("sensitive adapter output", 200) == (
+            "[REDACTED - diagnostic unavailable]"
+        )
 
 
 def test_acp_mcp_servers_converts_config_to_acp_shape():

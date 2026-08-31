@@ -22,6 +22,21 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = CopilotACPClient(acp_cwd="/tmp")
 
+    def test_deprecated_cli_error_never_surfaces_adapter_stderr(self) -> None:
+        secret = "opaqueCredentialValue987654321"
+        stderr_text = (
+            "gh-copilot has been deprecated; no commands will be executed. "
+            f"token={secret} password=hunter2"
+        )
+
+        message = self.client._early_exit_error(stderr_text)
+
+        assert message is not None
+        self.assertIn("deprecated `gh copilot` extension", message)
+        self.assertNotIn(secret, message)
+        self.assertNotIn("hunter2", message)
+        self.assertNotIn("Original error", message)
+
 
 
     def test_stream_true_preserves_tool_call_deltas(self) -> None:
