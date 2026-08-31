@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/fork-agent-image.yml"
 DOC = ROOT / "docs/fork-agent-image.md"
 MANIFEST = ROOT / "scripts/emit-image-manifest.py"
+COMPACT_SBOM = ROOT / "scripts/compact-spdx-sbom.py"
 SHA = "1" * 40
 DIGEST = "sha256:" + "2" * 64
 REPOSITORY = "ghcr.io/mekenthompson/hermes-agent"
@@ -106,6 +107,98 @@ class ForkImageWorkflowTests(unittest.TestCase):
             "does not deploy",
         ):
             self.assertIn(phrase, text)
+
+    def test_publish_uses_bounded_package_sbom_and_preserves_full_evidence(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("scripts/compact-spdx-sbom.py", text)
+        self.assertIn("--max-bytes 16777216", text)
+        self.assertIn("sbom-path: agent-image.attestation.spdx.json", text)
+        self.assertRegex(
+            text,
+            r"(?s)Upload pre-publication evidence.*?agent-image\.spdx\.json.*?agent-image\.attestation\.spdx\.json",
+        )
+
+    def test_compact_sbom_retains_packages_and_package_relationships(self) -> None:
+        document = {
+            "spdxVersion": "SPDX-2.3",
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "packages": [
+                {"name": "alpha", "SPDXID": "SPDXRef-Package-alpha"},
+                {"name": "beta", "SPDXID": "SPDXRef-Package-beta"},
+            ],
+            "files": [{"fileName": "/bin/a", "SPDXID": "SPDXRef-File-a"}],
+            "relationships": [
+                {
+                    "spdxElementId": "SPDXRef-DOCUMENT",
+                    "relationshipType": "DESCRIBES",
+                    "relatedSpdxElement": "SPDXRef-Package-alpha",
+                },
+                {
+                    "spdxElementId": "SPDXRef-Package-beta",
+                    "relationshipType": "DEPENDENCY_OF",
+                    "relatedSpdxElement": "SPDXRef-Package-alpha",
+                },
+                {
+                    "spdxElementId": "SPDXRef-Package-alpha",
+                    "relationshipType": "CONTAINS",
+                    "relatedSpdxElement": "SPDXRef-File-a",
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "full.json"
+            output = Path(directory) / "attestation.json"
+            source.write_text(json.dumps(document), encoding="utf-8")
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(COMPACT_SBOM),
+                    "--input",
+                    str(source),
+                    "--output",
+                    str(output),
+                    "--max-bytes",
+                    "16777216",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            compact = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(compact["packages"], document["packages"])
+            self.assertEqual(compact["files"], [])
+            self.assertEqual(compact["relationships"], document["relationships"][:2])
+            self.assertLessEqual(output.stat().st_size, 16_777_216)
+
+    def test_compact_sbom_rejects_dangling_relationships(self) -> None:
+        document = {
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "packages": [{"name": "alpha", "SPDXID": "SPDXRef-Package-alpha"}],
+            "files": [],
+            "relationships": [
+                {
+                    "spdxElementId": "SPDXRef-Package-alpha",
+                    "relationshipType": "DEPENDS_ON",
+                    "relatedSpdxElement": "SPDXRef-Missing",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "full.json"
+            output = Path(directory) / "attestation.json"
+            source.write_text(json.dumps(document), encoding="utf-8")
+            result = subprocess.run(
+                ["python3", str(COMPACT_SBOM), "--input", str(source), "--output", str(output)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("dangling SPDX relationship", result.stderr)
+            self.assertFalse(output.exists())
 
     def test_manifest_generator_emits_immutable_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
