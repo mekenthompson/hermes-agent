@@ -45,12 +45,22 @@ class _FakeCompletions:
 class _FakeClient:
     def __init__(self):
         self.chat = SimpleNamespace(completions=_FakeCompletions())
+        self.agent_name = "somevendor"
+        self.base_url = "acp://somevendor"
+
+    def close(self):
+        return None
 
 
 def _agent(monkeypatch, base_url: str, **kwargs):
     from run_agent import AIAgent
 
     client = _FakeClient()
+    client.base_url = base_url
+    monkeypatch.setattr(
+        "agent.acp_client.create_acp_client",
+        lambda **_kw: client,
+    )
     monkeypatch.setattr("run_agent.OpenAI", lambda **_kw: client)
     monkeypatch.setattr("run_agent.get_tool_definitions", lambda *a, **k: [])
     agent = AIAgent(
