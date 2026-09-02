@@ -3,6 +3,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+import asyncio
 
 import pytest
 
@@ -166,3 +167,65 @@ async def test_dispatch_internal_plugin_event_keeps_slash_payload_as_text():
     assert result == "treated as conversation"
     assert event.is_command() is False
     handler.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+async def test_profile_services_start_for_every_multiplex_profile(tmp_path, monkeypatch):
+    from gateway import run as gateway_run
+    from hermes_cli import plugins as plugin_module
+
+    active_home = tmp_path / "active"
+    secondary_home = tmp_path / "secondary"
+    active_home.mkdir()
+    secondary_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(active_home))
+    monkeypatch.setenv("HERMES_PROFILE", "active")
+
+    seen: list[tuple[str, Path, Path]] = []
+
+    def service(label):
+        async def run(runtime):
+            seen.append(
+                (
+                    label,
+                    Path(runtime.profile_home),
+                    Path(get_hermes_home()),
+                )
+            )
+            await runtime.stop_event.wait()
+
+        return run
+
+    managers = {
+        active_home: SimpleNamespace(_profile_services=[("linear", service("active"))]),
+        secondary_home: SimpleNamespace(
+            _profile_services=[("linear", service("secondary"))]
+        ),
+    }
+    monkeypatch.setattr(
+        plugin_module,
+        "get_plugin_manager",
+        lambda: managers[Path(get_hermes_home())],
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_multiplex_profile_homes",
+        lambda _config: [("active", active_home), ("secondary", secondary_home)],
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._start_plugin_profile_services()
+    await asyncio.sleep(0)
+
+    assert seen == [
+        ("active", active_home, active_home),
+        ("secondary", secondary_home, secondary_home),
+    ]
+    assert {task.get_name() for task in runner._profile_service_tasks} == {
+        "profile-service:active:linear",
+        "profile-service:secondary:linear",
+    }
+
+    await runner._stop_plugin_profile_services()
+    assert runner._profile_service_tasks == []

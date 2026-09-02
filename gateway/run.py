@@ -20363,40 +20363,61 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pass
 
     def _start_plugin_profile_services(self) -> None:
-        """Start plugin profile services against this live gateway."""
+        """Start plugin profile services for every profile served by this gateway."""
         from types import SimpleNamespace
 
         from hermes_cli.plugins import get_plugin_manager
         from hermes_constants import get_hermes_home
 
         stop_event = getattr(self, "_profile_service_stop", None)
-        if stop_event is None:
+        if stop_event is None or stop_event.is_set():
             stop_event = asyncio.Event()
             self._profile_service_stop = stop_event
         self._profile_service_tasks = []
-        profile_name = (
+        active_profile = (
             os.getenv("HERMES_PROFILE")
             or os.getenv("HERMES_AGENT_PROFILE")
             or "default"
         ).strip() or "default"
-        runtime = SimpleNamespace(
-            profile_home=str(get_hermes_home()),
-            profile_name=profile_name,
-            stop_event=stop_event,
-            gateway=self,
-        )
-        try:
-            services = list(get_plugin_manager()._profile_services)
-        except Exception:
-            services = []
-        for name, factory in services:
-            try:
-                task = asyncio.create_task(factory(runtime), name=f"profile-service:{name}")
-            except Exception:
-                logger.exception("Failed to start plugin profile service %s", name)
-                continue
-            self._profile_service_tasks.append(task)
-            logger.info("Started plugin profile service %s", name)
+        profiles = [(active_profile, Path(get_hermes_home()))]
+        if getattr(self.config, "multiplex_profiles", False):
+            profiles.extend(
+                (name, Path(home))
+                for name, home in _multiplex_profile_homes(self.config)
+                if name != active_profile
+            )
+
+        for profile_name, profile_home in profiles:
+            with _profile_runtime_scope(profile_home):
+                runtime = SimpleNamespace(
+                    profile_home=str(get_hermes_home()),
+                    profile_name=profile_name,
+                    stop_event=stop_event,
+                    gateway=self,
+                )
+                try:
+                    services = list(get_plugin_manager()._profile_services)
+                except Exception:
+                    services = []
+                for name, factory in services:
+                    try:
+                        task = asyncio.create_task(
+                            factory(runtime),
+                            name=f"profile-service:{profile_name}:{name}",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to start plugin profile service %s for profile %s",
+                            name,
+                            profile_name,
+                        )
+                        continue
+                    self._profile_service_tasks.append(task)
+                    logger.info(
+                        "Started plugin profile service %s for profile %s",
+                        name,
+                        profile_name,
+                    )
 
     async def _stop_plugin_profile_services(self) -> None:
         stop_event = getattr(self, "_profile_service_stop", None)
