@@ -78,6 +78,17 @@ class ProviderProfile:
     # top-level fields rather than ignoring them.
     supports_prompt_cache_key: bool = False
 
+    # ── External-process providers (auth_type="external_process") ──
+    # An agent CLI driven over stdio (ACP) rather than an HTTP endpoint. These
+    # describe how to launch it; hermes_cli/auth.py's
+    # resolve_external_process_provider_credentials() reads them instead of
+    # hardcoding one vendor's binary. Env vars are checked in order and win
+    # over the static defaults, so an operator can point at a custom build.
+    process_command: str = ""            # default binary, e.g. "copilot"
+    process_args: tuple = ()             # default argv tail, e.g. ("--acp", "--stdio")
+    process_command_env_vars: tuple = ()  # env overrides for the binary, in priority order
+    process_args_env_var: str = ""       # env override for argv (shlex-split)
+
     # ── Model catalog ─────────────────────────────────────────
     # fallback_models: curated list shown in /model picker when live fetch fails.
     # Only agentic models that support tool calling should appear here.
@@ -86,13 +97,6 @@ class ProviderProfile:
     # hostname: base hostname for URL→provider reverse-mapping in model_metadata.py
     # e.g. "api.gmi-serving.com". Derived from base_url when empty.
     hostname: str = ""
-
-    # picker_group: id of a hermes_cli.models.PROVIDER_GROUPS entry this
-    # provider folds under in interactive pickers (hermes model / setup
-    # wizard / Telegram), e.g. "anthropic" for claude-acp. Empty = ungrouped,
-    # shown as its own top-level row. Display only — see
-    # hermes_cli.models.provider_group_for_slug / group_providers.
-    picker_group: str = ""
 
     # ── Client-level quirks (set once at client construction) ─
     default_headers: dict[str, str] = field(default_factory=dict)
@@ -227,6 +231,31 @@ class ProviderProfile:
         Implementations are called on the per-request hot path and must not
         block on network I/O — answer from a cache and return None while
         cold.
+        """
+        return None
+
+    def create_client(self, **client_kwargs: Any) -> Any | None:
+        """Return a provider-specific client, or ``None`` for the standard one.
+
+        Most providers speak OpenAI-compatible HTTP and want the shared
+        ``openai.OpenAI`` client the core builds — they inherit this and return
+        ``None``. A provider whose wire protocol is not HTTP at all (the ACP
+        subprocess shims) or which needs a native SDK overrides this and
+        returns its own client object.
+
+        ``client_kwargs`` is the same mapping the core would have passed to
+        ``openai.OpenAI`` (``api_key``, ``base_url``, ``command``, ``args``,
+        timeouts, headers…). Unknown keys must be tolerated: the core adds to
+        this mapping over time, so an override should accept ``**kwargs`` and
+        pick what it needs rather than enumerate.
+
+        Returning ``None`` (the default) is always safe — the caller falls
+        through to its existing construction path.
+
+        This is the hook that lets a provider ship *outside* this tree: with it,
+        a profile registered from ``~/.hermes/plugins/model-providers/`` or a
+        pip entry point can supply its own transport without any core edit. See
+        ``plugins/model-providers/copilot-acp/`` for the in-tree example.
         """
         return None
 
