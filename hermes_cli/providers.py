@@ -265,35 +265,6 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
     ),
 }
 
-# Auto-extend HERMES_OVERLAYS with any ACP subprocess provider (auth_type
-# "external_process", base_url "acp://<agent>") registered in providers/ —
-# e.g. a claude-acp or codex-acp plugin from
-# https://github.com/mvdbastos/hermes-acp-agents. These aren't in models.dev,
-# so without an overlay entry get_provider() returns None for them, the same
-# failure mode the "vertex" comment above describes. copilot-acp is the one
-# ACP provider declared explicitly above (its own base_url env var predates
-# this mechanism); plugins only need to add a ProviderProfile, not edit this
-# file.
-try:
-    from providers import list_providers as _list_providers_for_overlays
-
-    for _pp in _list_providers_for_overlays():
-        if _pp.name in HERMES_OVERLAYS:
-            continue
-        if _pp.auth_type != "external_process" or not str(_pp.base_url or "").startswith("acp://"):
-            continue
-        _base_url_var = next(
-            (v for v in _pp.env_vars if v.endswith("_BASE_URL") or v.endswith("_URL")), ""
-        )
-        HERMES_OVERLAYS[_pp.name] = HermesOverlay(
-            transport="codex_responses",
-            auth_type="external_process",
-            base_url_override=_pp.base_url,
-            base_url_env_var=_base_url_var,
-        )
-except Exception:
-    pass
-
 
 # -- Resolved provider -------------------------------------------------------
 # The merged result of models.dev + overlay + user config.
@@ -490,19 +461,6 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "xai-oauth": "xAI Grok OAuth (SuperGrok / Premium+)",
     "opencode-free": "OpenCode Free",
 }
-
-# Auto-extend _LABEL_OVERRIDES for the ACP subprocess providers auto-added to
-# HERMES_OVERLAYS above, using each profile's display_name.
-try:
-    from providers import list_providers as _list_providers_for_labels
-
-    for _pp in _list_providers_for_labels():
-        if _pp.name in _LABEL_OVERRIDES:
-            continue
-        if _pp.auth_type == "external_process" and str(_pp.base_url or "").startswith("acp://") and _pp.display_name:
-            _LABEL_OVERRIDES[_pp.name] = _pp.display_name
-except Exception:
-    pass
 
 
 # -- Transport → API mode mapping ---------------------------------------------
@@ -1064,6 +1022,29 @@ def resolve_provider_full(
     custom_pdef = resolve_custom_provider(name, custom_providers)
     if custom_pdef is not None:
         return custom_pdef
+
+    # 2c. Managed local runtime: the llamacpp aliases are a real provider
+    # whenever the managed server (or a detected external one) resolves —
+    # no credential and no providers: entry required, the credential is
+    # reachability. Without this rung the model-switch path rejected the
+    # very provider the Local Models 'Use' flow writes to config
+    # ("Unknown provider 'llamacpp'" from the desktop dropdown).
+    if raw in ("llamacpp", "llama.cpp", "llama-cpp"):
+        try:
+            from hermes_cli.local_runtime.endpoint import resolve_llamacpp_endpoint
+
+            endpoint = resolve_llamacpp_endpoint(wait_for_boot_s=0)
+        except Exception:
+            endpoint = None
+        if endpoint:
+            return ProviderDef(
+                id="llamacpp",
+                name="Local",
+                transport="openai_chat",
+                api_key_env_vars=(),
+                base_url=endpoint["base_url"],
+                source="local-runtime",
+            )
 
     # 3. Try models.dev directly (for providers not in our ALIASES)
     try:

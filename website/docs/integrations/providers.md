@@ -36,8 +36,8 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **xAI (Grok) — Responses API** | `XAI_API_KEY` in `~/.hermes/.env` (provider: `xai`) |
 | **xAI Grok OAuth (SuperGrok)** | `hermes model` → "xAI Grok OAuth (SuperGrok / Premium+)" — browser login, no API key. See [guide](../guides/xai-grok-oauth.md) |
 | **Qwen Cloud (Alibaba DashScope)** | `DASHSCOPE_API_KEY` in `~/.hermes/.env` (provider: `alibaba`; mainland-China endpoint: `alibaba-cn`) |
-| **Alibaba Cloud (Coding Plan)** | `ALIBABA_CODING_PLAN_API_KEY` (falls back to `DASHSCOPE_API_KEY`) (provider: `alibaba-coding-plan`, alias: `alibaba_coding`; mainland-China endpoint: `alibaba-coding-plan-cn`) — separate billing SKU, different endpoint |
-| **Alibaba Cloud (Token Plan)** | `ALIBABA_TOKEN_PLAN_API_KEY` in `~/.hermes/.env` (provider: `alibaba-token-plan`; mainland-China endpoint: `alibaba-token-plan-cn`) — Model Studio flat-token tier |
+| **Alibaba Cloud (Coding Plan)** | `ALIBABA_CODING_PLAN_API_KEY` (falls back to `DASHSCOPE_API_KEY`) (provider: `alibaba-coding-plan`, alias: `alibaba_coding`; mainland-China endpoint: `alibaba-coding-plan-cn` with `ALIBABA_CODING_PLAN_CN_API_KEY`, falling back to the shared keys) — separate billing SKU, different endpoint |
+| **Alibaba Cloud (Token Plan)** | `ALIBABA_TOKEN_PLAN_API_KEY` in `~/.hermes/.env` (provider: `alibaba-token-plan`; mainland-China endpoint: `alibaba-token-plan-cn` with `ALIBABA_TOKEN_PLAN_CN_API_KEY`, falling back to the shared key) — Model Studio flat-token tier |
 | **Kilo Code** | `KILOCODE_API_KEY` in `~/.hermes/.env` (provider: `kilocode`) |
 | **Xiaomi MiMo** | `XIAOMI_API_KEY` in `~/.hermes/.env` (provider: `xiaomi`, aliases: `mimo`, `xiaomi-mimo`) |
 | **Tencent TokenHub** | `TOKENHUB_API_KEY` in `~/.hermes/.env` (provider: `tencent-tokenhub`, aliases: `tencent`, `tokenhub`, `tencentmaas`) |
@@ -60,6 +60,8 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **StepFun** | `STEPFUN_API_KEY` in `~/.hermes/.env` (provider: `stepfun`) |
 | **LM Studio** | `hermes model` → "LM Studio" (provider: `lmstudio`, optional `LM_API_KEY`) |
 | **Custom Endpoint** | `hermes model` → choose "Custom endpoint" (saved in `config.yaml`) |
+
+All three OpenCode providers send an opaque, per-conversation `x-opencode-session` header on every request (main turns on every transport plus auxiliary calls such as compression and titles). OpenCode uses it to pin a conversation to one backend so its prompt cache stays warm; the value is derived from the Hermes session id and carries no personal data.
 
 For the official API-key path, see the dedicated [Google Gemini guide](/guides/google-gemini).
 
@@ -244,97 +246,6 @@ model:
 | `HERMES_COPILOT_ACP_COMMAND` | Override the Copilot CLI binary path (default: `copilot`) |
 | `HERMES_COPILOT_ACP_ARGS` | Override ACP args (default: `--acp --stdio`) |
 
-### ACP Agent Backends (Claude Code, Codex, and more)
-
-The generalized ACP client (issue #5257) extends the `copilot-acp` pattern to any
-coding agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com)
-through its official adapter. Hermes spawns the adapter as a stdio subprocess per
-request; the agent uses **its own login/credentials** and picks **its own underlying
-model** — the model name you select in Hermes is only forwarded as a hint.
-
-`copilot-acp` ships built into Hermes core. Every other agent — Claude Code, Codex
-CLI, and anything the community adds — is a **plugin**, not core: install
-[mvdbastos/hermes-acp-agents](https://github.com/mvdbastos/hermes-acp-agents) into
-`$HERMES_HOME/plugins/model-providers/` to get `claude-acp` and `codex-acp`. That
-repo also documents how to add an agent Hermes doesn't ship yet (Gemini CLI, Qwen
-Code, Cursor, ...) — contributions welcome.
-
-| Provider | Ships in | Spawns | Requires |
-|----------|----------|--------|----------|
-| `copilot-acp` | Hermes core | `copilot --acp --stdio` | GitHub Copilot CLI + `copilot login` (see above) |
-| `claude-acp` | [hermes-acp-agents](https://github.com/mvdbastos/hermes-acp-agents) plugin | `claude-agent-acp` (falls back to `claude-code-acp`) | `npm i -g @agentclientprotocol/claude-agent-acp` + Claude Code login (or `ANTHROPIC_API_KEY`) |
-| `codex-acp` | [hermes-acp-agents](https://github.com/mvdbastos/hermes-acp-agents) plugin | `codex-acp` | `npm i -g @zed-industries/codex-acp` + Codex CLI login (or `OPENAI_API_KEY`) |
-
-**One-off usage** (after installing the plugin):
-
-```bash
-hermes --provider claude-acp --model claude-acp -z "your prompt"
-```
-
-**Set as default** — via the setup wizard (`hermes setup` → the agents appear nested
-under their vendor's provider group, e.g. **Anthropic ▸ Claude Code ACP**), via the
-gateway `/model` picker on Telegram/Discord, or manually:
-
-```yaml
-model:
-  provider: "claude-acp"
-  default: "claude-acp"
-```
-
-**Custom or additional agents** — any ACP-speaking command can be wired up with env
-vars, no code or plugin needed:
-
-| Environment variable | Description |
-|---------------------|-------------|
-| `HERMES_ACP_{NAME}_COMMAND` | Full launch command for agent `{name}` (shlex-split, e.g. `HERMES_ACP_CLINE_COMMAND="npx cline-acp --stdio"` enables `acp://cline`) |
-| `HERMES_ACP_{NAME}_ARGS` | Override just the arguments for a registered agent |
-| `CLAUDE_ACP_BASE_URL` / `CODEX_ACP_BASE_URL` / … | Override the `acp://{agent}` backend marker per provider (declared by each plugin) |
-
-#### MCP servers
-
-ACP backends receive the MCP servers from your `mcp_servers` config at session
-start, the same set native Hermes tool use gets, with `${ENV_VAR}` placeholders
-resolved and exfiltration-shaped entries filtered out. Servers configured with
-neither a `command` nor a `url` are skipped.
-
-Permission requests for MCP tools (`mcp__<server>__<tool>`) are answered by
-whether `<server>` is one Hermes forwarded — a server the agent reaches on its
-own is refused regardless of `approvals.acp_mode`, and if no servers were
-forwarded, every MCP call is denied.
-
-#### Permission requests (`approvals.acp_mode`)
-
-ACP agents ask their client for permission before running commands they consider
-sensitive — Claude Code, for example, gates ordinary state-changing commands like
-`docker start`. Hermes answers those requests according to `approvals.acp_mode`:
-
-| Mode | Behaviour |
-|------|-----------|
-| `bridge` *(default)* | Route the request through the same approval gate Hermes uses for its own terminal tool. Safe commands pass through; dangerous ones honour your deny rules, allowlists, `/yolo`, and — in a gateway session — an interactive approval prompt. |
-| `deny` | Refuse every request. Use when ACP backends should have no side effects at all. |
-| `allow` | Approve every request. For sandboxed deployments that already trust whatever the agent can reach. |
-
-```yaml
-approvals:
-  acp_mode: bridge
-```
-
-This is config-only: there is deliberately no environment override, because the
-setting decides whether an ACP backend may take side effects and belongs
-somewhere an operator can audit. Unrecognised values fall back to `bridge`, and
-any failure in the approval layer denies — an ACP backend never gets more
-privilege than Hermes's own terminal tool.
-
-:::note Trade-offs vs. API providers
-ACP backends run one subprocess per request: no streaming, and Hermes tool use is
-emulated through prompt-injected `<tool_call>` blocks rather than native function
-calling. They shine for delegating to an agent you already pay for via subscription
-(Claude Pro/Max, ChatGPT, Copilot) — as the always-on gateway default, a native API
-provider is usually the better fit. The agent's file access is confined to the
-session working directory, and its permission requests follow `approvals.acp_mode`
-(above).
-:::
-
 ### First-Class API-Key Providers
 
 These providers have built-in support with dedicated provider IDs. Set the API key and use `--provider` to select:
@@ -418,7 +329,7 @@ model:
 Base URLs can be overridden with `NOVITA_BASE_URL`, `GLM_BASE_URL`, `KIMI_BASE_URL`, `MINIMAX_BASE_URL`, `MINIMAX_CN_BASE_URL`, `DASHSCOPE_BASE_URL`, `XIAOMI_BASE_URL`, `GMI_BASE_URL`, `META_BASE_URL`, or `TOKENHUB_BASE_URL` environment variables.
 
 :::note Meta contributor tier
-`muse-spark-1.2-contributor` is Meta's discounted tier — Meta may train on your prompts and completions, so [interactive model selection asks for confirmation](../user-guide/configuring-models.md) before using it. Use `muse-spark-1.2` (standard pricing, no training) for confidential work.
+`muse-spark-1.2-contributor` and `muse-spark-1.3-contributor` are Meta's contributor tiers — Meta may train on your prompts and completions, so [interactive model selection asks for confirmation](../user-guide/configuring-models.md) before using either. For current pricing and rate limits, see [Meta Model API pricing and rate limits](https://dev.meta.ai/docs/pricing-rate-limits/). Use the standard `muse-spark-1.2` / `muse-spark-1.3` (no training) for confidential work.
 :::
 
 :::note Z.AI Endpoint Auto-Detection
@@ -593,6 +504,8 @@ hermes chat --provider alibaba_coding --model qwen3-coder-plus
 ```
 
 `alibaba_coding` uses the same `DASHSCOPE_API_KEY` your `alibaba` entry already uses — no separate key needed, just a different routing target. Before this provider was registered, users who set `provider: alibaba_coding` in `config.yaml` silently fell through to OpenRouter routing.
+
+For the mainland-China endpoint (`alibaba-coding-plan-cn`, `https://coding.dashscope.aliyuncs.com/v1`) set `ALIBABA_CODING_PLAN_CN_API_KEY`. The CN provider still falls back to `ALIBABA_CODING_PLAN_API_KEY` / `DASHSCOPE_API_KEY`, but with only the shared key set the `/model` picker lists just the international row — set the CN key (or `provider: alibaba-coding-plan-cn` in `config.yaml`) to surface the CN one. The same applies to `alibaba-token-plan-cn` with `ALIBABA_TOKEN_PLAN_CN_API_KEY`.
 
 ### MiniMax (OAuth)
 

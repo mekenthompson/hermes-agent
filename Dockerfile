@@ -47,9 +47,8 @@ FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df228
 # Bookworm-based slim image used so the produced binary links
 # against glibc 2.36, which runs cleanly on our Debian 13 (trixie, glibc
 # 2.41) runtime.  Bumping to a new Node major is a one-line ARG change; see
-# #4977. This index was verified on 2026-08-31: its linux/amd64 npm
-# bundle contains tar 7.5.19, fixing CVE-2026-59873.
-FROM node:26-bookworm-slim@sha256:367679cf9792759492a486e4aa4b421764d71a9546a6dae8aab81a99eb797b3e AS node_source
+# #4977.
+FROM node:26-bookworm-slim@sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73 AS node_source
 FROM debian:13.4
 
 # Disable Python stdout buffering to ensure logs are printed immediately.
@@ -335,13 +334,12 @@ RUN mkdir -p /opt/hermes/bin && \
 # (.github/workflows/docker.yml) passes ${{ github.sha }} so
 # every published image has it.
 ARG HERMES_GIT_SHA=
-ARG HERMES_IMAGE_IDENTITY=nousresearch/hermes-agent
 RUN set -eu; \
     if [ -n "${HERMES_GIT_SHA}" ]; then \
         printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha; \
     fi; \
     mkdir -p /etc/hermes; \
-    HERMES_GIT_SHA="${HERMES_GIT_SHA}" HERMES_IMAGE_IDENTITY="${HERMES_IMAGE_IDENTITY}" python3 -c 'import json, os, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; marker = pathlib.Path("/etc/hermes/image-provenance.json"); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "image", "manager": "docker", "image": os.environ["HERMES_IMAGE_IDENTITY"], "version": project["version"], "revision": os.environ.get("HERMES_GIT_SHA") or None}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
+    HERMES_GIT_SHA="${HERMES_GIT_SHA}" python3 -c 'import json, os, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; marker = pathlib.Path("/etc/hermes/image-provenance.json"); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "image", "manager": "docker", "image": "nousresearch/hermes-agent", "version": project["version"], "revision": os.environ.get("HERMES_GIT_SHA") or None}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
 
 # ---------- s6-overlay service wiring ----------
 # Static services declared at build time: main-hermes + dashboard.

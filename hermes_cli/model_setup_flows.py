@@ -100,15 +100,23 @@ def _prune_replaced_custom_model_config_credentials(
     try:
         from agent.credential_pool import (
             CUSTOM_POOL_PREFIX,
-            get_custom_provider_pool_key,
+            custom_provider_pool_key_candidates,
         )
         from hermes_cli.auth import read_credential_pool, write_credential_pool
 
-        active_pool_key = get_custom_provider_pool_key(
-            base_url,
-            provider_name=provider_name or None,
-        )
-        if not active_pool_key:
+        # A keyed ``providers.<key>`` endpoint stores under the durable slug
+        # while legacy-named pools keep the ``custom:<display-name>`` key, so
+        # every identity the active endpoint may occupy must be skipped —
+        # comparing against a single preferred key false-prunes the provider's
+        # own legacy-named pool (verified regression from PR #100413 review).
+        active_pool_keys = {
+            str(key).strip().lower()
+            for key in custom_provider_pool_key_candidates(
+                base_url,
+                provider_name=provider_name or None,
+            )
+        }
+        if not active_pool_keys:
             return
         pools = read_credential_pool(None)
         if not isinstance(pools, dict):
@@ -117,7 +125,7 @@ def _prune_replaced_custom_model_config_credentials(
             if (
                 not isinstance(pool_key, str)
                 or not pool_key.startswith(CUSTOM_POOL_PREFIX)
-                or pool_key == active_pool_key
+                or pool_key in active_pool_keys
                 or not isinstance(entries, list)
             ):
                 continue
@@ -531,6 +539,15 @@ def _model_flow_nous(config, current_model="", args=None):
     # of CLI release cadence.
     unavailable_models: list[str] = []
     unavailable_message = ""
+
+    # Neither the curated list nor the Portal's recommendations know what the
+    # org may reach. Narrow before the tier split, so an id the policy rescues
+    # still has to pass the free/paid predicate instead of going around it.
+    from hermes_cli.models import nous_policy_allowed_ids, restrict_to_nous_policy
+
+    _policy_allowed = nous_policy_allowed_ids()
+    _policy_narrowed = False
+
     if free_tier:
         try:
             from hermes_cli.nous_account import (
@@ -551,6 +568,11 @@ def _model_flow_nous(config, current_model="", args=None):
         model_ids, pricing = union_with_portal_free_recommendations(
             model_ids, pricing, _nous_portal_url,
         )
+        _before_policy = model_ids
+        model_ids = restrict_to_nous_policy(
+            model_ids, _policy_allowed, rescue_empty=True,
+        )
+        _policy_narrowed = model_ids != _before_policy
         model_ids, unavailable_models = partition_nous_models_by_tier(
             model_ids, pricing, free_tier=True
         )
@@ -558,6 +580,11 @@ def _model_flow_nous(config, current_model="", args=None):
         model_ids, pricing = union_with_portal_paid_recommendations(
             model_ids, pricing, _nous_portal_url,
         )
+        _before_policy = model_ids
+        model_ids = restrict_to_nous_policy(
+            model_ids, _policy_allowed, rescue_empty=True,
+        )
+        _policy_narrowed = model_ids != _before_policy
 
     if not model_ids and not unavailable_models:
         print("No models available for Nous Portal after filtering.")
@@ -572,6 +599,11 @@ def _model_flow_nous(config, current_model="", args=None):
             print(unavailable_message or f"Upgrade at {_url} to access paid models.")
         return
 
+    from hermes_cli.nous_account import nous_policy_notice
+
+    _policy_notice = nous_policy_notice(removed=_policy_narrowed)
+    if _policy_notice:
+        print(_policy_notice)
     print(
         f'Showing {len(model_ids)} curated models — use "Enter custom model name" for others.'
     )
@@ -2097,78 +2129,6 @@ def _model_flow_copilot_acp(config, current_model=""):
         )
         or selected
     )
-    _save_model_choice(selected)
-
-    cfg = load_config()
-    model = cfg.get("model")
-    if not isinstance(model, dict):
-        model = {"default": model} if model else {}
-        cfg["model"] = model
-    model["provider"] = provider_id
-    model["base_url"] = effective_base
-    model["api_mode"] = "chat_completions"
-    clear_model_endpoint_credentials(model, clear_api_mode=False)
-    save_config(cfg)
-    deactivate_provider()
-
-    print(f"Default model set to: {selected} (via {pconfig.name})")
-
-def _model_flow_acp_agent(config, current_model="", provider_id=""):
-    """Generic ACP-agent flow for any external_process ``acp://`` provider.
-
-    Covers every ACP agent except copilot-acp (own flow, GitHub model
-    catalog) — the plugin-shipped claude-acp/codex-acp, and any agent a
-    third-party plugin registers. These agents pick their own underlying
-    model, so the saved model name is only a hint forwarded to the ACP
-    session.
-    """
-    from hermes_cli.auth import (
-        PROVIDER_REGISTRY,
-        _save_model_choice,
-        deactivate_provider,
-        get_external_process_provider_status,
-        resolve_external_process_provider_credentials,
-    )
-    from hermes_cli.config import load_config, save_config
-    from agent.acp_agent_registry import agent_display_name, agent_install_hint
-
-    del config
-
-    pconfig = PROVIDER_REGISTRY[provider_id]
-    agent_name = provider_id.removesuffix("-acp")
-    display = agent_display_name(agent_name)
-
-    status = get_external_process_provider_status(provider_id)
-    resolved_command = (
-        status.get("resolved_command") or status.get("command") or agent_name
-    )
-    effective_base = status.get("base_url") or pconfig.inference_base_url
-
-    print(f"  {pconfig.name} delegates Hermes turns to {display}'s ACP adapter.")
-    print("  Hermes starts its own ACP subprocess for each request; the agent")
-    print("  uses its own login/credentials and picks its own underlying model")
-    print("  (the model name saved here is only a hint).")
-    print(f"  Command: {resolved_command}")
-    print(f"  Backend marker: {effective_base}")
-    print()
-
-    try:
-        creds = resolve_external_process_provider_credentials(provider_id)
-    except Exception as exc:
-        print(f"  ⚠ {exc}")
-        print(f"  {agent_install_hint(agent_name)}")
-        return
-
-    effective_base = creds.get("base_url") or effective_base
-
-    default_model = current_model if current_model == provider_id else provider_id
-    try:
-        entered = input(f"  Model hint [{default_model}]: ").strip()
-    except (KeyboardInterrupt, EOFError):
-        print("No change.")
-        return
-    selected = entered or default_model
-
     _save_model_choice(selected)
 
     cfg = load_config()
