@@ -165,6 +165,8 @@ COPY --chmod=0755 --from=node_source /usr/local/bin/node /usr/local/bin/
 COPY --from=node_source /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
     ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+# node:26 npm still vendors node-tar 7.5.16 (CVE-2026-59873). Replace in place.
+RUN npm --prefix /usr/local/lib/node_modules/npm install tar@7.5.22 --no-save --omit=dev --no-audit --no-fund && node -e "const v=require('/usr/local/lib/node_modules/npm/node_modules/tar/package.json').version.split('.').map(Number); if (v[0]<7||(v[0]===7&&v[1]<5)||(v[0]===7&&v[1]===5&&v[2]<19)) process.exit(1)"
 
 WORKDIR /opt/hermes
 
