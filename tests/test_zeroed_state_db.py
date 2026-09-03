@@ -298,3 +298,4 @@ def test_live_connection_0_byte_not_quarantined_in_process(tmp_path, monkeypatch
         conn.commit()
     finally:
         conn.close()
+
