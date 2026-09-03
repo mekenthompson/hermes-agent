@@ -5176,6 +5176,8 @@ class TurnRunner:
         fallback_msg_id: Optional[str] = None
         native_failed = False
         anonymous_seq = 0
+        from gateway.task_card_identity import resolve_task_card_title
+        card_title = resolve_task_card_title(get_hermes_home())
 
         def _compact(value: Any, limit: int = 120) -> str:
             text = re.sub(r"\s+", " ", str(value or "")).strip()
@@ -5196,7 +5198,7 @@ class TurnRunner:
                 f"- {task['title']} - {labels.get(task['status'], task['status'])}"
                 for task in _visible_tasks()
             ]
-            return "Hermes is working\n" + "\n".join(lines)
+            return f"{card_title}\n" + "\n".join(lines)
 
         def _apply_native_event(raw: Any) -> bool:
             nonlocal anonymous_seq
@@ -5273,7 +5275,7 @@ class TurnRunner:
                 result = await adapter.send_native_task_card_progress(
                     chat_id=ctx.source.chat_id,
                     tasks=_visible_tasks(),
-                    title="Hermes is working",
+                    title=card_title,
                     reply_to=ctx._progress_reply_to,
                     metadata=ctx._progress_metadata,
                     fallback_text=_fallback_text(),
@@ -7643,6 +7645,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._async_session_store = AsyncSessionStore(self.session_store)
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
+        self._profile_service_stop = asyncio.Event()
+        self._profile_service_tasks: list[asyncio.Task] = []
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
@@ -14638,6 +14642,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running = True
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
+        self._start_plugin_profile_services()
 
         try:
             await self._ensure_hosted_room_worker()
@@ -16418,6 +16423,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
         if callable(_stop_guards):
             _stop_guards()
+        stop_services = getattr(self, "_stop_plugin_profile_services", None)
+        if callable(stop_services):
+            try:
+                await stop_services()
+            except Exception:
+                logger.debug("plugin profile service stop failed", exc_info=True)
         if restart:
             self._restart_requested = True
             self._restart_detached = detached_restart
@@ -17891,6 +17902,72 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(self.config, "multiplex_profiles", False):
             return self._make_default_profile_message_handler()
         return self._handle_message
+
+    @staticmethod
+    def _validate_internal_plugin_event(event: MessageEvent) -> SessionSource:
+        """Validate the narrow event shape allowed for profile-local plugins."""
+        if not isinstance(event, MessageEvent):
+            raise TypeError("internal plugin dispatch requires a MessageEvent")
+        if event.internal is not True:
+            raise PermissionError("internal plugin events must set internal=True")
+        if event.allow_gateway_control is not False:
+            raise PermissionError(
+                "internal plugin events must set allow_gateway_control=False"
+            )
+        if event.message_type is not MessageType.TEXT:
+            raise ValueError("internal plugin dispatch accepts text events only")
+
+        source = event.source
+        if source is None:
+            raise ValueError("internal plugin events require a SessionSource")
+        if source.platform is not Platform.LOCAL:
+            raise PermissionError(
+                "internal plugin events must use the local platform"
+            )
+        if not str(getattr(source, "profile", "") or "").strip():
+            raise ValueError("internal plugin events require an explicit profile")
+        if not str(getattr(source, "chat_id", "") or "").strip():
+            raise ValueError("internal plugin events require a session chat_id")
+        return source
+
+    async def prepare_internal_plugin_session(self, event: MessageEvent) -> str:
+        """Persist a plugin-owned Hermes session without starting its agent turn.
+
+        Queue-backed plugins use this before acknowledging external work. The
+        eventual dispatch resolves the same source and starts the queued turn;
+        this method only makes the session durable and discoverable immediately.
+        """
+        source = self._validate_internal_plugin_event(event)
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                session_entry = (
+                    await self.async_session_store.get_or_create_session(
+                        source,
+                        touch_activity=False,
+                    )
+                )
+        else:
+            session_entry = await self.async_session_store.get_or_create_session(
+                source,
+                touch_activity=False,
+            )
+        return str(session_entry.session_id)
+
+    async def dispatch_internal_plugin_event(
+        self, event: MessageEvent
+    ) -> Optional[str]:
+        """Run one profile-local plugin event through the normal gateway turn.
+
+        This is deliberately narrower than adapter ingress. Plugins may start an
+        agent turn and receive its final text, but they may not impersonate a
+        messaging transport, bypass profile selection, execute gateway commands,
+        or inject media. The normal scoped message handler still owns session
+        lookup, persistence, model execution, and response normalization.
+        """
+        self._validate_internal_plugin_event(event)
+        handler = self._primary_message_handler()
+        return await handler(event)
 
     async def _handle_gateway_platform_event(self, event: dict, source) -> None:
         """Authorize and publish one normalized adapter event to plugin hooks."""
@@ -21066,6 +21143,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     delattr(event, attr)
                 except AttributeError:
                     pass
+
+    def _start_plugin_profile_services(self) -> None:
+        """Start plugin profile services for every profile served by this gateway."""
+        from types import SimpleNamespace
+
+        from hermes_cli.plugins import get_plugin_manager
+        from hermes_constants import get_hermes_home
+
+        stop_event = getattr(self, "_profile_service_stop", None)
+        if stop_event is None or stop_event.is_set():
+            stop_event = asyncio.Event()
+            self._profile_service_stop = stop_event
+        self._profile_service_tasks = []
+        active_profile = (
+            os.getenv("HERMES_PROFILE")
+            or os.getenv("HERMES_AGENT_PROFILE")
+            or "default"
+        ).strip() or "default"
+        profiles = [(active_profile, Path(get_hermes_home()))]
+        if getattr(self.config, "multiplex_profiles", False):
+            profiles.extend(
+                (name, Path(home))
+                for name, home in _multiplex_profile_homes(self.config)
+                if name != active_profile
+            )
+
+        for profile_name, profile_home in profiles:
+            with _profile_runtime_scope(profile_home):
+                runtime = SimpleNamespace(
+                    profile_home=str(get_hermes_home()),
+                    profile_name=profile_name,
+                    stop_event=stop_event,
+                    gateway=self,
+                )
+                try:
+                    services = list(get_plugin_manager()._profile_services)
+                except Exception:
+                    services = []
+                for name, factory in services:
+                    try:
+                        task = asyncio.create_task(
+                            factory(runtime),
+                            name=f"profile-service:{profile_name}:{name}",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to start plugin profile service %s for profile %s",
+                            name,
+                            profile_name,
+                        )
+                        continue
+                    self._profile_service_tasks.append(task)
+                    logger.info(
+                        "Started plugin profile service %s for profile %s",
+                        name,
+                        profile_name,
+                    )
+
+    async def _stop_plugin_profile_services(self) -> None:
+        stop_event = getattr(self, "_profile_service_stop", None)
+        if stop_event is not None and not stop_event.is_set():
+            stop_event.set()
+        tasks = list(getattr(self, "_profile_service_tasks", []) or [])
+        self._profile_service_tasks = []
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     def _install_plugin_message_injector(self) -> None:
         """Publish this live gateway's plugin message scheduler."""
