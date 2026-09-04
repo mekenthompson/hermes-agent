@@ -22,6 +22,7 @@ import logging
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
@@ -201,6 +202,51 @@ def _save_discovery_cache(cache: Dict[str, list]) -> None:
         logger.debug("Could not write tool discovery cache %s: %s", path, e)
 
 
+@dataclass(frozen=True, slots=True)
+class ToolInvocationContext:
+    """Immutable host-owned identity for the tool's originating session.
+
+    Values come from task-local gateway context, never model arguments. Empty
+    values mean the current execution path has no authenticated gateway field;
+    security-sensitive plugins must fail closed when required fields are empty.
+    """
+
+    profile: str = ""
+    platform: str = ""
+    user_id: str = ""
+    chat_id: str = ""
+    chat_type: str = ""
+    thread_id: str = ""
+    scope_id: str = ""
+    session_id: str = ""
+    session_key: str = ""
+    message_id: str = ""
+
+
+def _current_tool_invocation_context() -> ToolInvocationContext:
+    """Snapshot the current task-local gateway identity for one tool call."""
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return ToolInvocationContext()
+
+    def value(name: str) -> str:
+        return str(get_session_env(name, "") or "")
+
+    return ToolInvocationContext(
+        profile=value("HERMES_SESSION_PROFILE"),
+        platform=value("HERMES_SESSION_PLATFORM"),
+        user_id=value("HERMES_SESSION_USER_ID"),
+        chat_id=value("HERMES_SESSION_CHAT_ID"),
+        chat_type=value("HERMES_SESSION_CHAT_TYPE"),
+        thread_id=value("HERMES_SESSION_THREAD_ID"),
+        scope_id=value("HERMES_SESSION_SCOPE_ID"),
+        session_id=value("HERMES_SESSION_ID"),
+        session_key=value("HERMES_SESSION_KEY"),
+        message_id=value("HERMES_SESSION_MESSAGE_ID"),
+    )
+
+
 class ToolEntry:
     """Metadata for a single registered tool."""
 
@@ -208,11 +254,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "inject_invocation_context",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 inject_invocation_context=False):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -231,6 +279,7 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.inject_invocation_context = bool(inject_invocation_context)
 
 
 class _PluginOverridePolicy:
@@ -798,6 +847,7 @@ class ToolRegistry:
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
+        inject_invocation_context: bool = False,
         override: bool = False,
         scope: Optional[str] = None,
     ):
@@ -808,6 +858,11 @@ class ToolRegistry:
         default browser tool for a headed-Chrome CDP backend). Without it,
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
+
+        ``inject_invocation_context=True`` passes an immutable, host-owned
+        ``ToolInvocationContext`` keyword to the handler. The snapshot comes
+        from task-local gateway state, never tool arguments. Plugins must fail
+        closed when identity fields required by their policy are empty.
         """
         handler_owner = self._plugin_owner_of(handler)
         caller_owner = self._plugin_namespace_of_module(self._caller_module())
@@ -895,6 +950,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                inject_invocation_context=inject_invocation_context,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -1182,6 +1238,10 @@ class ToolRegistry:
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
+            if entry.inject_invocation_context:
+                # Overwrite, rather than setdefault: callers cannot spoof this
+                # security-sensitive keyword through an internal dispatch path.
+                kwargs["invocation_context"] = _current_tool_invocation_context()
             if entry.is_async:
                 from model_tools import _run_async
                 result = _run_async(entry.handler(args, **kwargs))
