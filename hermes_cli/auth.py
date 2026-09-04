@@ -571,22 +571,16 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
     ),
 }
 
-# Auto-extend PROVIDER_REGISTRY with any api-key provider registered in
-# providers/ that is not already declared above.  New providers only need a
-# plugins/model-providers/<name>/ plugin — no edits to this file required.
-try:
+# Auto-extend PROVIDER_REGISTRY with profiles discovered from bundled or user
+# plugins. Re-run this at provider-resolution time because plugin discovery can
+# legitimately happen after this module was imported.
+def _extend_provider_registry_from_profiles() -> None:
     from providers import list_providers as _list_providers_for_registry
+
     for _pp in _list_providers_for_registry():
         if _pp.name in PROVIDER_REGISTRY:
             continue
         if _pp.auth_type == "external_process":
-            # An external-process provider (an ACP CLI driven over stdio) has no
-            # API-key env vars to resolve — its credentials come from
-            # resolve_external_process_provider_credentials(), keyed on this
-            # auth_type. Registering it here is what lets a provider shipped
-            # outside this tree pass resolve_provider()'s known-provider gate;
-            # without it, `hermes -m <that provider>` dies with
-            # "Unknown provider" before any client is ever built.
             PROVIDER_REGISTRY[_pp.name] = ProviderConfig(
                 id=_pp.name,
                 name=_pp.display_name or _pp.name,
@@ -599,15 +593,21 @@ try:
             continue
         if _pp.auth_type != "api_key" or not _pp.env_vars:
             continue
-        # Skip providers that need custom token resolution or are special-cased
-        # in resolve_provider() (copilot/kimi/zai have bespoke token refresh;
-        # openrouter/custom are aggregator/user-supplied and handled outside
-        # the registry — adding them here breaks runtime_provider resolution
-        # that relies on `openrouter not in PROVIDER_REGISTRY`).
+        # These providers use bespoke token refresh or aggregator/user-supplied
+        # handling; inserting them into this registry changes runtime routing.
         if _pp.name in {"copilot", "kimi-coding", "kimi-coding-cn", "zai", "openrouter", "custom"}:
             continue
-        _api_key_vars = tuple(v for v in _pp.env_vars if not v.endswith("_BASE_URL") and not v.endswith("_URL"))
-        _base_url_var = next((v for v in _pp.env_vars if v.endswith("_BASE_URL") or v.endswith("_URL")), None)
+        _api_key_vars = tuple(
+            value for value in _pp.env_vars
+            if not value.endswith("_BASE_URL") and not value.endswith("_URL")
+        )
+        _base_url_var = next(
+            (
+                value for value in _pp.env_vars
+                if value.endswith("_BASE_URL") or value.endswith("_URL")
+            ),
+            None,
+        )
         PROVIDER_REGISTRY[_pp.name] = ProviderConfig(
             id=_pp.name,
             name=_pp.display_name or _pp.name,
@@ -616,10 +616,13 @@ try:
             api_key_env_vars=_api_key_vars or _pp.env_vars,
             base_url_env_var=_base_url_var or "",
         )
-        # Also register aliases so resolve_provider() resolves them
         for _alias in _pp.aliases:
             if _alias not in PROVIDER_REGISTRY:
                 PROVIDER_REGISTRY[_alias] = PROVIDER_REGISTRY[_pp.name]
+
+
+try:
+    _extend_provider_registry_from_profiles()
 except Exception:
     pass
 
@@ -2806,6 +2809,13 @@ def resolve_provider(
     7. AWS Bedrock credential chain
     8. Error (no provider configured)
     """
+    try:
+        _extend_provider_registry_from_profiles()
+    except Exception:
+        # Preserve the existing unknown-provider path when optional plugin
+        # discovery itself is unavailable.
+        pass
+
     normalized = (requested or "auto").strip().lower()
 
     # Normalize provider aliases
@@ -8226,8 +8236,37 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
 def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str, Any]:
     """Resolve runtime details for local subprocess-backed providers."""
+    # Provider plugins can register after this module builds its compatibility
+    # registry. Resolve the canonical profile at call time so late-discovered
+    # external-process providers do not depend on import order.
+    profile = None
+    try:
+        from providers import get_provider_profile as _get_provider_profile
+
+        profile = _get_provider_profile(provider_id)
+    except Exception:
+        profile = None
+
     pconfig = PROVIDER_REGISTRY.get(provider_id)
-    if not pconfig or pconfig.auth_type != "external_process":
+    if (
+        pconfig is not None and pconfig.auth_type != "external_process"
+    ) or (
+        profile is not None and profile.auth_type != "external_process"
+    ):
+        raise AuthError(
+            f"Provider '{provider_id}' is not an external-process provider.",
+            provider=provider_id,
+            code="invalid_provider",
+        )
+    if profile is not None and profile.auth_type == "external_process":
+        if pconfig is None:
+            pconfig = ProviderConfig(
+                id=profile.name,
+                name=profile.display_name or profile.name,
+                auth_type="external_process",
+                inference_base_url=profile.base_url,
+            )
+    elif pconfig is None:
         raise AuthError(
             f"Provider '{provider_id}' is not an external-process provider.",
             provider=provider_id,
@@ -8243,14 +8282,6 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     # another vendor's. copilot-acp's values live in its profile, which is why
     # HERMES_COPILOT_ACP_COMMAND / COPILOT_CLI_PATH / HERMES_COPILOT_ACP_ARGS
     # keep working unchanged.
-    profile = None
-    try:
-        from providers import get_provider_profile as _get_provider_profile
-
-        profile = _get_provider_profile(provider_id)
-    except Exception:
-        profile = None
-
     command_env_vars = tuple(getattr(profile, "process_command_env_vars", ()) or ())
     default_command = str(getattr(profile, "process_command", "") or "")
     default_args = list(getattr(profile, "process_args", ()) or [])

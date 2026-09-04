@@ -1953,30 +1953,34 @@ def _resolve_explicit_runtime(
 
 
 def _is_external_process_provider(provider: str) -> bool:
-    """Whether ``provider`` is declared as an external-process (CLI) provider.
+    """Whether ``provider`` is declared as an external-process provider.
 
-    Reads the CLI provider registry first (which now absorbs registered
-    ProviderProfiles, in-tree and out), then falls back to the profile registry
-    directly so the check works before the CLI registry has been extended.
+    The static CLI registry and the runtime profile registry must agree when
+    both contain the provider. A disagreement is rejected before either auth
+    lane can run.
     """
     name = (provider or "").strip().lower()
     if not name:
         return False
-    try:
-        from hermes_cli.auth import PROVIDER_REGISTRY
 
-        pconfig = PROVIDER_REGISTRY.get(name)
-        if pconfig is not None:
-            return pconfig.auth_type == "external_process"
-    except Exception:
-        pass
+    pconfig = PROVIDER_REGISTRY.get(name)
     try:
         from providers import get_provider_profile
 
         profile = get_provider_profile(name)
     except Exception:
-        return False
-    return profile is not None and getattr(profile, "auth_type", "") == "external_process"
+        profile = None
+
+    static_auth = getattr(pconfig, "auth_type", None)
+    profile_auth = getattr(profile, "auth_type", None)
+    if static_auth and profile_auth and static_auth != profile_auth:
+        raise AuthError(
+            f"Provider '{name}' has conflicting authentication metadata.",
+            provider=name,
+            code="invalid_provider",
+        )
+    auth_type = profile_auth or static_auth
+    return auth_type == "external_process"
 
 
 def resolve_runtime_provider(
