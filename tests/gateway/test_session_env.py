@@ -76,6 +76,51 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     runner._clear_session_env(tokens)
 
 
+
+def test_set_session_env_uses_dedicated_gateway_profile(monkeypatch):
+    """A dedicated gateway binds its host-owned profile when the source omits it."""
+    from types import SimpleNamespace
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="8248703757",
+        chat_type="dm",
+        user_id="8248703757",
+    )
+    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+    monkeypatch.setenv("HERMES_PROFILE", "overlord")
+
+    tokens = runner._set_session_env(context)
+    try:
+        assert get_session_env("HERMES_SESSION_PROFILE") == "overlord"
+    finally:
+        runner._clear_session_env(tokens)
+
+
+def test_set_session_env_does_not_guess_profile_in_multiplex_mode(monkeypatch):
+    """A missing multiplex route fails closed instead of borrowing process profile."""
+    from types import SimpleNamespace
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=True)
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="D123",
+        chat_type="dm",
+        user_id="U123",
+    )
+    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+    monkeypatch.setenv("HERMES_PROFILE", "overlord")
+
+    tokens = runner._set_session_env(context)
+    try:
+        assert get_session_env("HERMES_SESSION_PROFILE") == ""
+    finally:
+        runner._clear_session_env(tokens)
+
+
 def test_clear_session_env_restores_previous_state(monkeypatch):
     """_clear_session_env should restore contextvars to their pre-handler values."""
     runner = object.__new__(GatewayRunner)
