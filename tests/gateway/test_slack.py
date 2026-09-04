@@ -5059,8 +5059,12 @@ class TestNativeTaskCardProgress:
         second = [{"id": "call-1", "title": "terminal", "status": "complete"}]
 
         results = await asyncio.gather(
-            adapter.send_native_task_card_progress("C1", first, metadata=metadata),
-            adapter.send_native_task_card_progress("C1", second, metadata=metadata),
+            adapter.send_native_task_card_progress(
+                "C1", first, metadata=metadata, fallback_text="list"
+            ),
+            adapter.send_native_task_card_progress(
+                "C1", second, metadata=metadata, fallback_text="list"
+            ),
         )
 
         assert all(result.success for result in results)
@@ -5069,15 +5073,14 @@ class TestNativeTaskCardProgress:
         assert [call.args[0] for call in calls] == [
             "chat.startStream",
             "chat.appendStream",
-            "chat.appendStream",
         ]
-        assert calls[0].kwargs["json"] == {
-            "channel": "C1",
-            "thread_ts": "thread-1",
-            "task_display_mode": "plan",
-            "recipient_team_id": "T1",
-            "recipient_user_id": "U1",
-        }
+        start_payload = calls[0].kwargs["json"]
+        assert start_payload["task_display_mode"] == "plan"
+        assert start_payload["recipient_team_id"] == "T1"
+        assert start_payload["recipient_user_id"] == "U1"
+        assert "markdown_text" not in start_payload
+        assert start_payload["chunks"][0]["type"] == "plan_update"
+        assert "markdown_text" not in calls[1].kwargs["json"]
         adapter._app.client.api_call.assert_not_awaited()
 
         await adapter.stop_native_task_card_progress("C1", metadata=metadata)
@@ -5138,10 +5141,61 @@ class TestNativeTaskCardProgress:
 
         assert [call.args[0] for call in client.api_call.await_args_list] == [
             "chat.startStream",
-            "chat.appendStream",
             "chat.stopStream",
         ]
         assert adapter._native_task_card_streams == {}
+
+    @pytest.mark.asyncio
+    async def test_first_native_progress_starts_with_chunks_and_no_markdown(
+        self, adapter
+    ):
+        client = adapter._app.client
+        client.api_call.side_effect = [{"ts": "stream-1"}]
+        result = await adapter.send_native_task_card_progress(
+            "C1",
+            [{"id": "call-1", "title": "terminal", "status": "in_progress"}],
+            metadata={"thread_id": "thread-1"},
+            fallback_text="Hermes is working\n- terminal - running",
+        )
+
+        assert result.success is True
+        assert [call.args[0] for call in client.api_call.await_args_list] == [
+            "chat.startStream"
+        ]
+        payload = client.api_call.await_args.kwargs["json"]
+        assert payload["task_display_mode"] == "plan"
+        assert "markdown_text" not in payload
+        assert payload["chunks"][0]["type"] == "plan_update"
+        assert payload["chunks"][1]["id"] == "call-1"
+
+    @pytest.mark.asyncio
+    async def test_later_native_progress_appends_chunks_without_markdown(
+        self, adapter
+    ):
+        client = adapter._app.client
+        client.api_call.side_effect = [{"ts": "stream-1"}, {"ok": True}]
+        metadata = {"thread_id": "thread-1"}
+        await adapter.send_native_task_card_progress(
+            "C1",
+            [{"id": "call-1", "title": "terminal", "status": "in_progress"}],
+            metadata=metadata,
+            fallback_text="Hermes is working\n- terminal - running",
+        )
+        result = await adapter.send_native_task_card_progress(
+            "C1",
+            [{"id": "call-1", "title": "terminal", "status": "complete"}],
+            metadata=metadata,
+            fallback_text="Hermes is working\n- terminal - complete",
+        )
+
+        assert result.success is True
+        assert [call.args[0] for call in client.api_call.await_args_list] == [
+            "chat.startStream",
+            "chat.appendStream",
+        ]
+        append_payload = client.api_call.await_args_list[1].kwargs["json"]
+        assert "markdown_text" not in append_payload
+        assert append_payload["chunks"][-1]["status"] == "complete"
 
 
 # ---------------------------------------------------------------------------

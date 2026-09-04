@@ -2814,11 +2814,29 @@ class SlackAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error="Progress stream already stopped")
             try:
                 client = self._get_client(chat_id, team_id=stream.team_id)
+                chunks: List[Dict[str, Any]] = [
+                    {"type": "plan_update", "title": str(title)[:256]}
+                ]
+                for task in tasks:
+                    status = str(task.get("status") or "in_progress")
+                    if status not in {"in_progress", "complete", "error"}:
+                        status = "in_progress"
+                    task_id = str(task.get("id") or task.get("task_id") or "task")
+                    chunks.append(
+                        {
+                            "type": "task_update",
+                            "id": task_id,
+                            "title": str(task.get("title") or task_id)[:256],
+                            "status": status,
+                        }
+                    )
+
                 if not stream.stream_ts:
                     start_payload: Dict[str, Any] = {
                         "channel": chat_id,
                         "thread_ts": stream.thread_ts,
                         "task_display_mode": "plan",
+                        "chunks": chunks,
                     }
                     md = metadata or {}
                     recipient_team_id = (
@@ -2841,31 +2859,16 @@ class SlackAdapter(BasePlatformAdapter):
                         )
                     if not stream.stream_ts:
                         raise RuntimeError("Slack startStream returned no stream timestamp")
-
-                chunks: List[Dict[str, Any]] = [
-                    {"type": "plan_update", "title": str(title)[:256]}
-                ]
-                for task in tasks:
-                    status = str(task.get("status") or "in_progress")
-                    if status not in {"in_progress", "complete", "error"}:
-                        status = "in_progress"
-                    task_id = str(task.get("id") or task.get("task_id") or "task")
-                    chunks.append(
-                        {
-                            "type": "task_update",
-                            "id": task_id,
-                            "title": str(task.get("title") or task_id)[:256],
-                            "status": status,
-                        }
-                    )
+                    return SendResult(success=True, message_id=stream.stream_ts)
 
                 append_payload: Dict[str, Any] = {
                     "channel": chat_id,
                     "ts": stream.stream_ts,
                     "chunks": chunks,
                 }
-                if fallback_text:
-                    append_payload["markdown_text"] = fallback_text
+                # Slack rejects appendStream that mixes task-card chunks with
+                # markdown_text. fallback_text stays on the signature for
+                # callers that post a separate text fallback.
                 await client.api_call("chat.appendStream", json=append_payload)
                 return SendResult(success=True, message_id=stream.stream_ts)
             except Exception as exc:  # pragma: no cover - defensive logging
