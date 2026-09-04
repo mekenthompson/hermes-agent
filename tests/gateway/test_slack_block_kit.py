@@ -25,6 +25,16 @@ class TestRenderBlocksBasics:
         assert blocks[0]["text"]["type"] == "plain_text"
         assert blocks[0]["text"]["text"] == "Title"
 
+    def test_paragraph_sections_expand_without_show_more(self):
+        blocks = render_blocks("A regular reply paragraph")
+        assert blocks == [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "A regular reply paragraph"},
+                "expand": True,
+            }
+        ]
+
 
 class TestNestedLists:
     def test_nested_bullets_produce_increasing_indent(self):
