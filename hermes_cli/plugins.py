@@ -1797,6 +1797,7 @@ class PluginContext:
         description: str = "",
         emoji: str = "",
         override: bool = False,
+        *,
         inject_invocation_context: bool = False,
     ) -> Optional[PluginRegistration]:
         """Register a tool in the global registry **and** track it as plugin-provided.
