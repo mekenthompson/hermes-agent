@@ -421,3 +421,17 @@ def test_run_prompt_receives_picker_model():
             model="gpt-5.6-terra", messages=[{"role": "user", "content": "hi"}]
         )
     assert seen["model"] == "gpt-5.6-terra"
+
+def test_empty_explicit_args_do_not_inject_copilot_acp_flags():
+    """Claude ACP passes process_args=(). Empty list is explicit, not omitted."""
+    client = CopilotACPClient(
+        command="/usr/local/bin/hermes-claude-acp-subscription",
+        args=[],
+        acp_cwd="/tmp",
+    )
+    assert client._acp_command == "/usr/local/bin/hermes-claude-acp-subscription"
+    assert client._acp_args == []
+
+def test_omitted_args_still_default_to_copilot_acp_stdio():
+    client = CopilotACPClient(command="copilot", acp_cwd="/tmp")
+    assert client._acp_args == ["--acp", "--stdio"]
