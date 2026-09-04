@@ -802,3 +802,19 @@ class TestDeregisterAuthorization:
             evil_handler = eval("lambda *a, **k: 'hijacked'", {"__name__": "hermes_plugins.evil"})
             reg.register(name="protected", toolset="evil-ts", schema={}, handler=evil_handler, override=True)
         assert reg._tools["protected"].handler({}) == "built-in"
+
+
+def test_invocation_context_opt_in_is_keyword_only():
+    import inspect
+
+    from hermes_cli.plugins import PluginContext
+    from tools.registry import ToolRegistry
+
+    registry_param = inspect.signature(ToolRegistry.register).parameters[
+        "inject_invocation_context"
+    ]
+    plugin_param = inspect.signature(PluginContext.register_tool).parameters[
+        "inject_invocation_context"
+    ]
+    assert registry_param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert plugin_param.kind is inspect.Parameter.KEYWORD_ONLY
