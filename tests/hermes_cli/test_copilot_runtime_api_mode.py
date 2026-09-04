@@ -70,6 +70,10 @@ def test_resolver_routes_copilot_by_target_model_for_every_credential_path(
     # Keep this a real copilot_model_api_mode decision without making a live
     # catalog request. The API-mode contract is determined by the model family.
     monkeypatch.setattr(models, "fetch_github_model_catalog", lambda **_kwargs: [])
+    # KEN-317 registry check compares static overlay auth_type (api_key)
+    # against the Copilot plugin profile (auth_type=copilot). Isolate this
+    # api_mode test from that disagreement.
+    monkeypatch.setattr("providers.get_provider_profile", lambda _name: None)
 
     kwargs = {"requested": "copilot", "target_model": target_model}
     if credential_source == "pool":
