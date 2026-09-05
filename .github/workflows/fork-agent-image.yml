@@ -67,6 +67,14 @@ jobs:
           '
           docker run --rm --entrypoint hermes "$TEST_IMAGE" --version
 
+      - name: Verify OAuth recovery in the exact built image
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --entrypoint python3 \
+            --env PYTHONPATH=/opt/hermes \
+            --mount type=bind,src="$PWD/scripts/verify-dashboard-oauth-image.py",dst=/tmp/verify-dashboard-oauth-image.py,readonly \
+            "$TEST_IMAGE" /tmp/verify-dashboard-oauth-image.py
+
       - name: Generate image SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:

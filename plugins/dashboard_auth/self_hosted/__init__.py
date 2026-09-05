@@ -614,15 +614,13 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
 
         disco = self._get_discovery()
 
+        jwks_client = self._get_jwks_client()
         try:
-            signing_key = self._get_jwks_client().get_signing_key_from_jwt(
-                id_token
-            )
+            signing_key = jwks_client.get_signing_key_from_jwt(id_token)
         except Exception as exc:
-            # Unreachable JWKS -> ProviderError (503); a bearer that is not
-            # one of our JWTs (opaque peer key, foreign kid) -> InvalidCodeError
-            # (None / next provider). Folding both into 503 produced #94558.
-            raise classify_jwks_lookup_error(exc) from exc
+            raise classify_jwks_lookup_error(
+                exc, jwks_client=jwks_client, token=id_token
+            ) from exc
 
         try:
             claims = jwt.decode(
@@ -637,27 +635,9 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             # verify_session() catches this and returns None per protocol.
             raise InvalidCodeError(f"ID token expired: {exc}") from exc
         except jwt.InvalidTokenError as exc:
-            # Surface the actual iss/aud the token carried so operators can
-            # debug config drift between the configured issuer/client_id and
-            # what the IDP emits. Decoding-without-verification is safe here:
-            # we already failed verification and never trust these values.
-            details = ""
-            try:
-                unverified = jwt.decode(
-                    id_token,
-                    options={"verify_signature": False, "verify_exp": False},
-                )
-                details = (
-                    f" [token iss={unverified.get('iss')!r} "
-                    f"aud={unverified.get('aud')!r}; "
-                    f"expected iss={disco['issuer']!r} "
-                    f"aud={self._client_id!r}]"
-                )
-            except Exception:
-                pass
-            raise ProviderError(
-                f"ID token verification failed: {exc}{details}"
-            ) from exc
+            # A signature or registered-claim failure is an invalid caller
+            # credential, not evidence that the provider is unavailable.
+            raise InvalidCodeError(f"ID token verification failed: {exc}") from exc
 
         return claims
 
