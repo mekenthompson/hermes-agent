@@ -110,29 +110,17 @@ class RefreshExpiredError(Exception):
     """
 
 
-def classify_jwks_lookup_error(exc: BaseException) -> Exception:
+def classify_jwks_lookup_error(
+    exc: BaseException, *, jwks_client: object | None = None, token: str | None = None
+) -> Exception:
     """Map a ``PyJWKClient.get_signing_key_from_jwt`` failure to the protocol.
 
-    Only a genuine transport failure (the IDP's JWKS endpoint could not be
-    fetched) is a :class:`ProviderError` — middleware turns that into 503
-    "auth provider unreachable" so a flaky IDP never forces a logout.
-
-    Everything else means the token itself cannot be verified by this
-    provider and is an :class:`InvalidCodeError` (``verify_session`` returns
-    ``None``, the middleware tries the next provider / refresh / 401):
-
-    * ``jwt.DecodeError`` — the bearer is not a JWT at all (an opaque peer
-      key, a legacy session token, garbage). #94558: hosted agents answered
-      every non-JWT bearer with a fast 503 ``Auth provider 'nous'
-      unreachable`` even though Portal was healthy, because "cannot parse"
-      and "cannot reach" were folded into one branch.
-    * ``jwt.PyJWKSetError`` — the JWKS was fetched fine but holds no key for
-      this token's ``kid`` (rotated/foreign key). The provider was reached;
-      the token is simply not one of ours.
-
-    ``PyJWKClientConnectionError`` is the only ``PyJWKClientError`` subclass
-    that denotes unreachability; a bare ``PyJWKClientError`` (unexpected
-    JWKS shape) is kept as a provider fault since the IDP misbehaved.
+    A bare ``PyJWKClientError`` is ambiguous in PyJWT: it represents either a
+    usable key set with no matching ``kid`` or an unusable JWKS document. When
+    the real client and token are available, enumerate its supported signing
+    keys rather than parsing exception text. A nonempty usable key set proves
+    an unknown, absent, or null ``kid`` is a caller credential failure; a
+    failed/empty enumeration is an IDP failure.
     """
     try:
         import jwt
@@ -140,9 +128,25 @@ def classify_jwks_lookup_error(exc: BaseException) -> Exception:
         return ProviderError(f"JWKS lookup failed: {exc!r}")
     if isinstance(exc, jwt.PyJWKClientConnectionError):
         return ProviderError(f"JWKS lookup failed: {exc}")
-    if isinstance(exc, (jwt.DecodeError, jwt.PyJWKSetError)):
+    if isinstance(exc, jwt.PyJWKSetError):
+        return ProviderError(f"JWKS lookup failed: {exc}")
+    if isinstance(exc, jwt.DecodeError):
         return InvalidCodeError(f"token not verifiable by this provider: {exc}")
     if isinstance(exc, jwt.PyJWKClientError):
+        if jwks_client is None or token is None:
+            return ProviderError(f"JWKS lookup failed: {exc}")
+        try:
+            kid = jwt.get_unverified_header(token).get("kid")
+        except jwt.InvalidTokenError as header_error:
+            return InvalidCodeError(
+                f"token not verifiable by this provider: {header_error}"
+            )
+        try:
+            signing_keys = jwks_client.get_signing_keys()  # type: ignore[attr-defined]
+        except Exception as keyset_error:
+            return classify_jwks_lookup_error(keyset_error)
+        if signing_keys and all(key.key_id != kid for key in signing_keys):
+            return InvalidCodeError("token not verifiable by this provider")
         return ProviderError(f"JWKS lookup failed: {exc}")
     if isinstance(exc, jwt.InvalidTokenError):
         return InvalidCodeError(f"token not verifiable by this provider: {exc}")

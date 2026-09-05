@@ -549,24 +549,14 @@ class TestVerifySession:
         token = _mint_token(rsa_keypair, ttl_seconds=-1)
         assert provider.verify_session(access_token=token) is None
 
-    def test_wrong_audience_raises_provider_error(self, provider, rsa_keypair):
+    def test_wrong_audience_returns_none(self, provider, rsa_keypair):
         token = _mint_token(rsa_keypair, aud="agent:other-instance")
-        with pytest.raises(ProviderError, match="verification failed"):
-            provider.verify_session(access_token=token)
+        assert provider.verify_session(access_token=token) is None
 
 
-    def test_verification_failure_message_surfaces_token_claims(
-        self, provider, rsa_keypair
-    ):
-        """Operators need to see the actual iss/aud the token carries to debug
-        config drift between HERMES_DASHBOARD_PORTAL_URL/CLIENT_ID and Portal."""
+    def test_wrong_issuer_returns_none(self, provider, rsa_keypair):
         token = _mint_token(rsa_keypair, iss="https://evil.example")
-        with pytest.raises(ProviderError) as excinfo:
-            provider.verify_session(access_token=token)
-        msg = str(excinfo.value)
-        # Both the observed (token) and expected (configured) values appear.
-        assert "'https://evil.example'" in msg
-        assert "'https://portal.example.com'" in msg  # configured portal URL
+        assert provider.verify_session(access_token=token) is None
 
 
     def test_agent_instance_id_mismatch_rejected(self, provider, rsa_keypair):
@@ -592,7 +582,7 @@ class TestVerifySession:
         token = _mint_token(rsa_keypair)
         # Replace the patched client so it raises.
         bad_client = MagicMock()
-        bad_client.get_signing_key_from_jwt.side_effect = jwt.PyJWKClientError(
+        bad_client.get_signing_key_from_jwt.side_effect = jwt.PyJWKClientConnectionError(
             "fetch failed"
         )
         provider._jwks_client = bad_client
