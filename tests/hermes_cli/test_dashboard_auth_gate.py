@@ -18,6 +18,21 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 
 
+@pytest.fixture(autouse=True)
+def _isolate_dashboard_public_url(monkeypatch):
+    """Keep local-only cases independent of operator public-URL settings.
+
+    Individual external-URL cases set ``HERMES_DASHBOARD_PUBLIC_URL`` after
+    this fixture runs, so they continue to exercise the real resolver's env
+    precedence.  Config is pinned empty here too: this file's loopback cases
+    assert bind behavior, not a developer's dashboard.public_url setting.
+    """
+    from hermes_cli.dashboard_auth import prefix
+
+    monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
+    monkeypatch.setattr(prefix, "_load_dashboard_section", lambda: {})
+
+
 @pytest.fixture
 def client_loopback():
     # Pin the bound-host state for host_header_middleware so requests with
@@ -139,6 +154,9 @@ def _stub_uvicorn_run(monkeypatch):
         async def shutdown(self, sockets=None):
             pass
 
+    # These tests stub the server rather than binding a socket. Keep unrelated
+    # local gateway processes from turning auth configuration checks into exits.
+    monkeypatch.setattr(web_server, "_port_bind_conflict", lambda host, port: False)
     monkeypatch.setattr(uvicorn, "Config", _FakeConfig)
     monkeypatch.setattr(uvicorn, "Server", lambda config: _FakeServer())
     return captured
