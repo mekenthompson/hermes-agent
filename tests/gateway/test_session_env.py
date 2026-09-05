@@ -77,21 +77,20 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     runner._clear_session_env(tokens)
 
 
-def test_set_session_env_binds_durable_session_id_and_profile():
-    """Gateway child tools receive the identity of the owning chat turn."""
+def test_set_session_env_exports_durable_session_id():
+    """Gateway child tools receive the durable identity of the owning turn."""
     runner = object.__new__(GatewayRunner)
     source = SessionSource(
         platform=Platform.SLACK,
         chat_id="C123",
         chat_type="group",
-        profile="overlord",
     )
     context = build_session_context(
         source,
         GatewayConfig(),
         SessionEntry(
-            session_key="agent:overlord:slack:group:C123",
-            session_id="session-overlord-123",
+            session_key="agent:main:slack:group:C123",
+            session_id="session-main-123",
             created_at=datetime.now(),
             updated_at=datetime.now(),
         ),
@@ -99,39 +98,39 @@ def test_set_session_env_binds_durable_session_id_and_profile():
 
     tokens = runner._set_session_env(context)
     try:
-        assert get_session_env("HERMES_SESSION_PROFILE") == "overlord"
-        assert get_session_env("HERMES_SESSION_ID") == "session-overlord-123"
+        assert get_session_env("HERMES_SESSION_ID") == "session-main-123"
     finally:
         runner._clear_session_env(tokens)
 
 
-@pytest.mark.parametrize(
-    ("configured", "legacy_configured", "expected"),
-    [
-        ("OverLord", "legacy", "overlord"),
-        ("", "Legacy", "legacy"),
-        ("../outside", "legacy", None),
-        ("/absolute", "legacy", None),
-        ("root", "legacy", None),
-        ("bad/name", "legacy", None),
-    ],
-)
-def test_gateway_construction_validates_runtime_profile_for_context_export(
-    monkeypatch, configured, legacy_configured, expected
-):
-    """Launch configuration is canonicalized or rejected before tool export."""
-    monkeypatch.setenv("HERMES_PROFILE", configured)
-    monkeypatch.setenv("HERMES_AGENT_PROFILE", legacy_configured)
 
-    runner = GatewayRunner(GatewayConfig())
-
-    assert runner._configured_runtime_profile_name == expected
-
-
-def test_set_session_env_keeps_default_context_profile_empty(monkeypatch):
-    """Without a configured runtime or route, export retains the default blank."""
-    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+def test_set_session_env_uses_launch_profile_after_environment_mutation(monkeypatch):
+    """A dedicated gateway retains its validated launch identity per turn."""
+    monkeypatch.setenv("HERMES_PROFILE", "OverLord")
     monkeypatch.delenv("HERMES_AGENT_PROFILE", raising=False)
+    runner = GatewayRunner(GatewayConfig(multiplex_profiles=False))
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="8248703757",
+        chat_type="dm",
+        user_id="8248703757",
+    )
+    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+    monkeypatch.setenv("HERMES_PROFILE", "rebound")
+
+    tokens = runner._set_session_env(context)
+    try:
+        assert get_session_env("HERMES_SESSION_PROFILE") == "overlord"
+    finally:
+        runner._clear_session_env(tokens)
+
+
+def test_set_session_env_drops_invalid_launch_profile_instead_of_legacy_fallback(
+    monkeypatch,
+):
+    """An invalid primary launch identity fails closed before tool export."""
+    monkeypatch.setenv("HERMES_PROFILE", "../outside")
+    monkeypatch.setenv("HERMES_AGENT_PROFILE", "legacy")
     runner = GatewayRunner(GatewayConfig(multiplex_profiles=False))
     source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="group")
     context = SessionContext(source=source, connected_platforms=[], home_channels={})
@@ -143,28 +142,15 @@ def test_set_session_env_keeps_default_context_profile_empty(monkeypatch):
         runner._clear_session_env(tokens)
 
 
-def test_set_session_env_exports_runtime_profile_without_mutating_source(monkeypatch):
-    """A single-profile process exports its identity but leaves routing untouched."""
-    monkeypatch.setenv("HERMES_PROFILE", "OverLord")
-    monkeypatch.delenv("HERMES_AGENT_PROFILE", raising=False)
-    runner = GatewayRunner(GatewayConfig(multiplex_profiles=False))
-    source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="group")
-    context = SessionContext(source=source, connected_platforms=[], home_channels={})
-
-    tokens = runner._set_session_env(context)
-    try:
-        assert source.profile is None
-        assert get_session_env("HERMES_SESSION_PROFILE") == "overlord"
-    finally:
-        runner._clear_session_env(tokens)
-
-
-def test_set_session_env_prefers_routed_profile_over_runtime_profile(monkeypatch):
-    """An explicit route remains authoritative over process identity."""
+def test_set_session_env_prefers_routed_profile_over_launch_identity(monkeypatch):
+    """An explicit profile route is authoritative over gateway execution identity."""
     monkeypatch.setenv("HERMES_PROFILE", "overlord")
     runner = GatewayRunner(GatewayConfig(multiplex_profiles=False))
     source = SessionSource(
-        platform=Platform.SLACK, chat_id="C123", chat_type="group", profile="routed"
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="group",
+        profile="routed",
     )
     context = SessionContext(source=source, connected_platforms=[], home_channels={})
 
@@ -175,11 +161,17 @@ def test_set_session_env_prefers_routed_profile_over_runtime_profile(monkeypatch
         runner._clear_session_env(tokens)
 
 
-def test_set_session_env_does_not_export_runtime_profile_for_multiplexed_source(monkeypatch):
-    """A shared adapter never receives a process-identity fallback."""
+def test_set_session_env_does_not_guess_profile_in_multiplex_mode(monkeypatch):
+    """A missing multiplex route fails closed instead of borrowing process profile."""
     monkeypatch.setenv("HERMES_PROFILE", "overlord")
+    monkeypatch.delenv("HERMES_AGENT_PROFILE", raising=False)
     runner = GatewayRunner(GatewayConfig(multiplex_profiles=True))
-    source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="group")
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="D123",
+        chat_type="dm",
+        user_id="U123",
+    )
     context = SessionContext(source=source, connected_platforms=[], home_channels={})
 
     tokens = runner._set_session_env(context)

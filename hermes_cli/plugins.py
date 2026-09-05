@@ -1797,6 +1797,8 @@ class PluginContext:
         description: str = "",
         emoji: str = "",
         override: bool = False,
+        *,
+        inject_invocation_context: bool = False,
     ) -> Optional[PluginRegistration]:
         """Register a tool in the global registry **and** track it as plugin-provided.
 
@@ -1804,6 +1806,11 @@ class PluginContext:
         same name (e.g. swap the default ``browser_navigate`` for a custom
         CDP-backed implementation). Without it, attempting to register a name
         already claimed by a different toolset is rejected.
+
+        ``inject_invocation_context=True`` opts this handler into an
+        immutable ``ToolInvocationContext`` keyword containing host-owned
+        gateway identity. It is empty outside a bound gateway session, so
+        identity-sensitive plugins must fail closed.
 
         ``override=True`` against a built-in tool requires the operator to
         opt in via ``plugins.entries.<plugin_id>.allow_tool_override: true``
@@ -1844,6 +1851,7 @@ class PluginContext:
             is_async=is_async,
             description=description,
             emoji=emoji,
+            inject_invocation_context=inject_invocation_context,
             override=override,
             scope=scope,
         )

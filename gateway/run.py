@@ -7800,7 +7800,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # /reasoning, /fast overrides; per-turn sidecar notes; ephemeral
         # context pin; last-delivered voice-channel context) lives on
         # SessionState.conversation — see gateway/session_state.py.
-        # This is execution identity only.  It is validated at the process
+        # This is execution identity only. It is validated at the process
         # boundary and exported to child tools for a non-multiplexed session;
         # inbound profile routing remains solely on SessionSource.profile.
         configured_runtime_profile = (
@@ -27743,6 +27743,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        _source_profile = str(getattr(context.source, "profile", "") or "").strip()
+        if not _source_profile and not getattr(
+            getattr(self, "config", None), "multiplex_profiles", False
+        ):
+            # Dedicated gateways often have no explicit profile route on their
+            # SessionSource. Bind the process profile owned by this gateway so
+            # plugin tools receive the real agent identity instead of an empty
+            # field. Multiplex gateways must resolve a route and never borrow
+            # the process profile for an unbound source.
+            _source_profile = getattr(self, "_configured_runtime_profile_name", None) or ""
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -27758,17 +27768,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             session_id=context.session_id or "",
             message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=(
-                getattr(context.source, "profile", "")
-                or (
-                    getattr(self, "_configured_runtime_profile_name", None)
-                    if not getattr(
-                        getattr(self, "config", None), "multiplex_profiles", False
-                    )
-                    else ""
-                )
-                or ""
-            ),
+            profile=_source_profile,
             async_delivery=_async_delivery,
             cron_session="",
         )
