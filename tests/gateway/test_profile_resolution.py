@@ -371,6 +371,18 @@ class TestAdapterToSessionKeyIntegration:
         # A default-profile key would land in agent:main — must differ.
         assert key != build_session_key(source, profile=None)
 
+    def test_single_profile_runtime_does_not_stamp_source_profile(self, monkeypatch):
+        """Execution identity is exported later, not repurposed for routing."""
+        monkeypatch.setenv("HERMES_PROFILE", "overlord")
+        monkeypatch.delenv("HERMES_AGENT_PROFILE", raising=False)
+        runner = GatewayRunner(GatewayConfig(multiplex_profiles=False))
+        adapter = _stub_adapter(Platform.SLACK, runner)
+
+        source = adapter.build_source(chat_id="C123", chat_type="group")
+
+        assert source.profile is None
+
+
     @pytest.mark.asyncio
     async def test_adapter_drops_rejected_route_before_dispatch(self, mock_runner):
         mock_runner.config.multiplex_profile_allowlist = []

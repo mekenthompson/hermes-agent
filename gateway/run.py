@@ -7800,6 +7800,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # /reasoning, /fast overrides; per-turn sidecar notes; ephemeral
         # context pin; last-delivered voice-channel context) lives on
         # SessionState.conversation — see gateway/session_state.py.
+        # This is execution identity only.  It is validated at the process
+        # boundary and exported to child tools for a non-multiplexed session;
+        # inbound profile routing remains solely on SessionSource.profile.
+        configured_runtime_profile = (
+            os.getenv("HERMES_PROFILE")
+            or os.getenv("HERMES_AGENT_PROFILE")
+            or ""
+        )
+        try:
+            from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+            configured_runtime_profile = normalize_profile_name(
+                configured_runtime_profile
+            )
+            validate_profile_name(configured_runtime_profile)
+        except (ImportError, ValueError):
+            configured_runtime_profile = ""
+        self._configured_runtime_profile_name = configured_runtime_profile or None
         self._kanban_notifier_profile = self._active_profile_name()
         # Launch-time identity of the profile that owns ``self.adapters``;
         # ``_authorization_adapter`` compares against this rather than the
@@ -27738,8 +27756,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(context.source.user_name) if context.source.user_name else "",
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             session_key=context.session_key,
+            session_id=context.session_id or "",
             message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
+            profile=(
+                getattr(context.source, "profile", "")
+                or (
+                    getattr(self, "_configured_runtime_profile_name", None)
+                    if not getattr(
+                        getattr(self, "config", None), "multiplex_profiles", False
+                    )
+                    else ""
+                )
+                or ""
+            ),
             async_delivery=_async_delivery,
             cron_session="",
         )
