@@ -1,5 +1,9 @@
-import { describe, expect, it, vi } from 'vitest'
+import http from 'node:http'
 
+import { describe, expect, it, vi } from 'vitest'
+import { WebSocketServer } from 'ws'
+
+import { mintGatewayWsTicketWithSessionToken } from './gateway-ticket-transport'
 import {
   applyRemoteRequestHeaders,
   createRegistryGatewayWsUrlHandler,
@@ -15,16 +19,18 @@ const accessHeaders = {
 function createHarness(connection: RegistryGatewayWsConnection) {
   const store = createRemoteWsHeaderStore()
   const ensureBackend = vi.fn(async () => connection)
+  const mintConfiguredTokenTicket = vi.fn(async () => 'configured-token-ticket')
   const mintTicket = vi.fn(async () => 'fresh-ticket')
 
   const handler = createRegistryGatewayWsUrlHandler({
     ensureBackend,
+    mintConfiguredTokenTicket,
     mintTicket,
     buildTicketUrl: baseUrl => `${baseUrl.replace(/^https:/, 'wss:')}/api/ws?region=us&ticket=fresh-ticket&profile=old`,
     rememberHeaders: store.remember
   })
 
-  return { ensureBackend, handler, mintTicket, store }
+  return { ensureBackend, handler, mintConfiguredTokenTicket, mintTicket, store }
 }
 
 function expectRequestHeaders(
@@ -105,29 +111,192 @@ describe('registry gateway WebSocket headers', () => {
     expect(store.headersFor(thirdUrl)).toEqual(accessHeaders)
   })
 
-  it('token path binds headers to the exact profile scoped URL', async () => {
-    const { ensureBackend, handler, mintTicket, store } = createHarness({
-      authMode: 'token',
-      baseUrl: 'https://gateway.example',
-      wsUrl: 'wss://gateway.example/api/ws?token=secret&trace=one&profile=old',
-      headers: accessHeaders,
-      profile: 'research',
-      sharedRemote: true
+  it('configured-token registry reconnect mints fresh scoped tickets through the production transport', async () => {
+    const requests: http.IncomingHttpHeaders[] = []
+    const unusedTickets = new Set<string>()
+
+    const server = http.createServer((request, response) => {
+      requests.push(request.headers)
+      const ticket = `one-use-ticket-${requests.length}`
+      unusedTickets.add(ticket)
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ ticket }))
     })
 
-    const result = await handler({ connectionId: 'remote-one', profile: 'research' })
-    const expectedUrl = 'wss://gateway.example/api/ws?token=secret&trace=one&profile=research'
+    const socketServer = new WebSocketServer({ noServer: true })
+    server.on('upgrade', (request, socket, head) => {
+      const ticket = new URL(request.url || '/', 'http://127.0.0.1').searchParams.get('ticket')
 
-    expect(result).toBe(expectedUrl)
-    expect(ensureBackend).toHaveBeenCalledWith('remote-one', 'research')
+      if (!ticket || !unusedTickets.delete(ticket)) {
+        socket.end('HTTP/1.1 401 Unauthorized\r\n\r\n')
+
+        return
+      }
+
+      socketServer.handleUpgrade(request, socket, head, webSocket => {
+        webSocket.send('ready')
+      })
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    expect(address && typeof address === 'object').toBeTruthy()
+    const baseUrl = `http://127.0.0.1:${(address as any).port}`
+
+    const storedConnections = new Map<string, RegistryGatewayWsConnection>([
+      [
+        'remote-one',
+        {
+          authMode: 'token',
+          baseUrl,
+          headers: { 'X-Remote-Scope': 'one' },
+          mode: 'remote',
+          profile: 'research',
+          remoteKind: 'url',
+          sharedRemote: true,
+          token: 'remote-one-secret',
+          wsUrl: 'ws://127.0.0.1/stale?ticket=already-consumed'
+        }
+      ],
+      [
+        'remote-two',
+        {
+          authMode: 'token',
+          baseUrl,
+          headers: accessHeaders,
+          mode: 'remote',
+          profile: 'research',
+          remoteKind: 'url',
+          sharedRemote: true,
+          token: 'remote-two-secret',
+          wsUrl: 'ws://127.0.0.1/stale?ticket=already-consumed'
+        }
+      ]
+    ])
+
+    const store = createRemoteWsHeaderStore()
+    const ensureBackend = vi.fn(async (connectionId: unknown) => storedConnections.get(String(connectionId))!)
+
+    const handler = createRegistryGatewayWsUrlHandler({
+      ensureBackend,
+      mintConfiguredTokenTicket: (connection: any) =>
+        mintGatewayWsTicketWithSessionToken(connection.baseUrl, connection.token, connection.headers),
+      mintTicket: async () => {
+        throw new Error('OAuth ticket transport must not receive configured-token connections')
+      },
+      buildTicketUrl: (url, ticket) => `${url.replace('http:', 'ws:')}/api/ws?ticket=${ticket}`,
+      rememberHeaders: store.remember
+    })
+
+    const connectOnce = (url: string) =>
+      new Promise<void>((resolve, reject) => {
+        const socket = new WebSocket(url)
+        socket.addEventListener('message', () => {
+          socket.close()
+          resolve()
+        })
+        socket.addEventListener('error', () => reject(new Error('one-use WebSocket upgrade failed')))
+      })
+
+    try {
+      const initial = await handler({ connectionId: 'remote-two', profile: 'research' })
+      const reconnect = await handler({ connectionId: 'remote-two', profile: 'research' })
+
+      await connectOnce(initial)
+      await connectOnce(reconnect)
+
+      expect(ensureBackend).toHaveBeenNthCalledWith(1, 'remote-two', 'research')
+      expect(ensureBackend).toHaveBeenNthCalledWith(2, 'remote-two', 'research')
+      expect(requests).toHaveLength(2)
+
+      for (const request of requests) {
+        expect(request['x-hermes-session-token']).toBe('remote-two-secret')
+        expect(request['cf-access-client-id']).toBe('client-id')
+        expect(request['cf-access-client-secret']).toBe('client-secret')
+        expect(request['x-remote-scope']).toBeUndefined()
+      }
+
+      expect(initial).toContain('ticket=one-use-ticket-1')
+      expect(reconnect).toContain('ticket=one-use-ticket-2')
+      expect(initial).not.toContain('remote-two-secret')
+      expect(reconnect).not.toContain('remote-two-secret')
+      expect(initial).not.toContain('token=')
+      expect(reconnect).not.toContain('token=')
+      expect(store.headersFor(initial)).toEqual(accessHeaders)
+      expect(store.headersFor(reconnect)).toEqual(accessHeaders)
+      expectRequestHeaders(store, reconnect, accessHeaders)
+      expectNoHeadersForNearbyUrls(store, reconnect)
+      expect(unusedTickets).toEqual(new Set())
+    } finally {
+      socketServer.close()
+      await new Promise<void>((resolve, reject) => server.close(error => (error ? reject(error) : resolve())))
+    }
+  })
+
+  it('SSH remotes reuse the tunnel process-token URL and never mint a ticket', async () => {
+    // hermes serve --host 127.0.0.1 behind an SSH tunnel runs with the auth
+    // gate off: POST /api/auth/ws-ticket has no session and answers 401, so
+    // the legacy ?token= URL is the only WS credential that works there.
+    const connection: RegistryGatewayWsConnection = {
+      authMode: 'token',
+      baseUrl: 'http://127.0.0.1:45611',
+      mode: 'remote',
+      profile: 'research',
+      remoteKind: 'ssh',
+      token: 'ssh-process-token',
+      wsAuthTransport: 'token',
+      wsUrl: 'ws://127.0.0.1:45611/api/ws?token=ssh-process-token'
+    }
+
+    const { handler, mintConfiguredTokenTicket, mintTicket } = createHarness(connection)
+
+    const wsUrl = await handler({ connectionId: 'ssh-one', profile: 'research' })
+
+    expect(mintConfiguredTokenTicket).not.toHaveBeenCalled()
     expect(mintTicket).not.toHaveBeenCalled()
-    expect(store.headersFor(result)).toEqual(accessHeaders)
-    expectRequestHeaders(store, result, accessHeaders)
-    expectNoHeadersForNearbyUrls(store, result)
+    expect(wsUrl).toContain('token=ssh-process-token')
+    expect(wsUrl).not.toContain('ticket=')
+  })
+
+  it('SSH remotes without a recorded transport still skip ticket minting', async () => {
+    const connection: RegistryGatewayWsConnection = {
+      authMode: 'token',
+      baseUrl: 'http://127.0.0.1:45611',
+      mode: 'remote',
+      remoteKind: 'ssh',
+      token: 'ssh-process-token',
+      wsUrl: 'ws://127.0.0.1:45611/api/ws?token=ssh-process-token'
+    }
+
+    const { handler, mintConfiguredTokenTicket, mintTicket } = createHarness(connection)
+
+    const wsUrl = await handler({ connectionId: 'ssh-one' })
+
+    expect(mintConfiguredTokenTicket).not.toHaveBeenCalled()
+    expect(mintTicket).not.toHaveBeenCalled()
+    expect(wsUrl).toBe(connection.wsUrl)
+  })
+
+  it('non-gated URL remotes recorded as token transport keep their cached URL', async () => {
+    const connection: RegistryGatewayWsConnection = {
+      authMode: 'token',
+      baseUrl: 'http://gateway.internal:8642',
+      mode: 'remote',
+      remoteKind: 'url',
+      token: 'configured-token',
+      wsAuthTransport: 'token',
+      wsUrl: 'ws://gateway.internal:8642/api/ws?token=configured-token'
+    }
+
+    const { handler, mintConfiguredTokenTicket } = createHarness(connection)
+
+    const wsUrl = await handler({ connectionId: 'url-one' })
+
+    expect(mintConfiguredTokenTicket).not.toHaveBeenCalled()
+    expect(wsUrl).toBe(connection.wsUrl)
   })
 
   it('OAuth path binds headers to the exact fresh profile scoped URL', async () => {
-    const { handler, mintTicket, store } = createHarness({
+    const { handler, mintConfiguredTokenTicket, mintTicket, store } = createHarness({
       authMode: 'oauth',
       baseUrl: 'https://gateway.example',
       wsUrl: 'wss://gateway.example/api/ws?ticket=stale',
@@ -142,15 +311,17 @@ describe('registry gateway WebSocket headers', () => {
     expect(result).toBe(expectedUrl)
     expect(mintTicket).toHaveBeenCalledOnce()
     expect(mintTicket).toHaveBeenCalledWith('https://gateway.example', accessHeaders)
+    expect(mintConfiguredTokenTicket).not.toHaveBeenCalled()
     expect(store.headersFor(result)).toEqual(accessHeaders)
     expectRequestHeaders(store, result, accessHeaders)
     expectNoHeadersForNearbyUrls(store, result)
   })
 
   it('sharedRemote false preserves the original URL and exact header behavior', async () => {
-    const { handler, store } = createHarness({
+    const { handler, mintConfiguredTokenTicket, store } = createHarness({
       authMode: 'token',
       baseUrl: 'https://gateway.example',
+      mode: 'local',
       wsUrl: 'wss://gateway.example/api/ws?trace=one&token=secret',
       headers: accessHeaders,
       profile: 'research',
@@ -160,6 +331,7 @@ describe('registry gateway WebSocket headers', () => {
     const result = await handler({ connectionId: 'remote-one', profile: 'research' })
 
     expect(result).toBe('wss://gateway.example/api/ws?trace=one&token=secret')
+    expect(mintConfiguredTokenTicket).not.toHaveBeenCalled()
     expect(store.headersFor(result)).toEqual(accessHeaders)
     expectRequestHeaders(store, result, accessHeaders)
     expect(store.headersFor('wss://gateway.example/api/ws?token=secret&trace=one')).toEqual({})

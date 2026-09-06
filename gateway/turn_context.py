@@ -56,8 +56,6 @@ class TurnContext:
     # display_kind of the persisted user row for a self-injected turn; DB-only, never sent.
     # "internal_notification" for async-delegation/background notifications (#82888).
     persist_user_display_kind: Optional[str] = None
-    # Opaque profile-local plugin execution id; binds the live agent to one exact Stop target.
-    internal_plugin_execution_id: Optional[str] = None
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None

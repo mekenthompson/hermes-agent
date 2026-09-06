@@ -128,6 +128,30 @@ class TestWsTicketEndpoint:
         # returns either 401 or 302. Either is fine.
         assert r.status_code in (302, 401)
 
+    def test_explicit_token_mints_single_use_ticket_without_entering_ws_url(self, gated_app, monkeypatch):
+        configured_token = "desktop-session-token-0123456789abcdef"
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN", configured_token)
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", True, raising=False)
+
+        response = gated_app.post(
+            "/api/auth/ws-ticket",
+            headers={web_server._SESSION_HEADER_NAME: configured_token},
+        )
+
+        assert response.status_code == 200
+        ticket = response.json()["ticket"]
+        first = _fake_ws(query={"ticket": ticket})
+        replay = _fake_ws(query={"ticket": ticket})
+        direct = _fake_ws(query={"token": configured_token})
+
+        assert _web_server_chat._ws_auth_ok(first) is True
+        assert first._hermes_auth_identity == {
+            "user_id": "dashboard-session-token",
+            "provider": "dashboard-session-token",
+        }
+        assert _web_server_chat._ws_auth_ok(replay) is False
+        assert _web_server_chat._ws_auth_ok(direct) is False
+
 
     def test_get_method_is_not_allowed(self, gated_app):
         _logged_in(gated_app)

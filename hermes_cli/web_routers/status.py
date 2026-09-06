@@ -299,6 +299,11 @@ def _auth_gate_status() -> Dict[str, Any]:
             auth_flows.append("cookie")
             if _list_session_providers():
                 auth_flows.append("native_pkce")
+            # The OAuth gate remains engaged; this advertises the separately
+            # configured administrator-token transport used by native Desktop.
+            from hermes_cli.web_server import _SESSION_TOKEN_IS_EXPLICIT
+            if _SESSION_TOKEN_IS_EXPLICIT:
+                auth_flows.append("dashboard_session_token")
     except Exception:
         # Module not importable yet (early startup) — leave as [].
         pass

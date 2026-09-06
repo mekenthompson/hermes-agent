@@ -1964,7 +1964,6 @@ class GatewayTurnMixin:
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 message_type=event.message_type,
-                internal_plugin_execution_id=getattr(event, "_internal_plugin_execution_id", None),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -2937,15 +2936,7 @@ class GatewayTurnMixin:
                 session_key or "", run_generation,
             )
             return
-        if not self._promote_running_agent(
-            session_key=session_key, run_generation=run_generation, agent=agent_holder[0],
-            internal_plugin_execution_id=turn_ctx.internal_plugin_execution_id,
-        ):
-            logger.info(
-                "Skipping agent promotion for %s — session state changed before binding",
-                session_key or "",
-            )
-            return
+        self._session_state(session_key).turn.agent = agent_holder[0]
         if self._draining:
             self._update_runtime_status("draining")
 
@@ -3788,7 +3779,6 @@ class GatewayTurnMixin:
         channel_prompt: Optional[str] = None, moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
-        internal_plugin_execution_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -3812,7 +3802,6 @@ class GatewayTurnMixin:
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
-            internal_plugin_execution_id=internal_plugin_execution_id,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
