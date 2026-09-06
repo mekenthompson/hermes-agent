@@ -1,3 +1,4 @@
+import { connectionUsesWsTicket } from './connection-config'
 import { registryGatewayWsUrl } from './plugin-profile-routes'
 
 export interface RegistryGatewayWsConnection {
@@ -6,6 +7,7 @@ export interface RegistryGatewayWsConnection {
   mode?: 'local' | 'remote'
   remoteKind?: 'cloud' | 'ssh' | 'url'
   token?: null | string
+  wsAuthTransport?: 'ticket' | 'token'
   wsUrl: string
   headers?: Record<string, string>
   profile?: null | string
@@ -87,11 +89,15 @@ export function createRegistryGatewayWsUrlHandler(dependencies: RegistryGatewayW
     const connection = await dependencies.ensureBackend(connectionId, profile)
     let wsUrl = connection.wsUrl
 
-    if (connection.authMode === 'oauth' || (connection.mode === 'remote' && connection.remoteKind !== 'ssh')) {
+    // SSH remotes and non-gated gateways keep their cached process-token URL;
+    // OAuth and configured-token gateways that advertise the session-token flow
+    // re-mint a single-use ticket before every connect.
+    if (connectionUsesWsTicket(connection)) {
       const ticket =
         connection.authMode === 'oauth'
           ? await dependencies.mintTicket(connection.baseUrl, connection.headers)
           : await dependencies.mintConfiguredTokenTicket(connection)
+
       wsUrl = dependencies.buildTicketUrl(connection.baseUrl, ticket)
     }
 

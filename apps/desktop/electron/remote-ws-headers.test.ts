@@ -232,6 +232,69 @@ describe('registry gateway WebSocket headers', () => {
     }
   })
 
+  it('SSH remotes reuse the tunnel process-token URL and never mint a ticket', async () => {
+    // hermes serve --host 127.0.0.1 behind an SSH tunnel runs with the auth
+    // gate off: POST /api/auth/ws-ticket has no session and answers 401, so
+    // the legacy ?token= URL is the only WS credential that works there.
+    const connection: RegistryGatewayWsConnection = {
+      authMode: 'token',
+      baseUrl: 'http://127.0.0.1:45611',
+      mode: 'remote',
+      profile: 'research',
+      remoteKind: 'ssh',
+      token: 'ssh-process-token',
+      wsAuthTransport: 'token',
+      wsUrl: 'ws://127.0.0.1:45611/api/ws?token=ssh-process-token'
+    }
+
+    const { handler, mintConfiguredTokenTicket, mintTicket } = createHarness(connection)
+
+    const wsUrl = await handler({ connectionId: 'ssh-one', profile: 'research' })
+
+    expect(mintConfiguredTokenTicket).not.toHaveBeenCalled()
+    expect(mintTicket).not.toHaveBeenCalled()
+    expect(wsUrl).toContain('token=ssh-process-token')
+    expect(wsUrl).not.toContain('ticket=')
+  })
+
+  it('SSH remotes without a recorded transport still skip ticket minting', async () => {
+    const connection: RegistryGatewayWsConnection = {
+      authMode: 'token',
+      baseUrl: 'http://127.0.0.1:45611',
+      mode: 'remote',
+      remoteKind: 'ssh',
+      token: 'ssh-process-token',
+      wsUrl: 'ws://127.0.0.1:45611/api/ws?token=ssh-process-token'
+    }
+
+    const { handler, mintConfiguredTokenTicket, mintTicket } = createHarness(connection)
+
+    const wsUrl = await handler({ connectionId: 'ssh-one' })
+
+    expect(mintConfiguredTokenTicket).not.toHaveBeenCalled()
+    expect(mintTicket).not.toHaveBeenCalled()
+    expect(wsUrl).toBe(connection.wsUrl)
+  })
+
+  it('non-gated URL remotes recorded as token transport keep their cached URL', async () => {
+    const connection: RegistryGatewayWsConnection = {
+      authMode: 'token',
+      baseUrl: 'http://gateway.internal:8642',
+      mode: 'remote',
+      remoteKind: 'url',
+      token: 'configured-token',
+      wsAuthTransport: 'token',
+      wsUrl: 'ws://gateway.internal:8642/api/ws?token=configured-token'
+    }
+
+    const { handler, mintConfiguredTokenTicket } = createHarness(connection)
+
+    const wsUrl = await handler({ connectionId: 'url-one' })
+
+    expect(mintConfiguredTokenTicket).not.toHaveBeenCalled()
+    expect(wsUrl).toBe(connection.wsUrl)
+  })
+
   it('OAuth path binds headers to the exact fresh profile scoped URL', async () => {
     const { handler, mintConfiguredTokenTicket, mintTicket, store } = createHarness({
       authMode: 'oauth',

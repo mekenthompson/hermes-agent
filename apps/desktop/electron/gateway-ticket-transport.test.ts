@@ -13,6 +13,7 @@ async function withTicketFixture(
   run: (baseUrl: string, requests: CapturedRequest[]) => Promise<void>
 ) {
   const requests: CapturedRequest[] = []
+
   const server = http.createServer((request, response) => {
     const chunks: Buffer[] = []
     request.on('data', chunk => chunks.push(Buffer.from(chunk)))
@@ -44,12 +45,14 @@ test('configured-token production ticket transport mints distinct initial and re
 
     assert.notEqual(initialTicket, reconnectTicket)
     assert.equal(requests.length, 2)
+
     for (const request of requests) {
       assert.equal(request.headers['x-hermes-session-token'], token)
       assert.equal(request.headers['x-custom-gateway-header'], 'custom-value')
       assert.equal(request.method, 'POST')
       assert.equal(request.body, '')
     }
+
     for (const url of urls) {
       assert.match(url, /\?ticket=ticket-[12]$/)
       assert.doesNotMatch(url, /persistent-gateway-secret|[?&]token=/)
@@ -64,14 +67,17 @@ test('configured-token production ticket transport preserves real HTTP 401/403 v
         () => mintGatewayWsTicketWithSessionToken(baseUrl, 'persistent-gateway-secret'),
         (error: any) => {
           assert.equal(error.statusCode, statusCode)
+
           const classified: any = configuredGatewayTokenTicketFailure(
             error,
             'configured token rejected',
             'gateway unavailable'
           )
+
           assert.equal(classified.statusCode, statusCode)
           assert.equal(classified.needsConfiguredGatewayToken, statusCode === 401 || statusCode === 403 ? true : undefined)
           assert.match(classified.message, statusCode === 401 || statusCode === 403 ? /token rejected/ : /unavailable/)
+
           return true
         }
       )

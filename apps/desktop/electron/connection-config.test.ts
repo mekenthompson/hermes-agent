@@ -23,11 +23,13 @@ import {
   buildGatewayWsUrlWithTicket,
   configuredGatewayTokenTicketFailure,
   connectionScopeKey,
+  connectionUsesWsTicket,
   cookiesHaveLiveSession,
   cookiesHavePrivyAccessToken,
   cookiesHavePrivySession,
   cookiesHaveSession,
   gatewayTicketFailure,
+  gatewayWsAuthTransport,
   gatewayWsUrlIpcResult,
   isGatewayAuthRejection,
   localProfileEntry,
@@ -50,6 +52,7 @@ import {
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
   savedProfileSsh,
+  statusAdvertisesDashboardSessionToken,
   tokenPreview,
   translateSelfProfileQuery,
   withTransientRetries
@@ -1158,6 +1161,27 @@ test('resolveTestWsUrl (token mode) reports a rejected configured token without 
   )
 })
 
+test('resolveTestWsUrl (token transport) keeps the legacy ?token= URL and never mints', async () => {
+  const processToken = 'ssh-tunnel-process-token'
+  let mintCalls = 0
+
+  const url = await resolveTestWsUrl('http://127.0.0.1:45611', 'token', processToken, {
+    mintTicket: async () => {
+      mintCalls += 1
+
+      return 'unexpected-ticket'
+    },
+    wsAuthTransport: 'token'
+  })
+
+  assert.equal(mintCalls, 0)
+  assert.equal(url, `ws://127.0.0.1:45611/api/ws?token=${processToken}`)
+})
+
+test('resolveTestWsUrl (token transport, no token) still returns null', async () => {
+  assert.equal(await resolveTestWsUrl('http://127.0.0.1:45611', 'token', null, { wsAuthTransport: 'token' }), null)
+})
+
 test('resolveTestWsUrl (token mode, no token) returns null — genuine skip', async () => {
   assert.equal(await resolveTestWsUrl('https://gw.example.com', 'token', null), null)
 })
@@ -1402,4 +1426,58 @@ test('configured-token ticket rejection preserves HTTP status without requesting
       ok: false
     })
   }
+})
+
+// --- gatewayWsAuthTransport / connectionUsesWsTicket ---
+//
+// The ticket transport only works against a gated gateway that populates a
+// session for POST /api/auth/ws-ticket. SSH remotes reach a loopback
+// ``hermes serve`` through a tunnel with the gate off, so minting there 401s
+// and must never be attempted (the regression an independent review caught).
+
+test('statusAdvertisesDashboardSessionToken reads the auth_flows capability', () => {
+  assert.equal(statusAdvertisesDashboardSessionToken({ auth_flows: ['cookie', 'dashboard_session_token'] }), true)
+  assert.equal(statusAdvertisesDashboardSessionToken({ auth_flows: ['cookie'] }), false)
+  assert.equal(statusAdvertisesDashboardSessionToken({ auth_required: false }), false)
+  assert.equal(statusAdvertisesDashboardSessionToken(null), false)
+})
+
+test('gatewayWsAuthTransport: OAuth always mints tickets', () => {
+  assert.equal(gatewayWsAuthTransport({ authMode: 'oauth', remoteKind: 'url' }), 'ticket')
+  assert.equal(gatewayWsAuthTransport({ authMode: 'oauth', remoteKind: 'cloud', statusBody: {} }), 'ticket')
+})
+
+test('gatewayWsAuthTransport: SSH remotes keep the legacy token URL even when a status advertises the flow', () => {
+  assert.equal(gatewayWsAuthTransport({ authMode: 'token', remoteKind: 'ssh' }), 'token')
+  assert.equal(
+    gatewayWsAuthTransport({
+      authMode: 'token',
+      remoteKind: 'ssh',
+      statusBody: { auth_flows: ['cookie', 'dashboard_session_token'], auth_required: true }
+    }),
+    'token'
+  )
+})
+
+test('gatewayWsAuthTransport: URL/cloud token remotes mint only when the gateway advertises dashboard_session_token', () => {
+  const advertised = { auth_flows: ['cookie', 'dashboard_session_token'], auth_required: true }
+
+  assert.equal(gatewayWsAuthTransport({ authMode: 'token', remoteKind: 'url', statusBody: advertised }), 'ticket')
+  assert.equal(gatewayWsAuthTransport({ authMode: 'token', remoteKind: 'cloud', statusBody: advertised }), 'ticket')
+  // Non-gated loopback / reverse-proxied ``hermes serve``: no session, no ticket.
+  assert.equal(gatewayWsAuthTransport({ authMode: 'token', remoteKind: 'url', statusBody: { auth_required: false } }), 'token')
+  assert.equal(gatewayWsAuthTransport({ authMode: 'token', remoteKind: 'url' }), 'token')
+  assert.equal(gatewayWsAuthTransport({}), 'token')
+})
+
+test('connectionUsesWsTicket honours the recorded transport and falls back to the non-SSH remote rule', () => {
+  assert.equal(connectionUsesWsTicket({ authMode: 'oauth', mode: 'remote', remoteKind: 'url' }), true)
+  assert.equal(connectionUsesWsTicket({ authMode: 'token', mode: 'remote', remoteKind: 'url', wsAuthTransport: 'ticket' }), true)
+  assert.equal(connectionUsesWsTicket({ authMode: 'token', mode: 'remote', remoteKind: 'url', wsAuthTransport: 'token' }), false)
+  assert.equal(connectionUsesWsTicket({ authMode: 'token', mode: 'remote', remoteKind: 'ssh', wsAuthTransport: 'token' }), false)
+  // Legacy descriptors without the field: SSH never minted, other remotes did.
+  assert.equal(connectionUsesWsTicket({ authMode: 'token', mode: 'remote', remoteKind: 'ssh' }), false)
+  assert.equal(connectionUsesWsTicket({ authMode: 'token', mode: 'remote', remoteKind: 'url' }), true)
+  assert.equal(connectionUsesWsTicket({ authMode: 'token', mode: 'local' }), false)
+  assert.equal(connectionUsesWsTicket(null), false)
 })

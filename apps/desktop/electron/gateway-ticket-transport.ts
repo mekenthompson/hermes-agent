@@ -4,6 +4,7 @@ import https from 'node:https'
 function httpStatusError(statusCode: number | undefined, message: string) {
   const error: any = new Error(`${statusCode}: ${message}`)
   error.statusCode = statusCode
+
   return error
 }
 
@@ -36,15 +37,19 @@ async function mintGatewayWsTicketWithSessionToken(baseUrl: string, token: strin
 
           if ((response.statusCode || 500) >= 400) {
             reject(httpStatusError(response.statusCode, text || response.statusMessage || 'HTTP request failed'))
+
             return
           }
 
           try {
             const ticket = JSON.parse(text)?.ticket
+
             if (!ticket || typeof ticket !== 'string') {
               reject(new Error('Gateway did not return a WS ticket.'))
+
               return
             }
+
             resolve(ticket)
           } catch {
             reject(new Error(`Invalid JSON from ${url} (status ${response.statusCode}): ${text.slice(0, 200)}`))

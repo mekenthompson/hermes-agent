@@ -94,14 +94,17 @@ import { applyConnectionChange, sshQuitShouldBlock, teardownSshState } from './c
 import {
   apiRequestRegistryConnectionId,
   authModeFromStatus,
+  buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
   configuredGatewayTokenTicketFailure,
   connectionScopeKey,
+  connectionUsesWsTicket,
   cookiesHaveLiveSession,
   cookiesHavePrivyAccessToken,
   cookiesHavePrivySession,
   cookiesHaveSession,
   gatewayTicketFailure,
+  gatewayWsAuthTransport,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
   localProfileEntry,
@@ -8272,7 +8275,7 @@ async function freshGatewayWsUrl(profile) {
   // legacy callers and single-profile users are unchanged.
   const connection = await ensureBackend(profile)
 
-  if (connection.authMode === 'oauth' || connection.mode === 'remote') {
+  if (connectionUsesWsTicket(connection)) {
     const ticket =
       connection.authMode === 'oauth'
         ? await mintGatewayWsTicket(connection.baseUrl, connection.headers)
@@ -8285,7 +8288,9 @@ async function freshGatewayWsUrl(profile) {
     return wsUrl
   }
 
-  // Local process-token connections retain their legacy cached URL behavior.
+  // Local process-token, SSH-tunnelled, and non-gated remote connections keep
+  // their cached ``?token=`` URL: those backends never populate a session, so a
+  // ticket mint would be rejected (see gatewayWsAuthTransport).
   rememberRemoteWsHeaders(connection.wsUrl, connection.headers)
 
   return connection.wsUrl
@@ -10054,19 +10059,29 @@ async function buildRemoteConnection(
     )
   }
 
-  let ticket
+  const wsAuthTransport = await resolveRemoteWsAuthTransport(baseUrl, remoteKind, remoteHeaders)
+  let wsUrl
 
-  try {
-    ticket = await mintGatewayWsTicketWithSessionToken(baseUrl, token, remoteHeaders)
-  } catch (error) {
-    throw configuredGatewayTokenTicketFailure(
-      error,
-      'The configured gateway session token was rejected. Open Settings → Gateway and save a valid token.',
-      'Could not reach the remote Hermes gateway while refreshing its WebSocket ticket. Try reconnecting.'
-    )
+  if (wsAuthTransport === 'ticket') {
+    let ticket
+
+    try {
+      ticket = await mintGatewayWsTicketWithSessionToken(baseUrl, token, remoteHeaders)
+    } catch (error) {
+      throw configuredGatewayTokenTicketFailure(
+        error,
+        'The configured gateway session token was rejected. Open Settings → Gateway and save a valid token.',
+        'Could not reach the remote Hermes gateway while refreshing its WebSocket ticket. Try reconnecting.'
+      )
+    }
+
+    wsUrl = buildGatewayWsUrlWithTicket(baseUrl, ticket)
+  } else {
+    // SSH tunnels and non-gated gateways: the backend never populates a
+    // session for POST /api/auth/ws-ticket, so the (process-local) token rides
+    // the WS URL exactly as it did before ticket transport existed.
+    wsUrl = buildGatewayWsUrl(baseUrl, token)
   }
-
-  const wsUrl = buildGatewayWsUrlWithTicket(baseUrl, ticket)
 
   rememberRemoteWsHeaders(wsUrl, remoteHeaders)
 
@@ -10080,8 +10095,33 @@ async function buildRemoteConnection(
     remoteKind,
     headers: remoteHeaders,
     token,
+    wsAuthTransport,
     wsUrl
   }
+}
+
+// Decide whether a configured-token remote mints WS tickets or uses the legacy
+// ``?token=`` URL. SSH remotes never probe: they reach a loopback backend
+// through the tunnel whose auth gate is off. Other remotes ask the public
+// ``/api/status`` whether the gateway advertises ``dashboard_session_token``.
+async function resolveRemoteWsAuthTransport(baseUrl, remoteKind, headers = {}) {
+  if (remoteKind === 'ssh') {
+    return gatewayWsAuthTransport({ authMode: 'token', remoteKind })
+  }
+
+  let statusBody = null
+
+  try {
+    statusBody = await fetchPublicJson(`${baseUrl}/api/status`, { headers, timeoutMs: 8_000 })
+  } catch (error) {
+    throw configuredGatewayTokenTicketFailure(
+      error,
+      'The remote Hermes gateway rejected its public status probe. Check the connection settings.',
+      'Could not reach the remote Hermes gateway while checking its authentication mode. Try reconnecting.'
+    )
+  }
+
+  return gatewayWsAuthTransport({ authMode: 'token', remoteKind, statusBody })
 }
 
 const sshConnections = new Map<string, any>()
@@ -11169,6 +11209,7 @@ async function testDesktopConnectionConfig(input: any = {}) {
   let token = null
   let authMode = 'token'
   let testHeaders = {}
+  let remoteKind = 'url'
 
   if (wantRemote && block?.url) {
     baseUrl = normalizeRemoteBaseUrl(block.url)
@@ -11184,6 +11225,7 @@ async function testDesktopConnectionConfig(input: any = {}) {
     token = remote.token
     authMode = normAuthMode(remote.authMode)
     testHeaders = remote.headers || {}
+    remoteKind = remote.remoteKind || 'url'
   }
 
   const status = (await fetchConnectionStatus(baseUrl, authMode, token, testHeaders)) as any
@@ -11199,7 +11241,8 @@ async function testDesktopConnectionConfig(input: any = {}) {
     mintTicket: url =>
       authMode === 'oauth'
         ? mintGatewayWsTicket(url, testHeaders)
-        : mintGatewayWsTicketWithSessionToken(url, token, testHeaders)
+        : mintGatewayWsTicketWithSessionToken(url, token, testHeaders),
+    wsAuthTransport: gatewayWsAuthTransport({ authMode, remoteKind, statusBody: status })
   })
 
   // Skip the WS leg only when the runtime genuinely lacks a WebSocket (so an
@@ -15404,7 +15447,8 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
     mintTicket: url =>
       authMode === 'oauth'
         ? mintGatewayWsTicket(url, testHeaders)
-        : mintGatewayWsTicketWithSessionToken(url, token, testHeaders)
+        : mintGatewayWsTicketWithSessionToken(url, token, testHeaders),
+    wsAuthTransport: gatewayWsAuthTransport({ authMode, statusBody: status })
   })
 
   if (wsUrl && typeof globalThis.WebSocket === 'function') {
