@@ -167,6 +167,7 @@ function configuredGatewayTokenTicketFailure(error, authMessage, transportMessag
   }
 
   err.cause = error
+
   return err
 }
 
@@ -266,6 +267,7 @@ async function resolveTestWsUrl(baseUrl, authMode, token, deps: any = {}) {
         authMode === 'oauth'
           ? 'Reached the gateway over HTTP, but the OAuth session was rejected while minting a WebSocket ticket. Open Settings → Gateway and sign in again.'
           : 'Reached the gateway over HTTP, but the configured gateway session token was rejected. Open Settings → Gateway and save a valid token.'
+
       const transportMessage =
         'Reached the gateway over HTTP, but could not mint a WebSocket ticket. Check the remote gateway connection and try again.'
 
@@ -947,6 +949,7 @@ function authModeFromStatus(statusBody) {
   if (Array.isArray(statusBody?.auth_flows) && statusBody.auth_flows.includes('dashboard_session_token')) {
     return 'token'
   }
+
   return statusBody && statusBody.auth_required ? 'oauth' : 'token'
 }
 
@@ -1049,8 +1052,8 @@ export {
   authModeFromStatus,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
-  connectionScopeKey,
   configuredGatewayTokenTicketFailure,
+  connectionScopeKey,
   cookiesHaveLiveSession,
   cookiesHavePrivyAccessToken,
   cookiesHavePrivySession,

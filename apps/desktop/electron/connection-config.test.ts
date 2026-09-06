@@ -21,8 +21,8 @@ import {
   authModeFromStatus,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
-  connectionScopeKey,
   configuredGatewayTokenTicketFailure,
+  connectionScopeKey,
   cookiesHaveLiveSession,
   cookiesHavePrivyAccessToken,
   cookiesHavePrivySession,
@@ -1122,9 +1122,11 @@ test('tokenPreview returns a masked suffix for long tokens', () => {
 test('resolveTestWsUrl (token mode) mints a ticket and never serializes the configured secret', async () => {
   const configuredToken = 'persistent-gateway-administrator-secret'
   const calls: string[] = []
+
   const url = await resolveTestWsUrl('https://gw.example.com/hermes', 'token', configuredToken, {
     mintTicket: async baseUrl => {
       calls.push(baseUrl)
+
       return 'token-mode-ticket'
     }
   })
@@ -1150,6 +1152,7 @@ test('resolveTestWsUrl (token mode) reports a rejected configured token without 
       assert.equal(error.statusCode, 401)
       assert.equal(error.needsOauthLogin, undefined)
       assert.equal(error.cause, cause)
+
       return true
     }
   )

@@ -1,15 +1,15 @@
 import http from 'node:http'
-import { WebSocketServer } from 'ws'
 
 import { describe, expect, it, vi } from 'vitest'
+import { WebSocketServer } from 'ws'
 
+import { mintGatewayWsTicketWithSessionToken } from './gateway-ticket-transport'
 import {
   applyRemoteRequestHeaders,
   createRegistryGatewayWsUrlHandler,
   createRemoteWsHeaderStore,
   type RegistryGatewayWsConnection
 } from './remote-ws-headers'
-import { mintGatewayWsTicketWithSessionToken } from './gateway-ticket-transport'
 
 const accessHeaders = {
   'CF-Access-Client-Id': 'client-id',
@@ -114,6 +114,7 @@ describe('registry gateway WebSocket headers', () => {
   it('configured-token registry reconnect mints fresh scoped tickets through the production transport', async () => {
     const requests: http.IncomingHttpHeaders[] = []
     const unusedTickets = new Set<string>()
+
     const server = http.createServer((request, response) => {
       requests.push(request.headers)
       const ticket = `one-use-ticket-${requests.length}`
@@ -121,12 +122,14 @@ describe('registry gateway WebSocket headers', () => {
       response.writeHead(200, { 'content-type': 'application/json' })
       response.end(JSON.stringify({ ticket }))
     })
+
     const socketServer = new WebSocketServer({ noServer: true })
     server.on('upgrade', (request, socket, head) => {
       const ticket = new URL(request.url || '/', 'http://127.0.0.1').searchParams.get('ticket')
 
       if (!ticket || !unusedTickets.delete(ticket)) {
         socket.end('HTTP/1.1 401 Unauthorized\r\n\r\n')
+
         return
       }
 
@@ -138,6 +141,7 @@ describe('registry gateway WebSocket headers', () => {
     const address = server.address()
     expect(address && typeof address === 'object').toBeTruthy()
     const baseUrl = `http://127.0.0.1:${(address as any).port}`
+
     const storedConnections = new Map<string, RegistryGatewayWsConnection>([
       [
         'remote-one',
@@ -168,8 +172,10 @@ describe('registry gateway WebSocket headers', () => {
         }
       ]
     ])
+
     const store = createRemoteWsHeaderStore()
     const ensureBackend = vi.fn(async (connectionId: unknown) => storedConnections.get(String(connectionId))!)
+
     const handler = createRegistryGatewayWsUrlHandler({
       ensureBackend,
       mintConfiguredTokenTicket: (connection: any) =>
@@ -180,6 +186,7 @@ describe('registry gateway WebSocket headers', () => {
       buildTicketUrl: (url, ticket) => `${url.replace('http:', 'ws:')}/api/ws?ticket=${ticket}`,
       rememberHeaders: store.remember
     })
+
     const connectOnce = (url: string) =>
       new Promise<void>((resolve, reject) => {
         const socket = new WebSocket(url)
@@ -200,12 +207,14 @@ describe('registry gateway WebSocket headers', () => {
       expect(ensureBackend).toHaveBeenNthCalledWith(1, 'remote-two', 'research')
       expect(ensureBackend).toHaveBeenNthCalledWith(2, 'remote-two', 'research')
       expect(requests).toHaveLength(2)
+
       for (const request of requests) {
         expect(request['x-hermes-session-token']).toBe('remote-two-secret')
         expect(request['cf-access-client-id']).toBe('client-id')
         expect(request['cf-access-client-secret']).toBe('client-secret')
         expect(request['x-remote-scope']).toBeUndefined()
       }
+
       expect(initial).toContain('ticket=one-use-ticket-1')
       expect(reconnect).toContain('ticket=one-use-ticket-2')
       expect(initial).not.toContain('remote-two-secret')

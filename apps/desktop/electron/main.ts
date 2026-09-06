@@ -94,10 +94,9 @@ import { applyConnectionChange, sshQuitShouldBlock, teardownSshState } from './c
 import {
   apiRequestRegistryConnectionId,
   authModeFromStatus,
-  buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
-  connectionScopeKey,
   configuredGatewayTokenTicketFailure,
+  connectionScopeKey,
   cookiesHaveLiveSession,
   cookiesHavePrivyAccessToken,
   cookiesHavePrivySession,
@@ -8278,6 +8277,7 @@ async function freshGatewayWsUrl(profile) {
       connection.authMode === 'oauth'
         ? await mintGatewayWsTicket(connection.baseUrl, connection.headers)
         : await mintGatewayWsTicketWithSessionToken(connection.baseUrl, connection.token, connection.headers)
+
     const wsUrl = buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
 
     rememberRemoteWsHeaders(wsUrl, connection.headers)
