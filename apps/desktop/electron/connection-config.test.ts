@@ -22,6 +22,7 @@ import {
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
   connectionScopeKey,
+  configuredGatewayTokenTicketFailure,
   cookiesHaveLiveSession,
   cookiesHavePrivyAccessToken,
   cookiesHavePrivySession,
@@ -910,6 +911,16 @@ test('authModeFromStatus returns oauth when auth_required is true', () => {
   assert.equal(authModeFromStatus({ auth_required: true, auth_providers: ['nous'] }), 'oauth')
 })
 
+test('authModeFromStatus selects token when the gate advertises a dashboard session token', () => {
+  assert.equal(
+    authModeFromStatus({
+      auth_required: true,
+      auth_flows: ['cookie', 'native_pkce', 'dashboard_session_token']
+    }),
+    'token'
+  )
+})
+
 test('authModeFromStatus returns token when auth_required is false/missing', () => {
   assert.equal(authModeFromStatus({ auth_required: false }), 'token')
   assert.equal(authModeFromStatus({}), 'token')
@@ -1108,9 +1119,40 @@ test('tokenPreview returns a masked suffix for long tokens', () => {
 // and must FAIL (not skip) when an OAuth session can't mint a ws-ticket — that
 // is the exact false-positive PR #39098 set out to eliminate.
 
-test('resolveTestWsUrl (token mode) builds a ?token= URL the WS probe can use', async () => {
-  const url = await resolveTestWsUrl('https://gw.example.com', 'token', 'tok123')
-  assert.equal(url, 'wss://gw.example.com/api/ws?token=tok123')
+test('resolveTestWsUrl (token mode) mints a ticket and never serializes the configured secret', async () => {
+  const configuredToken = 'persistent-gateway-administrator-secret'
+  const calls: string[] = []
+  const url = await resolveTestWsUrl('https://gw.example.com/hermes', 'token', configuredToken, {
+    mintTicket: async baseUrl => {
+      calls.push(baseUrl)
+      return 'token-mode-ticket'
+    }
+  })
+
+  assert.deepEqual(calls, ['https://gw.example.com/hermes'])
+  assert.equal(url, 'wss://gw.example.com/hermes/api/ws?ticket=token-mode-ticket')
+  assert.ok(!url.includes(configuredToken))
+  assert.ok(!url.includes(`token=${configuredToken}`))
+})
+
+test('resolveTestWsUrl (token mode) reports a rejected configured token without requesting OAuth login', async () => {
+  const cause = Object.assign(new Error('rejected'), { statusCode: 401 })
+
+  await assert.rejects(
+    () =>
+      resolveTestWsUrl('https://gw.example.com', 'token', 'configured-token', {
+        mintTicket: async () => {
+          throw cause
+        }
+      }),
+    (error: any) => {
+      assert.match(error.message, /configured gateway session token was rejected/i)
+      assert.equal(error.statusCode, 401)
+      assert.equal(error.needsOauthLogin, undefined)
+      assert.equal(error.cause, cause)
+      return true
+    }
+  )
 })
 
 test('resolveTestWsUrl (token mode, no token) returns null — genuine skip', async () => {
@@ -1341,4 +1383,20 @@ test('OAuth ticket-mint 401 stays on the reauth path (never Cloud-down)', () => 
   assert.equal(wrapped.message, 'auth message')
   assert.equal((wrapped as any).needsOauthLogin, true)
   assert.equal((wrapped as any).statusCode, 401)
+})
+
+test('configured-token ticket rejection preserves HTTP status without requesting OAuth login', async () => {
+  for (const statusCode of [401, 403]) {
+    const source = Object.assign(new Error(`${statusCode}: rejected`), { statusCode })
+    const wrapped = configuredGatewayTokenTicketFailure(source, 'configured token rejected', 'gateway unavailable') as any
+
+    assert.equal(wrapped.needsConfiguredGatewayToken, true)
+    assert.equal(wrapped.needsOauthLogin, undefined)
+    assert.equal(wrapped.statusCode, statusCode)
+    assert.deepEqual(await gatewayWsUrlIpcResult(async () => Promise.reject(wrapped)), {
+      error: 'configured token rejected',
+      needsConfiguredGatewayToken: true,
+      ok: false
+    })
+  }
 })

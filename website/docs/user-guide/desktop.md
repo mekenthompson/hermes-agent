@@ -340,7 +340,7 @@ Side-by-side routing is live: each registered gateway dials its own backends and
 "Remote backend" means a **`hermes serve`** server running on the remote machine — that is the process the desktop app connects to. Nothing in this section works unless that backend is actually up and reachable. The desktop app does not start it for you; you (or a `systemd` service) keep `hermes serve` running on the remote host, and the app attaches to it. If you also use messaging channels (Telegram, Discord, etc.), the **gateway** is a *separate* long-running process you start independently — see the note after the setup steps.
 :::
 
-The connection has two halves: on the backend you protect it with an **auth provider**, and in the app you enter the backend's URL and sign in. Binding the backend to a non-loopback address automatically engages its auth gate, and the provider you configure is what lets the desktop app through.
+The connection has two halves: on the backend you protect it with an **auth provider** or an explicitly configured operator token, and in the app you enter the backend's URL and authenticate. Binding the backend to a non-loopback address automatically engages its auth gate.
 
 **Pick a provider based on where the backend lives:**
 
@@ -382,6 +382,14 @@ Running the backend as a systemd service? Give the unit `EnvironmentFile=%h/.her
 The backend reads and writes your `.env` (API keys, secrets) and can run agent commands. The **username/password** setup shown above is for a trusted network — never expose a password-protected backend directly to the open internet; put it behind a VPN. [Tailscale](https://tailscale.com/) is the clean option: bind to the machine's tailscale IP (`--host <tailscale-ip>`) and use `http://<tailscale-ip>:9119` as the Remote URL so only your tailnet can reach it. To reach a backend over the public internet, use the **OAuth (Nous Portal)** provider instead.
 :::
 
+### Persistent session tokens on a trusted network
+
+For an operator-managed backend on a private network or VPN, configure a unique random `HERMES_DASHBOARD_SESSION_TOKEN` of at least 32 characters through the backend's protected environment or secret manager before starting `hermes serve`. Treat it as a full dashboard administrator credential: never commit or share it, and use HTTPS or an encrypted VPN.
+
+The non-loopback authentication gate remains enabled. `/api/status` advertises `dashboard_session_token` in `auth_flows`; a compatible Desktop build then offers the **Session token** field. Desktop sends the configured token in `X-Hermes-Session-Token` for REST and exchanges it for a fresh, 30-second single-use WebSocket ticket on every connection and reconnect. The persistent token is never placed in a WebSocket URL.
+
+The token remains valid across server restarts while its configured value is unchanged. To rotate it, replace the backend secret, restart the backend, and update the saved Desktop token. Automatically generated process-local tokens do not enable this remote mode.
+
 ### In the app
 
 **Settings → Gateways → Remote gateway:**
@@ -399,7 +407,7 @@ The remote gateway host is configured per [profile](./profiles.md), so each prof
 ### Troubleshooting
 
 - **Sign-in fails with 401 / "Invalid credentials"** — the username or password doesn't match the backend's `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` / `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD`. The backend returns the same generic error for an unknown user and a wrong password (no enumeration oracle), so double-check both. Confirm the gate is on with `curl -s http://<host>:9119/api/status | jq '.auth_required, .auth_providers'` — it should report `true` and include `"basic"`.
-- **No "Sign in" button — it asks for a session token instead** — the backend's username/password provider isn't active. `/api/status` won't list `"basic"` in `auth_providers`. Make sure both the username and a password (or password hash) are set in `~/.hermes/.env` and that the dashboard process actually loaded them.
+- **No "Sign in" button — it asks for a session token instead** — this is expected when `/api/status` advertises `dashboard_session_token` in `auth_flows`: use the configured backend secret. If you intended username/password sign-in instead, confirm its credentials are configured and loaded and that no explicit dashboard token is selecting token mode.
 - **Signed out on every restart** — set `HERMES_DASHBOARD_BASIC_AUTH_SECRET` to a stable value. Without it the token-signing key is regenerated per boot, invalidating all sessions.
 - **Connection refused / times out** — the backend bound to `127.0.0.1` (the default) or a firewall/VPN is blocking the port. Bind to `0.0.0.0` or the tailscale IP and open the port to your trusted network.
 

@@ -154,6 +154,17 @@ async def gated_auth_middleware(
     # route): not a cookie session, must not bounce to /login.
     if getattr(request.state, "token_authenticated", False) or _path_is_public(request.url.path):
         return await call_next(request)
+    # Explicit dashboard tokens are configured administrator credentials for
+    # native remote clients. Check them before provider bearer verification so
+    # an unavailable provider cannot reject a valid configured connection.
+    from hermes_cli.web_server import (
+        _explicit_session_token_session,
+        _has_valid_explicit_session_token,
+    )
+
+    if _has_valid_explicit_session_token(request):
+        request.state.session = _explicit_session_token_session()
+        return await call_next(request)
     # RFC 8252 native-app bearer path: the same provider-minted access token the cookie flow
     # stores, verified with the same provider stack, no cookie read or set. A presented-but-
     # invalid bearer gets the structured 401 so the desktop refreshes/re-logs instead of
