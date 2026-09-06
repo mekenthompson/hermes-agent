@@ -18,11 +18,15 @@ from fastapi.testclient import TestClient  # noqa: E402
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "clamp-test-token")
+    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "clamp-test-token-0123456789abcdef0123456789")
     from hermes_cli import web_server
 
     with TestClient(web_server.app, raise_server_exceptions=False) as c:
-        c.headers["Authorization"] = "Bearer clamp-test-token"
+        # web_server resolves _SESSION_TOKEN once, at import. Read it back from
+        # the module instead of assuming the env var above won the race — any
+        # test file that imports web_server earlier in the session fixes the
+        # token before this fixture runs.
+        c.headers["Authorization"] = f"Bearer {web_server._SESSION_TOKEN}"
         yield c
 
 

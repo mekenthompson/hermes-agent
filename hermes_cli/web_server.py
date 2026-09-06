@@ -292,10 +292,16 @@ app.include_router(_memory_oauth_router)
 # HERMES_DASHBOARD_SESSION_TOKEN; otherwise fresh per server start. It dies with
 # the process and is injected into the SPA HTML so only the web UI can use it.
 def _resolve_session_token() -> str:
-    return os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
+    configured = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN")
+    if configured is None:
+        return secrets.token_urlsafe(32)
+    if len(configured) < 32:
+        raise ValueError("HERMES_DASHBOARD_SESSION_TOKEN must be at least 32 characters")
+    return configured
 
 
 _SESSION_TOKEN = _resolve_session_token()
+_SESSION_TOKEN_IS_EXPLICIT = "HERMES_DASHBOARD_SESSION_TOKEN" in os.environ
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _SSH_OWNER_NONCE: Optional[str] = None
 _SSH_RUNTIME_PURELIB: Optional[Tuple[str, int, int]] = None
@@ -388,6 +394,32 @@ def _has_valid_session_token(request: Request) -> bool:
         return True
     auth = request.headers.get("authorization", "")
     return hmac.compare_digest(auth.encode(), f"Bearer {_SESSION_TOKEN}".encode())
+
+
+def _has_valid_explicit_session_token(request: Request) -> bool:
+    """True only when the operator configured the matching dashboard token."""
+    if not _SESSION_TOKEN_IS_EXPLICIT:
+        return False
+    session_header = request.headers.get(_SESSION_HEADER_NAME, "")
+    return bool(session_header) and hmac.compare_digest(
+        session_header.encode(), _SESSION_TOKEN.encode()
+    )
+
+
+def _explicit_session_token_session():
+    """Return the stable synthetic identity for an explicit dashboard token."""
+    from hermes_cli.dashboard_auth.base import Session
+
+    return Session(
+        user_id="dashboard-session-token",
+        email="",
+        display_name="Dashboard session token",
+        org_id="",
+        provider="dashboard-session-token",
+        expires_at=2**63 - 1,
+        access_token="",
+        refresh_token="",
+    )
 
 
 # Routes that may also authenticate via ``?token=`` (download links opened by
@@ -1103,14 +1135,15 @@ def _configure_auth_gate(
         )
 
     if app.state.auth_required:
-        # No escape hatch serves a gated dashboard without a provider.
+        # A configured administrator token is a valid remote credential; a
+        # generated process token is deliberately not.
         from hermes_cli.dashboard_auth import list_providers
-        if not list_providers():
+        if not list_providers() and not _SESSION_TOKEN_IS_EXPLICIT:
             raise SystemExit(_no_auth_provider_message(host))
         _log.info(
             "Dashboard binding to %s with auth gate enabled. Providers: %s",
             host,
-            ", ".join(p.name for p in list_providers()),
+            ", ".join(p.name for p in list_providers()) or "explicit dashboard session token",
         )
 
 
