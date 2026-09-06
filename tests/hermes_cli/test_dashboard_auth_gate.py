@@ -203,6 +203,36 @@ def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
     assert web_server.app.state.auth_required is True
 
 
+def test_start_server_public_with_explicit_dashboard_token_needs_no_provider(monkeypatch):
+    """An explicit 64-character Desktop credential is sufficient for a gated bind.
+
+    This is deliberately narrower than making a public dashboard anonymous:
+    the OAuth gate remains engaged, but an operator-provisioned token is a
+    valid authentication method when no OAuth/password provider is installed.
+    """
+    from hermes_cli.dashboard_auth import clear_providers
+
+    clear_providers()
+    captured = _stub_uvicorn_run(monkeypatch)
+    token = "t" * 64
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN", token)
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", True)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+
+    web_server.start_server(
+        host="0.0.0.0", port=9119, open_browser=False, allow_public=False,
+    )
+
+    assert web_server.app.state.auth_required is True
+    assert captured["kwargs"].get("host") == "0.0.0.0"
+
+
 def test_start_server_public_without_insecure_records_auth_required(monkeypatch):
     """Public bind without --insecure: the gate engages and auth_required=True.
 

@@ -343,6 +343,20 @@ async def gated_auth_middleware(
     if _path_is_public(path):
         return await call_next(request)
 
+    # An explicitly configured dashboard token is a per-gateway administrator
+    # credential for native Desktop clients. It is intentionally checked before
+    # OAuth/bearer verification so an unavailable identity provider cannot take
+    # a configured private-gateway Desktop offline. Generated process tokens
+    # are excluded by this helper and therefore never gain remote authority.
+    from hermes_cli.web_server import (
+        _explicit_session_token_session,
+        _has_valid_explicit_session_token,
+    )
+
+    if _has_valid_explicit_session_token(request):
+        request.state.session = _explicit_session_token_session()
+        return await call_next(request)
+
     # RFC 8252 native-app bearer path (goal: no session cookies). The desktop
     # authenticates REST with ``Authorization: Bearer <access_token>`` — the
     # SAME provider-minted access token the cookie flow stores in

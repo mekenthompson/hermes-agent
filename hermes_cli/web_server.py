@@ -626,16 +626,26 @@ app.include_router(_memory_oauth_router)
 # The desktop shell mints the token and injects it via
 # HERMES_DASHBOARD_SESSION_TOKEN so its main process can authenticate the
 # /api calls it makes on the user's behalf; otherwise we generate one fresh
-# on every server start. Either way it dies when the process exits and is
-# injected into the SPA HTML so only the legitimate web UI can use it.
+# on every server start. The explicit token is also the only session-token
+# credential allowed through a non-loopback OAuth gate: accepting a generated
+# process token there would accidentally turn every remote process start into
+# a remotely usable administrator credential.
 # ---------------------------------------------------------------------------
 
 
 def _resolve_session_token() -> str:
-    return os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
+    configured = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN")
+    if configured is None:
+        return secrets.token_urlsafe(32)
+    if len(configured) < 32:
+        raise ValueError(
+            "HERMES_DASHBOARD_SESSION_TOKEN must be at least 32 characters"
+        )
+    return configured
 
 
 _SESSION_TOKEN = _resolve_session_token()
+_SESSION_TOKEN_IS_EXPLICIT = "HERMES_DASHBOARD_SESSION_TOKEN" in os.environ
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _SSH_OWNER_NONCE: Optional[str] = None
 _SSH_RUNTIME_PURELIB: Optional[Tuple[str, int, int]] = None
@@ -763,6 +773,46 @@ def _has_valid_session_token(request: Request) -> bool:
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
     return hmac.compare_digest(auth.encode(), expected.encode())
+
+
+def _has_valid_explicit_session_token(request: Request) -> bool:
+    """True only for the operator-configured dashboard token.
+
+    A generated local-dashboard token deliberately has no remote authority.
+    Keep this separate from ``_has_valid_session_token`` because loopback and
+    ``--insecure`` retain their process-generated-token behavior.
+    """
+    if not _SESSION_TOKEN_IS_EXPLICIT:
+        return False
+    session_header = request.headers.get(_SESSION_HEADER_NAME, "")
+    if session_header and hmac.compare_digest(
+        session_header.encode(), _SESSION_TOKEN.encode()
+    ):
+        return True
+    # Desktop opens file downloads in the OS browser, which cannot inject a
+    # request header. Keep the existing query-token exception restricted to
+    # its read-only allowlist; it must never authorize arbitrary API routes.
+    return request.method in {"GET", "HEAD"} and _has_valid_query_token(
+        request, request.url.path
+    )
+
+
+def _explicit_session_token_session():
+    """Return the stable machine identity for an explicit dashboard token."""
+    from hermes_cli.dashboard_auth.base import Session
+
+    return Session(
+        user_id="dashboard-session-token",
+        email="",
+        display_name="Dashboard session token",
+        org_id="",
+        provider="dashboard-session-token",
+        # Process-scoped token validity is established by the constant-time
+        # comparison above, not a remote identity provider expiry.
+        expires_at=2**63 - 1,
+        access_token="",
+        refresh_token="",
+    )
 
 
 # Routes that may also authenticate via a ``?token=`` query param, for download
@@ -4040,6 +4090,12 @@ async def get_status(profile: Optional[str] = None):
                 auth_flows.append("cookie")
                 if _list_session_providers():
                     auth_flows.append("native_pkce")
+                # This does not make the OAuth gate optional: it advertises a
+                # separately configured, administrator-owned Desktop token so
+                # clients can select their long-lived token transport instead
+                # of attempting an unavailable OAuth login.
+                if _SESSION_TOKEN_IS_EXPLICIT:
+                    auth_flows.append("dashboard_session_token")
         except Exception:
             # Module not importable yet (early startup) — leave as [].
             pass
@@ -16652,6 +16708,19 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     """
     auth_required = bool(getattr(app.state, "auth_required", False))
     if auth_required:
+        # A configured Desktop token is multi-use by design: remote Desktop
+        # reconnects reuse the securely stored per-gateway credential. Do not
+        # permit the generated loopback process token on this path.
+        token = ws.query_params.get("token", "")
+        if _SESSION_TOKEN_IS_EXPLICIT and token and hmac.compare_digest(
+            token.encode(), _SESSION_TOKEN.encode()
+        ):
+            session = _explicit_session_token_session()
+            ws._hermes_auth_identity = {
+                "user_id": session.user_id,
+                "provider": session.provider,
+            }
+            return None, "explicit-token"
         # Lazy import — keeps this function importable in test harnesses
         # that don't bring in the dashboard_auth layer.
         from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
@@ -19864,11 +19933,12 @@ def start_server(
         )
 
     if app.state.auth_required:
-        # The gate engages on every non-loopback bind. Require at least one
-        # provider to be registered, else fail closed — there is no longer an
-        # escape hatch that serves the dashboard without authentication.
+        # The gate engages on every non-loopback bind. Require an OAuth/password
+        # provider or an operator-configured dashboard token, else fail closed.
+        # `_SESSION_TOKEN_IS_EXPLICIT` excludes freshly generated process tokens,
+        # which must never become a remote authentication escape hatch.
         from hermes_cli.dashboard_auth import list_providers
-        if not list_providers():
+        if not list_providers() and not _SESSION_TOKEN_IS_EXPLICIT:
             # Surface the *specific* reason any bundled provider declined
             # to register (e.g. missing HERMES_DASHBOARD_OAUTH_CLIENT_ID).
             # Each provider plugin that ships with Hermes Agent exposes a
@@ -19976,7 +20046,8 @@ def start_server(
         _log.info(
             "Dashboard binding to %s with auth gate enabled. Providers: %s",
             host,
-            ", ".join(p.name for p in list_providers()),
+            ", ".join(p.name for p in list_providers())
+            or "explicit dashboard session token",
         )
 
     # Record the bound host so host_header_middleware can validate incoming

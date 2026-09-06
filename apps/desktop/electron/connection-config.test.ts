@@ -910,6 +910,16 @@ test('authModeFromStatus returns oauth when auth_required is true', () => {
   assert.equal(authModeFromStatus({ auth_required: true, auth_providers: ['nous'] }), 'oauth')
 })
 
+test('authModeFromStatus selects dashboard token when OAuth gate advertises it', () => {
+  assert.equal(
+    authModeFromStatus({
+      auth_required: true,
+      auth_flows: ['cookie', 'native_pkce', 'dashboard_session_token']
+    }),
+    'token'
+  )
+})
+
 test('authModeFromStatus returns token when auth_required is false/missing', () => {
   assert.equal(authModeFromStatus({ auth_required: false }), 'token')
   assert.equal(authModeFromStatus({}), 'token')

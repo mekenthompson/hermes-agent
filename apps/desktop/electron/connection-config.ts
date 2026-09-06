@@ -914,9 +914,15 @@ function tokenPreview(value) {
 /**
  * Classify a gateway's auth mode from its public /api/status body.
  * `auth_required: true` → OAuth gate engaged; otherwise legacy token auth.
+ * A gated gateway may advertise `dashboard_session_token` in `auth_flows`:
+ * OAuth enforcement stays enabled, while an explicit per-gateway Desktop
+ * token is available through the legacy token transport.
  * Returns 'oauth' | 'token'.
  */
 function authModeFromStatus(statusBody) {
+  if (Array.isArray(statusBody?.auth_flows) && statusBody.auth_flows.includes('dashboard_session_token')) {
+    return 'token'
+  }
   return statusBody && statusBody.auth_required ? 'oauth' : 'token'
 }
 

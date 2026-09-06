@@ -267,6 +267,27 @@ class TestWsAuthOkGated:
         ws = _fake_ws(query={"token": web_server._SESSION_TOKEN})
         assert web_server._ws_auth_ok(ws) is False
 
+    def test_explicit_dashboard_token_is_multi_use_for_desktop_reconnect(
+        self, gated_app, monkeypatch
+    ):
+        token = "desktop-session-token-0123456789abcdef"
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN", token)
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", True)
+
+        missing = _fake_ws(query={})
+        weak = _fake_ws(query={"token": "too-short"})
+        first = _fake_ws(query={"token": token})
+        reconnect = _fake_ws(query={"token": token})
+
+        assert web_server._ws_auth_ok(missing) is False
+        assert web_server._ws_auth_ok(weak) is False
+        assert web_server._ws_auth_ok(first) is True
+        assert web_server._ws_auth_ok(reconnect) is True
+        assert first._hermes_auth_identity == {
+            "user_id": "dashboard-session-token",
+            "provider": "dashboard-session-token",
+        }
+
     def test_rejection_audit_logs(self, gated_app, tmp_path, monkeypatch):
         # Point the audit log at a tmp dir so we can read what got written.
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
