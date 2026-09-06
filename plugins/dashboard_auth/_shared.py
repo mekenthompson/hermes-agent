@@ -193,22 +193,17 @@ def verify_jwt(
     token: str, jwks_client: Any, *, algorithms: list[str], audience: str, issuer: str, label: str) -> Dict[str, Any]:
     """Verify ``token`` against ``jwks_client`` with pinned ``aud``/``iss``.
 
-    Unreachable JWKS → ``ProviderError`` (503); a bearer that is not one of our JWTs
-    (opaque peer key, foreign kid) → ``InvalidCodeError`` (None / next provider); folding
-    both into 503 broke peer-key bearers. Expiry raises ``InvalidCodeError`` (verify_session
-    maps it to None); any other claim failure raises ``ProviderError`` with the unverified
-    iss/aud appended so operators can spot config drift.
+    Unreachable or malformed JWKS → ``ProviderError`` (503); a bearer that is not
+    verifiable by this provider → ``InvalidCodeError`` (None / next provider). Expiry
+    and registered-claim failures are caller credential failures, not evidence that
+    the provider is unavailable.
     """
     import jwt  # lazy — keeps startup fast for the ungated path
 
     try:
         signing_key = jwks_client.get_signing_key_from_jwt(token)
     except Exception as exc:
-        # Unreachable JWKS -> ProviderError (503); a bearer that is not one of our JWTs (opaque peer key,
-        # foreign kid) -> InvalidCodeError (None / next provider). Folding both into 503 produced #94558.
-        # Unreachable JWKS -> ProviderError (503); a bearer that is not one of our JWTs (opaque peer key,
-        # foreign kid) -> InvalidCodeError (None / next provider). Folding both into 503 produced #94558.
-        raise classify_jwks_lookup_error(exc) from exc
+        raise classify_jwks_lookup_error(exc, jwks_client=jwks_client, token=token) from exc
     try:
         return jwt.decode(
             token, signing_key.key, algorithms=algorithms, audience=audience, issuer=issuer,
@@ -216,17 +211,7 @@ def verify_jwt(
     except jwt.ExpiredSignatureError as exc:
         raise InvalidCodeError(f"{label} expired: {exc}") from exc
     except jwt.InvalidTokenError as exc:
-        # Decoding without verification is safe here: verification already failed and
-        # these values are surfaced for diagnostics only, never trusted.
-        details = ""
-        try:
-            unverified = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
-            details = (
-                f" [token iss={unverified.get('iss')!r} aud={unverified.get('aud')!r}; "
-                f"expected iss={issuer!r} aud={audience!r}]")
-        except Exception:
-            pass
-        raise ProviderError(f"{label} verification failed: {exc}{details}") from exc
+        raise InvalidCodeError(f"{label} verification failed: {exc}") from exc
 
 
 # ---- Shared provider skeletons ----

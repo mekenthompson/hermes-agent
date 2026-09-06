@@ -281,13 +281,61 @@ def _register_plugin_provider(pp: Any) -> None:
         PROVIDER_REGISTRY.setdefault(alias, pconfig)
 
 
+def _extend_provider_registry_from_profiles() -> None:
+    """Register profiles discovered after this module was imported.
+
+    Existing static rows win, so an out-of-tree profile cannot silently change
+    a built-in provider's auth lane.
+    """
+    from providers import list_providers
+
+    for profile in list_providers():
+        if profile.name not in PROVIDER_REGISTRY:
+            _register_plugin_provider(profile)
+
+
 try:
-    from providers import list_providers as _list_providers_for_registry
-    for _pp in _list_providers_for_registry():
-        if _pp.name not in PROVIDER_REGISTRY:
-            _register_plugin_provider(_pp)
+    _extend_provider_registry_from_profiles()
 except Exception:
     pass
+
+
+def _external_process_provider_config(provider_id: str) -> tuple[ProviderConfig, Any]:
+    """Return process-provider metadata, rejecting unsafe process-auth collisions.
+
+    Built-in OAuth/native overlays can intentionally refine static API-key
+    metadata. A disagreement involving ``external_process`` is different: it
+    would choose HTTP credentials or a subprocess based solely on import order.
+    """
+    pconfig = PROVIDER_REGISTRY.get(provider_id)
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider_id)
+    except Exception:
+        profile = None
+    static_auth = getattr(pconfig, "auth_type", None)
+    profile_auth = getattr(profile, "auth_type", None)
+    if (static_auth == "external_process" or profile_auth == "external_process") and static_auth and profile_auth and static_auth != profile_auth:
+        raise AuthError(
+            f"Provider '{provider_id}' has conflicting authentication metadata.",
+            provider=provider_id,
+            code="invalid_provider",
+        )
+    if profile_auth == "external_process" and pconfig is None and profile is not None:
+        pconfig = ProviderConfig(
+            id=profile.name,
+            name=profile.display_name or profile.name,
+            auth_type="external_process",
+            inference_base_url=profile.base_url,
+        )
+    if not pconfig or pconfig.auth_type != "external_process":
+        raise AuthError(
+            f"Provider '{provider_id}' is not an external-process provider.",
+            provider=provider_id,
+            code="invalid_provider",
+        )
+    return pconfig, profile
 
 
 def get_anthropic_key() -> str:
@@ -1409,6 +1457,11 @@ def resolve_provider(
     1. 3. 4. 5. Provider-specific API keys (GLM, Kimi, MiniMax, ...) -> that provider 7. 8. Error (no
     provider configured) See #29285.
     """
+    try:
+        _extend_provider_registry_from_profiles()
+    except Exception:
+        # Optional profile discovery must not disturb existing fallback paths.
+        pass
     normalized = (requested or "auto").strip().lower()
     normalized = _plugin_aliases().get(normalized, normalized)
 
@@ -1849,17 +1902,18 @@ def _external_process_auth_evidence(provider_id: str) -> tuple[bool, Optional[st
 
 
 def _external_process_spec(
-    pconfig: ProviderConfig) -> tuple[str, List[str], str, Optional[str], tuple[str, ...]]:
+    pconfig: ProviderConfig, profile: Any = None) -> tuple[str, List[str], str, Optional[str], tuple[str, ...]]:
     """``(command, args, base_url, resolved_command, command_env_vars)`` for an ACP provider.
 
     Launch details come from the provider's own profile (copilot-acp: HERMES_COPILOT_ACP_COMMAND /
     COPILOT_CLI_PATH / HERMES_COPILOT_ACP_ARGS), so out-of-tree providers describe their binary."""
     base_url = _provider_env_base_url(pconfig) or pconfig.inference_base_url
-    try:
-        from providers import get_provider_profile as _get_provider_profile
-        profile = _get_provider_profile(pconfig.id)
-    except Exception:
-        profile = None
+    if profile is None:
+        try:
+            from providers import get_provider_profile as _get_provider_profile
+            profile = _get_provider_profile(pconfig.id)
+        except Exception:
+            profile = None
     command_env_vars = tuple(getattr(profile, "process_command_env_vars", ()) or ())
     args_env_var = str(getattr(profile, "process_args_env_var", "") or "")
     command = (next((v for v in (os.getenv(var, "").strip() for var in command_env_vars) if v), "")
@@ -2037,13 +2091,9 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
 def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str, Any]:
     """Resolve runtime details for local subprocess-backed providers."""
-    pconfig = PROVIDER_REGISTRY.get(provider_id)
-    if not pconfig or pconfig.auth_type != "external_process":
-        raise AuthError(
-            f"Provider '{provider_id}' is not an external-process provider.",
-            provider=provider_id, code="invalid_provider")
+    pconfig, profile = _external_process_provider_config(provider_id)
 
-    command, args, base_url, resolved_command, command_env_vars = _external_process_spec(pconfig)
+    command, args, base_url, resolved_command, command_env_vars = _external_process_spec(pconfig, profile)
     if not resolved_command and not base_url.startswith("acp+tcp://"):
         _hint = " or set " + "/".join(command_env_vars) if command_env_vars else ""
         raise AuthError(

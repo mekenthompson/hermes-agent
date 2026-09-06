@@ -70,7 +70,7 @@ jobs:
   # protected publish job after these tests pass.
   build:
     needs: [detect]
-    if: github.repository == 'NousResearch/hermes-agent' && needs.detect.outputs.build == 'true'
+    if: github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && needs.detect.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:

@@ -1286,6 +1286,7 @@ class GatewayStartupMixin:
         self._running = True
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
+        self._start_plugin_profile_services()
         await self._start_finish_wiring(connected_count)
         self._start_spawn_background_watchers()
         logger.info("Press Ctrl+C to stop")

@@ -14,7 +14,7 @@ import stat
 
 import pytest
 
-from providers import register_provider
+from providers import get_provider_profile, register_provider
 from providers.base import ProviderProfile
 
 
@@ -71,6 +71,82 @@ def test_an_out_of_tree_external_process_provider_resolves_end_to_end(fake_cli, 
 
     runtime = resolve_runtime_provider(requested="acme", target_model="acme")
     assert (runtime["provider"], runtime["base_url"], runtime["source"]) == ("acme-acp", "acp://acme", "process")
+
+
+def test_provider_registered_after_auth_import_resolves_from_profile(fake_cli):
+    from hermes_cli import auth
+
+    late = _AcmeACPProfile(
+        name="late-acp",
+        display_name="Late ACP",
+        base_url="acp://late",
+        auth_type="external_process",
+        process_command="acme-cli",
+        process_args=("--late",),
+    )
+    register_provider(late)
+
+    assert "late-acp" not in auth.PROVIDER_REGISTRY
+    creds = auth.resolve_external_process_provider_credentials("late-acp")
+    assert (creds["command"], creds["args"], creds["base_url"]) == (
+        str(fake_cli / "acme-cli"),
+        ["--late"],
+        "acp://late",
+    )
+
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    runtime = resolve_runtime_provider(requested="late-acp")
+    assert runtime["provider"] == "late-acp"
+    assert runtime["command"] == str(fake_cli / "acme-cli")
+    assert runtime["args"] == ["--late"]
+
+
+def test_static_and_profile_auth_types_must_agree(fake_cli, monkeypatch):
+    from hermes_cli import auth
+
+    conflict = _AcmeACPProfile(
+        name="collision-acp",
+        display_name="Collision ACP",
+        base_url="acp://collision",
+        auth_type="external_process",
+        process_command="acme-cli",
+    )
+    register_provider(conflict)
+    monkeypatch.setitem(
+        auth.PROVIDER_REGISTRY,
+        "collision-acp",
+        auth.ProviderConfig(
+            id="collision-acp",
+            name="Collision ACP",
+            auth_type="api_key",
+            api_key_env_vars=("COLLISION_API_KEY",),
+        ),
+    )
+
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    with pytest.raises(auth.AuthError, match="conflicting authentication metadata"):
+        resolve_runtime_provider(requested="collision-acp")
+
+
+def test_profile_cannot_override_static_external_auth_type(fake_cli):
+    from hermes_cli import auth
+
+    original = get_provider_profile("copilot-acp")
+    conflict = _AcmeACPProfile(
+        name="copilot-acp",
+        display_name="Conflicting Copilot",
+        base_url="https://example.invalid",
+        auth_type="api_key",
+        process_command="acme-cli",
+    )
+    register_provider(conflict)
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        with pytest.raises(auth.AuthError, match="conflicting authentication metadata"):
+            resolve_runtime_provider(requested="copilot-acp")
+    finally:
+        register_provider(original)
 
 
 def test_copilot_acp_launch_details_are_unchanged(fake_cli, monkeypatch):

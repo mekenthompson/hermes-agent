@@ -2060,6 +2060,7 @@ from gateway.run_notifications import GatewayNotificationsMixin
 from gateway.run_inbound import GatewayInboundMixin
 from gateway.run_goals import GatewayGoalsMixin
 from gateway.run_agent_cache import GatewayAgentCacheMixin
+from gateway.run_plugin_services import GatewayPluginServicesMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -3254,7 +3255,7 @@ class GatewayRunner(
     GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
     GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
-    GatewayAgentCacheMixin):
+    GatewayAgentCacheMixin, GatewayPluginServicesMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
@@ -3278,7 +3279,9 @@ class GatewayRunner(
     _profile_failed_platforms: Optional[Dict[str, Dict[Platform, asyncio.Task]]] = None
     _systemd_watchdog: Optional[Any] = None
     _startup_restore_in_progress: bool = False
-    _startup_warmup_task: Optional[asyncio.Task] = None
+    _startup_warmup_task: Optional["asyncio.Task"] = None
+    _profile_service_stop: Optional[asyncio.Event] = None
+    _profile_service_tasks: list[asyncio.Task] = []
 
     # Legacy per-session dict attrs as LIVE views over ``self._sessions``; new code: _session_state(key)
     _running_agents = legacy_dict_property("_running_agents")
@@ -3501,6 +3504,21 @@ class GatewayRunner(
         # Launch-time identity of the profile that owns ``self.adapters``; ``_authorization_adapter``
         # compares against this rather than the per-turn ``_active_profile_name()``.
         self._primary_profile_name = self._kanban_notifier_profile = self._active_profile_name()
+        # Execution identity is snapshotted at launch. Routing remains owned by
+        # SessionSource.profile and must never be changed by this export value.
+        configured_runtime_profile = (
+            os.getenv("HERMES_PROFILE") or os.getenv("HERMES_AGENT_PROFILE") or ""
+        )
+        try:
+            from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+            configured_runtime_profile = normalize_profile_name(configured_runtime_profile)
+            validate_profile_name(configured_runtime_profile)
+        except (ImportError, ValueError):
+            configured_runtime_profile = ""
+        self._configured_runtime_profile_name = configured_runtime_profile or None
+        self._profile_service_stop = asyncio.Event()
+        self._profile_service_tasks = []
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None
@@ -4115,6 +4133,11 @@ class GatewayRunner(
         # True keeps CLI/unknown paths working; stateless adapters (api_server) declare False.
         _adapter = (getattr(self, "adapters", None) or {}).get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        source_profile = str(getattr(context.source, "profile", "") or "").strip()
+        if not source_profile and not getattr(
+            getattr(self, "config", None), "multiplex_profiles", False
+        ):
+            source_profile = getattr(self, "_configured_runtime_profile_name", None) or ""
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -4126,8 +4149,9 @@ class GatewayRunner(
             user_name=str(context.source.user_name) if context.source.user_name else "",
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             session_key=context.session_key,
+            session_id=context.session_id or "",
             message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
+            profile=source_profile,
             async_delivery=_async_delivery,
             cron_session="")
 

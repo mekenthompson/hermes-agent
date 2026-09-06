@@ -420,6 +420,16 @@ class PluginContext:
         logger.debug("Plugin %s spawned supervised task: %s", self.manifest.name, task_name)
         return task
 
+    def register_profile_service(self, name: str, factory) -> None:
+        """Register a long-running per-profile async service.
+
+        The gateway starts *factory(runtime)* after it is running. *runtime*
+        has ``profile_home``, ``profile_name``, ``stop_event``, and ``gateway``.
+        """
+        if not name or not callable(factory):
+            raise ValueError("profile service requires a name and callable factory")
+        self._manager._profile_services.append((str(name), factory))
+
     def register_approval_transport(self, name: str, present_fn: Callable) -> None:
         """Register a human approval transport, inactive until ``security.approval.transport:
         <name>`` selects it. It receives a redacted ``ApprovalRequest`` and returns only a
@@ -450,6 +460,7 @@ class PluginContext:
         self, name: str, toolset: str, schema: dict, handler: Callable,
         check_fn: Callable | None = None, requires_env: list | None = None, is_async: bool = False,
         description: str = "", emoji: str = "", override: bool = False,
+        *, inject_invocation_context: bool = False,
     ) -> Optional[PluginRegistration]:
         """Register a tool in the global registry and track it as plugin-provided. ``override=True``
         replaces a same-named built-in (without it a name claimed by another toolset is rejected) and
@@ -459,6 +470,11 @@ class PluginContext:
         ``override=True`` against a built-in tool requires the operator to opt in via
         ``plugins.entries.<plugin_id>.allow_tool_override: true`` in config.yaml — mirrors the trust gate
         pattern used for ``ctx.llm`` provider/model overrides (#23194).
+
+        ``inject_invocation_context=True`` opts the handler into an immutable
+        ``ToolInvocationContext`` keyword containing host-owned gateway
+        identity. It is empty outside a bound gateway session, so
+        identity-sensitive plugins must fail closed.
         """
         if override and not self._tool_override_allowed(name):
             raise PluginToolOverrideError(
@@ -477,6 +493,7 @@ class PluginContext:
             name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
             requires_env=requires_env, is_async=is_async, description=description, emoji=emoji,
             override=override, scope=scope,
+            inject_invocation_context=inject_invocation_context,
         )
         registered = registry.snapshot_registration(name, scope=scope)
         handle = None
@@ -1141,6 +1158,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._approval_transports: Dict[str, Any] = {}
         self._slack_action_handlers: List[tuple] = []
         self._platform_handler_factories: Dict[str, List[tuple]] = {}
+        self._profile_services: list[tuple[str, Any]] = []
         # Event bus: owner-tagged subscriptions (unload removes zombies); one daemon worker keeps
         # registration order while emitters never block; per-worker chain depth caps mutual emitters.
         self._subscriptions: Dict[str, List[_EventSubscription]] = {}

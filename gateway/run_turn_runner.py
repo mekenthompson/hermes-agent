@@ -289,6 +289,7 @@ class TurnRunner:
         fallback_msg_id: Optional[str] = None
         native_failed: bool = False
         anonymous_seq: int = 0
+        title: str = "Hermes is working"
 
         @staticmethod
         def _compact(value: Any, limit: int = 120) -> str:
@@ -301,7 +302,7 @@ class TurnRunner:
         def fallback_text(self) -> str:
             labels = {"in_progress": "running", "complete": "complete", "error": "error"}
             lines = [f"- {t['title']} - {labels.get(t['status'], t['status'])}" for t in self.visible_tasks()]
-            return "Hermes is working\n" + "\n".join(lines)
+            return self.title + "\n" + "\n".join(lines)
 
         def _upsert(self, call_id: str, title: str) -> Dict[str, str]:
             if call_id not in self.tasks:
@@ -347,7 +348,7 @@ class TurnRunner:
             return
         if not st.native_failed:
             result = await st.adapter.send_native_task_card_progress(
-                chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title="Hermes is working",
+                chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title=st.title,
                 reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata, fallback_text=st.fallback_text(),
             )
             if getattr(result, "success", False):
@@ -378,7 +379,10 @@ class TurnRunner:
         See #29483.
         """
         ctx = self._ctx
-        st = self._TaskCardState(adapter)
+        from gateway.task_card_identity import resolve_task_card_title
+        from hermes_constants import get_hermes_home
+
+        st = self._TaskCardState(adapter, title=resolve_task_card_title(get_hermes_home()))
         try:
             while ctx._run_still_current():
                 try:

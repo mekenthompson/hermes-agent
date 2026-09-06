@@ -16,6 +16,10 @@ from urllib.parse import quote
 from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
+# Module import (not ``from … import``) so a partially initialised web_server
+# during its own startup import chain is fine: the explicit-token helpers are
+# resolved as attributes at request time, and tests may monkeypatch them.
+import hermes_cli.web_server as _web_server
 from hermes_cli.dashboard_auth import list_session_providers
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import ProviderError, RefreshExpiredError
@@ -153,6 +157,12 @@ async def gated_auth_middleware(
     # Already authenticated by the token-auth seam (service caller on a registered token
     # route): not a cookie session, must not bounce to /login.
     if getattr(request.state, "token_authenticated", False) or _path_is_public(request.url.path):
+        return await call_next(request)
+    # Explicit dashboard tokens are configured administrator credentials for
+    # native remote clients. Check them before provider bearer verification so
+    # an unavailable provider cannot reject a valid configured connection.
+    if _web_server._has_valid_explicit_session_token(request):
+        request.state.session = _web_server._explicit_session_token_session()
         return await call_next(request)
     # RFC 8252 native-app bearer path: the same provider-minted access token the cookie flow
     # stores, verified with the same provider stack, no cookie read or set. A presented-but-

@@ -210,8 +210,9 @@ class TestSessionTokenInjection:
 
         original_app = ws.app
         original_token = ws._SESSION_TOKEN
-        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "desktop-seeded-token")
-        assert ws._resolve_session_token() == "desktop-seeded-token"
+        token = "desktop-seeded-token-0123456789abcdef"
+        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", token)
+        assert ws._resolve_session_token() == token
         # No module reload: the loaded app and its adopted token are untouched.
         assert ws.app is original_app
         assert ws._SESSION_TOKEN == original_token
@@ -233,8 +234,9 @@ class TestSessionTokenInjection:
         original_app = ws.app
         original_header_name = ws._SESSION_HEADER_NAME
         original_token = ws._SESSION_TOKEN
-        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "desktop-seeded-token")
-        assert ws._resolve_session_token() == "desktop-seeded-token"
+        token = "desktop-seeded-token-0123456789abcdef"
+        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", token)
+        assert ws._resolve_session_token() == token
         monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
         with patch.object(ws.secrets, "token_urlsafe", return_value="generated-token"):
             assert ws._resolve_session_token() == "generated-token"

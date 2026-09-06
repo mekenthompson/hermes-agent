@@ -843,6 +843,9 @@ def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, targe
     if not explicit_base_url and not explicit_api_key:
         yield _local_endpoint_bypass(requested_provider, explicit_api_key, explicit_base_url)
     provider = resolve_provider(requested_provider, explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url)
+    # Reject a subprocess-vs-HTTP auth collision before an API-key/OAuth lane
+    # has a chance to consume the static half of the metadata.
+    _is_external_process_provider(provider)
     model_cfg = _get_model_config()
     yield _opencode_free_runtime(provider, requested_provider, model_cfg, target_model)
     yield _resolve_explicit_runtime(provider=provider, requested_provider=requested_provider, model_cfg=model_cfg,
