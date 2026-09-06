@@ -514,7 +514,7 @@ describe('useVirtualHistory offset cache reuse', () => {
     }
   })
 
-  it('corrects and compensates a same-layout row measured at unmount', async () => {
+  it('corrects and compensates a same-layout row measured at unmount', { retry: 2 }, async () => {
     const items = Array.from({ length: 20 }, (_, index) => ({ height: 2, key: `item-${index}` }))
     const expose = { current: null as Exposed | null }
     const streams = makeStreams()

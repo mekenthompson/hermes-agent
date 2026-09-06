@@ -21,7 +21,9 @@ jobs:
     # 96 cores clear the floor that the slowest single test file sets (about
     # 82s). A second slice divides work that is already at that floor, and
     # adds a second setup.
-    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'ubuntu-latest-96-core' || 'ubuntu-latest' }}
+    # Fork: mekenthompson/hermes-agent runs own-branch pushes/PRs on ephemeral self-hosted
+    # runners (labels self-hosted,linux,x64,pixsoul). PRs from other repos stay GitHub-hosted.
+    runs-on: ${{ fromJSON(github.repository == 'mekenthompson/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","linux","x64","pixsoul"]' || github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '"ubuntu-latest-96-core"' || '"ubuntu-latest"') }}
     timeout-minutes: 60
     steps:
       - name: Checkout code
