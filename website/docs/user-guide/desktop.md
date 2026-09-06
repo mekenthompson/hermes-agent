@@ -384,17 +384,13 @@ The backend reads and writes your `.env` (API keys, secrets) and can run agent c
 
 ### Persistent session tokens on a trusted network
 
-For an operator-managed backend on a private network or VPN, you can configure `HERMES_DASHBOARD_SESSION_TOKEN` instead of depending on an external login provider. Use a unique, randomly generated secret of at least 32 characters for each backend, and supply it through that backend's protected environment or secret manager before starting `hermes serve`. Treat it as a full dashboard administrator credential: never commit it, put it in shell history, or share it between backends. Use HTTPS or an encrypted VPN, not unencrypted traffic over an untrusted network.
+For an operator-managed backend on a private network or VPN, configure a unique random `HERMES_DASHBOARD_SESSION_TOKEN` of at least 32 characters through the backend's protected environment or secret manager before starting `hermes serve`. Treat it as a full dashboard administrator credential: never commit or share it, and use HTTPS or an encrypted VPN.
 
-With a configured token, the non-loopback authentication gate remains enabled (`auth_required: true`). `/api/status` advertises `dashboard_session_token` in `auth_flows`, and a compatible Desktop build shows the **Session token** field. Paste that backend's secret into the field and save the connection. Older Desktop builds that still force browser sign-in need an update. Existing OAuth-only backends continue to use their normal sign-in flow.
+The non-loopback authentication gate remains enabled. `/api/status` advertises `dashboard_session_token` in `auth_flows`; a compatible Desktop build then offers the **Session token** field. Desktop sends the configured token in `X-Hermes-Session-Token` for REST and exchanges it for a fresh, 30-second single-use WebSocket ticket on every connection and reconnect. The persistent token is never placed in a WebSocket URL.
 
-This credential is not an expiring OAuth access token or a browser handoff link. It remains valid across server restarts while the configured secret stays the same. To rotate it, replace the backend secret, restart the backend and update Desktop; the previous secret will no longer authenticate new requests or connections. Changing the value in a secret manager alone does not update a running backend; the restart applies the replacement and disconnects existing connections. Automatically generated process-local tokens do not enable this remote mode.
-
-Desktop sends the configured token in `X-Hermes-Session-Token` for ordinary HTTP requests and uses the existing authenticated WebSocket transport. Query-token HTTP authentication is restricted to the existing download endpoint; do not append tokens to arbitrary API URLs. Avoid recording authenticated URLs in proxy/access logs.
+The token remains valid across server restarts while its configured value is unchanged. To rotate it, replace the backend secret, restart the backend, and update the saved Desktop token. Automatically generated process-local tokens do not enable this remote mode.
 
 ### In the app
-
-The following steps describe provider-based sign-in; for an explicit token use the section above.
 
 **Settings → Gateways → Remote gateway:**
 
@@ -411,7 +407,7 @@ The remote gateway host is configured per [profile](./profiles.md), so each prof
 ### Troubleshooting
 
 - **Sign-in fails with 401 / "Invalid credentials"** — the username or password doesn't match the backend's `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` / `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD`. The backend returns the same generic error for an unknown user and a wrong password (no enumeration oracle), so double-check both. Confirm the gate is on with `curl -s http://<host>:9119/api/status | jq '.auth_required, .auth_providers'` — it should report `true` and include `"basic"`.
-- **No "Sign in" button — it asks for a session token instead** — this is expected when `/api/status` advertises `dashboard_session_token` in `auth_flows`: use the configured backend secret. If you intended username/password sign-in instead, check that both the username and a password (or password hash) are configured and loaded, and that an explicit `HERMES_DASHBOARD_SESSION_TOKEN` is not selecting token mode. A backend without the explicit-token capability should advertise its active provider in `auth_providers`.
+- **No "Sign in" button — it asks for a session token instead** — this is expected when `/api/status` advertises `dashboard_session_token` in `auth_flows`: use the configured backend secret. If you intended username/password sign-in instead, confirm its credentials are configured and loaded and that no explicit dashboard token is selecting token mode.
 - **Signed out on every restart** — set `HERMES_DASHBOARD_BASIC_AUTH_SECRET` to a stable value. Without it the token-signing key is regenerated per boot, invalidating all sessions.
 - **Connection refused / times out** — the backend bound to `127.0.0.1` (the default) or a firewall/VPN is blocking the port. Bind to `0.0.0.0` or the tailscale IP and open the port to your trusted network.
 

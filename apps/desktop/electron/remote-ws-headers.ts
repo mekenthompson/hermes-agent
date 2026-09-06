@@ -3,6 +3,9 @@ import { registryGatewayWsUrl } from './plugin-profile-routes'
 export interface RegistryGatewayWsConnection {
   authMode: string
   baseUrl: string
+  mode?: 'local' | 'remote'
+  remoteKind?: 'cloud' | 'ssh' | 'url'
+  token?: null | string
   wsUrl: string
   headers?: Record<string, string>
   profile?: null | string
@@ -11,6 +14,7 @@ export interface RegistryGatewayWsConnection {
 
 interface RegistryGatewayWsUrlDependencies {
   ensureBackend: (connectionId: unknown, profile: unknown) => Promise<RegistryGatewayWsConnection>
+  mintConfiguredTokenTicket: (connection: RegistryGatewayWsConnection) => Promise<string>
   mintTicket: (baseUrl: string, headers?: Record<string, string>) => Promise<string>
   buildTicketUrl: (baseUrl: string, ticket: string) => string
   rememberHeaders: (wsUrl: string, headers?: Record<string, string>) => void
@@ -83,8 +87,11 @@ export function createRegistryGatewayWsUrlHandler(dependencies: RegistryGatewayW
     const connection = await dependencies.ensureBackend(connectionId, profile)
     let wsUrl = connection.wsUrl
 
-    if (connection.authMode === 'oauth') {
-      const ticket = await dependencies.mintTicket(connection.baseUrl, connection.headers)
+    if (connection.authMode === 'oauth' || (connection.mode === 'remote' && connection.remoteKind !== 'ssh')) {
+      const ticket =
+        connection.authMode === 'oauth'
+          ? await dependencies.mintTicket(connection.baseUrl, connection.headers)
+          : await dependencies.mintConfiguredTokenTicket(connection)
       wsUrl = dependencies.buildTicketUrl(connection.baseUrl, ticket)
     }
 

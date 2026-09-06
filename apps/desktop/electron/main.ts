@@ -97,6 +97,7 @@ import {
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
   connectionScopeKey,
+  configuredGatewayTokenTicketFailure,
   cookiesHaveLiveSession,
   cookiesHavePrivyAccessToken,
   cookiesHavePrivySession,
@@ -158,7 +159,7 @@ import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { formatDesktopLogLine } from './desktop-log-line'
-import { resolveDesktopRemoteRoute } from './desktop-remote-route'
+import { resolveDesktopRemoteRoute, v1SshTerminalPoolKey } from './desktop-remote-route'
 import {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
@@ -200,6 +201,7 @@ import {
   writeBufferToFile
 } from './gateway-file-download'
 import { startGatewaysAfterUpdateAbort, stopGatewayBeforeUpdate } from './gateway-stop-before-update'
+import { mintGatewayWsTicketWithSessionToken as mintGatewayWsTicketWithSessionTokenTransport } from './gateway-ticket-transport'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { registerGitIpc } from './git-ipc'
 import { clearStaleGitLocks } from './gitlock'
@@ -274,6 +276,10 @@ import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { LEGACY_OAUTH_PARTITION, resolveOauthPartition } from './oauth-partition'
 import { createParentStartMarkerResolver, parentWatchdogEnv } from './parent-process-identity'
 import { registerPetOverlayIpc } from './pet-overlay-ipc'
+import {
+  pendingNotice as pendingPluginCompatNotice,
+  recordDismissed as recordPluginCompatDismissed
+} from './plugin-compat-notice'
 import {
   buildRegistryProfileRoutes,
   isLocalEnumerationFailure,
@@ -407,7 +413,12 @@ import { isHermesOwnedVenvDaemon } from './venv-holder-select'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { enumerateWindowsFrontToBack, enumerationFailed, readWindowBelow } from './window-below'
-import { registrySshScopeForWindowRoute, WindowConnectionRouteRegistry } from './window-connection-route'
+import {
+  registrySshPoolScopeByConnectionId,
+  registrySshScopeForWindowRoute,
+  WindowConnectionRouteRegistry
+} from './window-connection-route'
+import { createWindowOpenHandler } from './window-open-policy'
 import { installWindowRendererLifecycle } from './window-renderer-lifecycle'
 import { createWindowRevealController } from './window-reveal'
 import {
@@ -5290,10 +5301,9 @@ function fetchJson(url, token, options: any = {}) {
               'X-Hermes-Session-Token': token,
               // RFC 8252 native flow authenticates the gated gateway with a bearer
               // token instead of the loopback session-token header. When
-              // ``options.bearer`` is set we send Authorization: Bearer <token>;
-              // the gateway's OAuth gate verifies it via the provider stack with
-              // no cookie involved.
-              ...(options.bearer ? { Authorization: `Bearer ${options.bearer}` } : {}),
+              // ``options.bearer`` sends a Bearer credential; the gateway's
+              // OAuth gate verifies it via the provider stack with no cookie.
+              ...(options.bearer ? { Authorization: 'Bearer ' + options.bearer } : {}),
               ...(body ? { 'Content-Length': String(body.length) } : {})
             }
           },
@@ -5305,7 +5315,9 @@ function fetchJson(url, token, options: any = {}) {
               const text = Buffer.concat(chunks).toString('utf8')
 
               if ((res.statusCode || 500) >= 400) {
-                reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
+                const error: any = new Error(`${res.statusCode}: ${text || res.statusMessage}`)
+                error.statusCode = res.statusCode
+                reject(error)
 
                 return
               }
@@ -6712,6 +6724,57 @@ function getAppIconPath() {
     return resolveAppIcon(APP_ICON_PATHS)
   } catch {
     return undefined
+  }
+}
+
+// One-time modal for plugins importing pre-decomposition module paths (see
+// electron/plugin-compat-notice.ts). The backend writes the report during plugin
+// discovery; we show each distinct report exactly once and remember the dismissal
+// in userData so the user is never nagged twice about the same set of plugins.
+let pluginCompatNoticeShown = false
+
+async function showPluginCompatNoticeOnce() {
+  if (pluginCompatNoticeShown) {
+    return
+  }
+
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return
+  }
+
+  let notice
+
+  try {
+    notice = pendingPluginCompatNotice(HERMES_HOME, app.getPath('userData'))
+  } catch (err) {
+    rememberLog(`[plugins] compat notice check failed: ${err.message}`)
+
+    return
+  }
+
+  if (!notice) {
+    return
+  }
+
+  pluginCompatNoticeShown = true
+  rememberLog(`[plugins] compat notice shown (${notice.key})`)
+
+  try {
+    await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      title: notice.title,
+      message: notice.message,
+      detail: notice.detail,
+      buttons: ['OK'],
+      defaultId: 0,
+      noLink: true
+    })
+  } finally {
+    try {
+      recordPluginCompatDismissed(app.getPath('userData'), notice.key)
+    } catch (err) {
+      rememberLog(`[plugins] could not persist compat notice dismissal: ${err.message}`)
+    }
   }
 }
 
@@ -8184,12 +8247,23 @@ async function mintGatewayWsTicket(baseUrl, headers = {}) {
   })
 }
 
+// Explicit remote gateway tokens authenticate only the ticket-mint POST. They
+// are never copied into a proxy-visible WebSocket URL.
+async function mintGatewayWsTicketWithSessionToken(baseUrl, sessionToken, headers = {}) {
+  return withTransientRetries(() =>
+    mintGatewayWsTicketWithSessionTokenTransport(baseUrl, sessionToken, {
+      ...headersForRemoteRequest(baseUrl),
+      ...headers
+    })
+  )
+}
+
 // Build a fresh WS URL for the *current* connection. Critical for reconnects:
 // OAuth WS tickets are single-use with a ~30s TTL, so the ticket baked into
 // the cached connection's wsUrl is stale on the second connect. The renderer
 // calls this immediately before every gateway.connect() so each WS upgrade
-// carries a freshly-minted ticket. For local/token connections this just
-// reuses the static token (no minting needed).
+// carries a freshly-minted ticket. Remote configured-token connections mint
+// with their stored token but never serialize that token in the WS URL.
 async function freshGatewayWsUrl(profile) {
   // Mint for the requested profile's backend, NOT always the primary. The
   // renderer re-mints right before every gateway.connect(); when swapping to a
@@ -8199,8 +8273,11 @@ async function freshGatewayWsUrl(profile) {
   // legacy callers and single-profile users are unchanged.
   const connection = await ensureBackend(profile)
 
-  if (connection.authMode === 'oauth') {
-    const ticket = await mintGatewayWsTicket(connection.baseUrl, connection.headers)
+  if (connection.authMode === 'oauth' || connection.mode === 'remote') {
+    const ticket =
+      connection.authMode === 'oauth'
+        ? await mintGatewayWsTicket(connection.baseUrl, connection.headers)
+        : await mintGatewayWsTicketWithSessionToken(connection.baseUrl, connection.token, connection.headers)
     const wsUrl = buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
 
     rememberRemoteWsHeaders(wsUrl, connection.headers)
@@ -8208,7 +8285,7 @@ async function freshGatewayWsUrl(profile) {
     return wsUrl
   }
 
-  // Local/token: the cached wsUrl already carries the (long-lived) token.
+  // Local process-token connections retain their legacy cached URL behavior.
   rememberRemoteWsHeaders(connection.wsUrl, connection.headers)
 
   return connection.wsUrl
@@ -9977,7 +10054,19 @@ async function buildRemoteConnection(
     )
   }
 
-  const wsUrl = buildGatewayWsUrl(baseUrl, token)
+  let ticket
+
+  try {
+    ticket = await mintGatewayWsTicketWithSessionToken(baseUrl, token, remoteHeaders)
+  } catch (error) {
+    throw configuredGatewayTokenTicketFailure(
+      error,
+      'The configured gateway session token was rejected. Open Settings → Gateway and save a valid token.',
+      'Could not reach the remote Hermes gateway while refreshing its WebSocket ticket. Try reconnecting.'
+    )
+  }
+
+  const wsUrl = buildGatewayWsUrlWithTicket(baseUrl, ticket)
 
   rememberRemoteWsHeaders(wsUrl, remoteHeaders)
 
@@ -10259,7 +10348,18 @@ function activeSshTerminalTarget(webContentsId?: number) {
 
     const state = sshConnections.get(scope)
 
-    return state && state.ssh ? { ssh: state.ssh, scope } : 'pending'
+    if (state && state.ssh) {
+      return { ssh: state.ssh, scope }
+    }
+
+    // The pool's single writer publishes under the per-profile bootstrap key
+    // while stamping the entry with its registry connection id (#97345), so a
+    // composite-key miss must still resolve the live tunnel by that identity
+    // instead of reporting 'pending' forever.
+    const pooledScope = registrySshPoolScopeByConnectionId(sshConnections, windowRoute.connectionId)
+    const pooledState = pooledScope === null ? null : sshConnections.get(pooledScope)
+
+    return pooledState && pooledState.ssh ? { ssh: pooledState.ssh, scope: pooledScope } : 'pending'
   }
 
   const profile = windowRoute?.profile ?? primaryProfileKey()
@@ -10279,9 +10379,7 @@ function activeSshTerminalTarget(webContentsId?: number) {
     return null
   }
 
-  const scope = route.connectionId
-    ? backendScopeKey(route.connectionId, profile)
-    : sshScopeKey(route.source === 'profile' ? profile : null)
+  const scope = v1SshTerminalPoolKey(route, profile)
 
   const state = sshConnections.get(scope)
 
@@ -11098,7 +11196,10 @@ async function testDesktopConnectionConfig(input: any = {}) {
   // connect to Hermes gateway". Mirror the renderer's connect here so the test
   // reflects the full path the app actually uses.
   const wsUrl = await resolveTestWsUrl(baseUrl, authMode, token, {
-    mintTicket: url => mintGatewayWsTicket(url, testHeaders)
+    mintTicket: url =>
+      authMode === 'oauth'
+        ? mintGatewayWsTicket(url, testHeaders)
+        : mintGatewayWsTicketWithSessionToken(url, token, testHeaders)
   })
 
   // Skip the WS leg only when the runtime genuinely lacks a WebSocket (so an
@@ -13049,6 +13150,10 @@ async function startHermes() {
     // accumulated count of the resolved episode.
     bootstrapRepairAttempt = 0
 
+    // The backend's plugin discovery just ran and refreshed HERMES_HOME/.plugin-compat-report.json.
+    // Surface it once (per distinct set of affected plugins) after the window is up; never block boot.
+    setTimeout(() => void showPluginCompatNoticeOnce(), 1500)
+
     return {
       baseUrl,
       mode: 'local',
@@ -13183,11 +13288,11 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
   }
 
   installContextMenuBridge(win)
-  win.webContents.setWindowOpenHandler(details => {
-    openExternalUrl(details.url)
-
-    return { action: 'deny' }
-  })
+  // Always deny, never open as a side effect: GHSA-9f4c-93c8-jc8g. Trusted
+  // links arrive via `hermes:openExternal`, not here. See window-open-policy.ts.
+  win.webContents.setWindowOpenHandler(
+    createWindowOpenHandler(origin => rememberLog(`[window-open] denied: ${origin}`))
+  )
   win.webContents.on('will-navigate', (event, url) => {
     if ((DEV_SERVER && url.startsWith(DEV_SERVER)) || (!DEV_SERVER && url.startsWith('file:'))) {
       return
@@ -15296,7 +15401,10 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
   // Same HTTP+WS two-leg check as testDesktopConnectionConfig: HTTP alone is
   // a false positive when the WebSocket leg is blocked.
   const wsUrl = await resolveTestWsUrl(baseUrl, authMode, token, {
-    mintTicket: url => mintGatewayWsTicket(url, testHeaders)
+    mintTicket: url =>
+      authMode === 'oauth'
+        ? mintGatewayWsTicket(url, testHeaders)
+        : mintGatewayWsTicketWithSessionToken(url, token, testHeaders)
   })
 
   if (wsUrl && typeof globalThis.WebSocket === 'function') {
@@ -15600,6 +15708,17 @@ ipcMain.handle('hermes:agents:roster', async () => {
 // hermes:gateway:ws-url. Same single-use-ticket discipline for OAuth sources.
 const registryGatewayWsUrlHandler = createRegistryGatewayWsUrlHandler({
   ensureBackend: ensureRegistryBackend,
+  mintConfiguredTokenTicket: async connection => {
+    try {
+      return await mintGatewayWsTicketWithSessionToken(connection.baseUrl, connection.token, connection.headers)
+    } catch (error) {
+      throw configuredGatewayTokenTicketFailure(
+        error,
+        'The configured gateway session token was rejected. Open Settings → Gateway and save a valid token.',
+        'Could not reach the remote Hermes gateway while refreshing its WebSocket ticket. Try reconnecting.'
+      )
+    }
+  },
   mintTicket: mintGatewayWsTicket,
   buildTicketUrl: buildGatewayWsUrlWithTicket,
   rememberHeaders: rememberRemoteWsHeaders

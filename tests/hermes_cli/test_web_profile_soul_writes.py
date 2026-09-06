@@ -30,7 +30,7 @@ SOUL = "# Persona\n\nYou are a careful, terse assistant.\n"
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "soul-test-token-0123456789abcdef")
+    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "soul-test-token")
     from hermes_cli import web_server
 
     with TestClient(web_server.app, raise_server_exceptions=False) as c:

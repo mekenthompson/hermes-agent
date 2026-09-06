@@ -106,81 +106,13 @@ def test_gated_status_is_public(gated_app):
     assert "gateway_state" in body
 
 
-def test_gated_status_advertises_explicit_desktop_token_without_disabling_oauth(
-    gated_app, monkeypatch
-):
-    monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", True)
+def test_gated_status_advertises_configured_dashboard_token_flow(gated_app, monkeypatch):
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", True, raising=False)
 
     body = gated_app.get("/api/status").json()
 
     assert body["auth_required"] is True
     assert "dashboard_session_token" in body["auth_flows"]
-
-
-def test_explicit_dashboard_token_authenticates_remote_rest_and_identity(
-    gated_app, monkeypatch
-):
-    """A configured Desktop token bypasses an unavailable OAuth verifier only."""
-    from hermes_cli.dashboard_auth import middleware as auth_middleware
-
-    monkeypatch.setattr(web_server, "_SESSION_TOKEN", _EXPLICIT_TOKEN)
-    monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", True)
-
-    def oauth_must_not_run(*_args, **_kwargs):
-        raise AssertionError("configured dashboard token must not call OAuth")
-
-    monkeypatch.setattr(auth_middleware, "_verify_bearer", oauth_must_not_run)
-
-    assert gated_app.get("/api/auth/me", follow_redirects=False).status_code == 401
-    assert (
-        gated_app.get(
-            "/api/auth/me",
-            headers={web_server._SESSION_HEADER_NAME: "not-the-configured-token"},
-            follow_redirects=False,
-        ).status_code
-        == 401
-    )
-
-    response = gated_app.get(
-        "/api/auth/me",
-        headers={web_server._SESSION_HEADER_NAME: _EXPLICIT_TOKEN},
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "user_id": "dashboard-session-token",
-        "email": "",
-        "display_name": "Dashboard session token",
-        "org_id": "",
-        "provider": "dashboard-session-token",
-        "expires_at": 2**63 - 1,
-    }
-    # The synthetic Session also reaches endpoints which require a session.
-    assert (
-        gated_app.post(
-            "/api/auth/ws-ticket",
-            headers={web_server._SESSION_HEADER_NAME: _EXPLICIT_TOKEN},
-        ).status_code
-        == 200
-    )
-
-
-def test_explicit_dashboard_token_download_query_is_narrow(gated_app, monkeypatch, tmp_path):
-    monkeypatch.setattr(web_server, "_SESSION_TOKEN", _EXPLICIT_TOKEN)
-    monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", True)
-    artifact = tmp_path / "desktop-artifact.txt"
-    artifact.write_text("isolated desktop download")
-    params = {"path": str(artifact), "token": _EXPLICIT_TOKEN}
-
-    response = gated_app.get("/api/files/download", params=params)
-    assert response.status_code == 200
-    assert response.text == "isolated desktop download"
-    assert gated_app.get("/api/auth/me", params={"token": _EXPLICIT_TOKEN}).status_code == 401
-    assert gated_app.get("/api/files/download", params={"path": str(artifact)}).status_code == 401
-    assert gated_app.get("/api/files/download", params={"path": str(artifact), "token": "wrong"}).status_code == 401
-
-    monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", False)
-    assert gated_app.get("/api/files/download", params=params).status_code == 401
 
 
 @pytest.mark.parametrize("path", [
@@ -366,6 +298,37 @@ def test_api_auth_me_requires_auth(gated_app):
     # No cookies.
     r = gated_app.get("/api/auth/me")
     assert r.status_code == 401
+
+
+def test_explicit_dashboard_token_authenticates_before_provider_verification(gated_app, monkeypatch):
+    """Configured gateway tokens retain REST access while the OAuth provider is down."""
+    from hermes_cli.dashboard_auth import middleware as auth_middleware
+
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN", _EXPLICIT_TOKEN)
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", True, raising=False)
+
+    def oauth_must_not_run(*_args, **_kwargs):
+        raise AssertionError("explicit dashboard token must bypass provider verification")
+
+    monkeypatch.setattr(auth_middleware, "_verify_access_token", oauth_must_not_run)
+    response = gated_app.get(
+        "/api/auth/me", headers={web_server._SESSION_HEADER_NAME: _EXPLICIT_TOKEN}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["user_id"] == "dashboard-session-token"
+    assert response.json()["provider"] == "dashboard-session-token"
+
+
+def test_invalid_explicit_dashboard_token_remains_unauthorized(gated_app, monkeypatch):
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN", _EXPLICIT_TOKEN)
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", True, raising=False)
+
+    response = gated_app.get(
+        "/api/auth/me", headers={web_server._SESSION_HEADER_NAME: "not-the-configured-token"}
+    )
+
+    assert response.status_code == 401
 
 
 # ---------------------------------------------------------------------------

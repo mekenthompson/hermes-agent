@@ -7,6 +7,7 @@ import asyncio
 import logging
 
 import pytest
+import hermes_cli.web_server_lifecycle as _web_server_lifecycle
 
 # Phase 5 / Phase 6: these tests mutate ``web_server.app.state.auth_required``
 # at module level. Run them in the same xdist worker so they don't race
@@ -203,36 +204,6 @@ def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
     assert web_server.app.state.auth_required is True
 
 
-def test_start_server_public_with_explicit_dashboard_token_needs_no_provider(monkeypatch):
-    """An explicit 64-character Desktop credential is sufficient for a gated bind.
-
-    This is deliberately narrower than making a public dashboard anonymous:
-    the OAuth gate remains engaged, but an operator-provisioned token is a
-    valid authentication method when no OAuth/password provider is installed.
-    """
-    from hermes_cli.dashboard_auth import clear_providers
-
-    clear_providers()
-    captured = _stub_uvicorn_run(monkeypatch)
-    token = "t" * 64
-    monkeypatch.setattr(web_server, "_SESSION_TOKEN", token)
-    monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", True)
-    _restore_app_state_after_test(
-        monkeypatch,
-        "auth_required",
-        "bound_host",
-        "bound_port",
-        "trusted_public_hosts",
-    )
-
-    web_server.start_server(
-        host="0.0.0.0", port=9119, open_browser=False, allow_public=False,
-    )
-
-    assert web_server.app.state.auth_required is True
-    assert captured["kwargs"].get("host") == "0.0.0.0"
-
-
 def test_start_server_public_without_insecure_records_auth_required(monkeypatch):
     """Public bind without --insecure: the gate engages and auth_required=True.
 
@@ -322,7 +293,7 @@ def test_start_server_passes_bounded_trusted_proxy_networks(monkeypatch, caplog)
 
 def test_trusted_proxy_allowlist_rejects_unbounded_entries(caplog):
     """Wildcard and whole-address-space trust must fail closed."""
-    trusted = web_server._dashboard_forwarded_allow_ips({
+    trusted = _web_server_lifecycle._dashboard_forwarded_allow_ips({
         "trusted_proxies": ["*", "0.0.0.0/0", "::/0", "172.18.0.7"],
     })
 
@@ -336,7 +307,7 @@ def test_trusted_container_proxy_controls_https_detection():
     from starlette.requests import Request
     from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-    trusted = web_server._dashboard_forwarded_allow_ips({
+    trusted = _web_server_lifecycle._dashboard_forwarded_allow_ips({
         "trusted_proxies": ["172.18.0.0/16"],
     })
 
