@@ -118,6 +118,7 @@ _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
+_INTERNAL_PLUGIN_EXECUTION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -17922,6 +17923,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return self._handle_message
 
     @staticmethod
+    def _validate_internal_plugin_execution_id(execution_id: str) -> str:
+        """Return one bounded opaque plugin execution identity or reject it."""
+        if not isinstance(execution_id, str) or not _INTERNAL_PLUGIN_EXECUTION_ID_RE.fullmatch(
+            execution_id
+        ):
+            raise ValueError("execution_id must be a canonical opaque identifier")
+        return execution_id
+
+    @staticmethod
     def _validate_internal_plugin_event(event: MessageEvent) -> SessionSource:
         """Validate the narrow event shape allowed for profile-local plugins."""
         if not isinstance(event, MessageEvent):
@@ -17972,8 +17982,126 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return str(session_entry.session_id)
 
+    def _internal_plugin_execution_records(self) -> dict:
+        records = self.__dict__.get("_internal_plugin_execution_registry")
+        if records is None:
+            records = {}
+            self.__dict__["_internal_plugin_execution_registry"] = records
+        return records
+
+    def _register_internal_plugin_execution(self, event: MessageEvent, session_key: str) -> None:
+        execution_id = self._validate_internal_plugin_execution_id(
+            getattr(event, "_internal_plugin_execution_id", "")
+        )
+        records = self._internal_plugin_execution_records()
+        if execution_id in records or any(
+            record["session_key"] == session_key for record in records.values()
+        ):
+            raise ValueError("internal plugin session already has a live execution")
+        state = self._peek_session_state(session_key)
+        expected_generation = (
+            int(state.persistent.run_generation) + 1 if state is not None else 1
+        )
+        records[execution_id] = {
+            "session_key": session_key,
+            "source": event.source,
+            "generation": expected_generation,
+            "agent": None,
+        }
+
+    def _bind_internal_plugin_execution(
+        self, event_or_execution_id: MessageEvent | str, *, session_key: str,
+        run_generation: int, agent: Any,
+    ) -> bool:
+        execution_id = (
+            event_or_execution_id
+            if isinstance(event_or_execution_id, str)
+            else getattr(event_or_execution_id, "_internal_plugin_execution_id", None)
+        )
+        record = self._internal_plugin_execution_records().get(execution_id)
+        state = self._peek_session_state(session_key)
+        if (
+            record is None
+            or record["session_key"] != session_key
+            or record["generation"] != run_generation
+            or state is None
+            or state.persistent.run_generation != run_generation
+            or state.turn.agent is not agent
+        ):
+            return False
+        record["agent"] = agent
+        return True
+
+    def _promote_running_agent(
+        self, *, session_key: str, run_generation: Optional[int], agent: Any,
+        internal_plugin_execution_id: Optional[str] = None,
+    ) -> bool:
+        """Publish one live agent and bind a matching internal execution safely."""
+        state = self._peek_session_state(session_key)
+        if state is None or (
+            run_generation is not None
+            and state.persistent.run_generation != run_generation
+        ) or (internal_plugin_execution_id is not None and run_generation is None):
+            return False
+        state.turn.agent = agent
+        if internal_plugin_execution_id is not None:
+            assert run_generation is not None
+            self._bind_internal_plugin_execution(
+                internal_plugin_execution_id,
+                session_key=session_key,
+                run_generation=run_generation,
+                agent=agent,
+            )
+        return True
+
+    def _retire_internal_plugin_execution(self, execution_id: Optional[str]) -> None:
+        if not execution_id:
+            return
+        record = self._internal_plugin_execution_records().pop(execution_id, None)
+        if record is not None:
+            retired = self.__dict__.setdefault("_internal_plugin_retired_executions", OrderedDict())
+            retired[execution_id] = None
+            retired.move_to_end(execution_id)
+            while len(retired) > 256:
+                retired.popitem(last=False)
+
+    async def request_stop(
+        self, *, session_key: str, expected_execution_id: str,
+        reason: str = "Internal plugin stop requested",
+    ) -> dict:
+        execution_id = self._validate_internal_plugin_execution_id(expected_execution_id)
+        receipt = {"session_key": session_key, "execution_id": execution_id}
+        record = self._internal_plugin_execution_records().get(execution_id)
+        if record is None:
+            status = "stale" if execution_id in self.__dict__.get("_internal_plugin_retired_executions", {}) else "not_running"
+            return {"status": status, **receipt}
+        state = self._peek_session_state(session_key)
+        if (
+            record["session_key"] != session_key
+            or state is None
+            or state.persistent.run_generation != record["generation"]
+        ):
+            return {"status": "stale", **receipt}
+        agent = record["agent"]
+        if (
+            agent is None
+            or agent is _AGENT_PENDING_SENTINEL
+            or state.turn.agent is not agent
+        ):
+            # A pending state has no exact agent to which a Stop could have
+            # been delivered.  Do not manufacture a binding from the live slot.
+            return {"status": "not_running", **receipt}
+        if not request_hard_interrupt(agent, reason):
+            return {"status": "not_delivered", **receipt}
+        # "accepted" acknowledges delivery to this bound agent only; it does
+        # not claim that executor-backed work has physically stopped.
+        return {"status": "accepted", **receipt}
+
     async def dispatch_internal_plugin_event(
-        self, event: MessageEvent
+        self,
+        event: MessageEvent,
+        *,
+        execution_id: Optional[str] = None,
     ) -> Optional[str]:
         """Run one profile-local plugin event through the normal gateway turn.
 
@@ -17983,9 +18111,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         or inject media. The normal scoped message handler still owns session
         lookup, persistence, model execution, and response normalization.
         """
-        self._validate_internal_plugin_event(event)
-        handler = self._primary_message_handler()
-        return await handler(event)
+        source = self._validate_internal_plugin_event(event)
+        if execution_id is None:
+            handler = self._primary_message_handler()
+            return await handler(event)
+        execution_id = self._validate_internal_plugin_execution_id(execution_id)
+        setattr(event, "_internal_plugin_execution_id", execution_id)
+        self._register_internal_plugin_execution(
+            event, self._session_key_for_source(source)
+        )
+        handler_completed = False
+        try:
+            result = await self._primary_message_handler()(event)
+            handler_completed = True
+            return result
+        finally:
+            # A wrapper cancellation is not evidence that executor-backed work
+            # stopped. Retire only after the real handler returned normally.
+            if handler_completed:
+                self._retire_internal_plugin_execution(execution_id)
 
     async def _handle_gateway_platform_event(self, event: dict, source) -> None:
         """Authorize and publish one normalized adapter event to plugin hooks."""
@@ -23367,6 +23511,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                internal_plugin_execution_id=getattr(
+                    event, "_internal_plugin_execution_id", None
+                ),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -31325,6 +31472,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        internal_plugin_execution_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -31346,6 +31494,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                internal_plugin_execution_id=internal_plugin_execution_id,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -31360,6 +31509,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                internal_plugin_execution_id=internal_plugin_execution_id,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -31504,6 +31654,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        internal_plugin_execution_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -32168,7 +32319,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     run_generation,
                 )
                 return
-            self._session_state(session_key).turn.agent = agent_holder[0]
+            if not self._promote_running_agent(
+                session_key=session_key,
+                run_generation=run_generation,
+                agent=agent_holder[0],
+                internal_plugin_execution_id=internal_plugin_execution_id,
+            ):
+                logger.info(
+                    "Skipping agent promotion for %s — session state changed before binding",
+                    session_key or "",
+                )
+                return
             if self._draining:
                 self._update_runtime_status("draining")
         
