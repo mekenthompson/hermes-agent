@@ -252,6 +252,7 @@ class NativeTaskCardAdapter(ProgressCaptureAdapter):
             {
                 "chat_id": chat_id,
                 "tasks": [dict(task) for task in tasks],
+                "title": title,
                 "metadata": dict(metadata or {}),
                 "fallback_text": fallback_text,
             }
@@ -1101,6 +1102,36 @@ async def test_slack_native_progress_correlates_concurrent_duplicate_tools_by_id
     ]
     assert adapter.sent == []
     assert adapter.native_stops == 1
+
+
+@pytest.mark.asyncio
+async def test_slack_native_progress_uses_profile_display_name_for_card_and_fallback(
+    monkeypatch, tmp_path
+):
+    """The live turn runner resolves the card title from the scoped profile metadata."""
+    from hermes_cli.profiles import write_profile_meta
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    write_profile_meta(tmp_path, display_name="Ariadne")
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DuplicateNativeToolsAgent,
+        session_id="sess-native-profile-title",
+        platform=Platform.SLACK,
+        chat_id="C1",
+        thread_id="thread-1",
+        adapter_cls=NativeTaskCardAdapter,
+        user_id="U1",
+        scope_id="T1",
+    )
+
+    assert result["final_response"] == "done"
+    assert {update["title"] for update in adapter.native_updates} == {"Ariadne is working"}
+    assert all(
+        update["fallback_text"].startswith("Ariadne is working\n")
+        for update in adapter.native_updates
+    )
 
 
 @pytest.mark.asyncio
