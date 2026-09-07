@@ -7,7 +7,7 @@ This fork packages the complete Hermes Agent runtime from its existing root `Doc
 - Pull requests build, smoke-test, generate an image SBOM, and run the critical-vulnerability gate without registry credentials.
 - Manual publication is the only publishing path. Merging to `main` does not publish an image.
 - Publication is accepted only for an exact pushed commit selected from `main`.
-- The `agent-image-publish` GitHub environment must require environment approval before its first use.
+- Publication has no manual reviewer prerequisite. It fails closed unless the repository's `CI` push run for this exact `main` SHA completed successfully; a green run for a different SHA is not accepted.
 - The workflow publishes only `ghcr.io/mekenthompson/hermes-agent:sha-<commit>` and does not create `latest`.
 - This workflow does not deploy containers, update Fleet, mutate profile state, or migrate production.
 
@@ -17,7 +17,7 @@ The preflight job builds the complete image, verifies `/etc/hermes/image-provena
 
 The protected publish job downloads and re-verifies that same scanned `linux/amd64` candidate, pushes it without rebuilding, and emits GitHub-signed build-provenance and package-SBOM attestations for the resulting registry digest. Multi-architecture publication is intentionally deferred until it can preserve this same build-once promotion guarantee.
 
-Review the SBOM for dependency and license anomalies and review the vulnerability report before granting environment approval. The environment approval is the human release gate; it is not replaced by a successful build.
+The scan, exact-candidate verification, and CI gate are automated release prerequisites. They do not authorize deployment.
 
 ## Fleet handoff
 

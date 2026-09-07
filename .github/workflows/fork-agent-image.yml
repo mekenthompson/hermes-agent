@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: read
+  actions: read # inspect CI for the exact selected commit; publication fails closed without it
 
 concurrency:
   group: fork-agent-image-${{ github.event.pull_request.number || github.sha }}
@@ -151,12 +152,26 @@ jobs:
     environment: agent-image-publish
     permissions:
       contents: read
+      actions: read
       packages: write
       id-token: write
       attestations: write
     steps:
       - name: Checkout exact pushed commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Verify exact main CI gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-exact-main-ci.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow "ci.yaml" \
+            --sha "$GITHUB_SHA" \
+            --workflow-path ".github/workflows/ci.yaml"
 
       - name: Download exact scanned candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
