@@ -149,10 +149,15 @@ candidate-123-1: digest: sha256:222222222222222222222222222222222222222222222222
         self.assertNotIn("id-token: write", preflight)
         self.assertNotIn("docker/login-action", preflight)
 
+    def test_publish_does_not_also_run_the_duplicate_preflight_build_and_scan(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        preflight = text.split("\n  publish:\n", 1)[0]
+        self.assertIn("github.event.inputs.publish != 'true'", preflight)
+
     def test_promotion_preserves_the_scanned_manifest_digest_at_the_sha_tag(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("--prefer-index=false", text)
-        self.assertIn('docker buildx imagetools inspect --format \'{{.Digest}}\' "$TEST_IMAGE"', text)
+        self.assertIn('docker buildx imagetools inspect --format \'{{.Manifest.Digest}}\' "$TEST_IMAGE"', text)
         self.assertIn('test "$promoted_digest" = "$digest"', text)
 
     def test_remote_config_verifier_binds_remote_manifest_to_scanned_image_id(self) -> None:

@@ -238,7 +238,7 @@ jobs:
           docker buildx imagetools inspect --raw "$immutable_ref" > remote-manifest.json
           python3 scripts/verify-remote-image-config.py --image-id "$local_image_id" --manifest remote-manifest.json
           docker buildx imagetools create --prefer-index=false --tag "$TEST_IMAGE" "$immutable_ref"
-          promoted_digest=$(docker buildx imagetools inspect --format '{{.Digest}}' "$TEST_IMAGE")
+          promoted_digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$TEST_IMAGE")
           test "$promoted_digest" = "$digest"
           python3 scripts/emit-image-manifest.py \
             --repository "$IMAGE_REPOSITORY" \
