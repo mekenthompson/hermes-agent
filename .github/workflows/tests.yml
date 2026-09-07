@@ -23,11 +23,9 @@ jobs:
     # adds a second setup.
     # Four GitHub-hosted slices keep the fork off the failed, single-capacity
     # pixsoul runner. Upstream retains its one 96-core job.
-    if: github.repository == 'mekenthompson/hermes-agent' || matrix.slice == 1
     strategy:
       fail-fast: false
-      matrix:
-        slice: [1, 2, 3, 4]
+      matrix: ${{ fromJSON(github.repository == 'mekenthompson/hermes-agent' && '{"slice":[1,2,3,4],"slices":[4]}' || '{"slice":[1],"slices":[1]}') }}
     runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'ubuntu-latest-96-core' || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
@@ -107,7 +105,7 @@ jobs:
         # set is identical to the list the removed matrix job used to pass in.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh --slice ${{ matrix.slice }}/4
+          scripts/run_tests.sh --slice ${{ matrix.slice }}/${{ matrix.slices }}
         env:
           # This is the maximum number of test FILES that run together.
           # run_tests_parallel.py starts one pytest subprocess for each file
