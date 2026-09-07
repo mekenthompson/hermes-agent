@@ -79,10 +79,25 @@ class GatewayPluginServicesMixin:
         return str(entry.session_id)
 
     async def dispatch_internal_plugin_event(
-        self, event: MessageEvent
+        self, event: MessageEvent, *, execution_id: Optional[str] = None,
+        execution_policy: Optional[dict] = None,
     ) -> Optional[str]:
         """Dispatch a validated plugin event through the normal scoped handler."""
         self._validate_internal_plugin_event(event)
+        # The lifecycle mixin consumes these only for a named internal execution.
+        # Never consult or modify profile config here: this is a one-execution capability.
+        if execution_policy is not None:
+            if execution_id is None or not isinstance(execution_policy, dict):
+                raise ValueError("internal execution policy requires an execution_id and mapping")
+            max_iterations = execution_policy.get("max_iterations")
+            wall_seconds = execution_policy.get("wall_seconds")
+            if (type(max_iterations) is not int or max_iterations < 1
+                    or isinstance(wall_seconds, bool) or not isinstance(wall_seconds, (int, float))
+                    or not (0 < float(wall_seconds) < float("inf"))):
+                raise ValueError("internal execution policy requires positive finite limits")
+            event._internal_plugin_execution_policy = {
+                "max_iterations": max_iterations, "wall_seconds": float(wall_seconds),
+            }
         return await self._primary_message_handler()(event)
 
     def _start_plugin_profile_services(self) -> None:

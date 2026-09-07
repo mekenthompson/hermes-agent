@@ -45,6 +45,7 @@ class TurnContext:
     session_key: Optional[str] = None
     run_generation: Optional[int] = None
     internal_plugin_execution_id: Optional[str] = None
+    internal_plugin_execution_policy: Optional[dict] = None
     # Set by the loop-side promotion task before the executor may launch.
     execution_launch_gate: Any = None
     execution_launch_allowed: bool = True

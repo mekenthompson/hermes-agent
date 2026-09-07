@@ -138,11 +138,24 @@ class GatewayExecutionLifecycleMixin:
             occupancy="unknown" if record["observed_tool"] else "released",
         )
 
-    async def dispatch_internal_plugin_event(self, event, *, execution_id: Optional[str] = None):
+    async def dispatch_internal_plugin_event(self, event, *, execution_id: Optional[str] = None,
+                                             execution_policy: Optional[dict] = None):
         if execution_id is None:
             return await super().dispatch_internal_plugin_event(event)
         execution_id = self._validate_internal_plugin_execution_id(execution_id)
         source = self._validate_internal_plugin_event(event)
+        # Validate at the core boundary too: callers cannot smuggle a policy through
+        # a plugin-services implementation that predates the validation above.
+        if execution_policy is not None:
+            max_iterations = execution_policy.get("max_iterations") if isinstance(execution_policy, dict) else None
+            wall_seconds = execution_policy.get("wall_seconds") if isinstance(execution_policy, dict) else None
+            if (type(max_iterations) is not int or max_iterations < 1
+                    or isinstance(wall_seconds, bool) or not isinstance(wall_seconds, (int, float))
+                    or not (0 < float(wall_seconds) < float("inf"))):
+                raise ValueError("internal execution policy requires positive finite limits")
+            event._internal_plugin_execution_policy = {
+                "max_iterations": max_iterations, "wall_seconds": float(wall_seconds),
+            }
         event._internal_plugin_execution_id = execution_id
         self._register_internal_plugin_execution(event, self._session_key_for_source(source))
         try:

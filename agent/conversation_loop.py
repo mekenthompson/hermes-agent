@@ -121,7 +121,7 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
     budget = getattr(agent, "run_budget_seconds", None)
     started = getattr(agent, "_run_budget_started_at", None)
     if not budget or not started or getattr(agent, "_run_budget_wrapup_injected", False) or (
-        (time.time() - started) < 0.8 * float(budget)
+        (time.monotonic() - started) < 0.8 * float(budget)
     ):
         return False
     for msg in reversed(messages):
@@ -137,7 +137,7 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
             agent._run_budget_wrapup_injected = True
             logger.info(
                 "Run budget wrap-up notice injected (budget=%.0fs, elapsed=%.0fs)",
-                float(budget), time.time() - started,
+                float(budget), time.monotonic() - started,
             )
             return True
     return False

@@ -2231,6 +2231,7 @@ def init_agent(
     for _name in _GATEWAY_IDENTITY_PARAMS:
         setattr(agent, f"_{_name}", _params[_name])
     # Shared iteration budget: parent creates, children inherit.
+    agent._iteration_budget_is_shared = iteration_budget is not None
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
     # CLI replaces this with _cprint so raw ANSI status lines go through prompt_toolkit's
     # renderer (StdoutProxy would mangle them). None = builtins.print.

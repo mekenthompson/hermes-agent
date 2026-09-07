@@ -569,7 +569,7 @@ class AIAgent(
         run_budget = getattr(self, "run_budget_seconds", None)
         started = getattr(self, "_run_budget_started_at", None)
         if run_budget and started and not self._stale_timeout_is_explicit():
-            remaining = float(run_budget) - (time.time() - started)
+            remaining = float(run_budget) - (time.monotonic() - started)
             timeout = min(timeout, max(60.0, remaining * 0.5))
         return timeout
 

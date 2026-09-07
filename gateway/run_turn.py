@@ -1972,6 +1972,7 @@ class GatewayTurnMixin:
                 persist_user_display_metadata={"gateway_input_owner": prepared.persistence_owner},
                 message_type=event.message_type,
                 internal_plugin_execution_id=getattr(event, "_internal_plugin_execution_id", None),
+                internal_plugin_execution_policy=getattr(event, "_internal_plugin_execution_policy", None),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -3805,6 +3806,7 @@ class GatewayTurnMixin:
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
         internal_plugin_execution_id: Optional[str] = None,
+        internal_plugin_execution_policy: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -3833,6 +3835,7 @@ class GatewayTurnMixin:
         # Kept on the turn context only until promotion; an ID is never inferred
         # from a later live slot.
         turn_ctx.internal_plugin_execution_id = internal_plugin_execution_id
+        turn_ctx.internal_plugin_execution_policy = internal_plugin_execution_policy
         if internal_plugin_execution_id is not None:
             # A threading.Event crosses the executor boundary without treating cancellation
             # of its asyncio wrapper as physical worker completion.

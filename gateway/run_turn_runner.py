@@ -962,6 +962,7 @@ class TurnRunner:
         return ctx.AIAgent(
             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
             max_iterations=max_iterations, quiet_mode=True, verbose_logging=False,
+            run_budget_seconds=(ctx.internal_plugin_execution_policy or {}).get("wall_seconds"),
             enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=ctx.disabled_toolsets,
             ephemeral_system_prompt=combined_ephemeral or None,
             prefill_messages=runner._prefill_messages or None,
@@ -1630,6 +1631,11 @@ class TurnRunner:
         platform_key = "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value
         combined_ephemeral = self._combined_ephemeral_prompt()
         max_iterations = _current_max_iterations()
+        execution_policy = ctx.internal_plugin_execution_policy
+        if execution_policy is not None:
+            # The core lifecycle already validates this opaque per-execution policy.
+            # It must win over the mutable profile-global gateway configuration.
+            max_iterations = execution_policy["max_iterations"]
         try:
             model, runtime_kwargs = runner._resolve_session_agent_runtime(
                 source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,

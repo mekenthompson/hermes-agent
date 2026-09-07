@@ -473,10 +473,12 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
         agent._replay_compression_warning()
         agent._compression_warning = None  # send once
 
-    agent.iteration_budget = IterationBudget(agent.max_iterations)
+    # A delegated child receives its parent's native budget and must never reset it.
+    if not getattr(agent, "_iteration_budget_is_shared", False):
+        agent.iteration_budget = IterationBudget(agent.max_iterations)
     # Wall-clock run budget: stamped only when configured (one wrap-up notice per run).
     agent._run_budget_started_at = (
-        time.time() if getattr(agent, "run_budget_seconds", None) else None
+        time.monotonic() if getattr(agent, "run_budget_seconds", None) else None
     )
     # Reset the streaming context / think scrubbers at the top of each turn.
     for name in ("_stream_context_scrubber", "_stream_think_scrubber"):
