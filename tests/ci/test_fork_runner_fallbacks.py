@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import re
+import runpy
 import unittest
 from pathlib import Path
 
@@ -14,6 +17,21 @@ EXPECTED = {
 
 
 class ForkRunnerFallbackTests(unittest.TestCase):
+    def test_matrix_covers_entire_suite_for_fork_and_upstream(self) -> None:
+        text = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+        line = next(x for x in text.splitlines() if "matrix:" in x)
+        choices = [json.loads(x) for x in re.findall(r"'(\{.*?\})'", line)]
+        self.assertEqual(choices, [{"slice": [1, 2, 3, 4], "slices": [4]}, {"slice": [1], "slices": [1]}])
+        self.assertIn("github.repository == 'mekenthompson/hermes-agent'", line)
+        runner = runpy.run_path(str(ROOT / "scripts/run_tests_parallel.py"))
+        files = runner["_discover_files"]([ROOT / "tests"])
+        self.assertGreater(len(files), 100)
+        for choice in choices:
+            buckets = runner["_compute_lpt_slices"](files, choice["slices"][0], {}, ROOT)
+            selected = [p for i in choice["slice"] for p in buckets[i - 1]]
+            self.assertEqual(sorted(selected), sorted(files))
+            self.assertEqual(len(selected), len(set(selected)))
+
     def test_upstream_large_runners_have_standard_fork_fallbacks(self) -> None:
         trust_guard = (
             "github.repository == 'NousResearch/hermes-agent' && "
@@ -30,6 +48,8 @@ class ForkRunnerFallbackTests(unittest.TestCase):
                 self.assertIn(expected, lines)
 
         tests_lines = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8").splitlines()
+        self.assertFalse(any("matrix." in line for line in tests_lines if line.startswith("    if:")))
+        self.assertIn("          scripts/run_tests.sh --slice ${{ matrix.slice }}/${{ matrix.slices }}", tests_lines)
         expected_workers = (
             f"          HERMES_TEST_WORKERS: ${{{{ {trust_guard} && "
             "'96' || '4' }}"
