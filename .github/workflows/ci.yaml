@@ -261,6 +261,9 @@ jobs:
     outputs:
       needs-json: ${{ steps.evaluate.outputs.needs-json }}
     steps:
+      # This job invokes the versioned policy helper from the checked-out PR
+      # revision; unlike the former inline Python, it therefore needs a checkout.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Evaluate job results
         id: evaluate
         env:

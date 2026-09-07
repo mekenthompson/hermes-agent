@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -57,3 +60,19 @@ def test_evaluate_needs_rejects_failure_and_cancelled_results(
     summary = _mod.evaluate_needs(needs)
     assert summary.compact == {name: info["result"] for name, info in needs.items()}
     assert summary.failed == expected_failed
+
+
+def test_policy_file_runs_as_the_aggregate_job_entrypoint(tmp_path: Path) -> None:
+    """The checkout-provided script writes the output consumed by the workflow job."""
+    output_path = tmp_path / "github-output"
+    result = subprocess.run(
+        [sys.executable, str(_PATH)],
+        input=json.dumps({"tests": {"result": "success"}}),
+        text=True,
+        capture_output=True,
+        env={**os.environ, "GITHUB_OUTPUT": str(output_path)},
+        check=True,
+    )
+
+    assert "All checks passed (or were skipped)" in result.stdout
+    assert output_path.read_text(encoding="utf-8") == 'needs-json={"tests":"success"}\n'
