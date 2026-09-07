@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from types import SimpleNamespace
 
 from unittest.mock import AsyncMock
 
@@ -419,3 +420,24 @@ async def test_real_to_thread_cancellation_does_not_release_until_physical_worke
         "occupancy": "released", "tools": "none", "children": "none",
         "processes": "none", "remote": "none",
     }
+
+
+@pytest.mark.asyncio
+async def test_stale_internal_plugin_promotion_releases_launch_fence():
+    """A stale generation must not leave the executor blocked at the launch fence."""
+    runner = object.__new__(GatewayRunner)
+    runner._is_session_run_current = lambda *_args: False
+    gate = threading.Event()
+    turn_ctx = SimpleNamespace(
+        session_key="local:aggie:linear-session-1",
+        run_generation=7,
+        agent_holder=[object()],
+        internal_plugin_execution_id=_EXECUTION_ID,
+        execution_launch_gate=gate,
+        execution_launch_allowed=False,
+    )
+
+    await runner._run_agent_track_agent(turn_ctx)
+
+    assert turn_ctx.execution_launch_allowed is False
+    assert gate.is_set()
