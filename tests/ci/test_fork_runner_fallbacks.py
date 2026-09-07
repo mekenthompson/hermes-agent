@@ -21,7 +21,7 @@ class ForkRunnerFallbackTests(unittest.TestCase):
         text = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
         line = next(x for x in text.splitlines() if "matrix:" in x)
         choices = [json.loads(x) for x in re.findall(r"'(\{.*?\})'", line)]
-        self.assertEqual(choices, [{"slice": [1, 2, 3, 4, 5, 6], "slices": [6]}, {"slice": [1], "slices": [1]}])
+        self.assertEqual(choices, [{"slice": [1, 2, 3, 4, 5, 6, 7, 8], "slices": [8]}, {"slice": [1], "slices": [1]}])
         self.assertIn("github.repository == 'mekenthompson/hermes-agent'", line)
         runner = runpy.run_path(str(ROOT / "scripts/run_tests_parallel.py"))
         files = runner["_discover_files"]([ROOT / "tests"])

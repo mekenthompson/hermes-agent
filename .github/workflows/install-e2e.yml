@@ -58,6 +58,9 @@ jobs:
   # by both route matrices, so the two routes cover the same set.
   pick-releases:
     name: Pick release tags
+    # Upstream only on the schedule and tag pushes: the fork has no release
+    # process, and every scheduled run there failed for 15 min twice a day.
+    if: github.repository == 'NousResearch/hermes-agent' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:

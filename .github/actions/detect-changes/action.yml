@@ -63,6 +63,12 @@ outputs:
   ci_review_files:
     description: JSON list of CI-sensitive files changed by the pull request.
     value: ${{ steps.classify.outputs.ci_review_files }}
+  os_tests:
+    description: Run the macOS / Windows pytest lanes (fork consumes; upstream gates them on python).
+    value: ${{ steps.classify.outputs.os_tests }}
+  binary_artifacts:
+    description: An image or archive file changed (fork gates the infographic / profile-archive tree checks on it).
+    value: ${{ steps.classify.outputs.binary_artifacts }}
 
 runs:
   using: composite
@@ -81,6 +87,10 @@ runs:
         EVENT_NAME: ${{ github.event_name }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        # Fork-only push scoping (scripts/ci/push_changed_files.py).
+        PUSH_BEFORE: ${{ github.event.before }}
+        PUSH_AFTER: ${{ github.sha }}
+        PUSH_FORCED: ${{ github.event.forced }}
       run: |
         set -euo pipefail
 
@@ -119,6 +129,12 @@ runs:
             echo "::warning::compare API failed (attempt $i); retrying in 10s"
             sleep 10
           done
+        elif [ "$EVENT_NAME" = "push" ] && [ "$REPO" = "mekenthompson/hermes-agent" ]; then
+          # Fork only: scope a main push to the pushed range
+          # (github.event.before...github.sha). The helper prints nothing —
+          # so the classifier fails open — on a first or forced push, a
+          # non-fast-forward or truncated compare, or an API failure.
+          CHANGED="$(python3 scripts/ci/push_changed_files.py)"
         fi
 
         echo "Changed files:"

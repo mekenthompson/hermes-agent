@@ -43,7 +43,10 @@ jobs:
     name: CI review comment (live)
     # Fork PRs get no comment: the poller needs a write token, and the
     # ``pull_requests`` payload is empty for a fork run.
+    # Upstream only: the fork reads check results with ``gh``; a poller that
+    # lives as long as the CI run would double its runner-minutes for a comment.
     if: >-
+      github.repository == 'NousResearch/hermes-agent' &&
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest

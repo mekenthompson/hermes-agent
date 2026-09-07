@@ -20,7 +20,9 @@ concurrency:
 jobs:
   publish:
     name: Publish inline E2E evidence
-    if: github.event.workflow_run.event == 'pull_request'
+    # Upstream only: Desktop E2E is disabled in ci.yaml, so no fork run ever
+    # produces the evidence artifact this publishes.
+    if: github.repository == 'NousResearch/hermes-agent' && github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: gh-image

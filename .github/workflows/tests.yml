@@ -21,13 +21,17 @@ jobs:
     # 96 cores clear the floor that the slowest single test file sets (about
     # 82s). A second slice divides work that is already at that floor, and
     # adds a second setup.
-    # Six GitHub-hosted slices keep the fork off the failed, single-capacity
+    # GitHub-hosted slices keep the fork off the failed, single-capacity
     # pixsoul runner. Four slices ran 8-11 min each on 4-core runners (run
-    # 34088223918); six bring the lane to ~6-7 min for two more short jobs.
-    # Upstream retains its one 96-core job.
+    # 34088223918); six ran 5.4-8.4 min (runs 34099933670, 34102475892) and
+    # were the critical path of every fork run. Setup is ~15s per slice with
+    # a warm uv cache, so eight bring the lane to ~5 min — level with the JS
+    # shards — for two more short jobs. Slicing is LPT by file count
+    # (test_durations.json is not committed), which is what keeps the
+    # partition identical across slices. Upstream retains its one 96-core job.
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(github.repository == 'mekenthompson/hermes-agent' && '{"slice":[1,2,3,4,5,6],"slices":[6]}' || '{"slice":[1],"slices":[1]}') }}
+      matrix: ${{ fromJSON(github.repository == 'mekenthompson/hermes-agent' && '{"slice":[1,2,3,4,5,6,7,8],"slices":[8]}' || '{"slice":[1],"slices":[1]}') }}
     runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'ubuntu-latest-96-core' || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
