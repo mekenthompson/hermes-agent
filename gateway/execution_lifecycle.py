@@ -1,8 +1,8 @@
 """Truthful lifecycle receipts for internal plugin executions.
 
-`accepted` means only that the bound in-process agent accepted an interrupt.
-It is deliberately not a claim about executor threads, tools, children, processes,
-or remote work; those stay occupied/unknown until the normal turn cleanup observes them.
+The lifecycle is deliberately local: a completed receipt means the gateway observed the
+agent worker finish with no observed tool/process/child lifetime.  Any observed tool (or
+untracked effect) remains unknown rather than being reported released.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import re
 from typing import Any, Optional
 
 _EXECUTION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-LIFECYCLE_VERSION = "execution-lifecycle/v1"
+LIFECYCLE_VERSION = "execution-lifecycle/v2"
 
 
 class GatewayExecutionLifecycleMixin:
@@ -30,9 +30,12 @@ class GatewayExecutionLifecycleMixin:
         if execution_id in records or any(r["session_key"] == session_key for r in records.values()):
             raise ValueError("internal plugin session already has a live execution")
         state = self._peek_session_state(session_key)
-        records[execution_id] = {"session_key": session_key, "source": event.source,
+        records[execution_id] = {
+            "session_key": session_key, "source": event.source,
             "generation": int(state.persistent.run_generation) + 1 if state else 1,
-            "agent": None, "accepted": False}
+            "agent": None, "accepted": False, "stop_requested": False,
+            "worker_done": None, "worker_started": False, "observed_tool": False,
+        }
 
     def _bind_internal_plugin_execution(self, execution_id: Optional[str], *, session_key: str,
                                         run_generation: int, agent: Any) -> bool:
@@ -40,17 +43,23 @@ class GatewayExecutionLifecycleMixin:
             execution_id = getattr(execution_id, "_internal_plugin_execution_id", None)
         record = self._internal_plugin_execution_records().get(execution_id)
         state = self._peek_session_state(session_key)
-        if not record or record["session_key"] != session_key or record["generation"] != run_generation or not state or state.persistent.run_generation != run_generation or state.turn.agent is not agent:
+        if (not record or record["stop_requested"] or record["session_key"] != session_key
+                or record["generation"] != run_generation or not state
+                or state.persistent.run_generation != run_generation or state.turn.agent is not agent):
             return False
         record["agent"] = agent
         return True
 
     def _promote_running_agent(self, *, session_key: str, run_generation: int, agent: Any,
                                internal_plugin_execution_id: Optional[str] = None) -> bool:
-        """Atomically bind only the current generation; used at the promotion fence."""
+        """Promotion fence. A Stop accepted during preparation prevents launch."""
         state = self._session_state(session_key)
         if state.persistent.run_generation != run_generation:
             return False
+        if internal_plugin_execution_id is not None:
+            record = self._internal_plugin_execution_records().get(internal_plugin_execution_id)
+            if not record or record["stop_requested"]:
+                return False
         state.turn.agent = agent
         if internal_plugin_execution_id is None:
             return True
@@ -58,13 +67,58 @@ class GatewayExecutionLifecycleMixin:
                                                      session_key=session_key,
                                                      run_generation=run_generation, agent=agent)
 
-    def _retire_internal_plugin_execution(self, execution_id: Optional[str]) -> None:
+    def _track_internal_plugin_execution_worker(self, execution_id: Optional[str], worker_done: Any) -> None:
+        """Attach the physical worker completion Event, never an await-wrapper Task.
+
+        Cancelling an asyncio wrapper around ``to_thread`` marks its Task done while the OS
+        thread continues; the worker's threading.Event is the only completion evidence here.
+        """
+        record = self._internal_plugin_execution_records().get(execution_id)
+        if record is not None:
+            record["worker_done"] = worker_done
+            record["worker_started"] = True
+
+    def _observe_internal_plugin_tool_event(self, execution_id: Optional[str], event_type: str) -> None:
+        if event_type == "tool.started":
+            record = self._internal_plugin_execution_records().get(execution_id)
+            if record is not None:
+                record["observed_tool"] = True
+
+    @staticmethod
+    def _worker_finished(record: dict) -> bool:
+        worker_done = record.get("worker_done")
+        if worker_done is None:
+            return True
+        is_set = getattr(worker_done, "is_set", None)
+        return bool(is_set and is_set())
+
+    def _retire_internal_plugin_execution(self, execution_id: Optional[str], *, state: str, occupancy: str) -> None:
         record = self._internal_plugin_execution_records().pop(execution_id, None)
         if record is not None:
             retired = self.__dict__.setdefault("_internal_plugin_retired_executions", OrderedDict())
-            retired[execution_id] = None
+            retired[execution_id] = {
+                "session_key": record["session_key"], "execution_id": execution_id,
+                "generation": record["generation"], "state": state, "occupancy": occupancy,
+                "tools": "unknown" if record["observed_tool"] else "none",
+                "children": "unknown" if record["observed_tool"] else "none",
+                "processes": "unknown" if record["observed_tool"] else "none",
+                "remote": "unknown" if record["observed_tool"] else "none",
+            }
             while len(retired) > 256:
                 retired.popitem(last=False)
+
+    def _complete_internal_plugin_execution(self, execution_id: Optional[str], *, wrapper_completed: bool = False) -> None:
+        record = self._internal_plugin_execution_records().get(execution_id)
+        # A normal outer handler return can still follow a timeout/cancelled await
+        # wrapper.  Once a physical worker was registered, only its Event is
+        # completion evidence; wrapper_completed is solely for no-worker turns.
+        if record is None or (record["worker_started"] and not self._worker_finished(record)) or (
+                not record["worker_started"] and not wrapper_completed):
+            return
+        self._retire_internal_plugin_execution(
+            execution_id, state="completed",
+            occupancy="unknown" if record["observed_tool"] else "released",
+        )
 
     async def dispatch_internal_plugin_event(self, event, *, execution_id: Optional[str] = None):
         if execution_id is None:
@@ -73,22 +127,19 @@ class GatewayExecutionLifecycleMixin:
         source = self._validate_internal_plugin_event(event)
         event._internal_plugin_execution_id = execution_id
         self._register_internal_plugin_execution(event, self._session_key_for_source(source))
-        completed = False
         try:
             result = await super().dispatch_internal_plugin_event(event)
-            completed = True
+        except BaseException:
+            # Wrapper cancellation is not completion evidence for a to_thread worker.
+            raise
+        else:
+            self._complete_internal_plugin_execution(execution_id, wrapper_completed=True)
             return result
-        finally:
-            # Cancellation of the wrapper is not evidence the to_thread worker ended.
-            if completed:
-                self._retire_internal_plugin_execution(execution_id)
 
     async def request_stop(self, *, session_key: str, expected_execution_id: str,
                            reason: str = "Internal plugin stop requested") -> dict:
         from gateway.run import _AGENT_PENDING_SENTINEL, request_hard_interrupt
         execution_id = self._validate_internal_plugin_execution_id(expected_execution_id)
-        # Preserve PR23's exact delivery ABI. Versioning belongs to the new
-        # observation query so older callbacks do not mistake it for completion.
         receipt = {"session_key": session_key, "execution_id": execution_id}
         record = self._internal_plugin_execution_records().get(execution_id)
         if record is None:
@@ -98,25 +149,37 @@ class GatewayExecutionLifecycleMixin:
         if record["session_key"] != session_key or not state or state.persistent.run_generation != record["generation"]:
             return {"status": "stale", **receipt}
         agent = record["agent"]
-        if agent is None or agent is _AGENT_PENDING_SENTINEL or state.turn.agent is not agent:
-            return {"status": "not_running", **receipt}
-        if not request_hard_interrupt(agent, reason):
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            record["stop_requested"] = True
+            record["accepted"] = True
+            return {"status": "accepted", **receipt}
+        if state.turn.agent is not agent or not request_hard_interrupt(agent, reason):
             return {"status": "not_delivered", **receipt}
         record["accepted"] = True
         return {"status": "accepted", **receipt}
 
     async def get_execution_lifecycle(self, *, session_key: str, execution_id: str) -> dict:
-        """Return only observed local state; unknown remote work remains occupied."""
+        """Observation ABI v2; `released` requires actual worker completion and no tool event."""
         execution_id = self._validate_internal_plugin_execution_id(execution_id)
         receipt = {"lifecycle_version": LIFECYCLE_VERSION, "session_key": session_key, "execution_id": execution_id}
         record = self._internal_plugin_execution_records().get(execution_id)
         if record is None:
-            state = "retired" if execution_id in self.__dict__.get("_internal_plugin_retired_executions", {}) else "not_running"
-            return {"state": state, "occupancy": "unknown" if state == "retired" else "not_occupied", **receipt}
+            tombstone = self.__dict__.get("_internal_plugin_retired_executions", {}).get(execution_id)
+            if tombstone is None:
+                return {"state": "not_running", "occupancy": "not_occupied", **receipt}
+            if tombstone["session_key"] != session_key:
+                return {"state": "stale", "occupancy": "unknown", **receipt}
+            return {**tombstone, **receipt}
         current = self._peek_session_state(session_key)
         if record["session_key"] != session_key or not current or current.persistent.run_generation != record["generation"]:
-            return {"state": "stale", "occupancy": "unknown", **receipt}
-        # We observe a bound agent, not the completion of its thread/tool/process tree.
-        return {"state": "interrupt_accepted" if record["accepted"] else "running",
-                "occupancy": "occupied", "agent_bound": record["agent"] is not None,
-                "tools": "unknown", "children": "unknown", "processes": "unknown", "remote": "unknown", **receipt}
+            return {"state": "stale", "occupancy": "unknown", "generation": record["generation"], **receipt}
+        if record["worker_started"] and self._worker_finished(record):
+            self._complete_internal_plugin_execution(execution_id)
+            return await self.get_execution_lifecycle(session_key=session_key, execution_id=execution_id)
+        state = "stop_requested" if record["stop_requested"] else ("interrupt_accepted" if record["accepted"] else "running")
+        return {"state": state, "occupancy": "occupied", "generation": record["generation"],
+                "agent_bound": record["agent"] is not None,
+                "tools": "unknown" if record["observed_tool"] else "none",
+                "children": "unknown" if record["observed_tool"] else "none",
+                "processes": "unknown" if record["observed_tool"] else "none",
+                "remote": "unknown" if record["observed_tool"] else "none", **receipt}

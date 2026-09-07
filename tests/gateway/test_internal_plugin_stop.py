@@ -178,8 +178,8 @@ def _register_bound_execution(runner, *, session_key, agent):
 
 
 @pytest.mark.asyncio
-async def test_stop_before_live_agent_promotion_is_not_accepted(tmp_path, monkeypatch):
-    """The normal handler's pending marker is not a deliverable stop target."""
+async def test_stop_before_live_agent_promotion_is_accepted_and_fences_launch(tmp_path, monkeypatch):
+    """Preparation has a receipt target even though it has no interruptable agent yet."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     runner = object.__new__(GatewayRunner)
     session_key = "local:aggie:linear-session-1"
@@ -196,8 +196,12 @@ async def test_stop_before_live_agent_promotion_is_not_accepted(tmp_path, monkey
         expected_execution_id=_EXECUTION_ID,
     )
 
-    assert receipt["status"] != "accepted"
+    assert receipt["status"] == "accepted"
     assert runner._internal_plugin_execution_records()[_EXECUTION_ID]["agent"] is None
+    assert not runner._promote_running_agent(
+        session_key=session_key, run_generation=7, agent=object(),
+        internal_plugin_execution_id=_EXECUTION_ID,
+    )
 
 
 @pytest.mark.asyncio
@@ -303,3 +307,50 @@ async def test_wrapper_cancellation_retains_execution_record(tmp_path, monkeypat
         await task
 
     assert _EXECUTION_ID in runner._internal_plugin_execution_records()
+
+
+@pytest.mark.asyncio
+async def test_real_to_thread_cancellation_does_not_release_until_physical_worker_finishes():
+    """An asyncio cancellation is not evidence that the executor thread has stopped."""
+    runner = object.__new__(GatewayRunner)
+    session_key = "local:aggie:linear-session-1"
+    event = _event()
+    event._internal_plugin_execution_id = _EXECUTION_ID
+    state = runner._session_state(session_key)
+    state.persistent.run_generation = 6
+    runner._register_internal_plugin_execution(event, session_key)
+    state.persistent.run_generation = 7
+    assert runner._promote_running_agent(
+        session_key=session_key, run_generation=7, agent=object(),
+        internal_plugin_execution_id=_EXECUTION_ID,
+    )
+
+    started, release, worker_done = threading.Event(), threading.Event(), threading.Event()
+
+    def blocking_worker():
+        started.set()
+        try:
+            assert release.wait(timeout=2)
+        finally:
+            worker_done.set()
+
+    wrapper = asyncio.create_task(asyncio.to_thread(blocking_worker))
+    assert await asyncio.to_thread(started.wait, 1)
+    runner._track_internal_plugin_execution_worker(_EXECUTION_ID, worker_done)
+    wrapper.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await wrapper
+
+    live = await runner.get_execution_lifecycle(session_key=session_key, execution_id=_EXECUTION_ID)
+    assert live["occupancy"] == "occupied"
+    assert live["state"] == "running"
+
+    release.set()
+    assert await asyncio.to_thread(worker_done.wait, 1)
+    retired = await runner.get_execution_lifecycle(session_key=session_key, execution_id=_EXECUTION_ID)
+    assert retired == {
+        "lifecycle_version": "execution-lifecycle/v2", "session_key": session_key,
+        "execution_id": _EXECUTION_ID, "generation": 7, "state": "completed",
+        "occupancy": "released", "tools": "none", "children": "none",
+        "processes": "none", "remote": "none",
+    }

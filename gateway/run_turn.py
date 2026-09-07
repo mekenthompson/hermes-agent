@@ -2952,11 +2952,19 @@ class GatewayTurnMixin:
                 session_key or "", run_generation,
             )
             return
-        self._session_state(session_key).turn.agent = agent_holder[0]
-        self._bind_internal_plugin_execution(
-            getattr(turn_ctx, "internal_plugin_execution_id", None),
+        execution_id = getattr(turn_ctx, "internal_plugin_execution_id", None)
+        allowed = self._promote_running_agent(
             session_key=session_key, run_generation=run_generation, agent=agent_holder[0],
-        ) if getattr(turn_ctx, "internal_plugin_execution_id", None) is not None else None
+            internal_plugin_execution_id=execution_id,
+        )
+        # The executor thread waits at TurnRunner's launch fence.  Setting this event is
+        # required on both paths: an accepted Stop before promotion must return without
+        # entering run_conversation, not strand the thread.
+        if execution_id is not None:
+            turn_ctx.execution_launch_allowed = allowed
+            turn_ctx.execution_launch_gate.set()
+        if not allowed:
+            return
         if self._draining:
             self._update_runtime_status("draining")
 
@@ -3138,6 +3146,9 @@ class GatewayTurnMixin:
         worker.executor_task = asyncio.ensure_future(
             self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
         )
+        execution_id = getattr(turn_ctx, "internal_plugin_execution_id", None)
+        if execution_id is not None:
+            self._track_internal_plugin_execution_worker(execution_id, worker.worker_done)
         return worker
 
     @staticmethod
@@ -3829,6 +3840,11 @@ class GatewayTurnMixin:
         # Kept on the turn context only until promotion; an ID is never inferred
         # from a later live slot.
         turn_ctx.internal_plugin_execution_id = internal_plugin_execution_id
+        if internal_plugin_execution_id is not None:
+            # A threading.Event crosses the executor boundary without treating cancellation
+            # of its asyncio wrapper as physical worker completion.
+            turn_ctx.execution_launch_gate = threading.Event()
+            turn_ctx.execution_launch_allowed = False
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
