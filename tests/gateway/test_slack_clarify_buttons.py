@@ -342,6 +342,41 @@ class TestSlackClarifyChoiceAction:
         assert entry is not None
         assert not entry.event.is_set()
 
+    @pytest.mark.asyncio
+    async def test_numeric_choice_preserves_every_prompt_section_in_update(self):
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        cm.register("cid-sections", "sk-sections", "Pick", ["first", "second"])
+        adapter._clarify_resolved["3.3"] = False
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+        first = "❓ Pick one\n\n1. first"
+        second = "2. second\n\nAdditional question context"
+        body = {
+            "message": {"ts": "3.3", "blocks": [
+                {"type": "section", "expand": True,
+                 "text": {"type": "mrkdwn", "text": first}},
+                {"type": "section", "expand": True,
+                 "text": {"type": "mrkdwn", "text": second}},
+                {"type": "actions", "elements": []},
+            ]},
+            "channel": {"id": "C1"},
+            "user": {"name": "norbert", "id": "U_N"},
+        }
+
+        await adapter._handle_clarify_action(
+            AsyncMock(), body, {"action_id": "hermes_clarify_choice_1", "value": "cid-sections|1"})
+
+        sections = [
+            block for block in mock_client.chat_update.call_args.kwargs["blocks"]
+            if block["type"] == "section"
+        ]
+        assert [block["text"]["text"] for block in sections] == [first, second]
+        assert all(block.get("expand") is True for block in sections)
+        assert all(len(block["text"]["text"]) <= 3000 for block in sections)
+
 
 # ===========================================================================
 # _handle_clarify_action — "Other" → text-capture → typed reply (c)
@@ -392,6 +427,41 @@ class TestSlackClarifyOtherFlow:
             entry = cm._entries.get("cidO")
         assert entry.response == "my custom answer"
         assert entry.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_other_preserves_every_prompt_section_in_update(self):
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        cm.register("cid-other-sections", "sk-other-sections", "Pick", ["x", "y"])
+        adapter._clarify_resolved["4.5"] = False
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+        first = "❓ Pick\n\n1. x"
+        second = "2. y\n\nAdditional question context"
+        body = {
+            "message": {"ts": "4.5", "blocks": [
+                {"type": "section", "expand": True,
+                 "text": {"type": "mrkdwn", "text": first}},
+                {"type": "section", "expand": True,
+                 "text": {"type": "mrkdwn", "text": second}},
+                {"type": "actions", "elements": []},
+            ]},
+            "channel": {"id": "C1"},
+            "user": {"name": "norbert", "id": "U_N"},
+        }
+
+        await adapter._handle_clarify_action(
+            AsyncMock(), body, {"action_id": "hermes_clarify_other", "value": "cid-other-sections|other"})
+
+        sections = [
+            block for block in mock_client.chat_update.call_args.kwargs["blocks"]
+            if block["type"] == "section"
+        ]
+        assert [block["text"]["text"] for block in sections] == [first, second]
+        assert all(block.get("expand") is True for block in sections)
+        assert all(len(block["text"]["text"]) <= 3000 for block in sections)
 
 
 # ===========================================================================
