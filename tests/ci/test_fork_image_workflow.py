@@ -51,6 +51,13 @@ class ForkImageWorkflowTests(unittest.TestCase):
         self.assertIn('--workflow-path ".github/workflows/ci.yaml"', text)
         self.assertIn("needs: preflight", text)
 
+    def test_publish_checks_out_the_gate_script_before_running_it(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        publish = text.split("\n  publish:\n", 1)[1]
+        self.assertLess(publish.index("Checkout exact pushed commit"), publish.index("Verify exact main CI gate"))
+        self.assertIn("persist-credentials: false", publish.split("Verify exact main CI gate", 1)[0])
+        self.assertLess(publish.index("Verify exact main CI gate"), publish.index("Log in to GHCR"))
+
     def test_preflight_builds_complete_image_and_gates_evidence(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
