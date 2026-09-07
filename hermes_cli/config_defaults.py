@@ -1390,6 +1390,9 @@ DEFAULT_CONFIG = {
         # Env: SLACK_IGNORE_OTHER_USER_MENTIONS.
         "ignore_other_user_mentions": False,
         "thread_require_mention": False,  # require @mention in thread replies too
+        # Channel IDs where joined thread follow-ups are allowed regardless of strict_mention or
+        # thread_require_mention. This never relaxes top-level channel gating.
+        "thread_participation_channels": "",
         "channel_prompts": {},  # per-channel ephemeral system prompts
     },
 

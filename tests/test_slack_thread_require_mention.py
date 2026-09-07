@@ -1,6 +1,8 @@
 import asyncio
 import os
 
+import pytest
+
 from gateway.config import PlatformConfig
 from plugins.platforms.slack.adapter import SlackAdapter, _apply_yaml_config
 
@@ -162,14 +164,19 @@ def test_thread_require_mention_allows_mentioned_thread_reply_without_sticky_thr
     assert len(handled) == 1
 
 
-def test_participation_only_thread_channel_allows_follow_up_after_bot_mention():
-    """Strict agents stay in a scoped thread only after this agent was invited."""
+@pytest.mark.parametrize("strict_mention,thread_require_mention", [
+    (False, False), (False, True), (True, False), (True, True),
+])
+def test_participation_channel_follows_invited_thread_for_every_legacy_flag_combination(
+    strict_mention, thread_require_mention,
+):
+    """The channel opt-in takes precedence only for a thread this bot joined."""
     adapter = make_adapter(
         {
             "allowed_channels": ["C123"],
             "require_mention": False,
-            "strict_mention": True,
-            "thread_require_mention": True,
+            "strict_mention": strict_mention,
+            "thread_require_mention": thread_require_mention,
             "thread_participation_channels": ["C123"],
         }
     )
@@ -190,6 +197,89 @@ def test_participation_only_thread_channel_allows_follow_up_after_bot_mention():
         "investigate this",
         "here is the requested log",
     ]
+
+
+@pytest.mark.parametrize(("strict_mention", "thread_require_mention", "follows"), [
+    (False, False, True), (False, True, False), (True, False, False), (True, True, False),
+])
+def test_without_participation_optin_preserves_legacy_thread_gating(
+    strict_mention, thread_require_mention, follows,
+):
+    """No selected channel means strict/thread flags retain their existing behavior."""
+    adapter = make_adapter(
+        {
+            "allowed_channels": ["C123"],
+            "require_mention": True,
+            "strict_mention": strict_mention,
+            "thread_require_mention": thread_require_mention,
+        }
+    )
+    handled = []
+
+    async def capture(event):
+        handled.append(event)
+
+    adapter.handle_message = capture
+    run(adapter._handle_slack_message(
+        slack_event("<@UBOT> investigate this", ts="101.000", thread_ts="100.000")
+    ))
+    run(adapter._handle_slack_message(
+        slack_event("here is the requested log", ts="102.000", thread_ts="100.000")
+    ))
+
+    assert [event.text for event in handled] == (
+        ["investigate this", "here is the requested log"]
+        if follows else ["investigate this"]
+    )
+
+
+def test_participation_optin_does_not_relax_top_level_strict_mention():
+    """The exception is scoped to follow-ups, not the selected channel's primary."""
+    adapter = make_adapter(
+        {
+            "allowed_channels": ["C123"],
+            "require_mention": True,
+            "strict_mention": True,
+            "thread_require_mention": True,
+            "thread_participation_channels": ["C123"],
+        }
+    )
+    handled = []
+
+    async def capture(event):
+        handled.append(event)
+
+    adapter.handle_message = capture
+    run(adapter._handle_slack_message(slack_event("unmentioned top-level request", ts="101.000")))
+
+    assert handled == []
+
+
+def test_non_selected_channel_preserves_legacy_thread_gating():
+    """Listing another channel cannot relax strict/thread gating in this one."""
+    adapter = make_adapter(
+        {
+            "allowed_channels": ["C123"],
+            "require_mention": False,
+            "strict_mention": True,
+            "thread_require_mention": True,
+            "thread_participation_channels": ["C456"],
+        }
+    )
+    handled = []
+
+    async def capture(event):
+        handled.append(event)
+
+    adapter.handle_message = capture
+    run(adapter._handle_slack_message(
+        slack_event("<@UBOT> investigate this", ts="101.000", thread_ts="100.000")
+    ))
+    run(adapter._handle_slack_message(
+        slack_event("here is the requested log", ts="102.000", thread_ts="100.000")
+    ))
+
+    assert [event.text for event in handled] == ["investigate this"]
 
 
 def test_participation_only_thread_channel_blocks_uninvited_thread():
