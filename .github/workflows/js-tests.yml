@@ -80,5 +80,17 @@ jobs:
       # ``check:*`` script needs no change here. An empty list is an error and
       # not an empty run, because an empty run reports green after it checks
       # nothing.
+      # Fork PRs run on four GitHub-hosted cores. Starting four check processes
+      # at once lets each Vitest process create its own worker pool, competing
+      # for the same CPUs and starving the first async UI test until its 15s
+      # deadline. Keep those forks to two check processes; each still discovers
+      # every check and the runner preserves its all-failures-at-end report.
+      # Trusted PRs and pushes retain the larger runner's automatic parallelism.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        env:
+          CI_FORK: ${{ github.repository != 'NousResearch/hermes-agent' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
+        run: |
+          if [ "$CI_FORK" = "true" ]; then
+            export WORKSPACE_CHECK_CONCURRENCY=2
+          fi
+          node .github/scripts/run-workspace-checks.mjs

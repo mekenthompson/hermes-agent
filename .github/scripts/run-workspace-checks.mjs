@@ -14,7 +14,9 @@
 // their lines, and a failure is then hard to read.
 //
 // This also runs on a laptop: `node .github/scripts/run-workspace-checks.mjs`.
-// `--concurrency N` sets the limit. `--list` prints the units and exits.
+// `--concurrency N` sets the limit. WORKSPACE_CHECK_CONCURRENCY supplies the
+// CI-specific default without changing local or large-runner scheduling.
+// `--list` prints the units and exits.
 
 import { execFileSync, spawn } from 'node:child_process'
 import { availableParallelism } from 'node:os'
@@ -91,10 +93,12 @@ async function main() {
   }
 
   const flagIdx = argv.indexOf('--concurrency')
-  const concurrency = Math.max(
-    1,
-    flagIdx !== -1 ? Number(argv[flagIdx + 1]) : Math.min(units.length, availableParallelism()),
-  )
+  const requestedConcurrency = flagIdx !== -1 ? argv[flagIdx + 1] : process.env.WORKSPACE_CHECK_CONCURRENCY
+  const requested = requestedConcurrency == null || requestedConcurrency === '' ? undefined : Number(requestedConcurrency)
+  if (requested !== undefined && (!Number.isInteger(requested) || requested < 1)) {
+    throw new Error(`concurrency must be a positive integer; got ${requestedConcurrency}`)
+  }
+  const concurrency = Math.min(units.length, requested ?? availableParallelism())
 
   console.log(`running ${units.length} checks, up to ${concurrency} at a time:`)
   for (const u of units) console.log(`  ${u.pkg} :: ${u.script}`)
