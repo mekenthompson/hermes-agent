@@ -20,6 +20,14 @@ REPOSITORY = "ghcr.io/mekenthompson/hermes-agent"
 
 
 class ForkImageWorkflowTests(unittest.TestCase):
+    def test_publishing_retains_scan_evidence_even_on_failure(self) -> None:
+        publish = WORKFLOW.read_text(encoding="utf-8").split("\n  publish:\n", 1)[1]
+        self.assertIn("name: Upload publication evidence", publish)
+        evidence = publish.split("name: Upload publication evidence", 1)[1].split("name: Upload Fleet handoff", 1)[0]
+        self.assertIn("if: always()", evidence)
+        for artifact in ("agent-image.spdx.json", "agent-image.attestation.spdx.json", "trivy-image.json", "remote-manifest.json"):
+            self.assertIn(artifact, evidence)
+
     def test_required_files_exist(self) -> None:
         for path in (WORKFLOW, DOC, MANIFEST):
             self.assertTrue(path.is_file(), path)
