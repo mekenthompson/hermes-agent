@@ -42,11 +42,12 @@ class _PrivateContinuationGrant:
     from the runner's private grant registry.
     """
 
-    __slots__ = ("event", "source", "session_key", "generation", "execution_id", "used")
+    __slots__ = ("event", "source", "session_key", "generation", "execution_id", "item_id", "used")
 
-    def __init__(self, event: Any, source: Any, session_key: str, generation: int, execution_id: str) -> None:
+    def __init__(self, event: Any, source: Any, session_key: str, generation: int, execution_id: str,
+                 item_id: int | None = None) -> None:
         self.event, self.source, self.session_key = event, source, session_key
-        self.generation, self.execution_id, self.used = generation, execution_id, False
+        self.generation, self.execution_id, self.item_id, self.used = generation, execution_id, item_id, False
 
 
 def _canonical(value: dict[str, str]) -> str:
@@ -255,7 +256,7 @@ class GatewayPrivateContinuationMixin:
         self._private_continuation_store(binding).enqueue(token=token, binding=binding, owner_generation=owner_generation, prompt=prompt)
 
     def _private_continuation_event(self, binding: dict[str, str], prompt: str,
-                                    execution_id: str) -> tuple[Any, str, _PrivateContinuationGrant]:
+                                    execution_id: str, *, item_id: int | None = None) -> tuple[Any, str, _PrivateContinuationGrant]:
         """Resolve only a pre-existing private owner route; never mint a Linear route."""
         from gateway.config import Platform
         from gateway.platforms.base import MessageEvent, MessageType
@@ -274,56 +275,89 @@ class GatewayPrivateContinuationMixin:
                              allow_gateway_control=False, metadata={})
         state = self._session_state(entry.session_key)
         generation = int(state.persistent.run_generation) + 1
-        grant = _PrivateContinuationGrant(event, source, entry.session_key, generation, execution_id)
+        grant = _PrivateContinuationGrant(event, source, entry.session_key, generation, execution_id, item_id)
         self.__dict__.setdefault("_private_continuation_grants", {})[id(grant)] = grant
         return event, entry.session_key, grant
 
-    async def drain_private_continuation(self, *, token: str, binding: dict[str, str], owner_generation: str,
-                                         authorize: Callable[[], bool]) -> bool:
-        """Dispatch one queue item into its existing private owner only when physically idle."""
+    async def prepare_private_continuation(self, *, token: str, binding: dict[str, str],
+                                           owner_generation: str, authorize: Callable[[], bool]) -> PrivateContinuationExecution:
+        """Reserve one durable continuation and return its Stop/lifecycle identity before launch."""
         if not callable(authorize) or authorize() is not True:
             raise ContinuationDenied("continuation requester is not authorized")
         store = self._private_continuation_store(binding)
         item = store.take(token=token, binding=binding, owner_generation=owner_generation)
         if item is None:
-            return False
+            raise ContinuationDenied("private continuation is unavailable")
         item_id, prompt = item
-        dispatched = False
+        grant = None
         try:
             execution_id = "private-continuation-" + secrets.token_urlsafe(24)
-            event, session_key, grant = self._private_continuation_event(binding, prompt, execution_id)
+            event, session_key, grant = self._private_continuation_event(
+                binding, prompt, execution_id, item_id=item_id
+            )
             if self._is_session_running(session_key):
-                store.requeue(item_id)
-                return False
-            dispatched = True
+                raise ContinuationDenied("private continuation owner is busy")
+            event._internal_plugin_execution_id = execution_id
+            self._register_internal_plugin_execution(event, session_key)
+            handle = PrivateContinuationExecution(execution_id, session_key, grant.generation)
+            self.__dict__.setdefault("_prepared_private_continuations", {})[id(handle)] = (handle, grant, store)
+            return handle
+        except Exception:
+            if grant is not None:
+                self.__dict__.get("_private_continuation_grants", {}).pop(id(grant), None)
+            store.requeue(item_id)
+            raise
+
+    async def launch_private_continuation(self, handle: PrivateContinuationExecution, *,
+                                          authorize: Callable[[], bool]) -> bool:
+        """Consume a prepared reservation through the normal handler exactly once."""
+        prepared = self.__dict__.get("_prepared_private_continuations", {}).pop(id(handle), None)
+        if (not isinstance(handle, PrivateContinuationExecution) or prepared is None
+                or prepared[0] is not handle):
+            raise ContinuationDenied("private continuation handle is unavailable")
+        _, grant, store = prepared
+        if not callable(authorize) or authorize() is not True:
+            raise ContinuationDenied("continuation requester is not authorized")
+        receipt = await self.get_execution_lifecycle(
+            session_key=handle.session_key, execution_id=handle.execution_id
+        )
+        if receipt.get("state") == "stopped":
+            return False
+        pre_claim = (receipt.get("state") == "stale" and receipt.get("generation") == handle.generation
+                     and self._session_state(handle.session_key).persistent.run_generation == handle.generation - 1)
+        if receipt.get("state") != "running" and not pre_claim:
+            raise ContinuationDenied("private continuation reservation is stale")
+        try:
             await self.dispatch_internal_plugin_event(
-                event, execution_id=execution_id, private_continuation_grant=grant
+                grant.event, execution_id=handle.execution_id, private_continuation_grant=grant
             )
         except Exception:
-            # Once dispatch was invoked, an exception cannot distinguish a local
-            # rejection from a started provider turn. Fence it durably instead of
-            # replaying a potentially side-effecting prompt.
-            if dispatched:
-                store.mark_ambiguous(item_id)
-            else:
-                store.requeue(item_id)
+            store.mark_ambiguous(grant.item_id)
             raise
-        else:
-            receipt = await self.get_execution_lifecycle(
-                session_key=session_key, execution_id=execution_id
+        receipt = await self.get_execution_lifecycle(
+            session_key=handle.session_key, execution_id=handle.execution_id
+        )
+        if not (
+            receipt.get("session_key") == handle.session_key
+            and receipt.get("execution_id") == handle.execution_id
+            and receipt.get("generation") == handle.generation
+            and receipt.get("state") == "completed"
+            and receipt.get("occupancy") == "released"
+            and all(receipt.get(field) == "none" for field in ("tools", "children", "processes", "remote"))
+        ):
+            return False
+        store.finish(grant.item_id)
+        return True
+
+    async def drain_private_continuation(self, *, token: str, binding: dict[str, str], owner_generation: str,
+                                         authorize: Callable[[], bool]) -> bool:
+        """Compatibility one-shot prepare and launch for a private continuation."""
+        try:
+            handle = await self.prepare_private_continuation(
+                token=token, binding=binding, owner_generation=owner_generation, authorize=authorize
             )
-            if not (
-                isinstance(receipt, dict)
-                and receipt.get("session_key") == session_key
-                and receipt.get("execution_id") == execution_id
-                and receipt.get("generation") == grant.generation
-                and receipt.get("state") == "completed"
-                and receipt.get("occupancy") == "released"
-                and all(receipt.get(field) == "none" for field in ("tools", "children", "processes", "remote"))
-            ):
-                # Completion of an await wrapper or dispatch acceptance is never
-                # completion of the private continuation's physical lifetime.
-                # Keep its durable delivery-inflight fence rather than replay it.
+        except ContinuationDenied as exc:
+            if str(exc) == "private continuation is unavailable":
                 return False
-            store.finish(item_id)
-            return True
+            raise
+        return await self.launch_private_continuation(handle, authorize=authorize)

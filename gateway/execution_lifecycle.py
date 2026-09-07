@@ -177,7 +177,13 @@ class GatewayExecutionLifecycleMixin:
         if execution_policy is not None:
             event._internal_plugin_execution_policy = validate_internal_execution_policy(execution_policy)
         event._internal_plugin_execution_id = execution_id
-        self._register_internal_plugin_execution(event, self._session_key_for_source(source))
+        session_key = self._session_key_for_source(source)
+        existing = self._internal_plugin_execution_records().get(execution_id)
+        if existing is None:
+            self._register_internal_plugin_execution(event, session_key)
+        elif (existing["session_key"] != session_key
+              or existing["generation"] != getattr(private_continuation_grant, "generation", None)):
+            raise ValueError("internal plugin execution reservation is stale")
         try:
             result = await super().dispatch_internal_plugin_event(
                 event, execution_id=execution_id, execution_policy=execution_policy,

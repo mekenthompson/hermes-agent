@@ -43,7 +43,7 @@ class GatewayPluginServicesMixin:
             grants = getattr(self, "_private_continuation_grants", {})
             grant = grants.get(id(private_continuation_grant))
             if (source.platform not in {Platform.SLACK, Platform.TELEGRAM}
-                    or grant is not private_continuation_grant or grant.used
+                    or grant is None or grant is not private_continuation_grant or grant.used
                     or grant.event is not event or grant.source is not source
                     or grant.execution_id != execution_id
                     or getattr(source, "chat_type", None) != "dm"):

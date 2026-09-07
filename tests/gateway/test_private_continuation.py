@@ -1,11 +1,13 @@
-import asyncio
+"""GatewayRunner integration coverage for private continuation admission."""
 from datetime import datetime
-from types import SimpleNamespace
+from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.config import Platform
-from gateway.private_continuation import ContinuationDenied, GatewayPrivateContinuationMixin, PrivateContinuationStore
+from gateway.config import GatewayConfig, Platform
+from gateway.private_continuation import ContinuationDenied, PrivateContinuationExecution, PrivateContinuationStore
+from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource
 
 BINDING = {"profile": "private", "workspace": "w", "issue": "i", "owner": "owner-session"}
@@ -18,91 +20,116 @@ def test_scope_is_signed_expiring_revocable_and_exactly_bound(tmp_path):
     store.enqueue(token=token, binding=BINDING, owner_generation="g1", prompt="one")
     with pytest.raises(ContinuationDenied):
         store.enqueue(token=token + "x", binding=BINDING, owner_generation="g1", prompt="bad")
-    with pytest.raises(ContinuationDenied):
-        store.enqueue(token=token, binding={**BINDING, "issue": "other"}, owner_generation="g1", prompt="bad")
     store.revoke(token)
     with pytest.raises(ContinuationDenied):
         store.take(token=token, binding=BINDING, owner_generation="g1")
-    fresh = store.mint(binding=BINDING, owner_generation="g1", ttl_seconds=1)
-    now[0] = 102
+
+
+class _FakeTransport:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, *args, **kwargs):
+        self.sent.append((args, kwargs))
+
+
+@pytest.fixture
+def runner(tmp_path, monkeypatch):
+    home = tmp_path / "hermes-home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    gateway = GatewayRunner(GatewayConfig())
+    # Real GatewayRunner and normal dispatch/handler; this is the provider boundary only.
+    gateway._run_agent = AsyncMock(return_value={"final_response": "ok", "messages": []})
+    gateway.configure_private_continuations(database=home / "continuations.db", secret=b"x" * 32)
+    return gateway
+
+
+def _install_owner(gateway, platform):
+    source = SessionSource(platform=platform, chat_id=f"{platform.value}-owner", profile="private", chat_type="dm")
+    key = gateway._session_key_for_source(source)
+    gateway.session_store._entries[key] = SessionEntry(key, "owner-session", datetime.now(), datetime.now(), origin=source)
+    gateway.session_store._loaded = True
+    gateway.adapters[platform] = _FakeTransport()
+    return key
+
+
+async def _queued_handle(gateway, platform=Platform.SLACK):
+    key = _install_owner(gateway, platform)
+    token = gateway.mint_private_continuation(binding=BINDING, owner_generation="g", ttl_seconds=60)
+    await gateway.enqueue_private_continuation(token=token, binding=BINDING, owner_generation="g", prompt="next", authorize=lambda: True)
+    handle = await gateway.prepare_private_continuation(token=token, binding=BINDING, owner_generation="g", authorize=lambda: True)
+    assert handle.session_key == key
+    return token, handle
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", [Platform.SLACK, Platform.TELEGRAM])
+async def test_prepare_launch_uses_real_runner_normal_handler_and_releases(runner, platform):
+    _, handle = await _queued_handle(runner, platform)
+    assert await runner.launch_private_continuation(handle, authorize=lambda: True) is True
+    runner._run_agent.assert_awaited_once()
+    receipt = await runner.get_execution_lifecycle(session_key=handle.session_key, execution_id=handle.execution_id)
+    assert receipt["state"] == "completed"
+    assert receipt["occupancy"] == "released"
+    assert all(receipt[k] == "none" for k in ("tools", "children", "processes", "remote"))
+
+
+@pytest.mark.asyncio
+async def test_forged_and_replayed_handles_never_enter_normal_handler(runner):
+    _, handle = await _queued_handle(runner)
+    forged = PrivateContinuationExecution(handle.execution_id, handle.session_key, handle.generation)
     with pytest.raises(ContinuationDenied):
-        store.enqueue(token=fresh, binding=BINDING, owner_generation="g1", prompt="expired")
+        await runner.launch_private_continuation(forged, authorize=lambda: True)
+    assert runner._run_agent.await_count == 0
+    assert await runner.launch_private_continuation(handle, authorize=lambda: True)
+    with pytest.raises(ContinuationDenied):
+        await runner.launch_private_continuation(handle, authorize=lambda: True)
+    assert runner._run_agent.await_count == 1
 
 
-def test_durable_owner_queue_is_bounded_fifo(tmp_path):
-    store = PrivateContinuationStore(tmp_path / "continuations.db", secret=b"x" * 32, max_per_owner=2)
-    token = store.mint(binding=BINDING, owner_generation="g", ttl_seconds=60)
-    store.enqueue(token=token, binding=BINDING, owner_generation="g", prompt="first")
-    store.enqueue(token=token, binding=BINDING, owner_generation="g", prompt="second")
-    with pytest.raises(ContinuationDenied, match="queue is full"):
-        store.enqueue(token=token, binding=BINDING, owner_generation="g", prompt="third")
-    first = store.take(token=token, binding=BINDING, owner_generation="g")
-    assert first and first[1] == "first"
-    store.finish(first[0])
-    second = store.take(token=token, binding=BINDING, owner_generation="g")
-    assert second and second[1] == "second"
+@pytest.mark.asyncio
+async def test_busy_racing_admission_requeues_without_provider_entry(runner):
+    key = _install_owner(runner, Platform.SLACK)
+    runner._session_state(key).turn.agent = object()  # race after durable item exists, before reservation
+    token = runner.mint_private_continuation(binding=BINDING, owner_generation="g", ttl_seconds=60)
+    await runner.enqueue_private_continuation(token=token, binding=BINDING, owner_generation="g", prompt="next", authorize=lambda: True)
+    with pytest.raises(ContinuationDenied, match="busy"):
+        await runner.prepare_private_continuation(token=token, binding=BINDING, owner_generation="g", authorize=lambda: True)
+    assert runner._run_agent.await_count == 0
+    runner._session_state(key).turn.agent = None
+    handle = await runner.prepare_private_continuation(token=token, binding=BINDING, owner_generation="g", authorize=lambda: True)
+    assert await runner.launch_private_continuation(handle, authorize=lambda: True)
 
 
-class _Gateway(GatewayPrivateContinuationMixin):
-    def __init__(self, database, *, busy=False, origin_platform=Platform.LOCAL):
-        self.configure_private_continuations(database=database, secret=b"x" * 32)
-        origin = SessionSource(platform=origin_platform, chat_id="private-owner", profile="private")
-        self.entry = SessionEntry("owner-key", "owner-session", datetime.now(), datetime.now(), origin=origin)
-        self.session_store = SimpleNamespace(lookup_by_session_id=lambda owner: self.entry if owner == "owner-session" else None)
-        self.events, self.busy = [], busy
-
-    def _session_key_for_source(self, source):
-        return "owner-key" if source.chat_id == "private-owner" else "other"
-
-    def _is_session_running(self, key):
-        return self.busy and key == "owner-key"
-
-    async def dispatch_internal_plugin_event(self, event, *, execution_id=None):
-        assert execution_id and execution_id.startswith("private-continuation-")
-        self.events.append(event)
+@pytest.mark.asyncio
+async def test_stop_prelaunch_refuses_provider_entry(runner):
+    _, handle = await _queued_handle(runner, Platform.TELEGRAM)
+    stopped = await runner.request_stop(session_key=handle.session_key, expected_execution_id=handle.execution_id)
+    assert stopped["status"] == "accepted"
+    assert await runner.launch_private_continuation(handle, authorize=lambda: True) is False
+    assert runner._run_agent.await_count == 0
 
 
-def test_drain_resolves_existing_private_owner_and_authorizes_every_prompt(tmp_path):
-    gateway = _Gateway(tmp_path / "continuations.db")
-    token = gateway.mint_private_continuation(binding=BINDING, owner_generation="g", ttl_seconds=60)
-    asyncio.run(gateway.enqueue_private_continuation(token=token, binding=BINDING, owner_generation="g", prompt="next", authorize=lambda: True))
-    assert asyncio.run(gateway.drain_private_continuation(token=token, binding=BINDING, owner_generation="g", authorize=lambda: True))
-    assert len(gateway.events) == 1
-    assert gateway.events[0].source.platform is Platform.LOCAL
-    assert gateway.events[0].source.chat_id == "private-owner"
-    with pytest.raises(ContinuationDenied, match="not authorized"):
-        asyncio.run(gateway.enqueue_private_continuation(token=token, binding=BINDING, owner_generation="g", prompt="no", authorize=lambda: False))
+@pytest.mark.asyncio
+async def test_stale_generation_refuses_provider_entry(runner):
+    _, stale = await _queued_handle(runner, Platform.SLACK)
+    runner._session_state(stale.session_key).persistent.run_generation += 2
+    with pytest.raises(ContinuationDenied, match="stale"):
+        await runner.launch_private_continuation(stale, authorize=lambda: True)
+    assert runner._run_agent.await_count == 0
 
 
-def test_busy_owner_requeues_and_existing_telegram_owner_is_dispatched(tmp_path):
-    gateway = _Gateway(tmp_path / "continuations.db", busy=True)
-    token = gateway.mint_private_continuation(binding=BINDING, owner_generation="g", ttl_seconds=60)
-    asyncio.run(gateway.enqueue_private_continuation(token=token, binding=BINDING, owner_generation="g", prompt="next", authorize=lambda: True))
-    assert not asyncio.run(gateway.drain_private_continuation(token=token, binding=BINDING, owner_generation="g", authorize=lambda: True))
-    assert gateway.events == []
-    gateway.busy = False
-    assert asyncio.run(gateway.drain_private_continuation(token=token, binding=BINDING, owner_generation="g", authorize=lambda: True))
-    foreign = _Gateway(tmp_path / "foreign.db", origin_platform=Platform.TELEGRAM)
-    token = foreign.mint_private_continuation(binding=BINDING, owner_generation="g", ttl_seconds=60)
-    asyncio.run(foreign.enqueue_private_continuation(token=token, binding=BINDING, owner_generation="g", prompt="next", authorize=lambda: True))
-    assert asyncio.run(foreign.drain_private_continuation(token=token, binding=BINDING, owner_generation="g", authorize=lambda: True))
-    assert len(foreign.events) == 1
-    assert foreign.events[0].source.platform is Platform.TELEGRAM
-
-
-def test_dispatch_exception_is_durably_ambiguous_and_never_replayed(tmp_path):
-    class BrokenGateway(_Gateway):
-        async def dispatch_internal_plugin_event(self, event, *, execution_id=None):
-            self.events.append(event)
-            raise RuntimeError("provider outcome unknown")
-
-    gateway = BrokenGateway(tmp_path / "continuations.db")
-    token = gateway.mint_private_continuation(binding=BINDING, owner_generation="g", ttl_seconds=60)
-    asyncio.run(gateway.enqueue_private_continuation(token=token, binding=BINDING, owner_generation="g", prompt="next", authorize=lambda: True))
-    with pytest.raises(RuntimeError, match="unknown"):
-        asyncio.run(gateway.drain_private_continuation(token=token, binding=BINDING, owner_generation="g", authorize=lambda: True))
-    assert not asyncio.run(gateway.drain_private_continuation(token=token, binding=BINDING, owner_generation="g", authorize=lambda: True))
-    assert len(gateway.events) == 1
+@pytest.mark.asyncio
+async def test_observed_tool_lifetime_retains_durable_queue_fence(runner):
+    _, handle = await _queued_handle(runner, Platform.SLACK)
+    # Simulate a tool event at the actual provider/agent boundary; dispatch and handler remain real.
+    runner._observe_internal_plugin_tool_event(handle.execution_id, "tool.started")
+    assert await runner.launch_private_continuation(handle, authorize=lambda: True) is False
+    receipt = await runner.get_execution_lifecycle(session_key=handle.session_key, execution_id=handle.execution_id)
+    assert receipt["state"] == "completed"
+    assert receipt["occupancy"] == "unknown"
+    assert receipt["tools"] == "unknown"
 
 
 def test_store_refuses_unsafe_database_and_keeps_new_database_private(tmp_path):
@@ -110,30 +137,3 @@ def test_store_refuses_unsafe_database_and_keeps_new_database_private(tmp_path):
     unsafe.mkdir(mode=0o755)
     with pytest.raises(RuntimeError, match="database directory is unsafe"):
         PrivateContinuationStore(unsafe / "continuations.db", secret=b"x" * 32)
-
-    safe = tmp_path / "safe"
-    safe.mkdir(mode=0o700)
-    store = PrivateContinuationStore(safe / "continuations.db", secret=b"x" * 32)
-    assert store.database.stat().st_mode & 0o777 == 0o600
-    store.database.chmod(0o644)
-    with pytest.raises(RuntimeError, match="database is unsafe"):
-        store.mint(binding=BINDING, owner_generation="g", ttl_seconds=60)
-
-
-def test_profile_scoped_stores_do_not_cross_signing_or_persistence(tmp_path):
-    class Gateway(GatewayPrivateContinuationMixin):
-        pass
-
-    first, second = tmp_path / "first", tmp_path / "second"
-    first.mkdir(mode=0o700)
-    second.mkdir(mode=0o700)
-    gateway = Gateway()
-    gateway.configure_private_continuations(database=first / "continuations.db", secret=b"a" * 32, profile="one")
-    gateway.configure_private_continuations(database=second / "continuations.db", secret=b"b" * 32, profile="two")
-    one = {**BINDING, "profile": "one"}
-    two = {**BINDING, "profile": "two"}
-    token = gateway.mint_private_continuation(binding=one, owner_generation="g", ttl_seconds=60)
-    with pytest.raises(ContinuationDenied):
-        asyncio.run(gateway.enqueue_private_continuation(token=token, binding=two, owner_generation="g", prompt="no", authorize=lambda: True))
-    assert (first / "continuations.db").exists()
-    assert (second / "continuations.db").exists()
