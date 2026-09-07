@@ -5072,27 +5072,53 @@ class SlackAdapter(BasePlatformAdapter):
                 chat_id=chat_id, question=question, choices=choices, clarify_id=clarify_id,
                 session_key=session_key, metadata=metadata)
 
+        def _escape(char: str) -> str:
+            return {"&": "&amp;", "<": "&lt;", ">": "&gt;"}.get(char, char)
+
+        labels = [str(choice).strip() or f"Option {idx + 1}" for idx, choice in enumerate(choices)]
+        prompt_parts = ["❓ "]
+        prompt_parts.extend(_escape(char) for char in (question or ""))
+        prompt_parts.append("\n\n")
+        for idx, label in enumerate(labels, start=1):
+            if idx > 1:
+                prompt_parts.append("\n")
+            prompt_parts.append(f"{idx}. ")
+            prompt_parts.extend(_escape(char) for char in label)
+
+        # Split escaped source atoms, not an already-rendered string, so HTML
+        # entities never straddle Slack's 3,000-character section boundary.
+        sections: list[str] = []
+        section = ""
+        for part in prompt_parts:
+            if section and len(section) + len(part) > 3000:
+                sections.append(section)
+                section = ""
+            section += part
+        if section:
+            sections.append(section)
+        body = "".join(sections)
+
+        # Block Kit allows 50 blocks and Slack truncates top-level text above
+        # 40,000 characters. Use the established numbered typed-answer send
+        # fallback rather than silently clipping any part of a choice.
+        action_block_count = (len(labels) + 5) // 5
+        if len(body) > 40000 or len(sections) + action_block_count > 50:
+            return await super().send_clarify(
+                chat_id=chat_id, question=question, choices=choices, clarify_id=clarify_id,
+                session_key=session_key, metadata=metadata)
+
         def _build() -> Tuple[str, list]:
-            # Escape mrkdwn control chars so the question renders literally;
-            # budget against the 3000-char section cap.
-            q = (question or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            body = f"❓ {q}"
-            budget = 3000 - len("...")
-            if len(body) > budget:
-                body = body[:budget] + "..."
-            # Slack caps an actions block at 5 elements; clarify caps choices at 4 (+ Other) but
-            # chunk anyway so larger lists degrade gracefully instead of 400ing.
-            elements = []
-            for idx, choice in enumerate(choices):
-                label = str(choice).strip() or f"Option {idx + 1}"
-                elements.append(
-                    self._button(
-                        label[:75], f"hermes_clarify_choice_{idx}",
-                        f"{clarify_id}|{idx}", emoji=True))
+            elements = [
+                self._button(str(idx + 1), f"hermes_clarify_choice_{idx}", f"{clarify_id}|{idx}", emoji=True)
+                for idx in range(len(labels))
+            ]
             elements.append(
                 self._button("✏️ Other…", "hermes_clarify_other", f"{clarify_id}|other", emoji=True)
             )
-            blocks: list = [{"type": "section", "text": {"type": "mrkdwn", "text": body}}]
+            blocks: list = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": text}, "expand": True}
+                for text in sections
+            ]
             for start in range(0, len(elements), 5):
                 blocks.append({"type": "actions", "elements": elements[start : start + 5]})
             return body, blocks
@@ -5192,12 +5218,36 @@ class SlackAdapter(BasePlatformAdapter):
                 break
         return original_text[:limit] if limit is not None else original_text
 
+    @staticmethod
+    def _clarify_section_texts(message: dict) -> list[str]:
+        """Every clarify prompt section, split again if Slack re-escaped its text."""
+        sections: list[str] = []
+        for block in message.get("blocks", []):
+            if block.get("type") != "section":
+                continue
+            text = (block.get("text") or {}).get("text", "")
+            section = ""
+            for atom in re.findall(r"&(?:amp;|lt;|gt;)|.", text, re.DOTALL):
+                if section and len(section) + len(atom) > 3000:
+                    sections.append(section)
+                    section = ""
+                section += atom
+            if section:
+                sections.append(section)
+        return sections
+
     async def _finalize_interactive_message(
-        self, channel_id: str, msg_ts: str, original_text: str, decision_text: str,
+        self, channel_id: str, msg_ts: str, original_text: str | list[str], decision_text: str,
         placeholder: str, label: str, team_id: Optional[str] = None, sanitize: bool = True) -> None:
         """Rewrite a button prompt to show the outcome and drop the buttons."""
+        original_sections = original_text if isinstance(original_text, list) else [original_text]
         updated_blocks = [
-            {"type": "section", "text": {"type": "mrkdwn", "text": original_text or placeholder}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}, "expand": True}
+            for text in original_sections if text
+        ] or [
+            {"type": "section", "text": {"type": "mrkdwn", "text": placeholder}, "expand": True},
+        ]
+        updated_blocks += [
             {"type": "context", "elements": [{"type": "mrkdwn", "text": decision_text}]}]
         try:
             await self._get_client(channel_id, team_id=team_id).chat_update(
@@ -5298,7 +5348,7 @@ class SlackAdapter(BasePlatformAdapter):
             "Command approval request", "approval", team_id or None)
 
     async def _update_clarify_message(
-        self, channel_id: str, msg_ts: str, question_text: str, decision_text: str) -> None:
+        self, channel_id: str, msg_ts: str, question_text: list[str], decision_text: str) -> None:
         """Rewrite a clarify message to show the outcome and drop the buttons."""
         await self._finalize_interactive_message(
             channel_id, msg_ts, question_text, decision_text, "Clarification", "clarify", sanitize=False
@@ -5317,7 +5367,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Double-click guard — atomic pop (mirrors approval).
         if self._clarify_resolved.pop(msg_ts, True):
             return
-        original_text = self._section_text(message, limit=None)
+        original_text = self._clarify_section_texts(message)
         from tools import clarify_gateway as _clarify_mod
         # "Other" → text-capture mode: mark_awaiting_text flips the entry and the
         # gateway's text-intercept resolves it from the user's next message.
