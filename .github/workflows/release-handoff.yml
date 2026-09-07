@@ -1,0 +1,110 @@
+name: Release Handoff
+
+# Cross-repo hand-off of a freshly published fork Agent image to hermes-fleet.
+#
+# This workflow never builds or publishes anything. It runs after "Fork Agent
+# Image" completes on main, downloads that run's agent-image-manifest-<sha>
+# artifact, and opens (or reuses) an auto-merging PR in hermes-fleet that pins
+# release/agent-image-manifest.json to the published digest. hermes-fleet's
+# own required checks remain the merge gate.
+#
+# workflow_run context: github.sha / github.ref are main HEAD at the time this
+# run starts, not the commit the triggering run published. Everything below
+# binds to github.event.workflow_run.head_sha and .id instead.
+#
+# Identity: the App private key lives only in this workflow, in a job that
+# holds no packages permission, so a registry-writing job never sees it.
+
+on:
+  workflow_run:
+    workflows: ["Fork Agent Image"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  # One Fleet main exists: serialize all source SHAs until each protected PR merges.
+  group: release-handoff-fleet
+  cancel-in-progress: false
+
+env:
+  SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+  SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+  SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+  MANIFEST_ARTIFACT: agent-image-manifest-${{ github.event.workflow_run.head_sha }}
+
+jobs:
+  pin-fleet:
+    name: Pin Agent in hermes-fleet
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event != 'pull_request' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.repository == 'mekenthompson/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout handoff script from main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/ci/open_fleet_pin_pr.py
+          sparse-checkout-cone-mode: false
+
+      # A "Fork Agent Image" run concludes success even when its detect job
+      # decided the push could not change the image (docs-only) and publish
+      # was skipped. No manifest artifact exists then, and there is nothing
+      # to pin: end successfully with a notice rather than failing.
+      - name: Locate the handoff manifest artifact
+        id: locate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          count=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" \
+            --jq "[.artifacts[] | select(.name == \"$MANIFEST_ARTIFACT\" and .expired == false)] | length")
+          if [ "$count" = "0" ]; then
+            echo "::notice::Run $SOURCE_RUN_URL for $SOURCE_SHA uploaded no $MANIFEST_ARTIFACT (publish skipped); nothing to pin."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download the handoff manifest from the triggering run
+        if: steps.locate.outputs.found == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          name: agent-image-manifest-${{ github.event.workflow_run.head_sha }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Mint a hermes-fleet-scoped App token
+        if: steps.locate.outputs.found == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: mekenthompson
+          repositories: hermes-fleet
+
+      - name: Open the auto-merging pin PR in hermes-fleet
+        if: steps.locate.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/open_fleet_pin_pr.py \
+            --manifest "$RUNNER_TEMP/handoff/agent-image-manifest.json" \
+            --expected-revision "$SOURCE_SHA" \
+            --source-run-url "$SOURCE_RUN_URL" \
+            --fleet-repo mekenthompson/hermes-fleet
