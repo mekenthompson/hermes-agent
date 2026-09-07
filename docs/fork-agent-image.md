@@ -31,6 +31,16 @@ A successful publication emits `agent-image-manifest.json` containing:
 
 Fleet must consume the image digest from this manifest. It must not consume the SHA tag as its parent reference.
 
+The hand-off to Fleet is automatic. `.github/workflows/release-handoff.yml` runs on `workflow_run` when a "Fork Agent Image" run for `main` completes successfully. It never builds or publishes anything: it downloads the `agent-image-manifest-<sha>` artifact of the triggering run by run ID, mints a short-lived token for the GitHub App `hermes-release-bot` scoped to `mekenthompson/hermes-fleet` only, and runs `scripts/ci/open_fleet_pin_pr.py`, which:
+
+- validates the manifest (schema 1, repository `ghcr.io/mekenthompson/hermes-agent`, a 40-hex `revision` equal to the triggering run's `head_sha`, a `sha256` digest, and `immutable_ref == repository@digest`); a `workflow_run` job sees `github.sha` as the current `main` HEAD, so the workflow binds every step to `github.event.workflow_run.head_sha` and `.id` instead;
+- does nothing when hermes-fleet `main` already carries an identical `release/agent-image-manifest.json`;
+- otherwise creates branch `release/pin-agent-<short sha>` from hermes-fleet `main`, commits the manifest through the contents API as `release: pin Agent <short> (<digest12>)`, opens a PR titled `release: pin Agent <short>` (body: revision, digest, immutable ref, source run URL), and arms squash auto-merge with `gh pr merge --auto --squash`. hermes-fleet's required checks remain the merge gate;
+- is idempotent: an existing branch or open PR with the same manifest content is reused, so a re-run of the handoff never duplicates work;
+- fails closed when the branch already exists with different content (a half-finished or foreign branch of the same name is never built upon), when several PRs are open from the branch, or when any non-404 API call fails.
+
+When "Fork Agent Image" succeeded but its `publish` job was skipped (a docs-only push), no manifest artifact exists; the handoff job then ends successfully with a notice and pins nothing. The App private key (`RELEASE_BOT_PRIVATE_KEY`) and app ID (`RELEASE_BOT_APP_ID`) are referenced only by this workflow, whose job holds `actions: read` and `contents: read` and no `packages` permission, so the key is never present in a job that can write the registry. The script accepts `--dry-run` for local rehearsal against a real manifest: it performs every read and prints every write without performing it.
+
 ## Rollback
 
 Rollback selects a previously reviewed `agent-image-manifest.json` and restores the prior image digest in Fleet. Rebuilding an old tag is not rollback. Publishing this Agent image alone does not deploy or restart any Fleet profile.
