@@ -45,10 +45,12 @@ DEFAULT = {
     "rust": True,
     "mcp_catalog": False,
     "ci_review": True,
+    "os_tests": True,
+    "binary_artifacts": True,
 }
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, installer=False, desktop_updater=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None) -> dict[str, bool]:
+def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, installer=False, desktop_updater=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None, os_tests=None, binary_artifacts=False) -> dict[str, bool]:
     # python_prod tracks python except for tests-only diffs; default it to
     # python so the majority of cases don't need to spell it out.
     #
@@ -57,6 +59,10 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
     # flake bundles the compiled ui-tui. Pass either explicitly to override.
     _python_prod = python if python_prod is None else python_prod
     _product = _python_prod or frontend
+    # os_tests fires for the installer / desktop-updater surfaces (their
+    # tests are Windows integration tests) and for platform-named paths;
+    # pass it explicitly for the latter.
+    _os_tests = (installer or desktop_updater) if os_tests is None else os_tests
     return {
         "python": python,
         "python_prod": _python_prod,
@@ -74,6 +80,8 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
         "rust": rust,
         "mcp_catalog": mcp_catalog,
         "ci_review": ci_review,
+        "os_tests": _os_tests,
+        "binary_artifacts": binary_artifacts,
     }
 
 
@@ -83,7 +91,7 @@ CASES = {
     # pyproject.toml declares the pytest markers the OS lanes select on, so it
     # also re-arms the desktop_updater integration tests (fail-open).
     "dep manifest → python": (["pyproject.toml"], _lanes(python=True, scan=True, deps=True, uv_lock=True, desktop_updater=True)),
-    "uv.lock → python": (["uv.lock"], _lanes(python=True, uv_lock=True)),
+    "uv.lock → python": (["uv.lock"], _lanes(python=True, uv_lock=True, os_tests=True)),
     "ts package → frontend": (["apps/desktop/src/app.tsx"], _lanes(frontend=True)),
     "ui-tui → frontend": (["ui-tui/src/entry.ts"], _lanes(frontend=True)),
     # Lockfile bump shifts every TS package's tree, but not the Python suite.
@@ -203,6 +211,27 @@ CASES = {
     "conftest → python + desktop_updater": (
         ["tests/conftest.py"],
         _lanes(python=True, python_prod=False, scan=True, desktop_updater=True),
+    ),
+    # OS lanes (fork consumes ``os_tests``; upstream gates them on python).
+    "platform-named source → os_tests": (
+        ["tools/windows_native.py"],
+        _lanes(python=True, scan=True, os_tests=True),
+    ),
+    "os-marked test file → os_tests": (
+        ["tests/hermes_cli/test_gateway_windows.py"],
+        _lanes(python=True, python_prod=False, scan=True, os_tests=True),
+    ),
+    "unmarked test file → no os_tests": (
+        ["tests/agent/test_foo.py"],
+        _lanes(python=True, python_prod=False, scan=True),
+    ),
+    "committed image → binary_artifacts": (
+        ["infographic/pr-1.png"],
+        _lanes(python=True, binary_artifacts=True),
+    ),
+    "profile archive → binary_artifacts": (
+        ["exports/profile.tar.gz"],
+        _lanes(python=True, binary_artifacts=True),
     ),
     "tests + prod source → both lanes": (
         ["tests/agent/test_foo.py", "agent/x.py"],

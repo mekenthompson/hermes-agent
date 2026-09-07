@@ -50,6 +50,7 @@ class ForkImageWorkflowTests(unittest.TestCase):
         publish = " ".join(workflow["jobs"]["publish"]["if"].split())
         self.assertEqual(
             publish,
+            "needs.detect.outputs.docker == 'true' && "
             "github.repository == 'mekenthompson/hermes-agent' && "
             "github.ref == 'refs/heads/main' && "
             "(github.event_name == 'push' || "
@@ -57,6 +58,7 @@ class ForkImageWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(
             preflight,
+            "needs.detect.outputs.docker == 'true' && "
             "github.repository == 'mekenthompson/hermes-agent' && "
             "github.event_name != 'push' && "
             "(github.event_name == 'pull_request' || "
@@ -259,6 +261,8 @@ candidate-123-1: digest: sha256:222222222222222222222222222222222222222222222222
         for phrase in (
             "automatic",
             "every push to `main`",
+            "image input",
+            "fails open",
             "workflow_dispatch",
             "exact pushed commit",
             "no manual reviewer prerequisite",

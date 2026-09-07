@@ -36,6 +36,14 @@ jobs:
   # detect: run the classifier once. Every downstream job reads its outputs
   # to decide whether to run. On push/dispatch the classifier fails open
   # (all lanes true) so post-merge validation is never weakened.
+  #
+  # Fork (mekenthompson): main pushes are scoped to the pushed range
+  # (scripts/ci/push_changed_files.py) and a few jobs below carry an extra
+  # fork-only gate. Never add ``paths:`` to this workflow's ``push`` trigger:
+  # fork-agent-image.yml waits for a *successful* CI run of the exact SHA,
+  # and a push that creates no run would block publication for 30 minutes.
+  # ``detect`` and ``all-checks-pass`` always run, so a scoped run in which
+  # every lane is skipped still concludes ``success``.
   # ─────────────────────────────────────────────────────────────────────
   detect:
     name: Detect affected areas
@@ -57,6 +65,8 @@ jobs:
       mcp_catalog: ${{ steps.classify.outputs.mcp_catalog }}
       ci_review: ${{ steps.classify.outputs.ci_review }}
       ci_review_files: ${{ steps.classify.outputs.ci_review_files }}
+      os_tests: ${{ steps.classify.outputs.os_tests }}
+      binary_artifacts: ${{ steps.classify.outputs.binary_artifacts }}
       event_name: ${{ github.event_name }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -80,10 +90,13 @@ jobs:
   # the OS-marked tests it collects are skipped there by design (see the
   # `_OS_MARKS` comment in tests/conftest.py) — this is where they run.
   # Same `python` lane gate: if no Python changed, neither runs.
+  # Fork: additionally gated on ``os_tests`` — the fork ships Linux
+  # containers, so a diff with no OS-specific surface skips the Windows and
+  # macOS runners (its second-longest lane).
   tests-os:
     name: OS-specific tests
     needs: detect
-    if: needs.detect.outputs.python == 'true'
+    if: needs.detect.outputs.python == 'true' && (github.repository != 'mekenthompson/hermes-agent' || needs.detect.outputs.os_tests == 'true')
     uses: ./.github/workflows/tests-os.yml
     with:
       # The Windows lane spawns the real desktop-update hand-off script
@@ -141,7 +154,9 @@ jobs:
   docs-site:
     name: Docs Site
     needs: detect
-    if: needs.detect.outputs.site == 'true'
+    # Fork: never — deploy-site.yml is upstream-only, so the fork deploys no
+    # docs site and a Docusaurus build validates nothing it ships.
+    if: needs.detect.outputs.site == 'true' && github.repository != 'mekenthompson/hermes-agent'
     uses: ./.github/workflows/docs-site-checks.yml
 
   history-check:
@@ -153,7 +168,9 @@ jobs:
   contributor-check:
     name: Check contributors
     needs: detect
-    if: needs.detect.outputs.python == 'true'
+    # Fork: PRs only. On a main push HEAD == origin/main, so the merge-base
+    # range is empty and the job checks nothing.
+    if: needs.detect.outputs.python == 'true' && (github.repository != 'mekenthompson/hermes-agent' || needs.detect.outputs.event_name == 'pull_request')
     uses: ./.github/workflows/contributor-check.yml
 
   uv-lockfile:
@@ -167,14 +184,18 @@ jobs:
     if: needs.detect.outputs.uv_lock == 'true'
     uses: ./.github/workflows/uv-lockfile-check.yml
 
+  # Both tree checks reject files by extension; the fork runs them only when
+  # the diff carries such a file (classifier ``binary_artifacts``).
   infographic-check:
     name: Check no committed infographics
     needs: detect
+    if: github.repository != 'mekenthompson/hermes-agent' || needs.detect.outputs.binary_artifacts == 'true'
     uses: ./.github/workflows/infographic-check.yml
 
   profile-artifact-check:
     name: Profile artifact check
     needs: detect
+    if: github.repository != 'mekenthompson/hermes-agent' || needs.detect.outputs.binary_artifacts == 'true'
     uses: ./.github/workflows/profile-artifact-check.yml
 
   case-collision-check:
@@ -217,6 +238,11 @@ jobs:
 
   osv-scanner:
     name: OSV scan
+    needs: detect
+    # Fork: only when a lockfile or pyproject changed. The pinned set cannot
+    # gain a CVE from a diff that does not touch it; osv-scanner.yml's weekly
+    # schedule still covers newly published advisories against main.
+    if: github.repository != 'mekenthompson/hermes-agent' || needs.detect.outputs.uv_lock == 'true' || needs.detect.outputs.npm_lock == 'true' || needs.detect.outputs.deps == 'true'
     uses: ./.github/workflows/osv-scanner.yml
 
   # ─────────────────────────────────────────────────────────────────────

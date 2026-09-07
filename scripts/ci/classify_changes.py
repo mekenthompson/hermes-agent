@@ -35,6 +35,20 @@ Lanes:
   lives under ``apps/``, so without this lane a Rust change matched ``frontend``
   and only the TypeScript matrix ran.
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
+* ``os_tests``    — the macOS / Windows pytest lanes. Upstream ignores this
+  key (its OS lanes ride on ``python``); the fork consumes it so a change
+  that touches no OS-specific surface does not pay for a Windows and a
+  macOS runner. It is true whenever the diff carries a platform-specific
+  path, an OS-marked test file, the test config, or a dependency manifest.
+* ``binary_artifacts`` — a changed image / archive file. The fork gates the
+  committed-infographic and profile-archive tree checks on it; upstream runs
+  those on every event regardless.
+
+Fork mode (``--fork`` / ``REPO=mekenthompson/hermes-agent``) refines only
+the ``.github/`` rule below: a workflow ci.yaml never calls cannot change
+what CI runs, and a workflow it does call only affects the lanes that gate
+it. Everything else in this file behaves identically upstream and in the
+fork.
 
 Docker is not a lane — it builds on push-to-main and release only,
 never per-PR.
@@ -63,12 +77,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+from pathlib import Path
 
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
 # Shipped page outside those packages, exercised by the desktop Electron suite.
 _FRONTEND_FILES = {"scripts/desktop-update/ui.html"}
+# Frontend trees the Dockerfile copies (apps/ is in .dockerignore except
+# apps/shared). Fork mode narrows ``docker`` to these; upstream keeps the
+# whole ``frontend`` lane as an image input.
+_IMAGE_FRONTEND = ("ui-tui/", "web/", "apps/shared/")
 _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
 _DOCKER_META = ("docker/", ".hadolint.yml", "Dockerfile") # docker setup
 _NIX_PATHS = ("nix/",) # nix files
@@ -136,6 +156,33 @@ _DESKTOP_UPDATER_FILES = {
 _RUST_PATHS = ("apps/bootstrap-installer/src-tauri/",)
 _RUST_FILENAMES = {"Cargo.toml", "Cargo.lock"}
 
+# The maintained fork. Its CI runs on 4-core hosted runners under a 20-job
+# concurrency cap, so it scopes harder than upstream where this file marks it.
+FORK_REPOSITORY = "mekenthompson/hermes-agent"
+_FORK_IMAGE_WORKFLOW = ".github/workflows/fork-agent-image.yml"
+_CI_ORCHESTRATOR = ".github/workflows/ci.yaml"
+
+# OS-specific surfaces: a path fragment that names a platform, the files the
+# OS lanes' selection depends on, and anything the installer / desktop
+# updater lanes already fire for. A changed test file that carries an OS
+# marker counts too (checked by content, see ``_is_os_marked_test``).
+_OS_PATH_FRAGMENTS = (
+    "windows", "win32", "winpty", "win_pty", "macos", "darwin", "powershell",
+    "platform", "desktop-update", "install", "clipboard", "keychain",
+    "launchd", "wsl", "msys", "appdata",
+)
+_OS_TESTS_FILES = {
+    "tests/conftest.py",
+    "pyproject.toml",
+    "uv.lock",
+    "scripts/ci/list_os_marked_tests.py",
+}
+_OS_MARKER_RE = re.compile(r"\b(?:windows_only|macos_only)\b")
+
+# Tree checks the fork gates: committed infographics (images) and profile
+# archives. Mirrors the extensions those two checks reject.
+_BINARY_ARTIFACT_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".tar.gz", ".tgz")
+
 def _is_docs(p: str) -> bool:
     if p.startswith(("skills/", "optional-skills/")):
         return False
@@ -198,6 +245,75 @@ def _is_rust(p: str) -> bool:
     )
 
 
+def _is_os_marked_test(p: str, root: Path) -> bool:
+    """Does the changed test file itself carry an OS marker?
+
+    Reads only the changed file (never the whole tree), so a diff of N files
+    costs N small reads at most. A file that is gone from the checkout was
+    deleted by the diff; a deletion cannot break the OS lanes (their
+    zero-tests guard covers the last marked file), so it is not marked.
+    """
+    if not (p.startswith("tests/") and p.endswith(".py")):
+        return False
+    try:
+        text = (root / p).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return bool(_OS_MARKER_RE.search(text))
+
+
+def _is_os_specific(p: str, root: Path) -> bool:
+    """Could ``p`` change what the macOS / Windows pytest lanes exercise?
+
+    Frontend and prose trees never can (they are not Python), whatever their
+    name says — ``apps/bootstrap-installer`` is TypeScript.
+    """
+    if _is_installer(p) or _is_desktop_updater(p) or p in _OS_TESTS_FILES:
+        return True
+    if _py_irrelevant(p):
+        return False
+    lowered = p.lower()
+    return any(fragment in lowered for fragment in _OS_PATH_FRAGMENTS) or _is_os_marked_test(p, root)
+
+
+def _is_binary_artifact(p: str) -> bool:
+    return p.lower().endswith(_BINARY_ARTIFACT_SUFFIXES)
+
+
+def _is_workflow(p: str) -> bool:
+    return p.startswith(".github/workflows/") and p.endswith((".yml", ".yaml"))
+
+
+def _ci_called_workflow_lanes(root: Path) -> dict[str, set[str]] | None:
+    """Map each workflow ci.yaml calls to the detect lanes gating that call.
+
+    ``{'.github/workflows/tests.yml': {'python'}, ...}``. A called workflow
+    whose job has no lane condition maps to an empty set. Returns ``None``
+    when ci.yaml cannot be parsed (no PyYAML, unreadable, malformed) so the
+    caller falls back to the upstream fail-open rule.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return None
+    try:
+        ci = yaml.safe_load((root / _CI_ORCHESTRATOR).read_text(encoding="utf-8"))
+    except (OSError, ValueError, yaml.YAMLError):
+        return None
+    jobs = ci.get("jobs") if isinstance(ci, dict) else None
+    if not isinstance(jobs, dict):
+        return None
+    lanes: dict[str, set[str]] = {}
+    for job in jobs.values():
+        uses = job.get("uses") if isinstance(job, dict) else None
+        if not isinstance(uses, str) or not uses.startswith("./"):
+            continue
+        cond = job.get("if")
+        gates = set(re.findall(r"needs\.detect\.outputs\.(\w+) == 'true'", cond)) if isinstance(cond, str) else set()
+        lanes.setdefault(uses[2:], set()).update(gates)
+    return lanes
+
+
 def _is_ci_review(p: str) -> bool:
     if p in _CI_REVIEW_FILES or p.startswith(_CI_REVIEW_PATHS):
         return True
@@ -211,38 +327,73 @@ def ci_review_files(files: list[str]) -> list[str]:
     return sorted({f.strip() for f in files if f.strip() and _is_ci_review(f.strip())})
 
 
-def classify(files: list[str]) -> dict[str, bool]:
-    """Map changed paths to ``{lane: should_run}``."""
+def classify(files: list[str], *, fork: bool = False, root: Path | None = None) -> dict[str, bool]:
+    """Map changed paths to ``{lane: should_run}``.
+
+    ``fork`` enables the fork-only ``.github/`` refinement (see the module
+    docstring); ``root`` is the checkout the changed paths are relative to
+    (defaults to the repository this script lives in).
+    """
+    root = root or Path(__file__).resolve().parents[2]
     files = [f.strip() for f in files if f.strip()]
-    python = any(not _py_irrelevant(f) for f in files)
-    python_prod = any(not _py_irrelevant(f) and not _py_test_only(f) for f in files)
+
+    # Fork: a workflow ci.yaml never calls (fork-agent-image.yml, the
+    # scheduled / workflow_run automations) cannot change what CI runs, and a
+    # called workflow only affects the lanes gating its call. Only ci.yaml
+    # itself, composite actions, .github/scripts and anything unparseable
+    # keep the upstream run-everything rule. Scoped workflow files leave the
+    # per-path lane computation entirely: they are neither prose nor Python,
+    # so the ``python`` denylist would otherwise keep every lane on for them.
+    github = [f for f in files if f.startswith(".github/")]
+    scoped: list[str] = []
+    called: dict[str, set[str]] = {}
+    if fork and github:
+        parsed = _ci_called_workflow_lanes(root)
+        if parsed is not None and all(_is_workflow(f) and f != _CI_ORCHESTRATOR for f in github):
+            called, scoped, github = parsed, github, []
+    lane_files = [f for f in files if f not in scoped]
+
+    python = any(not _py_irrelevant(f) for f in lane_files)
+    python_prod = any(not _py_irrelevant(f) and not _py_test_only(f) for f in lane_files)
     frontend = any(
         f.startswith(_FRONTEND) or f in _ROOT_NPM or f in _FRONTEND_FILES
-        for f in files
+        for f in lane_files
     )
-    deps = any(f == "pyproject.toml" for f in files)
-    npm_lock = any(f.split("/")[-1] == "package-lock.json" for f in files)
-    docker_meta = any(f.startswith(_DOCKER_META) for f in files)
-    
+    deps = any(f == "pyproject.toml" for f in lane_files)
+    npm_lock = any(f.split("/")[-1] == "package-lock.json" for f in lane_files)
+    docker_meta = any(f.startswith(_DOCKER_META) for f in lane_files)
+    image_frontend = frontend and (
+        not fork or any(f.startswith(_IMAGE_FRONTEND) or f in _ROOT_NPM for f in lane_files)
+    )
+
     ret = {
         "python": python,
         "python_prod": python_prod,
-        "docker": docker_meta or python_prod or frontend,
+        "docker": docker_meta or python_prod or image_frontend,
         "docker_meta": docker_meta,
         "frontend": frontend,
-        "site": any(f.startswith(_SITE) for f in files),
-        "scan": any(_is_scan(f) for f in files),
+        "site": any(f.startswith(_SITE) for f in lane_files),
+        "scan": any(_is_scan(f) for f in lane_files),
         "deps": deps,
-        "uv_lock": any(f in ("pyproject.toml", "uv.lock") for f in files),
+        "uv_lock": any(f in ("pyproject.toml", "uv.lock") for f in lane_files),
         "npm_lock": npm_lock,
-        "installer": any(_is_installer(f) for f in files),
-        "desktop_updater": any(_is_desktop_updater(f) for f in files),
-        "rust": any(_is_rust(f) for f in files),
-        "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
+        "installer": any(_is_installer(f) for f in lane_files),
+        "desktop_updater": any(_is_desktop_updater(f) for f in lane_files),
+        "rust": any(_is_rust(f) for f in lane_files),
+        "mcp_catalog": any(_is_mcp_catalog(f) for f in lane_files),
         "ci_review": any(_is_ci_review(f) for f in files),
-        "nix": python_prod or frontend or any(_is_nix(f) for f in files)
+        "nix": python_prod or frontend or any(_is_nix(f) for f in lane_files),
+        "os_tests": any(_is_os_specific(f, root) for f in lane_files),
+        "binary_artifacts": any(_is_binary_artifact(f) for f in lane_files),
     }
-    if not files or any(f.startswith(".github/") for f in files):
+    for f in scoped:
+        for lane in called.get(f, set()):
+            if lane in ret:
+                ret[lane] = True
+        if f == _FORK_IMAGE_WORKFLOW:
+            # The one .github file that is an image input (the build runs it).
+            ret["docker"] = True
+    if not files or github:
         ret["python"] = True
         ret["python_prod"] = True
         ret["docker"] = True
@@ -258,6 +409,12 @@ def classify(files: list[str]) -> dict[str, bool]:
         ret["rust"] = True
         ret["nix"] = True
         ret["ci_review"] = True
+        ret["os_tests"] = True
+        ret["binary_artifacts"] = True
+        if fork and files:
+            # .github/ is in .dockerignore: a CI-only diff cannot change the
+            # image, so the fork does not rebuild and republish it for one.
+            ret["docker"] = any(f == _FORK_IMAGE_WORKFLOW or not f.startswith(".github/") for f in files)
 
         # explicitly skip mcp catalog here. it's not needed unless those files are modified.
     return ret
@@ -318,6 +475,14 @@ def pull_request_changed_files() -> list[str]:
     return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
 
 
+def is_fork(argv: list[str] | None = None, environ: "os._Environ[str] | dict[str, str] | None" = None) -> bool:
+    """``--fork`` on the command line, or REPO / GITHUB_REPOSITORY naming the fork."""
+    argv = sys.argv[1:] if argv is None else argv
+    env = os.environ if environ is None else environ
+    repo = env.get("REPO") or env.get("GITHUB_REPOSITORY") or ""
+    return "--fork" in argv or repo == FORK_REPOSITORY
+
+
 def main() -> int:
     files = sys.stdin.read().splitlines()
     if not any(f.strip() for f in files):
@@ -329,7 +494,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             files = recovered
-    lanes = classify(files)
+    lanes = classify(files, fork=is_fork())
     out = "\n".join([
         *(f"{key}={str(value).lower()}" for key, value in lanes.items()),
         f"ci_review_files={json.dumps(ci_review_files(files))}",

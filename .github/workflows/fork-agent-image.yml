@@ -28,10 +28,38 @@ env:
   TEST_IMAGE: ghcr.io/mekenthompson/hermes-agent:sha-${{ github.sha }}
 
 jobs:
+  detect:
+    # Classify the diff once so a change that cannot alter the image (docs,
+    # tests/, website/, CI workflows — all in .dockerignore) neither builds
+    # nor republishes it. Pushes are scoped to the pushed range and PRs to
+    # the PR diff; a dispatch, a forced or first push, or an unreadable diff
+    # fail open (``docker=true``). See scripts/ci/classify_changes.py.
+    name: Detect image inputs
+    if: github.repository == 'mekenthompson/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      docker: ${{ steps.classify.outputs.docker }}
+    steps:
+      - name: Checkout exact workflow revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Classify changed files
+        id: classify
+        uses: ./.github/actions/detect-changes
+        with:
+          github-token: ${{ github.token }}
+
   preflight:
     # Pull requests and publish=false dispatches only; main pushes go
     # straight to the publish job, which builds and scans its own candidate.
+    needs: detect
     if: >-
+      needs.detect.outputs.docker == 'true' &&
       github.repository == 'mekenthompson/hermes-agent' &&
       github.event_name != 'push' &&
       (github.event_name == 'pull_request' ||
@@ -127,9 +155,12 @@ jobs:
           retention-days: 30
 
   publish:
-    # Every main push publishes automatically once the exact-SHA CI run is
-    # green; publish=true dispatches remain available for re-runs.
+    # Every main push that changes an image input publishes automatically
+    # once the exact-SHA CI run is green; publish=true dispatches remain
+    # available for re-runs (and always build: dispatch fails open).
+    needs: detect
     if: >-
+      needs.detect.outputs.docker == 'true' &&
       github.repository == 'mekenthompson/hermes-agent' &&
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' ||

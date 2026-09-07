@@ -57,6 +57,9 @@ concurrency:
 jobs:
   generate-patch:
     name: Generate eslint --fix patch
+    # Upstream only: the fork has no GitHub App to push a fix commit with,
+    # so every main push touching JS failed here after ~2.5 min.
+    if: github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
