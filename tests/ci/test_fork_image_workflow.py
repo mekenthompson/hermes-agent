@@ -12,6 +12,7 @@ WORKFLOW = ROOT / ".github/workflows/fork-agent-image.yml"
 DOC = ROOT / "docs/fork-agent-image.md"
 MANIFEST = ROOT / "scripts/emit-image-manifest.py"
 COMPACT_SBOM = ROOT / "scripts/compact-spdx-sbom.py"
+REMOTE_CONFIG = ROOT / "scripts/verify-remote-image-config.py"
 SHA = "1" * 40
 DIGEST = "sha256:" + "2" * 64
 REPOSITORY = "ghcr.io/mekenthompson/hermes-agent"
@@ -49,7 +50,8 @@ class ForkImageWorkflowTests(unittest.TestCase):
         self.assertIn("scripts/verify-exact-main-ci.py", text)
         self.assertIn('--workflow "ci.yaml"', text)
         self.assertIn('--workflow-path ".github/workflows/ci.yaml"', text)
-        self.assertIn("needs: preflight", text)
+        self.assertIn("before registry access", text)
+        self.assertNotIn("needs: preflight", text)
 
     def test_publish_checks_out_the_gate_script_before_running_it(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
@@ -86,18 +88,51 @@ class ForkImageWorkflowTests(unittest.TestCase):
 
     def test_publish_promotes_the_scanned_candidate_without_rebuilding(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
-        self.assertEqual(text.count("docker/build-push-action@"), 1)
-        self.assertIn("docker save", text)
-        self.assertIn("set -euo pipefail\n          docker save", text)
-        self.assertIn("agent-image.tar.gz", text)
-        self.assertIn("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c", text)
-        self.assertIn("docker load", text)
-        self.assertIn('docker push "$TEST_IMAGE"', text)
+        self.assertEqual(text.count("docker/build-push-action@"), 2)
+        self.assertNotIn("docker save", text)
+        self.assertNotIn("docker load", text)
+        self.assertNotIn("agent-image.tar.gz", text)
+        self.assertIn("candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}", text)
+        self.assertIn('docker push "$CANDIDATE_IMAGE"', text)
+        self.assertIn("scripts/verify-remote-image-config.py", text)
+        self.assertIn("docker buildx imagetools create", text)
         self.assertIn("actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e", text)
+
+    def test_pr_preflight_cannot_push_or_receive_registry_write_credentials(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        preflight = text.split("\n  publish:\n", 1)[0]
+        self.assertNotIn("packages: write", preflight)
+        self.assertNotIn("id-token: write", preflight)
+        self.assertNotIn("docker/login-action", preflight)
+        self.assertNotIn("docker push", preflight)
+
+    def test_remote_config_verifier_binds_remote_manifest_to_scanned_image_id(self) -> None:
+        manifest = {"schemaVersion": 2, "config": {"digest": DIGEST}}
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "manifest.json"
+            source.write_text(json.dumps(manifest), encoding="utf-8")
+            result = subprocess.run(
+                ["python3", str(REMOTE_CONFIG), "--image-id", DIGEST, "--manifest", str(source)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            mismatch = subprocess.run(
+                ["python3", str(REMOTE_CONFIG), "--image-id", "sha256:" + "3" * 64, "--manifest", str(source)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(mismatch.returncode, 0)
+            self.assertIn("does not match", mismatch.stderr)
 
     def test_publish_attests_the_exact_sha_tag_and_digest(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn('docker push "$TEST_IMAGE"', text)
+        self.assertIn('docker push "$CANDIDATE_IMAGE"', text)
+        self.assertIn('docker buildx imagetools create --tag "$TEST_IMAGE" "$immutable_ref"', text)
         self.assertIn("ghcr.io/mekenthompson/hermes-agent:sha-${{ github.sha }}", text)
         self.assertIn("actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8", text)
         self.assertIn("actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e", text)

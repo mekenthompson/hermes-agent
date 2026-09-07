@@ -24,7 +24,7 @@ env:
 
 jobs:
   preflight:
-    if: github.repository == 'mekenthompson/hermes-agent'
+    if: github.repository == 'mekenthompson/hermes-agent' && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -103,31 +103,6 @@ jobs:
           ignore-unfixed: true
           exit-code: 1
 
-      - name: Save exact scanned candidate
-        if: >-
-          github.event_name == 'workflow_dispatch' &&
-          github.event.inputs.publish == 'true' &&
-          github.ref == 'refs/heads/main'
-        run: |
-          set -euo pipefail
-          docker save "$TEST_IMAGE" | gzip -1 > agent-image.tar.gz
-
-      - name: Upload exact scanned candidate
-        if: >-
-          github.event_name == 'workflow_dispatch' &&
-          github.event.inputs.publish == 'true' &&
-          github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: fork-agent-image-candidate-${{ github.sha }}
-          path: |
-            agent-image.tar.gz
-            agent-image.spdx.json
-            agent-image.attestation.spdx.json
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
-
       - name: Upload pre-publication evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -141,7 +116,6 @@ jobs:
           retention-days: 30
 
   publish:
-    needs: preflight
     if: >-
       github.repository == 'mekenthompson/hermes-agent' &&
       github.event_name == 'workflow_dispatch' &&
@@ -162,7 +136,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Verify exact main CI gate
+      - name: Verify exact main CI gate before registry access
         run: |
           set -euo pipefail
           python3 scripts/verify-exact-main-ci.py \
@@ -171,18 +145,30 @@ jobs:
             --sha "$GITHUB_SHA" \
             --workflow-path ".github/workflows/ci.yaml"
 
-      - name: Download exact scanned candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: fork-agent-image-candidate-${{ github.sha }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Load and verify exact scanned candidate
+      - name: Build exact main candidate without publishing
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.TEST_IMAGE }}
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+            HERMES_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
+          cache-from: type=gha,scope=fork-agent-amd64
+          cache-to: type=gha,mode=max,scope=fork-agent-amd64
+
+      - name: Verify exact scanned candidate runtime
         env:
           EXPECTED_REVISION: ${{ github.sha }}
           EXPECTED_IMAGE_IDENTITY: ${{ env.IMAGE_REPOSITORY }}
         run: |
           set -euo pipefail
-          gzip -dc agent-image.tar.gz | docker load
           docker run --rm --env EXPECTED_REVISION --env EXPECTED_IMAGE_IDENTITY --entrypoint python3 "$TEST_IMAGE" -c '
           import importlib.metadata as metadata
           import json, os, pathlib
@@ -191,21 +177,63 @@ jobs:
           assert data["image"] == os.environ["EXPECTED_IMAGE_IDENTITY"], data
           assert data["version"] == metadata.version("hermes-agent"), data
           '
+          docker run --rm --entrypoint hermes "$TEST_IMAGE" --version
 
-      - name: Log in to GHCR
+      - name: Verify OAuth recovery in the exact scanned candidate
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --entrypoint python3 \
+            --env PYTHONPATH=/opt/hermes \
+            --mount type=bind,src="$PWD/scripts/verify-dashboard-oauth-image.py",dst=/tmp/verify-dashboard-oauth-image.py,readonly \
+            "$TEST_IMAGE" /tmp/verify-dashboard-oauth-image.py
+
+      - name: Generate image SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          image: ${{ env.TEST_IMAGE }}
+          format: spdx-json
+          output-file: agent-image.spdx.json
+          upload-artifact: false
+
+      - name: Create bounded package SBOM for attestation
+        run: |
+          set -euo pipefail
+          python3 scripts/compact-spdx-sbom.py \
+            --input agent-image.spdx.json \
+            --output agent-image.attestation.spdx.json \
+            --max-bytes 16777216
+
+      - name: Scan critical image vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.TEST_IMAGE }}
+          format: json
+          output: trivy-image.json
+          scanners: vuln
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: 1
+
+      - name: Log in to GHCR after scan and exact-CI gate
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Push exact scanned candidate
+      - name: Push unique scanned candidate and verify immutable handoff
         id: publish
         run: |
           set -euo pipefail
-          docker push "$TEST_IMAGE"
-          immutable_ref=$(docker image inspect --format '{{ index .RepoDigests 0 }}' "$TEST_IMAGE")
-          digest=${immutable_ref#*@}
+          CANDIDATE_IMAGE="$IMAGE_REPOSITORY:candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker tag "$TEST_IMAGE" "$CANDIDATE_IMAGE"
+          push_output=$(docker push "$CANDIDATE_IMAGE" 2>&1 | tee /dev/stderr)
+          digest=$(printf '%s\n' "$push_output" | python3 -c 'import re, sys; matches = re.findall(r"(?m)^digest: (sha256:[0-9a-f]{64})$", sys.stdin.read()); assert len(matches) == 1, matches; print(matches[0])')
+          immutable_ref="$IMAGE_REPOSITORY@$digest"
+          local_image_id=$(docker image inspect --format '{{.Id}}' "$TEST_IMAGE")
+          docker buildx imagetools inspect --raw "$immutable_ref" > remote-manifest.json
+          python3 scripts/verify-remote-image-config.py --image-id "$local_image_id" --manifest remote-manifest.json
+          docker buildx imagetools create --tag "$TEST_IMAGE" "$immutable_ref"
           python3 scripts/emit-image-manifest.py \
             --repository "$IMAGE_REPOSITORY" \
             --revision "${{ github.sha }}" \
