@@ -32,18 +32,64 @@ class ForkImageWorkflowTests(unittest.TestCase):
         for path in (WORKFLOW, DOC, MANIFEST):
             self.assertTrue(path.is_file(), path)
 
-    def test_workflow_is_fork_scoped_and_manual_publish_only(self) -> None:
+    def test_workflow_publishes_main_pushes_and_manual_dispatches_only(self) -> None:
+        import yaml
+
         text = WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn("github.repository == 'mekenthompson/hermes-agent'", text)
         self.assertRegex(text, r"(?m)^\s*pull_request:\s*$")
         self.assertNotIn("    paths:", text)
         self.assertRegex(text, r"(?m)^\s*workflow_dispatch:\s*$")
-        self.assertNotRegex(text, r"(?m)^\s*push:\s*$")
+        self.assertRegex(text, r"(?m)^  push:\n    branches: \[main\]\s*$")
         self.assertIn("type: boolean", text)
         self.assertIn("default: false", text)
-        self.assertIn("github.event.inputs.publish == 'true'", text)
-        self.assertIn("github.ref == 'refs/heads/main'", text)
         self.assertIn("environment: agent-image-publish", text)
+        workflow = yaml.safe_load(text)
+        self.assertEqual(sorted(workflow[True]), ["pull_request", "push", "workflow_dispatch"])
+        self.assertEqual(workflow[True]["push"], {"branches": ["main"]})
+        preflight = " ".join(workflow["jobs"]["preflight"]["if"].split())
+        publish = " ".join(workflow["jobs"]["publish"]["if"].split())
+        self.assertEqual(
+            publish,
+            "github.repository == 'mekenthompson/hermes-agent' && "
+            "github.ref == 'refs/heads/main' && "
+            "(github.event_name == 'push' || "
+            "(github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true'))",
+        )
+        self.assertEqual(
+            preflight,
+            "github.repository == 'mekenthompson/hermes-agent' && "
+            "github.event_name != 'push' && "
+            "(github.event_name == 'pull_request' || "
+            "(github.event_name == 'workflow_dispatch' && github.event.inputs.publish != 'true'))",
+        )
+        concurrency = workflow["concurrency"]
+        self.assertEqual(concurrency["group"], "fork-agent-image-${{ github.event.pull_request.number || github.sha }}")
+        self.assertEqual(concurrency["cancel-in-progress"], "${{ github.event_name == 'pull_request' }}")
+
+    def test_publish_waits_for_exact_main_ci_before_registry_write(self) -> None:
+        import yaml
+
+        text = WORKFLOW.read_text(encoding="utf-8")
+        steps = yaml.safe_load(text)["jobs"]["publish"]["steps"]
+        names = [step.get("name", "") for step in steps]
+        gate = next(i for i, step in enumerate(steps) if "scripts/verify-exact-main-ci.py" in step.get("run", ""))
+        self.assertIn("--wait", steps[gate]["run"])
+        self.assertIn("--timeout-minutes 30", steps[gate]["run"])
+        self.assertIn("--interval-seconds 20", steps[gate]["run"])
+        login = next(i for i, step in enumerate(steps) if str(step.get("uses", "")).startswith("docker/login-action@"))
+        push = next(i for i, step in enumerate(steps) if "docker push" in step.get("run", ""))
+        build = next(i for i, step in enumerate(steps) if str(step.get("uses", "")).startswith("docker/build-push-action@"))
+        scan = next(i for i, step in enumerate(steps) if str(step.get("uses", "")).startswith("aquasecurity/trivy-action@"))
+        self.assertLess(build, gate, names)
+        self.assertLess(scan, gate, names)
+        self.assertLess(gate, login, names)
+        self.assertLess(login, push, names)
+        for step in steps[:gate]:
+            self.assertNotIn("docker push", step.get("run", ""), step.get("name"))
+            self.assertNotIn("docker/login-action", str(step.get("uses", "")), step.get("name"))
+            self.assertNotIn("push-to-registry: true", str(step.get("with", {})), step.get("name"))
+        for step in steps[:login]:
+            self.assertFalse(str(step.get("uses", "")).startswith("actions/attest-"), step.get("name"))
 
     def test_workflow_has_least_privilege_boundaries(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
@@ -211,7 +257,9 @@ candidate-123-1: digest: sha256:222222222222222222222222222222222222222222222222
     def test_documentation_states_release_boundary_and_handoff(self) -> None:
         text = DOC.read_text(encoding="utf-8").lower()
         for phrase in (
-            "manual publication",
+            "automatic",
+            "every push to `main`",
+            "workflow_dispatch",
             "exact pushed commit",
             "no manual reviewer prerequisite",
             "image digest",
