@@ -225,12 +225,14 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     ``credential`` names what was presented so the accept path can log *how*.
 
     Loopback / ``--insecure``: legacy ``?token=`` (constant-time compared).
-    Gated: ``?ticket=`` (browser-minted, single-use, 30s TTL) or ``?internal=``
-    (process-lifetime, multi-use, only for server-spawned WS clients so the PTY
-    child can reconnect; never injected into the SPA).  The legacy token is
-    rejected in gated mode: a leaked ``_SESSION_TOKEN`` must not grant access.
+    Gated: ``?ticket=`` (browser-minted, single-use, 30s TTL), ``?internal=``
+    (process-lifetime, multi-use, only for server-spawned WS clients), or the
+    explicitly operator-configured (never generated) ``?token=`` used by stock
+    Desktop connections.  Exactly one credential shape is allowed on an upgrade
+    so a valid reusable token cannot bypass a malformed or invalid ticket.
     """
-    from hermes_cli.web_server import _SESSION_TOKEN, app
+    from hermes_cli.web_server import (
+        _SESSION_TOKEN, _SESSION_TOKEN_IS_EXPLICIT, _explicit_session_token_session, app)
     auth_required = bool(getattr(app.state, "auth_required", False))
     if auth_required:
         # Lazy import — keeps this function importable in test harnesses
@@ -254,6 +256,23 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                 "user_id": info.get("user_id"), "provider": info.get("provider")}
 
         internal = ws.query_params.get("internal", "")
+        query_ticket = ws.query_params.get("ticket", "")
+        token = ws.query_params.get("token", "")
+        protocol_ticket, protocol_reason = _gateway_ws_ticket_from_subprotocol(ws)
+        if protocol_reason == "invalid":
+            _reject("invalid ticket subprotocol")
+            return "ticket_invalid", "ticket-subprotocol"
+        # Never let a token select precedence over another credential. In
+        # particular, do not consume a ticket until ambiguity is ruled out.
+        query_items = (
+            ws.query_params.multi_items()
+            if hasattr(ws.query_params, "multi_items") else ws.query_params.items()
+        )
+        credential_count = sum(key in {"internal", "ticket", "token"} for key, _ in query_items)
+        if credential_count + bool(protocol_ticket) > 1:
+            _reject("multiple credentials")
+            return "credential_conflict", "multiple"
+
         if internal:
             try:
                 _stamp_identity(consume_internal_credential(internal))
@@ -262,25 +281,28 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                 _reject(f"internal: {exc}")
                 return "internal_invalid", "internal"
 
-        protocol_ticket, protocol_reason = _gateway_ws_ticket_from_subprotocol(ws)
-        if protocol_reason == "invalid":
-            return "ticket_invalid", "ticket-subprotocol"
-        ticket = protocol_ticket or ws.query_params.get("ticket", "")
-        if not ticket:
-            return "no_credential", "none"
+        ticket = protocol_ticket or query_ticket
+        if ticket:
+            try:
+                _stamp_identity(consume_ticket(ticket))
+                if protocol_ticket:
+                    # Select only the stable public protocol during accept. The
+                    # ticket-bearing protocol is a credential and must never be
+                    # reflected back to the browser or retained after admission.
+                    ws._hermes_ws_subprotocol = _GATEWAY_WS_PROTOCOL
+                    return None, "ticket-subprotocol"
+                return None, "ticket"
+            except TicketInvalid as exc:
+                _reject(str(exc))
+                return "ticket_invalid", "ticket"
 
-        try:
-            _stamp_identity(consume_ticket(ticket))
-            if protocol_ticket:
-                # Select only the stable public protocol during accept. The
-                # ticket-bearing protocol is a credential and must never be
-                # reflected back to the browser or retained after admission.
-                ws._hermes_ws_subprotocol = _GATEWAY_WS_PROTOCOL
-                return None, "ticket-subprotocol"
-            return None, "ticket"
-        except TicketInvalid as exc:
-            _reject(str(exc))
-            return "ticket_invalid", "ticket"
+        if token:
+            if _SESSION_TOKEN_IS_EXPLICIT and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+                session = _explicit_session_token_session()
+                _stamp_identity({"user_id": session.user_id, "provider": session.provider})
+                return None, "explicit-token"
+            return "token_mismatch", "token"
+        return "no_credential", "none"
 
     token = ws.query_params.get("token", "")
     if not token:
