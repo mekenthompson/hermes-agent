@@ -88,7 +88,7 @@ jobs:
             HERMES_GIT_SHA=${{ github.sha }}
             HERMES_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
           cache-from: type=gha,scope=fork-agent-amd64
-          cache-to: type=gha,mode=max,scope=fork-agent-amd64
+          cache-to: type=gha,mode=max,scope=fork-agent-amd64,ignore-error=true
 
       - name: Verify baked revision and runtime command
         env:
@@ -196,7 +196,7 @@ jobs:
             HERMES_GIT_SHA=${{ github.sha }}
             HERMES_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
           cache-from: type=gha,scope=fork-agent-amd64
-          cache-to: type=gha,mode=max,scope=fork-agent-amd64
+          cache-to: type=gha,mode=max,scope=fork-agent-amd64,ignore-error=true
 
       - name: Verify exact scanned candidate runtime
         env:
