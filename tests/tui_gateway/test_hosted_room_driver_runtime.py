@@ -757,13 +757,14 @@ def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
             waiting if binding.room_id == "room-waiting" else healthy
         ),
         turn_lock=RecordingTurnLocks(),
-        lease_ttl_seconds=0.4,
+        # This tests independent scheduling, not lease expiry under CI load.
+        lease_ttl_seconds=30.0,
         poll_interval_seconds=0.01,
         max_concurrent_rooms=2,
     )
 
     runtime.start()
-    assert waiting.submitted.wait(1.0)
+    assert waiting.submitted.wait(5.0)
     _wait_for(lambda: state.get_task(db, identities[1])["status"] == "settled")
     assert state.get_task(db, identities[0])["status"] == "running"
     assert runtime.stop(timeout=5.0)
@@ -1763,10 +1764,11 @@ def test_completion_wins_a_race_with_unacknowledged_stop(db: Path):
     identity = _identity()
     _admit(db, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc)
+    # Keep the lease alive while testing completion versus stop intent.
+    runtime = _runtime(db, rpc, lease_ttl_seconds=30.0)
 
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(5.0)
 
     def finish_only_after_stop_intent():
         if state.get_task(db, identity)["status"] == "stopping":
