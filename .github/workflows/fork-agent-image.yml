@@ -140,6 +140,8 @@ jobs:
           persist-credentials: false
 
       - name: Verify exact main CI gate before registry access
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           python3 scripts/verify-exact-main-ci.py \
