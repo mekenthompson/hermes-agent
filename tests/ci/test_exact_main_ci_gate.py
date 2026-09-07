@@ -57,6 +57,87 @@ class ExactMainCiGateTests(unittest.TestCase):
         self.assertIn(f"head_sha={SHA}", query)
         self.assertNotIn("status=", query)
 
+    def _wait(self, polls, *, timeout_seconds=1800, interval_seconds=20):
+        """Drive wait_for_exact_main_ci with a fake clock; each poll advances it by one interval."""
+        polls = list(polls)
+        fetches, slept, now = [], [], [0.0]
+        def fetch():
+            fetches.append(now[0])
+            return polls.pop(0) if len(polls) > 1 else polls[0]
+        def sleep(seconds):
+            slept.append(seconds)
+            now[0] += seconds
+        result = self.module.wait_for_exact_main_ci(
+            fetch, SHA, ".github/workflows/ci.yml",
+            timeout_seconds=timeout_seconds, interval_seconds=interval_seconds,
+            clock=lambda: now[0], sleep=sleep, log=lambda _message: None,
+        )
+        return result, fetches, slept
+
+    def test_wait_passes_when_in_progress_run_completes_successfully(self):
+        pending = run(status="in_progress", conclusion=None)
+        result, fetches, slept = self._wait([[pending], [pending], [run()]])
+        self.assertTrue(result)
+        self.assertEqual(len(fetches), 3)
+        self.assertEqual(slept, [20, 20])
+
+    def test_wait_fails_when_in_progress_run_completes_with_failure(self):
+        pending = run(status="in_progress", conclusion=None)
+        result, fetches, _ = self._wait([[pending], [run(conclusion="failure")]])
+        self.assertFalse(result)
+        self.assertEqual(len(fetches), 2)
+
+    def test_wait_fails_closed_on_timeout_without_sleeping_past_the_deadline(self):
+        pending = run(status="in_progress", conclusion=None)
+        result, fetches, slept = self._wait([[pending]], timeout_seconds=60, interval_seconds=20)
+        self.assertFalse(result)
+        self.assertEqual(slept, [20, 20, 20])
+        self.assertEqual(len(fetches), 4)
+
+    def test_wait_keeps_polling_while_no_run_exists_yet_then_honours_it(self):
+        result, fetches, _ = self._wait([[], [], [run()]])
+        self.assertTrue(result)
+        self.assertEqual(len(fetches), 3)
+        result, _, _ = self._wait([[]], timeout_seconds=40)
+        self.assertFalse(result)
+
+    def test_wait_honours_a_newer_run_that_supersedes_an_older_one(self):
+        older_success = run(created_at="2026-09-07T01:00:00Z")
+        newer_pending = run(status="in_progress", conclusion=None, created_at="2026-09-07T02:00:00Z")
+        newer_failed = run(conclusion="failure", created_at="2026-09-07T02:00:00Z")
+        result, fetches, _ = self._wait([[older_success, newer_pending], [older_success, newer_failed]])
+        self.assertFalse(result)
+        self.assertEqual(len(fetches), 2)
+        older_cancelled = run(conclusion="cancelled", created_at="2026-09-07T01:00:00Z")
+        older_pending = run(status="in_progress", conclusion=None, created_at="2026-09-07T01:00:00Z")
+        newer_success = run(created_at="2026-09-07T02:00:00Z")
+        result, _, _ = self._wait([[older_pending], [older_cancelled, newer_success]])
+        self.assertTrue(result)
+
+    def test_wait_does_not_sleep_when_the_first_poll_is_already_complete(self):
+        result, fetches, slept = self._wait([[run()]])
+        self.assertTrue(result)
+        self.assertEqual(len(fetches), 1)
+        self.assertEqual(slept, [])
+        result, _, slept = self._wait([[run(conclusion="failure")]])
+        self.assertFalse(result)
+        self.assertEqual(slept, [])
+
+    def test_cli_wait_flags_default_to_thirty_minutes_and_twenty_seconds(self):
+        import subprocess
+        result = subprocess.run(["python3", str(SCRIPT), "--help"], text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for flag in ("--wait", "--timeout-minutes", "--interval-seconds"):
+            self.assertIn(flag, result.stdout)
+
+    def test_publish_gate_waits_for_ci(self):
+        import yaml
+        text = (ROOT / ".github/workflows/" / self.workflow_name).read_text()
+        publish = yaml.safe_load(text)["jobs"][self.job_name]["steps"]
+        gates = [s for s in publish if "scripts/verify-exact-main-ci.py" in s.get("run", "")]
+        self.assertEqual(len(gates), 1)
+        self.assertIn("--wait", gates[0]["run"])
+
     def test_gate_authenticates_github_api(self):
         import yaml
         text = (ROOT / ".github/workflows/" / self.workflow_name).read_text()
