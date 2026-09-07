@@ -59,6 +59,15 @@ def test_thread_require_mention_env_bridge(monkeypatch):
     assert os.environ["SLACK_THREAD_REQUIRE_MENTION"] == "true"
 
 
+def test_thread_participation_channels_yaml_bridge(monkeypatch):
+    monkeypatch.delenv("SLACK_THREAD_PARTICIPATION_CHANNELS", raising=False)
+
+    _apply_yaml_config({}, {"thread_participation_channels": ["C123", "C456"]})
+
+    assert os.environ["SLACK_THREAD_PARTICIPATION_CHANNELS"] == "C123,C456"
+    os.environ.pop("SLACK_THREAD_PARTICIPATION_CHANNELS", None)
+
+
 def test_thread_require_mention_parses_yaml_and_env(monkeypatch):
     monkeypatch.setenv("SLACK_THREAD_REQUIRE_MENTION", "true")
 
@@ -151,3 +160,120 @@ def test_thread_require_mention_allows_mentioned_thread_reply_without_sticky_thr
     )
 
     assert len(handled) == 1
+
+
+def test_participation_only_thread_channel_allows_follow_up_after_bot_mention():
+    """Strict agents stay in a scoped thread only after this agent was invited."""
+    adapter = make_adapter(
+        {
+            "allowed_channels": ["C123"],
+            "require_mention": False,
+            "strict_mention": True,
+            "thread_require_mention": True,
+            "thread_participation_channels": ["C123"],
+        }
+    )
+    handled = []
+
+    async def capture(event):
+        handled.append(event)
+
+    adapter.handle_message = capture
+    run(adapter._handle_slack_message(
+        slack_event("<@UBOT> investigate this", ts="101.000", thread_ts="100.000")
+    ))
+    run(adapter._handle_slack_message(
+        slack_event("here is the requested log", ts="102.000", thread_ts="100.000")
+    ))
+
+    assert [event.text for event in handled] == [
+        "investigate this",
+        "here is the requested log",
+    ]
+
+
+def test_participation_only_thread_channel_blocks_uninvited_thread():
+    """The primary does not barge into a secondary agent's thread."""
+    adapter = make_adapter(
+        {
+            "allowed_channels": ["C123"],
+            "require_mention": False,
+            "strict_mention": True,
+            "thread_require_mention": True,
+            "thread_participation_channels": ["C123"],
+        }
+    )
+    handled = []
+
+    async def capture(event):
+        handled.append(event)
+
+    adapter.handle_message = capture
+    run(adapter._handle_slack_message(
+        slack_event("secondary agent's follow-up", ts="101.000", thread_ts="100.000")
+    ))
+
+    assert handled == []
+
+
+def test_participation_only_thread_channel_recovers_active_session_after_restart():
+    """A scoped thread retains its existing durable session participation."""
+    adapter = make_adapter(
+        {
+            "allowed_channels": ["C123"],
+            "require_mention": False,
+            "strict_mention": True,
+            "thread_require_mention": True,
+            "thread_participation_channels": ["C123"],
+        }
+    )
+    def active_session(channel_id, thread_ts, user_id, team_id="", *, chat_type="group"):
+        return True
+
+    adapter._has_active_session_for_thread = active_session
+    handled = []
+
+    async def capture(event):
+        handled.append(event)
+
+    adapter.handle_message = capture
+    run(adapter._handle_slack_message(
+        slack_event("resume from the last result", ts="101.000", thread_ts="100.000")
+    ))
+
+    assert [event.text for event in handled] == ["resume from the last result"]
+
+
+def test_participation_thread_parent_mention_is_scoped_to_its_workspace():
+    """A recovered parent mention cannot enroll an equal timestamp in another workspace."""
+    adapter = make_adapter(
+        {
+            "allowed_channels": ["C123"],
+            "require_mention": False,
+            "strict_mention": True,
+            "thread_require_mention": True,
+            "thread_participation_channels": ["C123"],
+        }
+    )
+
+    async def parent_text(channel_id, thread_ts, team_id="", strip_bot_mention=True):
+        return "<@UBOT> investigate" if team_id == "T1" else ""
+
+    adapter._fetch_thread_parent_text = parent_text
+    handled = []
+
+    async def capture(event):
+        handled.append(event)
+
+    adapter.handle_message = capture
+    run(adapter._handle_slack_message(
+        slack_event("first workspace follow-up", ts="101.000", thread_ts="100.000")
+    ))
+    other_workspace_event = slack_event(
+        "other workspace follow-up", ts="102.000", thread_ts="100.000")
+    other_workspace_event["team"] = "T2"
+    run(adapter._handle_slack_message(other_workspace_event))
+
+    assert [event.text for event in handled] == ["first workspace follow-up"]
+    assert ("T1", "100.000") in adapter._mentioned_threads
+    assert "100.000" not in adapter._mentioned_threads
