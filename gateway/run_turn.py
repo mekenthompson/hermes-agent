@@ -2939,6 +2939,9 @@ class GatewayTurnMixin:
                 "Skipping stale agent promotion for %s — generation %s is no longer current",
                 session_key or "", run_generation,
             )
+            if getattr(turn_ctx, "internal_plugin_execution_id", None) is not None:
+                turn_ctx.execution_launch_allowed = False
+                turn_ctx.execution_launch_gate.set()
             return
         execution_id = getattr(turn_ctx, "internal_plugin_execution_id", None)
         allowed = self._promote_running_agent(
