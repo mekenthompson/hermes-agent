@@ -41,6 +41,14 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         self.assertIn("github.event.workflow_run.head_repository.full_name == github.repository", guard)
         self.assertIn("github.repository == 'mekenthompson/hermes-agent'", guard)
 
+    def test_handoffs_are_serialized_across_source_shas(self) -> None:
+        text = workflow_text()
+        self.assertIn("group: release-handoff-fleet", text)
+        self.assertNotIn("group: release-handoff-${{ github.event.workflow_run.head_sha }}", text)
+
+    def test_workflow_allows_the_twelve_minute_merge_wait(self) -> None:
+        self.assertIn("timeout-minutes: 15", job_text())
+
     def test_artifact_is_downloaded_from_the_triggering_run_and_bound_to_its_head_sha(self) -> None:
         job = job_text()
         download = job.split("uses: actions/download-artifact@", 1)[1].split("\n      - name:", 1)[0]

@@ -29,6 +29,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,6 +39,9 @@ FLEET_MANIFEST_PATH = "release/agent-image-manifest.json"
 MANIFEST_KEYS = {"schema_version", "repository", "revision", "digest", "immutable_ref"}
 REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+READ_RETRY_ATTEMPTS = 3
+WAIT_ATTEMPTS = 72
+WAIT_SECONDS = 10
 
 GhRunner = Callable[[list[str], "str | None"], str]
 
@@ -57,6 +61,13 @@ class GhError(HandoffError):
     @property
     def not_found(self) -> bool:
         return "404" in self.stderr or "Not Found" in self.stderr
+
+    @property
+    def transient(self) -> bool:
+        text = f"{self.stdout}\n{self.stderr}".lower()
+        return "429" in text or any(str(code) in text for code in range(500, 600)) or any(
+            marker in text for marker in ("network", "timeout", "connection reset", "temporary failure")
+        )
 
 
 def short(sha: str) -> str:
@@ -122,12 +133,22 @@ def run_gh(args: list[str], input_text: str | None = None) -> str:
 class GitHub:
     """Thin contents/refs/PR client over ``gh``; tests inject a fake runner."""
 
-    def __init__(self, repo: str, gh: GhRunner = run_gh) -> None:
+    def __init__(self, repo: str, gh: GhRunner = run_gh, *, sleep: Callable[[float], None] = time.sleep) -> None:
         self.repo = repo
         self.gh = gh
+        self.sleep = sleep
 
-    def json(self, args: list[str], input_text: str | None = None) -> Any:
-        raw = self.gh(args, input_text)
+    def json(self, args: list[str], input_text: str | None = None, *, retry: bool = True) -> Any:
+        raw = ""
+        for attempt in range(READ_RETRY_ATTEMPTS):
+            try:
+                raw = self.gh(args, input_text)
+                break
+            except GhError as exc:
+                if not retry or not exc.transient or attempt + 1 == READ_RETRY_ATTEMPTS:
+                    raise
+                log(f"transient GitHub read failure; retrying ({attempt + 1}/{READ_RETRY_ATTEMPTS})")
+                self.sleep(2**attempt)
         try:
             return json.loads(raw) if raw.strip() else None
         except json.JSONDecodeError as exc:
@@ -139,7 +160,7 @@ class GitHub:
         if body is not None:
             args += ["--input", "-"]
             input_text = json.dumps(body)
-        return self.json(args, input_text)
+        return self.json(args, input_text, retry=method == "GET")
 
     def head(self, branch: str = "main") -> str:
         payload = self.api(f"repos/{self.repo}/git/ref/heads/{branch}") or {}
@@ -171,6 +192,14 @@ class GitHub:
     def create_branch(self, branch: str, sha: str) -> None:
         self.api(f"repos/{self.repo}/git/refs", method="POST", body={"ref": f"refs/heads/{branch}", "sha": sha})
 
+    def create_branch_reconciled(self, branch: str, sha: str) -> None:
+        try:
+            self.create_branch(branch, sha)
+        except GhError:
+            actual = self.branch_exists(branch)
+            if actual != sha:
+                raise HandoffError(f"ambiguous branch creation for {branch}; expected {short(sha)}, found {short(actual or '')}")
+
     def put_file(self, branch: str, path: str, content: bytes, message: str, existing_sha: str | None) -> str:
         body: dict[str, Any] = {
             "message": message,
@@ -181,6 +210,16 @@ class GitHub:
             body["sha"] = existing_sha
         payload = self.api(f"repos/{self.repo}/contents/{path}", method="PUT", body=body) or {}
         return require_sha((payload.get("commit") or {}).get("sha"), f"{self.repo}:{path} commit")
+
+    def put_file_reconciled(self, branch: str, path: str, content: bytes, message: str, existing_sha: str | None) -> str:
+        try:
+            return self.put_file(branch, path, content, message, existing_sha)
+        except GhError:
+            head = require_sha(self.branch_exists(branch), f"{self.repo}@{branch}")
+            actual, _ = self.file(path, head)
+            if actual != content:
+                raise HandoffError(f"ambiguous file write did not leave expected content on {branch}")
+            return head
 
     def find_open_pr(self, branch: str) -> dict[str, Any] | None:
         prs = (
@@ -206,15 +245,44 @@ class GitHub:
             raise HandoffError(f"gh pr create did not print a PR URL: {out!r}")
         return urls[-1]
 
+    def create_pr_reconciled(self, branch: str, title: str, body: str) -> str:
+        try:
+            return self.create_pr(branch, title, body)
+        except GhError:
+            existing = self.find_open_pr(branch)
+            if not existing:
+                raise HandoffError(f"ambiguous PR creation for {branch}; no matching open PR found")
+            return str(existing["url"])
+
+    def pr_status(self, number: int) -> dict[str, Any]:
+        payload = self.json([
+            "pr", "view", str(number), "-R", self.repo,
+            "--json", "url,number,state,headRefOid,mergeStateStatus,autoMergeRequest",
+        ]) or {}
+        require_sha(payload.get("headRefOid"), f"PR {number} head")
+        return payload
+
+    def update_branch(self, number: int, expected_head_sha: str) -> None:
+        self.api(
+            f"repos/{self.repo}/pulls/{number}/update-branch",
+            method="PUT",
+            body={"expected_head_sha": expected_head_sha},
+        )
+
     def enable_auto_merge(self, url: str) -> str:
         """Arm squash auto-merge; a no-op when the PR is already merged or already armed."""
         number = pr_number_from_url(url)
-        view = self.json(["pr", "view", str(number), "-R", self.repo, "--json", "state,autoMergeRequest"]) or {}
+        view = self.pr_status(number)
         if view.get("state") == "MERGED":
             return "already merged"
         if view.get("autoMergeRequest"):
             return "auto-merge already enabled"
-        self.gh(["pr", "merge", "--auto", "--squash", "-R", self.repo, str(number)], None)
+        try:
+            self.gh(["pr", "merge", "--auto", "--squash", "-R", self.repo, str(number)], None)
+        except GhError:
+            reconciled = self.pr_status(number)
+            if reconciled.get("state") != "MERGED" and not reconciled.get("autoMergeRequest"):
+                raise HandoffError(f"ambiguous auto-merge request for PR {number} was not applied")
         return "auto-merge enabled"
 
 
@@ -288,13 +356,13 @@ def ensure_pin_pr(github: GitHub, manifest: dict[str, Any], *, source_run_url: s
         existing = github.find_open_pr(branch)
         if existing:
             log(f"PR already open for {branch}: {existing['url']}")
-            return finish(github, existing["url"], status="pr-existing", dry_run=dry_run)
+            return finish(github, existing["url"], status="pr-existing", dry_run=dry_run, expected_content=content)
         if dry_run:
             log(f"[dry-run] would create a PR titled {title!r} from existing branch {branch}@{short(head_sha)}")
             return {"status": "pr-created", "pr_url": None, "dry_run": True}
-        url = github.create_pr(branch, title, pr_body(manifest, source_run_url))
+        url = github.create_pr_reconciled(branch, title, pr_body(manifest, source_run_url))
         log(f"created PR {url} from existing branch {branch}")
-        return finish(github, url, status="pr-created", dry_run=dry_run)
+        return finish(github, url, status="pr-created", dry_run=dry_run, expected_content=content)
 
     if dry_run:
         log(f"[dry-run] would create {github.repo}@{branch} from main@{short(base_sha)}")
@@ -302,21 +370,62 @@ def ensure_pin_pr(github: GitHub, manifest: dict[str, Any], *, source_run_url: s
         log(f"[dry-run] would create a PR titled {title!r} and arm squash auto-merge")
         return {"status": "pr-created", "pr_url": None, "dry_run": True}
 
-    github.create_branch(branch, base_sha)
-    commit = github.put_file(branch, FLEET_MANIFEST_PATH, content, commit_message(manifest), base_blob_sha)
+    github.create_branch_reconciled(branch, base_sha)
+    commit = github.put_file_reconciled(branch, FLEET_MANIFEST_PATH, content, commit_message(manifest), base_blob_sha)
     log(f"committed {FLEET_MANIFEST_PATH} to {branch} as {short(commit)}")
-    url = github.create_pr(branch, title, pr_body(manifest, source_run_url))
+    url = github.create_pr_reconciled(branch, title, pr_body(manifest, source_run_url))
     log(f"created PR {url}")
-    return finish(github, url, status="pr-created", dry_run=dry_run)
+    return finish(github, url, status="pr-created", dry_run=dry_run, expected_content=content)
 
 
-def finish(github: GitHub, url: str, *, status: str, dry_run: bool) -> dict[str, Any]:
+def finish(github: GitHub, url: str, *, status: str, dry_run: bool, expected_content: bytes) -> dict[str, Any]:
     if dry_run:
         log(f"[dry-run] would arm squash auto-merge on {url}")
         return {"status": status, "pr_url": url, "dry_run": True}
     outcome = github.enable_auto_merge(url)
-    log(f"{url}: {outcome}")
-    return {"status": status, "pr_url": url, "auto_merge": outcome}
+    merged = reconcile_and_wait(github, url, expected_content=expected_content)
+    log(f"{url}: {outcome}; {merged}")
+    return {"status": status, "pr_url": url, "auto_merge": outcome, "merge": merged}
+
+
+def reconcile_and_wait(github: GitHub, url: str, *, expected_content: bytes) -> str:
+    """Keep an auto-merging PR current with strict main and wait for its protected merge."""
+    number = pr_number_from_url(url)
+    updated_from: str | None = None
+    for _ in range(WAIT_ATTEMPTS):
+        status = github.pr_status(number)
+        state = status.get("state")
+        merge_state = status.get("mergeStateStatus")
+        head = require_sha(status.get("headRefOid"), f"PR {number} head")
+        if state == "MERGED":
+            actual, _ = github.file(FLEET_MANIFEST_PATH, head)
+            if actual != expected_content:
+                raise HandoffError(f"PR {number} merged without the expected pin content")
+            return "merged"
+        if state != "OPEN":
+            raise HandoffError(f"PR {number} ended in state {state!r}")
+        if merge_state in {"DIRTY", "UNSTABLE"}:
+            raise HandoffError(f"PR {number} cannot satisfy required checks/protection ({merge_state})")
+
+        if updated_from is not None and head != updated_from:
+            actual, _ = github.file(FLEET_MANIFEST_PATH, head)
+            if actual != expected_content:
+                raise HandoffError(f"PR {number} update-branch changed the expected pin content")
+            # The refresh has landed.  A subsequent main advance may require another update.
+            updated_from = None
+
+        if merge_state == "BEHIND":
+            if updated_from is None:
+                try:
+                    github.update_branch(number, head)
+                except GhError:
+                    # It may have succeeded; observe the branch rather than replaying a write.
+                    pass
+                updated_from = head
+        # update-branch is asynchronous.  In particular, a BEHIND PR may retain its
+        # old head briefly after the request; wait for observation before deciding it failed.
+        github.sleep(WAIT_SECONDS)
+    raise HandoffError(f"PR {number} did not merge within {WAIT_ATTEMPTS * WAIT_SECONDS} seconds")
 
 
 # ---------------------------------------------------------------------------

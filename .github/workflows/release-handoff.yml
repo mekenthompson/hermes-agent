@@ -26,7 +26,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-handoff-${{ github.event.workflow_run.head_sha }}
+  # One Fleet main exists: serialize all source SHAs until each protected PR merges.
+  group: release-handoff-fleet
   cancel-in-progress: false
 
 env:
@@ -45,7 +46,7 @@ jobs:
       github.event.workflow_run.head_repository.full_name == github.repository &&
       github.repository == 'mekenthompson/hermes-agent'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       actions: read
       contents: read

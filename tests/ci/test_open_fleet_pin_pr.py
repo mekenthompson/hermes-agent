@@ -63,6 +63,7 @@ class FakeGh:
         self.branch_present = branch_present
         self.open_pr = open_pr
         self.pr_view = pr_view or {"state": "OPEN", "autoMergeRequest": None}
+        self.pr_view_calls = 0
         self.calls: list[tuple[list[str], str | None]] = []
 
     def __call__(self, args: list[str], input_text: str | None = None) -> str:
@@ -74,7 +75,11 @@ class FakeGh:
         if args[:2] == ["pr", "create"]:
             return f"Creating pull request\n{PR_URL}\n"
         if args[:2] == ["pr", "view"]:
-            return json.dumps(self.pr_view)
+            self.pr_view_calls += 1
+            view = {"headRefOid": BRANCH_SHA, "mergeStateStatus": "CLEAN", "url": PR_URL, "number": 77, **self.pr_view}
+            if self.pr_view_calls > 1 and view["state"] == "OPEN":
+                view["state"] = "MERGED"
+            return json.dumps(view)
         if args[:2] == ["pr", "merge"]:
             return ""
         raise AssertionError(f"unexpected gh call {args}")
@@ -97,6 +102,9 @@ class FakeGh:
         if path == f"repos/{REPO}/git/refs" and method == "POST":
             return json.dumps({"ref": f"refs/heads/{BRANCH}"})
         if path == f"repos/{REPO}/contents/{mod.FLEET_MANIFEST_PATH}" and method == "PUT":
+            payload = json.loads(input_text or "{}")
+            self.branch_manifest = json.loads(base64.b64decode(payload["content"]).decode("utf-8"))
+            self.branch_present = True
             return json.dumps({"commit": {"sha": "e" * 40}})
         raise AssertionError(f"unexpected api call {method} {path}")
 
@@ -177,7 +185,7 @@ class PinPrTests(unittest.TestCase):
         gh = FakeGh(main_manifest=manifest(digest=OLD_DIGEST, revision=OTHER_SHA, immutable_ref=f"{mod.AGENT_REPOSITORY}@{OLD_DIGEST}"))
         code, result, _ = run_main(gh)
         self.assertEqual(code, 0)
-        self.assertEqual(result, {"status": "pr-created", "pr_url": PR_URL, "auto_merge": "auto-merge enabled"})
+        self.assertEqual(result, {"status": "pr-created", "pr_url": PR_URL, "auto_merge": "auto-merge enabled", "merge": "merged"})
 
         writes = gh.writes()
         self.assertEqual([w[:4] if w[0] == "api" else w[:2] for w in writes], [
@@ -278,6 +286,7 @@ class PinPrTests(unittest.TestCase):
                 code, result, _ = run_main(gh)
                 self.assertEqual(code, 0)
                 self.assertEqual(result["auto_merge"], expected)
+                self.assertEqual(result["merge"], "merged")
                 self.assertEqual(gh.writes(), [])
 
     def test_dry_run_reads_everything_and_writes_nothing(self) -> None:
@@ -309,6 +318,95 @@ class PinPrTests(unittest.TestCase):
         code, _, err = run_main(broken)  # type: ignore[arg-type]
         self.assertEqual(code, 1)
         self.assertIn("500", err)
+
+
+class StrictMainReconciliationTests(unittest.TestCase):
+    def test_behind_pr_waits_for_async_update_then_reconciles_a_later_main_advance(self) -> None:
+        calls: list[tuple[list[str], str | None]] = []
+        sleeps: list[float] = []
+        statuses = iter([
+            {"url": PR_URL, "number": 77, "state": "OPEN", "headRefOid": BRANCH_SHA, "mergeStateStatus": "BEHIND", "autoMergeRequest": {"enabledAt": "now"}},
+            # update-branch is asynchronous: the old head can remain BEHIND briefly.
+            {"url": PR_URL, "number": 77, "state": "OPEN", "headRefOid": BRANCH_SHA, "mergeStateStatus": "BEHIND", "autoMergeRequest": {"enabledAt": "now"}},
+            # A concurrent main advance leaves the refreshed head behind again.
+            {"url": PR_URL, "number": 77, "state": "OPEN", "headRefOid": "e" * 40, "mergeStateStatus": "BEHIND", "autoMergeRequest": {"enabledAt": "now"}},
+            {"url": PR_URL, "number": 77, "state": "MERGED", "headRefOid": "f" * 40, "mergeStateStatus": "CLEAN", "autoMergeRequest": {"enabledAt": "now"}},
+        ])
+
+        def gh(args: list[str], input_text: str | None = None) -> str:
+            calls.append((args, input_text))
+            if args[:2] == ["pr", "view"]:
+                return json.dumps(next(statuses))
+            if args[:2] == ["api", f"repos/{REPO}/pulls/77/update-branch"]:
+                self.assertEqual(args[3], "PUT")
+                return json.dumps({"message": "Updating pull request branch."})
+            if args[:2] == ["api", f"repos/{REPO}/contents/{mod.FLEET_MANIFEST_PATH}?ref={'e' * 40}"] or args[:2] == ["api", f"repos/{REPO}/contents/{mod.FLEET_MANIFEST_PATH}?ref={'f' * 40}"]:
+                return json.dumps(contents_payload(mod.canonical_json(manifest()).encode("utf-8")))
+            raise AssertionError(args)
+
+        github = mod.GitHub(REPO, gh, sleep=sleeps.append)
+        outcome = mod.reconcile_and_wait(github, PR_URL, expected_content=mod.canonical_json(manifest()).encode("utf-8"))
+
+        self.assertEqual(outcome, "merged")
+        updates = [(args, json.loads(body or "{}")) for args, body in calls if args[:2] == ["api", f"repos/{REPO}/pulls/77/update-branch"]]
+        self.assertEqual([body for _, body in updates], [{"expected_head_sha": BRANCH_SHA}, {"expected_head_sha": "e" * 40}])
+        self.assertEqual(sleeps, [mod.WAIT_SECONDS, mod.WAIT_SECONDS, mod.WAIT_SECONDS])
+
+    def test_merged_pr_must_still_contain_the_exact_expected_pin(self) -> None:
+        def gh(args: list[str], input_text: str | None = None) -> str:
+            if args[:2] == ["pr", "view"]:
+                return json.dumps({"url": PR_URL, "number": 77, "state": "MERGED", "headRefOid": BRANCH_SHA, "mergeStateStatus": "CLEAN"})
+            if args[:2] == ["api", f"repos/{REPO}/contents/{mod.FLEET_MANIFEST_PATH}?ref={BRANCH_SHA}"]:
+                return json.dumps(contents_payload(b"wrong manifest\n"))
+            raise AssertionError(args)
+
+        github = mod.GitHub(REPO, gh, sleep=lambda _: None)
+        with self.assertRaisesRegex(mod.HandoffError, "expected pin content"):
+            mod.reconcile_and_wait(github, PR_URL, expected_content=mod.canonical_json(manifest()).encode("utf-8"))
+
+    def test_wait_budget_is_twelve_minutes(self) -> None:
+        self.assertEqual(mod.WAIT_ATTEMPTS * mod.WAIT_SECONDS, 12 * 60)
+
+    def test_ambiguous_branch_creation_is_reconciled_only_at_expected_base(self) -> None:
+        calls: list[list[str]] = []
+
+        def gh(args: list[str], input_text: str | None = None) -> str:
+            calls.append(args)
+            if args[:2] == ["api", f"repos/{REPO}/git/refs"]:
+                raise mod.GhError(args, 1, "", "network timeout")
+            if args[:2] == ["api", f"repos/{REPO}/git/ref/heads/{BRANCH}"]:
+                return json.dumps({"object": {"sha": MAIN_SHA}})
+            raise AssertionError(args)
+
+        github = mod.GitHub(REPO, gh, sleep=lambda _: None)
+        github.create_branch_reconciled(BRANCH, MAIN_SHA)
+        self.assertEqual(calls[-1], ["api", f"repos/{REPO}/git/ref/heads/{BRANCH}", "-X", "GET"])
+
+    def test_ambiguous_pr_creation_reuses_only_the_matching_open_branch_pr(self) -> None:
+        def gh(args: list[str], input_text: str | None = None) -> str:
+            if args[:2] == ["pr", "create"]:
+                raise mod.GhError(args, 1, "", "network timeout")
+            if args[:2] == ["pr", "list"]:
+                return json.dumps([{"url": PR_URL, "number": 77, "headRefOid": BRANCH_SHA}])
+            raise AssertionError(args)
+
+        github = mod.GitHub(REPO, gh, sleep=lambda _: None)
+        self.assertEqual(github.create_pr_reconciled(BRANCH, "title", "body"), PR_URL)
+
+    def test_transient_idempotent_read_retries_but_fails_closed_after_bound(self) -> None:
+        for failure in ("HTTP 429: rate limited", "HTTP 503: unavailable"):
+            with self.subTest(failure=failure):
+                attempts = 0
+
+                def gh(args: list[str], input_text: str | None = None) -> str:
+                    nonlocal attempts
+                    attempts += 1
+                    raise mod.GhError(args, 1, "", failure)
+
+                github = mod.GitHub(REPO, gh, sleep=lambda _: None)
+                with self.assertRaisesRegex(mod.GhError, failure.split()[1]):
+                    github.head()
+                self.assertEqual(attempts, mod.READ_RETRY_ATTEMPTS)
 
 
 if __name__ == "__main__":
