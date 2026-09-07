@@ -24,7 +24,10 @@ env:
 
 jobs:
   preflight:
-    if: github.repository == 'mekenthompson/hermes-agent' && github.event_name == 'pull_request'
+    if: >-
+      github.repository == 'mekenthompson/hermes-agent' &&
+      (github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish != 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -227,13 +230,14 @@ jobs:
           set -euo pipefail
           CANDIDATE_IMAGE="$IMAGE_REPOSITORY:candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           docker tag "$TEST_IMAGE" "$CANDIDATE_IMAGE"
-          push_output=$(docker push "$CANDIDATE_IMAGE" 2>&1 | tee /dev/stderr)
-          digest=$(printf '%s\n' "$push_output" | python3 -c 'import re, sys; matches = re.findall(r"(?m)^digest: (sha256:[0-9a-f]{64})$", sys.stdin.read()); assert len(matches) == 1, matches; print(matches[0])')
+          digest=$(docker push "$CANDIDATE_IMAGE" 2>&1 | tee /dev/stderr | python3 scripts/extract-image-push-digest.py)
           immutable_ref="$IMAGE_REPOSITORY@$digest"
           local_image_id=$(docker image inspect --format '{{.Id}}' "$TEST_IMAGE")
           docker buildx imagetools inspect --raw "$immutable_ref" > remote-manifest.json
           python3 scripts/verify-remote-image-config.py --image-id "$local_image_id" --manifest remote-manifest.json
-          docker buildx imagetools create --tag "$TEST_IMAGE" "$immutable_ref"
+          docker buildx imagetools create --prefer-index=false --tag "$TEST_IMAGE" "$immutable_ref"
+          promoted_digest=$(docker buildx imagetools inspect --format '{{.Digest}}' "$TEST_IMAGE")
+          test "$promoted_digest" = "$digest"
           python3 scripts/emit-image-manifest.py \
             --repository "$IMAGE_REPOSITORY" \
             --revision "${{ github.sha }}" \

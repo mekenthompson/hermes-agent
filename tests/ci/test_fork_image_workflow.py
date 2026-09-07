@@ -13,6 +13,7 @@ DOC = ROOT / "docs/fork-agent-image.md"
 MANIFEST = ROOT / "scripts/emit-image-manifest.py"
 COMPACT_SBOM = ROOT / "scripts/compact-spdx-sbom.py"
 REMOTE_CONFIG = ROOT / "scripts/verify-remote-image-config.py"
+PUSH_DIGEST = ROOT / "scripts/extract-image-push-digest.py"
 SHA = "1" * 40
 DIGEST = "sha256:" + "2" * 64
 REPOSITORY = "ghcr.io/mekenthompson/hermes-agent"
@@ -106,6 +107,54 @@ class ForkImageWorkflowTests(unittest.TestCase):
         self.assertNotIn("docker/login-action", preflight)
         self.assertNotIn("docker push", preflight)
 
+    def test_push_digest_extractor_accepts_actual_docker_push_summary(self) -> None:
+        output = """The push refers to repository [ghcr.io/mekenthompson/hermes-agent]
+abc123: Pushed
+candidate-123-1: digest: sha256:2222222222222222222222222222222222222222222222222222222222222222 size: 1234
+"""
+        result = subprocess.run(
+            ["python3", str(PUSH_DIGEST)],
+            cwd=ROOT,
+            input=output,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), DIGEST)
+
+    def test_push_digest_extractor_rejects_missing_or_ambiguous_summaries(self) -> None:
+        for output in (
+            "The push refers to repository [ghcr.io/mekenthompson/hermes-agent]\n",
+            f"tag-a: digest: {DIGEST} size: 1\ntag-b: digest: {DIGEST} size: 2\n",
+        ):
+            with self.subTest(output=output):
+                result = subprocess.run(
+                    ["python3", str(PUSH_DIGEST)],
+                    cwd=ROOT,
+                    input=output,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("expected exactly one", result.stderr)
+
+    def test_manual_non_publish_dispatch_runs_the_no_credentials_preflight(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        preflight = text.split("\n  publish:\n", 1)[0]
+        self.assertIn("github.event_name == 'workflow_dispatch'", preflight)
+        self.assertIn("github.event.inputs.publish != 'true'", preflight)
+        self.assertNotIn("packages: write", preflight)
+        self.assertNotIn("id-token: write", preflight)
+        self.assertNotIn("docker/login-action", preflight)
+
+    def test_promotion_preserves_the_scanned_manifest_digest_at_the_sha_tag(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("--prefer-index=false", text)
+        self.assertIn('docker buildx imagetools inspect --format \'{{.Digest}}\' "$TEST_IMAGE"', text)
+        self.assertIn('test "$promoted_digest" = "$digest"', text)
+
     def test_remote_config_verifier_binds_remote_manifest_to_scanned_image_id(self) -> None:
         manifest = {"schemaVersion": 2, "config": {"digest": DIGEST}}
         with tempfile.TemporaryDirectory() as directory:
@@ -132,7 +181,7 @@ class ForkImageWorkflowTests(unittest.TestCase):
     def test_publish_attests_the_exact_sha_tag_and_digest(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn('docker push "$CANDIDATE_IMAGE"', text)
-        self.assertIn('docker buildx imagetools create --tag "$TEST_IMAGE" "$immutable_ref"', text)
+        self.assertIn('docker buildx imagetools create --prefer-index=false --tag "$TEST_IMAGE" "$immutable_ref"', text)
         self.assertIn("ghcr.io/mekenthompson/hermes-agent:sha-${{ github.sha }}", text)
         self.assertIn("actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8", text)
         self.assertIn("actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e", text)
