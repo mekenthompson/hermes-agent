@@ -20,6 +20,11 @@ class ForkRunnerFallbackTests(unittest.TestCase):
             "(github.event_name != 'pull_request' || "
             "github.event.pull_request.head.repo.full_name == github.repository)"
         )
+        fork_trust_guard = (
+            "github.repository == 'mekenthompson/hermes-agent' && "
+            "(github.event_name != 'pull_request' || "
+            "github.event.pull_request.head.repo.full_name == github.repository)"
+        )
         for relative, large_runner in EXPECTED.items():
             with self.subTest(workflow=relative):
                 lines = (ROOT / relative).read_text(encoding="utf-8").splitlines()
@@ -27,12 +32,22 @@ class ForkRunnerFallbackTests(unittest.TestCase):
                     f"    runs-on: ${{{{ {trust_guard} && "
                     f"'{large_runner}' || 'ubuntu-latest' }}}}"
                 )
+                if relative in {
+                    ".github/workflows/tests.yml",
+                    ".github/workflows/js-tests.yml",
+                }:
+                    expected = (
+                        "    runs-on: ${{ fromJSON("
+                        f"{fork_trust_guard} && "
+                        "'[\"self-hosted\",\"linux\",\"x64\",\"pixsoul\"]' || "
+                        f"{trust_guard} && '\"{large_runner}\"' || '\"ubuntu-latest\"') }}}}"
+                    )
                 self.assertIn(expected, lines)
 
         tests_lines = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8").splitlines()
         expected_workers = (
-            f"          HERMES_TEST_WORKERS: ${{{{ {trust_guard} && "
-            "'96' || '4' }}"
+            "          HERMES_TEST_WORKERS: ${{ "
+            f"{fork_trust_guard} && '6' || {trust_guard} && '96' || '4' }}}}"
         )
         self.assertIn(expected_workers, tests_lines)
         self.assertIn("    timeout-minutes: 60", tests_lines)
