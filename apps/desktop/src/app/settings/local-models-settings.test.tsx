@@ -374,7 +374,7 @@ describe('quickstart', () => {
     })
   })
 
-  it('pins the quickstart progress view while the job runs', { retry: 2 }, async () => {
+  it('pins the quickstart progress view while the job runs', async () => {
     $localRuntimeJobs.set([
       {
         job_id: 'q1',
