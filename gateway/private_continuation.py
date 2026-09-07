@@ -10,8 +10,10 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import sqlite3
+import stat
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -55,8 +57,8 @@ class PrivateContinuationStore:
     def __init__(self, database: Path, *, secret: bytes, max_per_owner: int = 10, now: Callable[[], float] = time.time) -> None:
         if len(secret) < 32 or max_per_owner < 1:
             raise ValueError("continuation secret must be at least 32 bytes and queue bound positive")
-        database.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.database, self.secret, self.max_per_owner, self.now = database, secret, max_per_owner, now
+        self.database = self._validate_database_path(Path(database))
+        self.secret, self.max_per_owner, self.now = secret, max_per_owner, now
         with self._connect() as conn:
             conn.executescript("""
             CREATE TABLE IF NOT EXISTS private_continuation_scopes (
@@ -73,8 +75,41 @@ class PrivateContinuationStore:
             if "owner_generation" not in columns:
                 raise RuntimeError("private continuation queue schema is incompatible")
 
+    @staticmethod
+    def _validate_database_path(database: Path) -> Path:
+        """Accept only a user-owned private regular SQLite path; never repair unsafe state."""
+        database = database.absolute()
+        try:
+            parent = database.parent.lstat()
+        except OSError as exc:
+            raise RuntimeError("private continuation database directory is unavailable") from exc
+        if (not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode)
+                or parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) != 0o700):
+            raise RuntimeError("private continuation database directory is unsafe")
+        try:
+            info = database.lstat()
+        except FileNotFoundError:
+            return database
+        except OSError as exc:
+            raise RuntimeError("private continuation database is unavailable") from exc
+        if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
+            raise RuntimeError("private continuation database is unsafe")
+        return database
+
     def _connect(self):
-        return sqlite3.connect(self.database, isolation_level=None, timeout=5)
+        new_database = not self.database.exists()
+        if not new_database:
+            self._validate_database_path(self.database)
+        conn = sqlite3.connect(self.database, isolation_level=None, timeout=5)
+        try:
+            if new_database:
+                os.chmod(self.database, 0o600)
+            self._validate_database_path(self.database)
+        except Exception:
+            conn.close()
+            raise
+        return conn
 
     def mint(self, *, binding: dict[str, str], owner_generation: str, ttl_seconds: int) -> str:
         if not isinstance(owner_generation, str) or not owner_generation or type(ttl_seconds) is not int or ttl_seconds < 1:
@@ -160,16 +195,39 @@ class PrivateContinuationStore:
 class GatewayPrivateContinuationMixin:
     """Canonical private-route continuation ABI for profile-local plugins."""
 
-    def configure_private_continuations(self, *, database: Path, secret: bytes, max_per_owner: int = 10) -> None:
-        self._private_continuations = PrivateContinuationStore(database, secret=secret, max_per_owner=max_per_owner)
+    def configure_private_continuations(self, *, database: Path, secret: bytes, max_per_owner: int = 10,
+                                       profile: str | None = None) -> None:
+        """Install one durable store, optionally scoped to a multiplexed profile."""
+        store = PrivateContinuationStore(database, secret=secret, max_per_owner=max_per_owner)
+        if profile is None:
+            self._private_continuations = store
+            return
+        if not isinstance(profile, str) or not profile:
+            raise ValueError("private continuation profile is required")
+        stores = getattr(self, "_private_continuations_by_profile", None)
+        if stores is None:
+            stores = {}
+            self._private_continuations_by_profile = stores
+        if profile in stores:
+            raise RuntimeError("private continuations are already configured for this profile")
+        stores[profile] = store
+
+    def _private_continuation_store(self, binding: dict[str, str]) -> PrivateContinuationStore:
+        stores = getattr(self, "_private_continuations_by_profile", {})
+        if binding.get("profile") in stores:
+            return stores[binding["profile"]]
+        store = getattr(self, "_private_continuations", None)
+        if store is None:
+            raise ContinuationDenied("private continuation capability is unavailable")
+        return store
 
     def mint_private_continuation(self, *, binding: dict[str, str], owner_generation: str, ttl_seconds: int) -> str:
-        return self._private_continuations.mint(binding=binding, owner_generation=owner_generation, ttl_seconds=ttl_seconds)
+        return self._private_continuation_store(binding).mint(binding=binding, owner_generation=owner_generation, ttl_seconds=ttl_seconds)
 
     async def enqueue_private_continuation(self, *, token: str, binding: dict[str, str], owner_generation: str, prompt: str, authorize: Callable[[], bool]) -> None:
         if not callable(authorize) or authorize() is not True:
             raise ContinuationDenied("continuation requester is not authorized")
-        self._private_continuations.enqueue(token=token, binding=binding, owner_generation=owner_generation, prompt=prompt)
+        self._private_continuation_store(binding).enqueue(token=token, binding=binding, owner_generation=owner_generation, prompt=prompt)
 
     def _private_continuation_event(self, binding: dict[str, str], prompt: str) -> tuple[Any, str]:
         """Resolve only a pre-existing private owner route; never mint a Linear route."""
@@ -199,7 +257,8 @@ class GatewayPrivateContinuationMixin:
         """Dispatch one queue item into its existing private owner only when physically idle."""
         if not callable(authorize) or authorize() is not True:
             raise ContinuationDenied("continuation requester is not authorized")
-        item = self._private_continuations.take(token=token, binding=binding, owner_generation=owner_generation)
+        store = self._private_continuation_store(binding)
+        item = store.take(token=token, binding=binding, owner_generation=owner_generation)
         if item is None:
             return False
         item_id, prompt = item
@@ -207,7 +266,7 @@ class GatewayPrivateContinuationMixin:
         try:
             event, session_key = self._private_continuation_event(binding, prompt)
             if self._is_session_running(session_key):
-                self._private_continuations.requeue(item_id)
+                store.requeue(item_id)
                 return False
             execution_id = "private-continuation-" + secrets.token_urlsafe(24)
             dispatched = True
@@ -217,10 +276,10 @@ class GatewayPrivateContinuationMixin:
             # rejection from a started provider turn. Fence it durably instead of
             # replaying a potentially side-effecting prompt.
             if dispatched:
-                self._private_continuations.mark_ambiguous(item_id)
+                store.mark_ambiguous(item_id)
             else:
-                self._private_continuations.requeue(item_id)
+                store.requeue(item_id)
             raise
         else:
-            self._private_continuations.finish(item_id)
+            store.finish(item_id)
             return True

@@ -103,3 +103,37 @@ def test_dispatch_exception_is_durably_ambiguous_and_never_replayed(tmp_path):
         asyncio.run(gateway.drain_private_continuation(token=token, binding=BINDING, owner_generation="g", authorize=lambda: True))
     assert not asyncio.run(gateway.drain_private_continuation(token=token, binding=BINDING, owner_generation="g", authorize=lambda: True))
     assert len(gateway.events) == 1
+
+
+def test_store_refuses_unsafe_database_and_keeps_new_database_private(tmp_path):
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o755)
+    with pytest.raises(RuntimeError, match="database directory is unsafe"):
+        PrivateContinuationStore(unsafe / "continuations.db", secret=b"x" * 32)
+
+    safe = tmp_path / "safe"
+    safe.mkdir(mode=0o700)
+    store = PrivateContinuationStore(safe / "continuations.db", secret=b"x" * 32)
+    assert store.database.stat().st_mode & 0o777 == 0o600
+    store.database.chmod(0o644)
+    with pytest.raises(RuntimeError, match="database is unsafe"):
+        store.mint(binding=BINDING, owner_generation="g", ttl_seconds=60)
+
+
+def test_profile_scoped_stores_do_not_cross_signing_or_persistence(tmp_path):
+    class Gateway(GatewayPrivateContinuationMixin):
+        pass
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir(mode=0o700)
+    second.mkdir(mode=0o700)
+    gateway = Gateway()
+    gateway.configure_private_continuations(database=first / "continuations.db", secret=b"a" * 32, profile="one")
+    gateway.configure_private_continuations(database=second / "continuations.db", secret=b"b" * 32, profile="two")
+    one = {**BINDING, "profile": "one"}
+    two = {**BINDING, "profile": "two"}
+    token = gateway.mint_private_continuation(binding=one, owner_generation="g", ttl_seconds=60)
+    with pytest.raises(ContinuationDenied):
+        asyncio.run(gateway.enqueue_private_continuation(token=token, binding=two, owner_generation="g", prompt="no", authorize=lambda: True))
+    assert (first / "continuations.db").exists()
+    assert (second / "continuations.db").exists()
