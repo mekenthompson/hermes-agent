@@ -17,6 +17,15 @@ jobs:
     # Fork stays on GitHub-hosted ubuntu-latest; self-hosted validation failed.
     runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
     timeout-minutes: 30
+    # Fork (mekenthompson): on a 4-core hosted runner the desktop ``ui``
+    # vitest project alone takes ~630s (733 jsdom files; run 34088223918),
+    # and the other nine units ~360s. Split the ``ui`` project into three
+    # ``vitest --shard`` legs on their own runners and run the remaining
+    # units together, so the lane finishes in ~5 min instead of ~12.
+    # Upstream keeps its single 32-core job (``unit: all``).
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(github.repository == 'mekenthompson/hermes-agent' && '{"unit":["checks","ui-1/3","ui-2/3","ui-3/3"]}' || '{"unit":["all"]}') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -89,8 +98,26 @@ jobs:
       - name: Run all workspace checks
         env:
           CI_FORK: ${{ github.repository != 'NousResearch/hermes-agent' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
+          CHECK_UNIT: ${{ matrix.unit }}
         run: |
           if [ "$CI_FORK" = "true" ]; then
             export WORKSPACE_CHECK_CONCURRENCY=2
           fi
-          node .github/scripts/run-workspace-checks.mjs
+          # ``all`` is the upstream single job. The fork matrix runs the
+          # desktop ``ui`` project (``check:test:ui`` == ``vitest run
+          # --project ui``) as N shards and every other unit in ``checks``.
+          case "$CHECK_UNIT" in
+            all)
+              node .github/scripts/run-workspace-checks.mjs
+              ;;
+            checks)
+              node .github/scripts/run-workspace-checks.mjs --skip 'apps/desktop :: check:test:ui'
+              ;;
+            ui-*)
+              npm run --prefix apps/desktop test:ui -- --shard="${CHECK_UNIT#ui-}"
+              ;;
+            *)
+              echo "::error::unknown check unit: $CHECK_UNIT"
+              exit 1
+              ;;
+          esac

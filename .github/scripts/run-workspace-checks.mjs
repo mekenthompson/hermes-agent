@@ -16,6 +16,7 @@
 // This also runs on a laptop: `node .github/scripts/run-workspace-checks.mjs`.
 // `--concurrency N` sets the limit. WORKSPACE_CHECK_CONCURRENCY supplies the
 // CI-specific default without changing local or large-runner scheduling.
+// `--skip "<pkg> :: <script>"` (repeatable) drops a unit that runs elsewhere.
 // `--list` prints the units and exits.
 
 import { execFileSync, spawn } from 'node:child_process'
@@ -87,8 +88,28 @@ async function main() {
     process.exit(1)
   }
 
+  // `--skip "<pkg> :: <script>"` (repeatable) removes a unit so it can run in
+  // a job of its own, e.g. a vitest project split with `--shard` across
+  // runners. An unknown label is an error: a renamed unit must not vanish
+  // from every job without anyone noticing.
+  const skipped = new Set()
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] !== '--skip') continue
+    const label = argv[++i]
+    if (!label || !units.some((u) => `${u.pkg} :: ${u.script}` === label)) {
+      console.error(`::error::--skip names no known check unit: ${label ?? '(missing)'}`)
+      process.exit(1)
+    }
+    skipped.add(label)
+  }
+  const selected = units.filter((u) => !skipped.has(`${u.pkg} :: ${u.script}`))
+  if (selected.length === 0) {
+    console.error('::error::--skip removed every check unit — refusing to report green having run nothing.')
+    process.exit(1)
+  }
+
   if (argv.includes('--list')) {
-    for (const u of units) console.log(`${u.pkg} :: ${u.script}`)
+    for (const u of selected) console.log(`${u.pkg} :: ${u.script}`)
     return
   }
 
@@ -98,13 +119,14 @@ async function main() {
   if (requested !== undefined && (!Number.isInteger(requested) || requested < 1)) {
     throw new Error(`concurrency must be a positive integer; got ${requestedConcurrency}`)
   }
-  const concurrency = Math.min(units.length, requested ?? availableParallelism())
+  const concurrency = Math.min(selected.length, requested ?? availableParallelism())
 
-  console.log(`running ${units.length} checks, up to ${concurrency} at a time:`)
-  for (const u of units) console.log(`  ${u.pkg} :: ${u.script}`)
+  console.log(`running ${selected.length} checks, up to ${concurrency} at a time:`)
+  for (const u of selected) console.log(`  ${u.pkg} :: ${u.script}`)
+  for (const label of skipped) console.log(`  (skipped by --skip) ${label}`)
   console.log('')
 
-  const queue = [...units]
+  const queue = [...selected]
   /** @type {{unit: {pkg: string, script: string}, code: number, output: string, ms: number}[]} */
   const results = []
 
@@ -124,7 +146,7 @@ async function main() {
     }
   }
 
-  await Promise.all(Array.from({ length: Math.min(concurrency, units.length) }, worker))
+  await Promise.all(Array.from({ length: Math.min(concurrency, selected.length) }, worker))
 
   const failed = results.filter((r) => r.code !== 0)
   console.log('\n=== summary ===')

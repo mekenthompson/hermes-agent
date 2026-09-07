@@ -21,7 +21,7 @@ class ForkRunnerFallbackTests(unittest.TestCase):
         text = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
         line = next(x for x in text.splitlines() if "matrix:" in x)
         choices = [json.loads(x) for x in re.findall(r"'(\{.*?\})'", line)]
-        self.assertEqual(choices, [{"slice": [1, 2, 3, 4], "slices": [4]}, {"slice": [1], "slices": [1]}])
+        self.assertEqual(choices, [{"slice": [1, 2, 3, 4, 5, 6], "slices": [6]}, {"slice": [1], "slices": [1]}])
         self.assertIn("github.repository == 'mekenthompson/hermes-agent'", line)
         runner = runpy.run_path(str(ROOT / "scripts/run_tests_parallel.py"))
         files = runner["_discover_files"]([ROOT / "tests"])
@@ -31,6 +31,36 @@ class ForkRunnerFallbackTests(unittest.TestCase):
             selected = [p for i in choice["slice"] for p in buckets[i - 1]]
             self.assertEqual(sorted(selected), sorted(files))
             self.assertEqual(len(selected), len(set(selected)))
+
+    def test_js_matrix_shards_ui_project_for_fork_only(self) -> None:
+        text = (ROOT / ".github/workflows/js-tests.yml").read_text(encoding="utf-8")
+        line = next(x for x in text.splitlines() if "matrix:" in x)
+        self.assertIn("github.repository == 'mekenthompson/hermes-agent'", line)
+        fork, upstream = [json.loads(x) for x in re.findall(r"'(\{.*?\})'", line)]
+        self.assertEqual(upstream, {"unit": ["all"]})
+        units = fork["unit"]
+        self.assertEqual(units[0], "checks")
+        shards = [u.removeprefix("ui-") for u in units[1:]]
+        counts = {int(x.split("/")[1]) for x in shards}
+        self.assertEqual(len(counts), 1)
+        total = counts.pop()
+        self.assertEqual([int(x.split("/")[0]) for x in shards], list(range(1, total + 1)))
+        for unit in ("all)", "checks)", "ui-*)"):
+            self.assertIn(f"            {unit}", text.splitlines())
+        # The skipped unit must be the same command the ui shards run.
+        self.assertIn("--skip 'apps/desktop :: check:test:ui'", text)
+        self.assertIn("npm run --prefix apps/desktop test:ui -- --shard=", text)
+        scripts = json.loads((ROOT / "apps/desktop/package.json").read_text(encoding="utf-8"))["scripts"]
+        self.assertEqual(scripts["check:test:ui"], "npm run test:ui")
+        self.assertEqual(scripts["test:ui"], "vitest run --project ui")
+
+    def test_fork_skips_upstream_only_packaging_workflows(self) -> None:
+        for relative in (".github/workflows/nix.yml", ".github/workflows/docker.yml"):
+            with self.subTest(workflow=relative):
+                lines = (ROOT / relative).read_text(encoding="utf-8").splitlines()
+                start = lines.index("  detect:")
+                block = lines[start : start + 12]
+                self.assertIn("    if: github.repository == 'NousResearch/hermes-agent'", block)
 
     def test_upstream_large_runners_have_standard_fork_fallbacks(self) -> None:
         trust_guard = (
