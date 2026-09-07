@@ -42,6 +42,15 @@ class ForkImageWorkflowTests(unittest.TestCase):
         self.assertNotIn("pull_request_target", text)
         self.assertNotIn("secrets.", text)
 
+    def test_publish_requires_a_successful_ci_run_for_this_exact_main_sha(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("Verify exact main CI gate", text)
+        self.assertIn("actions: read", text)
+        self.assertIn("scripts/verify-exact-main-ci.py", text)
+        self.assertIn('--workflow "ci.yaml"', text)
+        self.assertIn('--workflow-path ".github/workflows/ci.yaml"', text)
+        self.assertIn("needs: preflight", text)
+
     def test_preflight_builds_complete_image_and_gates_evidence(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
@@ -100,7 +109,7 @@ class ForkImageWorkflowTests(unittest.TestCase):
         for phrase in (
             "manual publication",
             "exact pushed commit",
-            "environment approval",
+            "no manual reviewer prerequisite",
             "image digest",
             "fleet",
             "rollback",
