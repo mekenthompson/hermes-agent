@@ -3806,8 +3806,11 @@ class SlackAdapter(BasePlatformAdapter):
                     strip_bot_mention=False)
                 if parent_text and f"<@{bot_uid}>" in parent_text:
                     # Remember so later replies skip the fetch.
-                    if not self._slack_strict_mention():
-                        self._register_mentioned_thread(event_thread_ts)
+                    if (
+                        not self._slack_strict_mention()
+                        or channel_id in self._slack_thread_participation_channels()
+                    ):
+                        self._register_mentioned_thread(event_thread_ts, team_id=team_id)
                     return True
         return False
 
@@ -3872,12 +3875,28 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug(
                 "[Slack] Ignoring message addressed to another user in channel %s", channel_id)
             return False
-        thread_gated = self._slack_thread_require_mention() and is_thread_reply and not is_mentioned
+        participation_only_thread = (
+            not is_dm
+            and is_thread_reply
+            and not is_mentioned
+            and channel_id in self._slack_thread_participation_channels()
+        )
+        thread_gated = (
+            self._slack_thread_require_mention()
+            and is_thread_reply
+            and not is_mentioned
+            and not participation_only_thread
+        )
         if force_process:
             return True
         free_channel = channel_id not in self._slack_require_mention_channels() and (
             channel_id in self._slack_free_response_channels() or not self._slack_require_mention())
-        if not free_channel and self._slack_strict_mention() and not is_mentioned:
+        if (
+            not free_channel
+            and self._slack_strict_mention()
+            and not is_mentioned
+            and not participation_only_thread
+        ):
             return False  # Strict mode: ignore until @-mentioned again
         if thread_gated:
             logger.debug(
@@ -3885,6 +3904,11 @@ class SlackAdapter(BasePlatformAdapter):
                 "(thread_require_mention=true): channel=%s thread_ts=%s", channel_id,
                 event_thread_ts)
             return False
+        if participation_only_thread:
+            return await self._should_wake_on_unmentioned_message(
+                event_thread_ts=event_thread_ts, channel_id=channel_id, user_id=user_id,
+                team_id=team_id, is_thread_reply=is_thread_reply,
+                chat_type="dm" if is_dm else "group")
         if free_channel:
             return True
         if not is_mentioned:
@@ -4188,7 +4212,8 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _apply_bot_mention(
         self, text: str, original_text: str, command_probe_text: str, is_command_text: bool,
-        bot_uid: str, thread_ts: Optional[str], team_id: str) -> Tuple[str, str, str, bool]:
+        bot_uid: str, thread_ts: Optional[str], team_id: str, channel_id: str,
+    ) -> Tuple[str, str, str, bool]:
         """Strip our mention, re-probe for a command hidden behind it, remember the thread.
         Returns updated ``(text, original_text, command_probe_text, is_command_text)``."""
         text = text.replace(f"<@{bot_uid}>", "").strip()
@@ -4205,9 +4230,13 @@ class SlackAdapter(BasePlatformAdapter):
         # Remember the thread so follow-ups auto-trigger (skipped under strict_mention /
         # thread_require_mention, which it would defeat). Session-scoped ``thread_ts`` because a
         # top-level @mention STARTS a thread whose replies must trigger too.
-        if (
-            thread_ts and not self._slack_strict_mention()
-            and not self._slack_thread_require_mention()):
+        if thread_ts and (
+            (
+                not self._slack_strict_mention()
+                and not self._slack_thread_require_mention()
+            )
+            or channel_id in self._slack_thread_participation_channels()
+        ):
             self._register_mentioned_thread(thread_ts, team_id=team_id)
         return text, original_text, command_probe_text, is_command_text
 
@@ -4294,7 +4323,7 @@ class SlackAdapter(BasePlatformAdapter):
         if is_mentioned:
             text, original_text, command_probe_text, is_command_text = self._apply_bot_mention(
                 text, original_text, command_probe_text, is_command_text, bot_uid, thread_ts,
-                team_id)
+                team_id, channel_id)
         # Thread history stays out of ``text``: prepending would push a command off char zero.
         (
             channel_context, thread_root_media_urls, thread_root_media_types,
@@ -5945,6 +5974,8 @@ class SlackAdapter(BasePlatformAdapter):
         "ignore_other_user_mentions", "SLACK_IGNORE_OTHER_USER_MENTIONS")
     _slack_thread_require_mention = _extra_or_env_flag_getter(
         "thread_require_mention", "SLACK_THREAD_REQUIRE_MENTION")
+    _slack_thread_participation_channels = _extra_or_env_channel_set_getter(
+        "thread_participation_channels", "SLACK_THREAD_PARTICIPATION_CHANNELS", coerce_scalar=True)
     _slack_disable_dms = _extra_or_env_flag_getter("disable_dms", "SLACK_DISABLE_DMS", strip=True)
 
     def _slack_message_addressed_to_other_user(self, text: str, self_uids: set) -> bool:
@@ -6440,6 +6471,7 @@ _YAML_BOOL_KEYS = (
 # (yaml key, env var, list-ish types joined with ","); str(value) when not a list.
 _YAML_LIST_KEYS = (
     ("free_response_channels", "SLACK_FREE_RESPONSE_CHANNELS", list),
+    ("thread_participation_channels", "SLACK_THREAD_PARTICIPATION_CHANNELS", list),
     ("require_mention_channels", "SLACK_REQUIRE_MENTION_CHANNELS", list),
     ("reaction_triggers", "SLACK_REACTION_TRIGGERS", (list, tuple, set)),
     ("reaction_trigger_target", "SLACK_REACTION_TRIGGER_TARGET", ()),
