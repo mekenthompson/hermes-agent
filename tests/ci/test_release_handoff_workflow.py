@@ -35,6 +35,10 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         guard = job.split("if: >-\n", 1)[1].split("runs-on:", 1)[0]
         self.assertIn("github.event.workflow_run.conclusion == 'success'", guard)
         self.assertIn("github.event.workflow_run.head_branch == 'main'", guard)
+        # A fork PR can name its branch "main"; only push/dispatch runs from
+        # this repository's own code may hand off with the App token.
+        self.assertIn("github.event.workflow_run.event != 'pull_request'", guard)
+        self.assertIn("github.event.workflow_run.head_repository.full_name == github.repository", guard)
         self.assertIn("github.repository == 'mekenthompson/hermes-agent'", guard)
 
     def test_artifact_is_downloaded_from_the_triggering_run_and_bound_to_its_head_sha(self) -> None:
