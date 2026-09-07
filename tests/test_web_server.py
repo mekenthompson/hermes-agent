@@ -109,6 +109,12 @@ def test_start_server_disables_ws_ping_on_loopback(monkeypatch):
     assert captured["ws_ping_timeout"] is None
 
 
+def test_start_server_disables_uvicorn_access_log_for_query_credentials(monkeypatch):
+    captured = _stub_uvicorn(monkeypatch)
+    web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+    assert captured["access_log"] is False
+
+
 def test_start_server_accepts_base64_desktop_attachments_above_preview_limit(monkeypatch):
     """The gateway frame cap must fit the Desktop attachment default after
     base64 expansion and JSON framing; uvicorn's 16 MiB default would reject

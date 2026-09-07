@@ -150,7 +150,13 @@ class TestWsTicketEndpoint:
             "provider": "dashboard-session-token",
         }
         assert _web_server_chat._ws_auth_ok(replay) is False
-        assert _web_server_chat._ws_auth_ok(direct) is False
+        # Stock Desktop also uses this explicitly configured reusable URL for
+        # initial connect and reconnect; it remains the same synthetic identity.
+        assert _web_server_chat._ws_auth_ok(direct) is True
+        assert direct._hermes_auth_identity == {
+            "user_id": "dashboard-session-token",
+            "provider": "dashboard-session-token",
+        }
 
 
     def test_get_method_is_not_allowed(self, gated_app):
@@ -210,15 +216,10 @@ def _fake_ws(
 ):
     """Build a stand-in for starlette.WebSocket good enough for _ws_auth_ok."""
 
-    class _QP:
-        def __init__(self, q):
-            self._q = q
-
-        def get(self, k, default=""):
-            return self._q.get(k, default)
+    from starlette.datastructures import QueryParams
 
     return SimpleNamespace(
-        query_params=_QP(query),
+        query_params=QueryParams(query),
         headers={"sec-websocket-protocol": ", ".join(protocols)} if protocols else {},
         client=SimpleNamespace(host=client_host),
         url=SimpleNamespace(path=path),
@@ -285,10 +286,34 @@ class TestWsAuthOkGated:
         assert _web_server_chat._ws_auth_ok(ambiguous) is False
 
 
-    def test_legacy_token_rejected_in_gated_mode(self, gated_app):
-        """Critical: gated mode must NOT honour the legacy token path
-        even when someone has access to the in-process value of
-        _SESSION_TOKEN (e.g. a leaked log line)."""
+    def test_explicit_configured_token_authenticates_reusable_standard_desktop_urls(self, gated_app, monkeypatch):
+        """A configured (never generated) gateway token supports /api/ws reconnects."""
+        configured_token = "test-configured-dashboard-token-0123456789abcdef"
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN", configured_token)
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", True, raising=False)
+
+        initial = _fake_ws(query={"token": configured_token}, path="/api/ws")
+        reconnect = _fake_ws(query={"token": configured_token}, path="/api/ws")
+
+        assert _web_server_chat._ws_auth_reason(initial) == (None, "explicit-token")
+        assert _web_server_chat._ws_auth_reason(reconnect) == (None, "explicit-token")
+        assert initial._hermes_auth_identity == {
+            "user_id": "dashboard-session-token",
+            "provider": "dashboard-session-token",
+        }
+
+    def test_multiple_gated_credentials_are_rejected_without_consuming_ticket(self, gated_app, monkeypatch):
+        configured_token = "test-configured-dashboard-token-0123456789abcdef"
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN", configured_token)
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", True, raising=False)
+        ticket = mint_ticket(user_id="ticket-user", provider="stub")
+
+        conflict = _fake_ws(query={"token": configured_token, "ticket": ticket}, path="/api/ws")
+        assert _web_server_chat._ws_auth_reason(conflict) == ("credential_conflict", "multiple")
+        assert _web_server_chat._ws_auth_ok(_fake_ws(query={"ticket": ticket})) is True
+
+    def test_generated_process_token_stays_rejected_in_gated_mode(self, gated_app, monkeypatch):
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", False, raising=False)
         ws = _fake_ws(query={"token": web_server._SESSION_TOKEN})
         assert _web_server_chat._ws_auth_ok(ws) is False
 

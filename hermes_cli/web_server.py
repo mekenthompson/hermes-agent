@@ -1192,8 +1192,14 @@ def _build_uvicorn_server(host: str, port: int, *, ssh_isolated: bool = False):
         served_app = wrap_asgi_with_ws_tracking(app, app.state.ssh_isolated_clients)
         ping_interval, ping_timeout = TUNNEL_WS_PING_INTERVAL_S, TUNNEL_WS_PING_TIMEOUT_S
 
+    from hermes_cli.dashboard_auth.log_redaction import redacted_uvicorn_log_config
+
     config = uvicorn.Config(
         served_app, host=host, port=port, log_level="warning",
+        # WebSocket accept/reject URLs use uvicorn.error, not only access logs.
+        # Redact both channels even if an operator increases the log verbosity.
+        log_config=redacted_uvicorn_log_config(),
+        access_log=False,
         # Off by default so _ws_client_is_allowed sees the real peer, not
         # X-Forwarded-For. Gated mode runs behind a TLS terminator and needs
         # X-Forwarded-Proto for cookie Secure flags.
