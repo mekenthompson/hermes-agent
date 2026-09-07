@@ -1415,7 +1415,11 @@ test('OAuth ticket-mint 401 stays on the reauth path (never Cloud-down)', () => 
 test('configured-token ticket rejection preserves HTTP status without requesting OAuth login', async () => {
   for (const statusCode of [401, 403]) {
     const source = Object.assign(new Error(`${statusCode}: rejected`), { statusCode })
-    const wrapped = configuredGatewayTokenTicketFailure(source, 'configured token rejected', 'gateway unavailable') as any
+    const wrapped = configuredGatewayTokenTicketFailure(
+      source,
+      'configured token rejected',
+      'gateway unavailable'
+    ) as any
 
     assert.equal(wrapped.needsConfiguredGatewayToken, true)
     assert.equal(wrapped.needsOauthLogin, undefined)
@@ -1465,16 +1469,28 @@ test('gatewayWsAuthTransport: URL/cloud token remotes mint only when the gateway
   assert.equal(gatewayWsAuthTransport({ authMode: 'token', remoteKind: 'url', statusBody: advertised }), 'ticket')
   assert.equal(gatewayWsAuthTransport({ authMode: 'token', remoteKind: 'cloud', statusBody: advertised }), 'ticket')
   // Non-gated loopback / reverse-proxied ``hermes serve``: no session, no ticket.
-  assert.equal(gatewayWsAuthTransport({ authMode: 'token', remoteKind: 'url', statusBody: { auth_required: false } }), 'token')
+  assert.equal(
+    gatewayWsAuthTransport({ authMode: 'token', remoteKind: 'url', statusBody: { auth_required: false } }),
+    'token'
+  )
   assert.equal(gatewayWsAuthTransport({ authMode: 'token', remoteKind: 'url' }), 'token')
   assert.equal(gatewayWsAuthTransport({}), 'token')
 })
 
 test('connectionUsesWsTicket honours the recorded transport and falls back to the non-SSH remote rule', () => {
   assert.equal(connectionUsesWsTicket({ authMode: 'oauth', mode: 'remote', remoteKind: 'url' }), true)
-  assert.equal(connectionUsesWsTicket({ authMode: 'token', mode: 'remote', remoteKind: 'url', wsAuthTransport: 'ticket' }), true)
-  assert.equal(connectionUsesWsTicket({ authMode: 'token', mode: 'remote', remoteKind: 'url', wsAuthTransport: 'token' }), false)
-  assert.equal(connectionUsesWsTicket({ authMode: 'token', mode: 'remote', remoteKind: 'ssh', wsAuthTransport: 'token' }), false)
+  assert.equal(
+    connectionUsesWsTicket({ authMode: 'token', mode: 'remote', remoteKind: 'url', wsAuthTransport: 'ticket' }),
+    true
+  )
+  assert.equal(
+    connectionUsesWsTicket({ authMode: 'token', mode: 'remote', remoteKind: 'url', wsAuthTransport: 'token' }),
+    false
+  )
+  assert.equal(
+    connectionUsesWsTicket({ authMode: 'token', mode: 'remote', remoteKind: 'ssh', wsAuthTransport: 'token' }),
+    false
+  )
   // Legacy descriptors without the field: SSH never minted, other remotes did.
   assert.equal(connectionUsesWsTicket({ authMode: 'token', mode: 'remote', remoteKind: 'ssh' }), false)
   assert.equal(connectionUsesWsTicket({ authMode: 'token', mode: 'remote', remoteKind: 'url' }), true)

@@ -20,7 +20,11 @@ async function withTicketFixture(
     request.on('end', () => {
       requests.push({ body: Buffer.concat(chunks).toString('utf8'), headers: request.headers, method: request.method })
       response.writeHead(statusCode, { 'content-type': 'application/json' })
-      response.end(statusCode >= 400 ? JSON.stringify({ detail: 'ticket rejected' }) : JSON.stringify({ ticket: `ticket-${requests.length}` }))
+      response.end(
+        statusCode >= 400
+          ? JSON.stringify({ detail: 'ticket rejected' })
+          : JSON.stringify({ ticket: `ticket-${requests.length}` })
+      )
     })
   })
 
@@ -41,7 +45,10 @@ test('configured-token production ticket transport mints distinct initial and re
     const headers = { 'X-Custom-Gateway-Header': 'custom-value' }
     const initialTicket = await mintGatewayWsTicketWithSessionToken(baseUrl, token, headers)
     const reconnectTicket = await mintGatewayWsTicketWithSessionToken(baseUrl, token, headers)
-    const urls = [buildGatewayWsUrlWithTicket(baseUrl, initialTicket), buildGatewayWsUrlWithTicket(baseUrl, reconnectTicket)]
+    const urls = [
+      buildGatewayWsUrlWithTicket(baseUrl, initialTicket),
+      buildGatewayWsUrlWithTicket(baseUrl, reconnectTicket)
+    ]
 
     assert.notEqual(initialTicket, reconnectTicket)
     assert.equal(requests.length, 2)
@@ -75,7 +82,10 @@ test('configured-token production ticket transport preserves real HTTP 401/403 v
           )
 
           assert.equal(classified.statusCode, statusCode)
-          assert.equal(classified.needsConfiguredGatewayToken, statusCode === 401 || statusCode === 403 ? true : undefined)
+          assert.equal(
+            classified.needsConfiguredGatewayToken,
+            statusCode === 401 || statusCode === 403 ? true : undefined
+          )
           assert.match(classified.message, statusCode === 401 || statusCode === 403 ? /token rejected/ : /unavailable/)
 
           return true

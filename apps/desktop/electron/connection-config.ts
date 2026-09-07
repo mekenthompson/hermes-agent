@@ -316,7 +316,9 @@ async function resolveTestWsUrl(baseUrl, authMode, token, deps: any = {}) {
     const mintTicket = deps.mintTicket
 
     if (typeof mintTicket !== 'function') {
-      throw new Error('resolveTestWsUrl: a mintTicket function is required when WebSocket authentication is configured.')
+      throw new Error(
+        'resolveTestWsUrl: a mintTicket function is required when WebSocket authentication is configured.'
+      )
     }
 
     let ticket
@@ -332,9 +334,9 @@ async function resolveTestWsUrl(baseUrl, authMode, token, deps: any = {}) {
       const transportMessage =
         'Reached the gateway over HTTP, but could not mint a WebSocket ticket. Check the remote gateway connection and try again.'
 
-      throw (authMode === 'oauth'
+      throw authMode === 'oauth'
         ? gatewayTicketFailure(error, authMessage, transportMessage)
-        : configuredGatewayTokenTicketFailure(error, authMessage, transportMessage))
+        : configuredGatewayTokenTicketFailure(error, authMessage, transportMessage)
     }
 
     return buildGatewayWsUrlWithTicket(baseUrl, ticket)

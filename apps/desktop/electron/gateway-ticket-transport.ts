@@ -13,7 +13,11 @@ function httpStatusError(statusCode: number | undefined, message: string) {
  * production transport keeps HTTP status structured so callers can distinguish
  * a rejected token from a server or network failure.
  */
-async function mintGatewayWsTicketWithSessionToken(baseUrl: string, token: string, headers: Record<string, string> = {}) {
+async function mintGatewayWsTicketWithSessionToken(
+  baseUrl: string,
+  token: string,
+  headers: Record<string, string> = {}
+) {
   const url = new URL(`${String(baseUrl).replace(/\/+$/, '')}/api/auth/ws-ticket`)
   const client = url.protocol === 'https:' ? https : http
 
