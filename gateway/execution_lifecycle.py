@@ -27,14 +27,19 @@ class GatewayExecutionLifecycleMixin:
     def _register_internal_plugin_execution(self, event, session_key: str) -> None:
         execution_id = self._validate_internal_plugin_execution_id(getattr(event, "_internal_plugin_execution_id", ""))
         records = self._internal_plugin_execution_records()
+        quarantined = self.__dict__.get("_internal_plugin_quarantined_sessions", {})
+        if session_key in quarantined:
+            raise ValueError("internal plugin session is quarantined by an execution with unknown effects")
         if execution_id in records or any(r["session_key"] == session_key for r in records.values()):
             raise ValueError("internal plugin session already has a live execution")
-        state = self._peek_session_state(session_key)
+        # Establish the Stop target before dispatch reaches the ordinary session-claim path.
+        state = self._session_state(session_key)
         records[execution_id] = {
             "session_key": session_key, "source": event.source,
             "generation": int(state.persistent.run_generation) + 1 if state else 1,
             "agent": None, "accepted": False, "stop_requested": False,
             "worker_done": None, "worker_started": False, "observed_tool": False,
+            "active_tool_calls": 0, "completed_tool_calls": 0,
         }
 
     def _bind_internal_plugin_execution(self, execution_id: Optional[str], *, session_key: str,
@@ -79,10 +84,14 @@ class GatewayExecutionLifecycleMixin:
             record["worker_started"] = True
 
     def _observe_internal_plugin_tool_event(self, execution_id: Optional[str], event_type: str) -> None:
-        if event_type == "tool.started":
-            record = self._internal_plugin_execution_records().get(execution_id)
-            if record is not None:
+        record = self._internal_plugin_execution_records().get(execution_id)
+        if record is not None:
+            if event_type == "tool.started":
                 record["observed_tool"] = True
+                record["active_tool_calls"] += 1
+            elif event_type == "tool.completed" and record["active_tool_calls"]:
+                record["active_tool_calls"] -= 1
+                record["completed_tool_calls"] += 1
 
     @staticmethod
     def _worker_finished(record: dict) -> bool:
@@ -104,8 +113,17 @@ class GatewayExecutionLifecycleMixin:
                 "processes": "unknown" if record["observed_tool"] else "none",
                 "remote": "unknown" if record["observed_tool"] else "none",
             }
+            # Do not evict unknown receipts: losing this evidence would falsely
+            # report a quarantined execution as not_running/not_occupied.
             while len(retired) > 256:
-                retired.popitem(last=False)
+                old_execution_id, old = next(iter(retired.items()))
+                if old["occupancy"] == "unknown":
+                    break
+                retired.pop(old_execution_id)
+            if occupancy == "unknown":
+                self.__dict__.setdefault("_internal_plugin_quarantined_sessions", {})[
+                    record["session_key"]
+                ] = execution_id
 
     def _complete_internal_plugin_execution(self, execution_id: Optional[str], *, wrapper_completed: bool = False) -> None:
         record = self._internal_plugin_execution_records().get(execution_id)
@@ -146,7 +164,15 @@ class GatewayExecutionLifecycleMixin:
             status = "stale" if execution_id in self.__dict__.get("_internal_plugin_retired_executions", {}) else "not_running"
             return {"status": status, **receipt}
         state = self._peek_session_state(session_key)
-        if record["session_key"] != session_key or not state or state.persistent.run_generation != record["generation"]:
+        # Registration reserves generation N+1 before the ordinary dispatcher claims it.
+        # Stop is valid in that narrow pre-claim interval, but never for an unrelated
+        # occupied session or a generation other than the reserved next one.
+        pre_claim = bool(
+            state and record["agent"] is None and state.turn.agent is None
+            and state.persistent.run_generation == record["generation"] - 1
+        )
+        if (record["session_key"] != session_key or not state
+                or (state.persistent.run_generation != record["generation"] and not pre_claim)):
             return {"status": "stale", **receipt}
         agent = record["agent"]
         if agent is None or agent is _AGENT_PENDING_SENTINEL:

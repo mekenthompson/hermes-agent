@@ -310,6 +310,71 @@ async def test_wrapper_cancellation_retains_execution_record(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_unknown_effect_tombstone_quarantines_the_session_from_replacement():
+    """A returned worker is not permission to overlap an unproved prior effect."""
+    runner = object.__new__(GatewayRunner)
+    session_key = "local:aggie:linear-session-1"
+    event = _event()
+    event._internal_plugin_execution_id = _EXECUTION_ID
+    state = runner._session_state(session_key)
+    state.persistent.run_generation = 6
+    runner._register_internal_plugin_execution(event, session_key)
+    runner._observe_internal_plugin_tool_event(_EXECUTION_ID, "tool.started")
+    runner._observe_internal_plugin_tool_event(_EXECUTION_ID, "tool.completed")
+    record = runner._internal_plugin_execution_records()[_EXECUTION_ID]
+    assert record["active_tool_calls"] == 0
+    assert record["completed_tool_calls"] == 1
+    runner._complete_internal_plugin_execution(_EXECUTION_ID, wrapper_completed=True)
+
+    assert (await runner.get_execution_lifecycle(
+        session_key=session_key, execution_id=_EXECUTION_ID
+    ))["occupancy"] == "unknown"
+
+    replacement = _event()
+    replacement._internal_plugin_execution_id = "plugin-exec-002"
+    with pytest.raises(ValueError, match="quarantined"):
+        runner._register_internal_plugin_execution(replacement, session_key)
+
+
+@pytest.mark.asyncio
+async def test_completed_no_tool_execution_allows_same_session_replacement():
+    """The quarantine is conservative without making ordinary no-tool turns unusable."""
+    runner = object.__new__(GatewayRunner)
+    session_key = "local:aggie:linear-session-1"
+    event = _event()
+    event._internal_plugin_execution_id = _EXECUTION_ID
+    runner._register_internal_plugin_execution(event, session_key)
+    runner._complete_internal_plugin_execution(_EXECUTION_ID, wrapper_completed=True)
+
+    replacement = _event()
+    replacement._internal_plugin_execution_id = "plugin-exec-002"
+    runner._register_internal_plugin_execution(replacement, session_key)
+    assert "plugin-exec-002" in runner._internal_plugin_execution_records()
+
+
+@pytest.mark.asyncio
+async def test_stop_during_registration_before_session_claim_is_accepted_and_fences_launch():
+    """Registration creates the stop target before the normal turn claim exists."""
+    runner = object.__new__(GatewayRunner)
+    session_key = "local:aggie:linear-session-1"
+    event = _event()
+    event._internal_plugin_execution_id = _EXECUTION_ID
+
+    runner._register_internal_plugin_execution(event, session_key)
+    assert runner._peek_session_state(session_key) is not None
+    assert (await runner.request_stop(
+        session_key=session_key, expected_execution_id=_EXECUTION_ID
+    ))["status"] == "accepted"
+
+    state = runner._session_state(session_key)
+    state.persistent.run_generation = 1
+    assert not runner._promote_running_agent(
+        session_key=session_key, run_generation=1, agent=object(),
+        internal_plugin_execution_id=_EXECUTION_ID,
+    )
+
+
+@pytest.mark.asyncio
 async def test_real_to_thread_cancellation_does_not_release_until_physical_worker_finishes():
     """An asyncio cancellation is not evidence that the executor thread has stopped."""
     runner = object.__new__(GatewayRunner)
