@@ -243,6 +243,11 @@ def _build_child_agent(
                 session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides,
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=parent_agent.iteration_budget,
+                cost_budget_policy=(
+                    {"estimated_cost_limit_usd": parent_agent._cost_budget[2],
+                     "issue_budget_key": parent_agent._cost_budget[1]}
+                    if getattr(parent_agent, "_cost_budget", None) else None
+                ),
             )
         except BaseException:
             # No child close() will ever run: release the dedicated handle here.

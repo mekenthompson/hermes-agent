@@ -938,8 +938,17 @@ class TurnRunner:
                     with suppress(KeyError):
                         cache.move_to_end(ctx.session_key)
                 self._runner._init_cached_agent_for_turn(out.agent, ctx._interrupt_depth)
-                # Cached agent may have been created with old config.
+                # Cached agents retain constructor state. Refresh every per-execution
+                # capability explicitly; no limit may leak into a later execution.
                 out.agent.max_iterations = max_iterations
+                policy = ctx.internal_plugin_execution_policy
+                if not hasattr(out.agent, "_gateway_default_run_budget_seconds"):
+                    out.agent._gateway_default_run_budget_seconds = out.agent.run_budget_seconds
+                out.agent.run_budget_seconds = (
+                    policy["wall_seconds"] if policy is not None else out.agent._gateway_default_run_budget_seconds
+                )
+                from agent.cost_budget import configure as _configure_cost_budget
+                _configure_cost_budget(out.agent, policy)
                 logger.debug("Reusing cached agent for session %s", ctx.session_key)
                 out.reused = True
                 return out
@@ -963,6 +972,7 @@ class TurnRunner:
             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
             max_iterations=max_iterations, quiet_mode=True, verbose_logging=False,
             run_budget_seconds=(ctx.internal_plugin_execution_policy or {}).get("wall_seconds"),
+            cost_budget_policy=ctx.internal_plugin_execution_policy,
             enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=ctx.disabled_toolsets,
             ephemeral_system_prompt=combined_ephemeral or None,
             prefill_messages=runner._prefill_messages or None,
