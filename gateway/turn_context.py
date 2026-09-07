@@ -44,6 +44,10 @@ class TurnContext:
     session_id: Optional[str] = None
     session_key: Optional[str] = None
     run_generation: Optional[int] = None
+    internal_plugin_execution_id: Optional[str] = None
+    # Set by the loop-side promotion task before the executor may launch.
+    execution_launch_gate: Any = None
+    execution_launch_allowed: bool = True
     process_task_id: str = ""
     process_baseline: frozenset[str] = field(default_factory=frozenset)
     _interrupt_depth: int = 0
