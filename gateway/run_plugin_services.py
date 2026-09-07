@@ -19,8 +19,7 @@ logger = logging.getLogger("gateway.run")
 class GatewayPluginServicesMixin:
     """Keep plugin-owned execution explicitly local to a served profile."""
 
-    @staticmethod
-    def _validate_internal_plugin_event(event: MessageEvent) -> SessionSource:
+    def _validate_internal_plugin_event(self, event: MessageEvent) -> SessionSource:
         """Validate the narrow event shape allowed for profile-local plugins."""
         if not isinstance(event, MessageEvent):
             raise TypeError("internal plugin dispatch requires a MessageEvent")
@@ -37,7 +36,25 @@ class GatewayPluginServicesMixin:
         if source is None:
             raise ValueError("internal plugin events require a SessionSource")
         if source.platform is not Platform.LOCAL:
-            raise PermissionError("internal plugin events must use the local platform")
+            # A signed private continuation may re-enter the exact existing DM
+            # route. No plugin supplies a provider route: core stamps the event
+            # after resolving the stored owner session, and this check resolves it
+            # again before the normal handler sees it.
+            owner_id = getattr(event, "_private_continuation_owner_session_id", None)
+            metadata = event.metadata if isinstance(event.metadata, dict) else {}
+            if (source.platform not in {Platform.SLACK, Platform.TELEGRAM}
+                    or metadata != {"private_continuation": True}
+                    or not isinstance(owner_id, str) or not owner_id
+                    or getattr(source, "chat_type", None) != "dm"):
+                raise PermissionError("internal plugin events must use the local platform")
+            store = getattr(self, "session_store", None)
+            entry = store.lookup_by_session_id(owner_id) if store is not None else None
+            origin = getattr(entry, "origin", None)
+            if (entry is None or origin is None or origin.profile != source.profile
+                    or origin.platform is not source.platform
+                    or origin.to_dict() != source.to_dict()
+                    or self._session_key_for_source(source) != entry.session_key):
+                raise PermissionError("private continuation owner route is unavailable")
         if not str(getattr(source, "profile", "") or "").strip():
             raise ValueError("internal plugin events require an explicit profile")
         if not str(getattr(source, "chat_id", "") or "").strip():
