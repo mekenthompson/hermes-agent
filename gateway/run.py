@@ -3219,6 +3219,7 @@ def _instantiate_builtin_adapter(platform: Platform, config: Any) -> Optional[Ba
 
 
 from gateway.execution_lifecycle import GatewayExecutionLifecycleMixin
+from gateway.private_continuation import GatewayPrivateContinuationMixin
 
 
 class GatewayRunner(
@@ -3226,7 +3227,8 @@ class GatewayRunner(
     GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
     GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
-    GatewayAgentCacheMixin, GatewayExecutionLifecycleMixin, GatewayPluginServicesMixin):
+    GatewayAgentCacheMixin, GatewayExecutionLifecycleMixin, GatewayPrivateContinuationMixin,
+    GatewayPluginServicesMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
