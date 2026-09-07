@@ -21,6 +21,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from hermes_state import SessionDB
@@ -157,6 +158,27 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
     db.create_session(session_id, source="cli")
     agent = _build_agent_with_db(db, session_id)
     agent._cached_system_prompt = "sys"
+    # A loaded CI shard can delay dispatching this worker beyond the real 50/100ms
+    # budgets. Keep the host clock at zero until the provider has actually started,
+    # then advance it past the total ceiling. This exercises the real timeout,
+    # cancellation, and admission-release paths without treating scheduler delay as
+    # provider silence.
+    clock_lock = threading.Lock()
+    clock_now = [0.0]
+
+    def _monotonic() -> float:
+        with clock_lock:
+            return clock_now[0]
+
+    def _advance_clock(seconds: float) -> None:
+        with clock_lock:
+            clock_now[0] += seconds
+
+    monkeypatch.setattr(
+        cc,
+        "time",
+        SimpleNamespace(monotonic=_monotonic, sleep=time.sleep, time=time.time),
+    )
     monkeypatch.setattr(
         "agent.conversation_compression.resolve_context_compression_timeouts",
         lambda cfg=None: (0.05, 0.1),
@@ -167,6 +189,7 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
 
     def _blocked_provider(_kwargs):
         provider_started.set()
+        _advance_clock(0.1)
         assert release_provider.wait(timeout=10)
         return "late-provider-result"
 
