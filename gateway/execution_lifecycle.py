@@ -7,11 +7,35 @@ untracked effect) remains unknown rather than being reported released.
 from __future__ import annotations
 
 from collections import OrderedDict
+import math
 import re
 from typing import Any, Optional
 
 _EXECUTION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_POLICY_FIELDS = {"max_iterations", "wall_seconds", "estimated_cost_limit_usd", "issue_budget_key"}
 LIFECYCLE_VERSION = "execution-lifecycle/v2"
+
+
+def validate_internal_execution_policy(value: object) -> dict:
+    """Return the canonical, finite limits for one named plugin execution."""
+    if not isinstance(value, dict) or set(value) != _POLICY_FIELDS:
+        raise ValueError("internal execution policy fields are invalid")
+    max_iterations = value["max_iterations"]
+    wall_seconds = value["wall_seconds"]
+    cost_limit = value["estimated_cost_limit_usd"]
+    budget_key = value["issue_budget_key"]
+    finite_positive = lambda item: (not isinstance(item, bool) and isinstance(item, (int, float))
+                                    and math.isfinite(float(item)) and float(item) > 0)
+    if (type(max_iterations) is not int or max_iterations < 1
+            or not finite_positive(wall_seconds) or not finite_positive(cost_limit)
+            or not isinstance(budget_key, str) or not budget_key.strip()):
+        raise ValueError("internal execution policy requires positive finite limits and issue_budget_key")
+    return {
+        "max_iterations": max_iterations,
+        "wall_seconds": float(wall_seconds),
+        "estimated_cost_limit_usd": float(cost_limit),
+        "issue_budget_key": budget_key.strip(),
+    }
 
 
 class GatewayExecutionLifecycleMixin:
@@ -138,28 +162,27 @@ class GatewayExecutionLifecycleMixin:
             occupancy="unknown" if record["observed_tool"] else "released",
         )
 
-    async def dispatch_internal_plugin_event(self, event, *, execution_id: Optional[str] = None,
-                                             execution_policy: Optional[dict] = None):
+    async def dispatch_internal_plugin_event(
+        self, event, *, execution_id: Optional[str] = None, execution_policy: Optional[dict] = None,
+        private_continuation_grant=None,
+    ):
         if execution_id is None:
-            return await super().dispatch_internal_plugin_event(event)
+            return await super().dispatch_internal_plugin_event(
+                event, execution_policy=execution_policy, private_continuation_grant=private_continuation_grant,
+            )
         execution_id = self._validate_internal_plugin_execution_id(execution_id)
-        source = self._validate_internal_plugin_event(event)
-        # Validate at the core boundary too: callers cannot smuggle a policy through
-        # a plugin-services implementation that predates the validation above.
+        source = self._validate_internal_plugin_event(
+            event, private_continuation_grant=private_continuation_grant, execution_id=execution_id,
+        )
         if execution_policy is not None:
-            max_iterations = execution_policy.get("max_iterations") if isinstance(execution_policy, dict) else None
-            wall_seconds = execution_policy.get("wall_seconds") if isinstance(execution_policy, dict) else None
-            if (type(max_iterations) is not int or max_iterations < 1
-                    or isinstance(wall_seconds, bool) or not isinstance(wall_seconds, (int, float))
-                    or not (0 < float(wall_seconds) < float("inf"))):
-                raise ValueError("internal execution policy requires positive finite limits")
-            event._internal_plugin_execution_policy = {
-                "max_iterations": max_iterations, "wall_seconds": float(wall_seconds),
-            }
+            event._internal_plugin_execution_policy = validate_internal_execution_policy(execution_policy)
         event._internal_plugin_execution_id = execution_id
         self._register_internal_plugin_execution(event, self._session_key_for_source(source))
         try:
-            result = await super().dispatch_internal_plugin_event(event)
+            result = await super().dispatch_internal_plugin_event(
+                event, execution_id=execution_id, execution_policy=execution_policy,
+                private_continuation_grant=private_continuation_grant,
+            )
         except BaseException:
             # Wrapper cancellation is not completion evidence for a to_thread worker.
             raise
@@ -191,6 +214,7 @@ class GatewayExecutionLifecycleMixin:
         if agent is None or agent is _AGENT_PENDING_SENTINEL:
             record["stop_requested"] = True
             record["accepted"] = True
+            self._retire_internal_plugin_execution(execution_id, state="stopped", occupancy="released")
             return {"status": "accepted", **receipt}
         if state.turn.agent is not agent or not request_hard_interrupt(agent, reason):
             return {"status": "not_delivered", **receipt}

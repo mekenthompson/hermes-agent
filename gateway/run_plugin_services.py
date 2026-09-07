@@ -19,7 +19,8 @@ logger = logging.getLogger("gateway.run")
 class GatewayPluginServicesMixin:
     """Keep plugin-owned execution explicitly local to a served profile."""
 
-    def _validate_internal_plugin_event(self, event: MessageEvent) -> SessionSource:
+    def _validate_internal_plugin_event(self, event: MessageEvent, *, private_continuation_grant=None,
+                                        execution_id: str | None = None) -> SessionSource:
         """Validate the narrow event shape allowed for profile-local plugins."""
         if not isinstance(event, MessageEvent):
             raise TypeError("internal plugin dispatch requires a MessageEvent")
@@ -36,24 +37,21 @@ class GatewayPluginServicesMixin:
         if source is None:
             raise ValueError("internal plugin events require a SessionSource")
         if source.platform is not Platform.LOCAL:
-            # A signed private continuation may re-enter the exact existing DM
-            # route. No plugin supplies a provider route: core stamps the event
-            # after resolving the stored owner session, and this check resolves it
-            # again before the normal handler sees it.
-            owner_id = getattr(event, "_private_continuation_owner_session_id", None)
-            metadata = event.metadata if isinstance(event.metadata, dict) else {}
+            # Provider routes have no caller-controlled provenance.  A one-shot
+            # grant is created by the core after exact persisted-route lookup and
+            # is consumed immediately before normal handler entry.
+            grants = getattr(self, "_private_continuation_grants", {})
+            grant = grants.get(id(private_continuation_grant))
             if (source.platform not in {Platform.SLACK, Platform.TELEGRAM}
-                    or metadata != {"private_continuation": True}
-                    or not isinstance(owner_id, str) or not owner_id
+                    or grant is not private_continuation_grant or grant.used
+                    or grant.event is not event or grant.source is not source
+                    or grant.execution_id != execution_id
                     or getattr(source, "chat_type", None) != "dm"):
                 raise PermissionError("internal plugin events must use the local platform")
-            store = getattr(self, "session_store", None)
-            entry = store.lookup_by_session_id(owner_id) if store is not None else None
-            origin = getattr(entry, "origin", None)
-            if (entry is None or origin is None or origin.profile != source.profile
-                    or origin.platform is not source.platform
-                    or origin.to_dict() != source.to_dict()
-                    or self._session_key_for_source(source) != entry.session_key):
+            session_key = self._session_key_for_source(source)
+            state = self._peek_session_state(session_key)
+            if (session_key != grant.session_key or state is None
+                    or state.persistent.run_generation != grant.generation - 1):
                 raise PermissionError("private continuation owner route is unavailable")
         if not str(getattr(source, "profile", "") or "").strip():
             raise ValueError("internal plugin events require an explicit profile")
@@ -80,24 +78,20 @@ class GatewayPluginServicesMixin:
 
     async def dispatch_internal_plugin_event(
         self, event: MessageEvent, *, execution_id: Optional[str] = None,
-        execution_policy: Optional[dict] = None,
+        execution_policy: Optional[dict] = None, private_continuation_grant=None,
     ) -> Optional[str]:
         """Dispatch a validated plugin event through the normal scoped handler."""
-        self._validate_internal_plugin_event(event)
-        # The lifecycle mixin consumes these only for a named internal execution.
-        # Never consult or modify profile config here: this is a one-execution capability.
+        self._validate_internal_plugin_event(
+            event, private_continuation_grant=private_continuation_grant, execution_id=execution_id,
+        )
         if execution_policy is not None:
-            if execution_id is None or not isinstance(execution_policy, dict):
-                raise ValueError("internal execution policy requires an execution_id and mapping")
-            max_iterations = execution_policy.get("max_iterations")
-            wall_seconds = execution_policy.get("wall_seconds")
-            if (type(max_iterations) is not int or max_iterations < 1
-                    or isinstance(wall_seconds, bool) or not isinstance(wall_seconds, (int, float))
-                    or not (0 < float(wall_seconds) < float("inf"))):
-                raise ValueError("internal execution policy requires positive finite limits")
-            event._internal_plugin_execution_policy = {
-                "max_iterations": max_iterations, "wall_seconds": float(wall_seconds),
-            }
+            if execution_id is None:
+                raise ValueError("internal execution policy requires an execution_id")
+            from gateway.execution_lifecycle import validate_internal_execution_policy
+            event._internal_plugin_execution_policy = validate_internal_execution_policy(execution_policy)
+        if event.source.platform is not Platform.LOCAL:
+            private_continuation_grant.used = True
+            self._private_continuation_grants.pop(id(private_continuation_grant), None)
         return await self._primary_message_handler()(event)
 
     def _start_plugin_profile_services(self) -> None:

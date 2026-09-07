@@ -16,12 +16,37 @@ import sqlite3
 import stat
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
 class ContinuationDenied(PermissionError):
     """A capability, binding, authorization, or readiness fence was not satisfied."""
+
+
+@dataclass(frozen=True)
+class PrivateContinuationExecution:
+    """The exact core execution reserved for a private continuation."""
+
+    execution_id: str
+    session_key: str
+    generation: int
+
+
+class _PrivateContinuationGrant:
+    """Unforgeable, one-shot admission held only by the GatewayRunner.
+
+    This deliberately is not an event attribute or a serializable capability.  The
+    normal handler admits a provider route only when it receives this exact object
+    from the runner's private grant registry.
+    """
+
+    __slots__ = ("event", "source", "session_key", "generation", "execution_id", "used")
+
+    def __init__(self, event: Any, source: Any, session_key: str, generation: int, execution_id: str) -> None:
+        self.event, self.source, self.session_key = event, source, session_key
+        self.generation, self.execution_id, self.used = generation, execution_id, False
 
 
 def _canonical(value: dict[str, str]) -> str:
@@ -229,7 +254,8 @@ class GatewayPrivateContinuationMixin:
             raise ContinuationDenied("continuation requester is not authorized")
         self._private_continuation_store(binding).enqueue(token=token, binding=binding, owner_generation=owner_generation, prompt=prompt)
 
-    def _private_continuation_event(self, binding: dict[str, str], prompt: str) -> tuple[Any, str]:
+    def _private_continuation_event(self, binding: dict[str, str], prompt: str,
+                                    execution_id: str) -> tuple[Any, str, _PrivateContinuationGrant]:
         """Resolve only a pre-existing private owner route; never mint a Linear route."""
         from gateway.config import Platform
         from gateway.platforms.base import MessageEvent, MessageType
@@ -245,12 +271,12 @@ class GatewayPrivateContinuationMixin:
         if self._session_key_for_source(source) != entry.session_key:
             raise ContinuationDenied("private continuation owner route changed")
         event = MessageEvent(text=prompt, message_type=MessageType.TEXT, source=source, internal=True,
-                             allow_gateway_control=False, metadata={"private_continuation": True})
-        # This marker is created only after the signed scope, exact owner lookup,
-        # and route equality checks above.  The plugin dispatcher rechecks the
-        # stored origin before accepting a non-LOCAL source.
-        setattr(event, "_private_continuation_owner_session_id", owner)
-        return event, entry.session_key
+                             allow_gateway_control=False, metadata={})
+        state = self._session_state(entry.session_key)
+        generation = int(state.persistent.run_generation) + 1
+        grant = _PrivateContinuationGrant(event, source, entry.session_key, generation, execution_id)
+        self.__dict__.setdefault("_private_continuation_grants", {})[id(grant)] = grant
+        return event, entry.session_key, grant
 
     async def drain_private_continuation(self, *, token: str, binding: dict[str, str], owner_generation: str,
                                          authorize: Callable[[], bool]) -> bool:
@@ -264,13 +290,15 @@ class GatewayPrivateContinuationMixin:
         item_id, prompt = item
         dispatched = False
         try:
-            event, session_key = self._private_continuation_event(binding, prompt)
+            execution_id = "private-continuation-" + secrets.token_urlsafe(24)
+            event, session_key, grant = self._private_continuation_event(binding, prompt, execution_id)
             if self._is_session_running(session_key):
                 store.requeue(item_id)
                 return False
-            execution_id = "private-continuation-" + secrets.token_urlsafe(24)
             dispatched = True
-            await self.dispatch_internal_plugin_event(event, execution_id=execution_id)
+            await self.dispatch_internal_plugin_event(
+                event, execution_id=execution_id, private_continuation_grant=grant
+            )
         except Exception:
             # Once dispatch was invoked, an exception cannot distinguish a local
             # rejection from a started provider turn. Fence it durably instead of
@@ -281,5 +309,21 @@ class GatewayPrivateContinuationMixin:
                 store.requeue(item_id)
             raise
         else:
+            receipt = await self.get_execution_lifecycle(
+                session_key=session_key, execution_id=execution_id
+            )
+            if not (
+                isinstance(receipt, dict)
+                and receipt.get("session_key") == session_key
+                and receipt.get("execution_id") == execution_id
+                and receipt.get("generation") == grant.generation
+                and receipt.get("state") == "completed"
+                and receipt.get("occupancy") == "released"
+                and all(receipt.get(field) == "none" for field in ("tools", "children", "processes", "remote"))
+            ):
+                # Completion of an await wrapper or dispatch acceptance is never
+                # completion of the private continuation's physical lifetime.
+                # Keep its durable delivery-inflight fence rather than replay it.
+                return False
             store.finish(item_id)
             return True
