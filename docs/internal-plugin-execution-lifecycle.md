@@ -1,0 +1,7 @@
+# Internal plugin execution lifecycle v2
+
+`GatewayRunner.dispatch_internal_plugin_event(event, execution_id=...)` and `request_stop(session_key, expected_execution_id, reason=...)` retain the delivery ABI. A stop receipt with `status: accepted` means either the exact bound agent accepted a cooperative interrupt or a preparation-phase stop was recorded at the launch fence; it never means a worker, tool, child, process, or remote effect has stopped.
+
+`get_execution_lifecycle(session_key=..., execution_id=...)` is versioned as `execution-lifecycle/v2`. Its response always repeats the requested `session_key` and `execution_id`; live and retired responses include the original `generation`. `occupancy: released` is emitted only after the physical worker completion event is observed and no tool lifecycle event was observed. A completed no-tool turn is retained as a bounded tombstone with its exact session/execution/generation receipt. If a tool started, `tools`, `children`, `processes`, and `remote` remain `unknown` at retirement and occupancy remains `unknown`; the gateway does not infer that effects ended.
+
+Cancelling an asyncio wrapper around `to_thread` is not worker completion. Until the worker's own completion event is observed, lifecycle reports `occupancy: occupied`. A Stop accepted before promotion makes promotion fail and the executor launch fence returns without entering `run_conversation`.

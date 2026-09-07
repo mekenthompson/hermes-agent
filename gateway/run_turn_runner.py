@@ -87,6 +87,8 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        if ctx.internal_plugin_execution_id is not None:
+            self._runner._observe_internal_plugin_tool_event(ctx.internal_plugin_execution_id, event_type)
         # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
         # gate: platforms with tool_progress off must still hear about a dead delegation.
         if event_type == "subagent.complete":
@@ -1646,6 +1648,14 @@ class TurnRunner:
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
+        execution_id = ctx.internal_plugin_execution_id
+        if execution_id is not None:
+            # A loop-side promotion decides this real thread boundary.  Do not
+            # enter run_conversation after a Stop was accepted while preparing.
+            ctx.execution_launch_gate.wait()
+            if not ctx.execution_launch_allowed:
+                return {"final_response": "", "messages": [], "api_calls": 0,
+                        "tools": [], "completed": True, "interrupted": True}
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
