@@ -118,7 +118,7 @@ def main() -> int:
             lambda before, after: compare_via_gh(repo, before, after),
         )
     except FailOpen as reason:
-        print(f"::warning::push_changed_files: {reason} - failing open (all lanes run)", file=sys.stderr)
+        print(f"::warning::push_changed_files: {reason} - failing open; all lanes run", file=sys.stderr)
         return 0
     print("\n".join(files))
     return 0
