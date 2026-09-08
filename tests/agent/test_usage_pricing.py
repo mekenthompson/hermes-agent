@@ -42,6 +42,19 @@ def test_astra_whole_request_price_tier_includes_cache_writes():
 
 
 
+def test_claude_acp_usage_remains_unpriced_without_adapter_billing_metadata():
+    """A Claude subscription can bill Team overage; token usage alone proves no price."""
+    result = estimate_usage_cost(
+        "opus[1m]",
+        CanonicalUsage(input_tokens=100, output_tokens=10),
+        provider="claude-acp",
+        base_url="acp://claude",
+    )
+
+    assert result.status == "unknown"
+    assert result.amount_usd is None
+
+
 def test_normalize_usage_reads_deepseek_native_cache_hit_tokens():
     """DeepSeek's native API (api.deepseek.com) reports context-cache hits as
     top-level prompt_cache_hit_tokens / prompt_cache_miss_tokens (with
