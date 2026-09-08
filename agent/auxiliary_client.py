@@ -5432,7 +5432,7 @@ def _get_cached_client(
         api_mode=api_mode, main_runtime=runtime, is_vision=is_vision, task=task,
     )
     # Probe clients may be adapters around a stub, so type-based filtering is insufficient.
-    # Never mutate the runtime cache while only checking provider availability.
+    # Do not insert probe results or evict runtime entries to make room for them.
     if client is not None and not _aux_probe_active():
         with _client_cache_lock:
             if cache_key not in _client_cache:

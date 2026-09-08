@@ -25,11 +25,21 @@ class TestAuxProbeMode:
         assert isinstance(client, aux._AuxProbeClientStub)
         assert client.api_key == "k"
 
+    def test_probe_stub_never_cached(self):
+        import agent.auxiliary_client as aux
+
+        stub = aux._AuxProbeClientStub()
+        key = ("probe-test", False, "", "", "", (), False, "", None, "m")
+        aux._store_cached_client(key, stub, "m")
+        with aux._client_cache_lock:
+            assert key not in aux._client_cache
+
     def test_probe_mode_does_not_cache_wrapped_client_or_evict_runtime_client(self, tmp_path, monkeypatch):
         """A probe wrapper must not replace a usable runtime client in the shared cache."""
         import agent.auxiliary_client as aux
 
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(aux, "_CLIENT_CACHE_MAX_SIZE", 1)
         runtime_key = aux._client_cache_key("runtime", async_mode=False, model="runtime-model")
         probe_key = aux._client_cache_key("probe", async_mode=False, model="probe-model")
         # Construct the real SDK client without credentials or a network request; the wrapper is
@@ -39,8 +49,15 @@ class TestAuxProbeMode:
             "runtime-model",
         )
 
+        builds = []
+
         def resolve_probe_wrapper(*_args, **_kwargs):
-            return aux.CodexAuxiliaryClient(aux._AuxProbeClientStub(), "probe-model"), "probe-model"
+            client = aux.CodexAuxiliaryClient(
+                aux._create_openai_client(api_key="test", base_url="http://127.0.0.1:9/v1"),
+                "probe-model",
+            )
+            builds.append(client)
+            return client, "probe-model"
 
         aux.shutdown_cached_clients()
         try:
@@ -54,6 +71,16 @@ class TestAuxProbeMode:
             with aux._client_cache_lock:
                 assert aux._client_cache[runtime_key][0] is runtime_client
                 assert probe_key not in aux._client_cache
+            real_client, _ = aux._get_cached_client("probe", "probe-model")
+            assert len(builds) == 2
+            assert real_client is not None
+            assert real_client is not probe_client
+            assert isinstance(probe_client._real_client, aux._AuxProbeClientStub)
+            assert not isinstance(real_client._real_client, aux._AuxProbeClientStub)
+            assert real_client._real_client.responses is not None
+            cached_client, _ = aux._get_cached_client("probe", "probe-model")
+            assert cached_client is real_client
+            assert len(builds) == 2
         finally:
             aux.shutdown_cached_clients()
 
