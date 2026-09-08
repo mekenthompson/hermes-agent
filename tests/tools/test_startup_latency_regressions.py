@@ -25,14 +25,37 @@ class TestAuxProbeMode:
         assert isinstance(client, aux._AuxProbeClientStub)
         assert client.api_key == "k"
 
-    def test_probe_stub_never_cached(self):
+    def test_probe_mode_does_not_cache_wrapped_client_or_evict_runtime_client(self, tmp_path, monkeypatch):
+        """A probe wrapper must not replace a usable runtime client in the shared cache."""
         import agent.auxiliary_client as aux
 
-        stub = aux._AuxProbeClientStub()
-        key = ("probe-test", False, "", "", "", (), False, "", None, "m")
-        aux._store_cached_client(key, stub, "m")
-        with aux._client_cache_lock:
-            assert key not in aux._client_cache
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        runtime_key = aux._client_cache_key("runtime", async_mode=False, model="runtime-model")
+        probe_key = aux._client_cache_key("probe", async_mode=False, model="probe-model")
+        # Construct the real SDK client without credentials or a network request; the wrapper is
+        # the shape returned by Codex/Responses routes during an availability probe.
+        runtime_client = aux.CodexAuxiliaryClient(
+            aux._load_openai_cls()(api_key="test", base_url="http://127.0.0.1:9/v1"),
+            "runtime-model",
+        )
+
+        def resolve_probe_wrapper(*_args, **_kwargs):
+            return aux.CodexAuxiliaryClient(aux._AuxProbeClientStub(), "probe-model"), "probe-model"
+
+        aux.shutdown_cached_clients()
+        try:
+            aux._store_cached_client(runtime_key, runtime_client, "runtime-model")
+            monkeypatch.setattr(aux, "resolve_provider_client", resolve_probe_wrapper)
+            with aux.aux_probe_mode():
+                probe_client, probe_model = aux._get_cached_client("probe", "probe-model")
+
+            assert isinstance(probe_client, aux.CodexAuxiliaryClient)
+            assert probe_model == "probe-model"
+            with aux._client_cache_lock:
+                assert aux._client_cache[runtime_key][0] is runtime_client
+                assert probe_key not in aux._client_cache
+        finally:
+            aux.shutdown_cached_clients()
 
     def test_probe_stub_raises_on_runtime_use(self):
         import agent.auxiliary_client as aux
