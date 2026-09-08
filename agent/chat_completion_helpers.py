@@ -1148,10 +1148,6 @@ def interruptible_api_call(agent, api_kwargs: dict):
     per-request client (interrupts close only that one); a stale-call detector
     kills the connection and raises so the main retry loop can back off / rotate
     credentials / fall back."""
-    # Admission is deliberately at the native request chokepoint, after retries have
-    # selected a route but before any provider bytes are sent.
-    from agent.cost_budget import admit as _admit_cost_budget
-    _admit_cost_budget(agent)
     # Nested-pool contexts (cron, delegated children) wedge on a worker thread
     # (#62151): run inline. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
@@ -3328,8 +3324,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     streaming codex runner; cron turns and delegated children run inline."""
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
-    from agent.cost_budget import admit as _admit_cost_budget
-    _admit_cost_budget(agent)
     if agent.api_mode == "codex_responses":
         return _stream_codex_passthrough(agent, api_kwargs, on_first_delta)
     if agent.api_mode == "bedrock_converse":

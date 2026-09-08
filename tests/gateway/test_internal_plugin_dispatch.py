@@ -10,6 +10,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
+from gateway.run_turn_runner import TurnRunner
 from gateway.session import SessionSource
 from hermes_constants import get_hermes_home
 
@@ -167,6 +168,54 @@ async def test_dispatch_internal_plugin_event_keeps_slash_payload_as_text():
     assert result == "treated as conversation"
     assert event.is_command() is False
     handler.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+async def test_named_execution_with_finite_controls_and_no_financial_fields_reaches_handler():
+    """The core execution capability is bounded by iterations and wall time, not dollars."""
+    runner = object.__new__(GatewayRunner)
+    handler = AsyncMock(return_value="agent construction reached")
+    runner._primary_message_handler = lambda: handler
+    event = _event()
+
+    result = await runner.dispatch_internal_plugin_event(
+        event,
+        execution_id="plugin-exec-finite-controls",
+        execution_policy={"max_iterations": 3, "wall_seconds": 45},
+    )
+
+    assert result == "agent construction reached"
+    assert event._internal_plugin_execution_policy == {
+        "max_iterations": 3,
+        "wall_seconds": 45.0,
+    }
+    handler.assert_awaited_once_with(event)
+
+
+def test_finite_execution_policy_reaches_the_agent_constructor_without_financial_fields():
+    """The actual TurnRunner constructor boundary receives only the two finite controls."""
+    source = SimpleNamespace(
+        user_id="u", user_id_alt=None, user_name="user", chat_id="chat", chat_name="chat",
+        chat_type="dm", thread_id=None,
+    )
+    constructor_calls = []
+    resolver = object.__new__(TurnRunner)
+    resolver._ctx = SimpleNamespace(
+        source=source, user_config={}, internal_plugin_execution_policy={
+            "max_iterations": 3, "wall_seconds": 45.0,
+        }, enabled_toolsets=None, disabled_toolsets=None, session_id="session", session_key="key",
+        AIAgent=lambda **kwargs: constructor_calls.append(kwargs) or object(),
+    )
+    resolver._runner = SimpleNamespace(
+        _prefill_messages=None, _service_tier=None, _session_db=SimpleNamespace(_db=None),
+        _refresh_fallback_model=lambda: None,
+    )
+
+    resolver._build_fresh_agent({"model": "test", "runtime": {}}, "cli", "", 3, None, {}, False)
+
+    assert constructor_calls[0]["max_iterations"] == 3
+    assert constructor_calls[0]["run_budget_seconds"] == 45.0
+    assert not {"estimated_cost_limit_usd", "issue_budget_key"} & constructor_calls[0].keys()
 
 
 @pytest.mark.asyncio

@@ -1,10 +1,11 @@
 """Exact-execution stop contract for profile-local plugin turns."""
 
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -12,6 +13,7 @@ from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway import run as gateway_run
 from gateway.run import GatewayRunner
+from gateway.run_turn_runner import TurnRunner
 from gateway.session import SessionSource
 
 
@@ -287,6 +289,81 @@ async def test_real_internal_plugin_dispatch_retires_normal_handler_execution(
 
 
 @pytest.mark.asyncio
+async def test_real_gateway_handler_executes_settled_builtin_tools_and_releases_receipt(
+    tmp_path, monkeypatch,
+):
+    """A normal internal turn must prove real builtin calls before its receipt releases."""
+    source_file = tmp_path / "real-tool-input.txt"
+    source_file.write_text("real tool lifecycle evidence\n", encoding="utf-8")
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(gateway_run, "_hermes_home", home)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {
+        "api_key": "offline-test", "base_url": "http://127.0.0.1:1/v1",
+        "provider": "openai-compat",
+    })
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", lambda *_args, **_kwargs: 100_000)
+
+    def response(content="", finish_reason="stop", tool_calls=None):
+        message = SimpleNamespace(content=content, tool_calls=tool_calls)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
+            model="offline-test", usage=None,
+        )
+
+    calls = [
+        SimpleNamespace(
+            id="real-read-file", type="function",
+            function=SimpleNamespace(name="read_file", arguments=json.dumps({"path": str(source_file)})),
+        ),
+        SimpleNamespace(
+            id="real-search-files", type="function",
+            function=SimpleNamespace(name="search_files", arguments=json.dumps({
+                "path": str(tmp_path), "pattern": "lifecycle evidence",
+            })),
+        ),
+    ]
+    provider = MagicMock()
+    provider.chat.completions.create.side_effect = [
+        response(finish_reason="tool_calls", tool_calls=calls), response(content="tools completed"),
+    ]
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", lambda **_kwargs: provider)
+
+    runner = GatewayRunner(gateway_run.GatewayConfig())
+    observed = []
+    observe = runner._observe_internal_plugin_tool_event
+
+    def record_lifecycle(*args, **kwargs):
+        if args[1] in {"tool.started", "tool.completed"}:
+            observed.append((args[1], kwargs["tool_call_id"], kwargs["tool_lifetime"]))
+        return observe(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_observe_internal_plugin_tool_event", record_lifecycle)
+    event = _event()
+    result = await runner.dispatch_internal_plugin_event(
+        event, execution_id=_EXECUTION_ID,
+        execution_policy={"max_iterations": 3, "wall_seconds": 45},
+    )
+
+    session_key = runner._session_key_for_source(event.source)
+    receipt = await runner.get_execution_lifecycle(session_key=session_key, execution_id=_EXECUTION_ID)
+    assert result == "tools completed"
+    assert provider.chat.completions.create.call_count == 2
+    assert observed[0:2] == [
+        ("tool.started", "real-read-file", "settled"),
+        ("tool.started", "real-search-files", "settled"),
+    ]
+    assert set(observed[2:]) == {
+        ("tool.completed", "real-read-file", "settled"),
+        ("tool.completed", "real-search-files", "settled"),
+    }
+    assert receipt["state"] == "completed"
+    assert receipt["occupancy"] == "released"
+    assert all(receipt[name] == "none" for name in ("tools", "children", "processes", "remote"))
+
+
+@pytest.mark.asyncio
 async def test_wrapper_cancellation_retains_execution_record(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     runner = object.__new__(GatewayRunner)
@@ -323,8 +400,7 @@ async def test_unknown_effect_tombstone_quarantines_the_session_from_replacement
     runner._observe_internal_plugin_tool_event(_EXECUTION_ID, "tool.started")
     runner._observe_internal_plugin_tool_event(_EXECUTION_ID, "tool.completed")
     record = runner._internal_plugin_execution_records()[_EXECUTION_ID]
-    assert record["active_tool_calls"] == 0
-    assert record["completed_tool_calls"] == 1
+    assert record["tool_lifetime_evidence_invalid"]
     runner._complete_internal_plugin_execution(_EXECUTION_ID, wrapper_completed=True)
 
     assert (await runner.get_execution_lifecycle(
@@ -351,6 +427,89 @@ async def test_completed_no_tool_execution_allows_same_session_replacement():
     replacement._internal_plugin_execution_id = "plugin-exec-002"
     runner._register_internal_plugin_execution(replacement, session_key)
     assert "plugin-exec-002" in runner._internal_plugin_execution_records()
+
+
+def _settled_tool_record(runner, *, lifetime="settled", completed=True):
+    """Drive the same lifecycle events the normal gateway handler receives."""
+    session_key = "local:aggie:linear-session-1"
+    event = _event()
+    event._internal_plugin_execution_id = _EXECUTION_ID
+    state = runner._session_state(session_key)
+    state.persistent.run_generation = 6
+    runner._register_internal_plugin_execution(event, session_key)
+    agent = SimpleNamespace(_active_children=[], _active_children_lock=threading.Lock())
+    state.persistent.run_generation = 7
+    assert runner._promote_running_agent(session_key=session_key, run_generation=7, agent=agent,
+                                          internal_plugin_execution_id=_EXECUTION_ID)
+    done = threading.Event()
+    done.set()
+    runner._track_internal_plugin_execution_worker(
+        _EXECUTION_ID, done, task_id="lifetime-test-task", session_key=session_key,
+        parent_session_id="lifetime-test-parent",
+    )
+    runner._observe_internal_plugin_tool_event(_EXECUTION_ID, "tool.started",
+                                                tool_call_id="call-001", tool_lifetime=lifetime)
+    if completed:
+        runner._observe_internal_plugin_tool_event(_EXECUTION_ID, "tool.completed",
+                                                    tool_call_id="call-001", tool_lifetime=lifetime)
+    return session_key
+
+
+@pytest.mark.asyncio
+async def test_normal_handler_settled_builtin_call_releases_only_after_completed_event(monkeypatch):
+    """The normal TurnRunner callback preserves IDs from a real tool event pair."""
+    runner = object.__new__(GatewayRunner)
+    session_key = _settled_tool_record(runner)
+    normal_handler = object.__new__(TurnRunner)
+    normal_handler._runner = runner
+    normal_handler._ctx = SimpleNamespace(
+        internal_plugin_execution_id=_EXECUTION_ID, log_queue=None, progress_queue=None,
+        _live_status_adapter=None, _run_still_current=lambda: True,
+    )
+    # Replace the helper's direct events with the actual normal-handler event path.
+    record = runner._internal_plugin_execution_records()[_EXECUTION_ID]
+    record["tool_calls"] = {}
+    normal_handler.progress_callback("tool.started", "read_file", "read", {},
+                                     tool_call_id="call-001", tool_lifetime="settled")
+    normal_handler.progress_callback("tool.completed", "read_file", None, None,
+                                     tool_call_id="call-001", tool_lifetime="settled")
+    monkeypatch.setattr("tools.process_registry.process_registry.has_active_processes", lambda _task: False)
+    monkeypatch.setattr("tools.async_delegation.has_live_for_session", lambda **_selectors: False)
+    receipt = await runner.get_execution_lifecycle(session_key=session_key, execution_id=_EXECUTION_ID)
+    assert receipt["occupancy"] == "released"
+    assert receipt["tools"] == "none"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifetime", ["unknown", "may_spawn"])
+async def test_unknown_or_detached_lifetime_remains_occupied(monkeypatch, lifetime):
+    runner = object.__new__(GatewayRunner)
+    session_key = _settled_tool_record(runner, lifetime=lifetime)
+    monkeypatch.setattr("tools.process_registry.process_registry.has_active_processes", lambda _task: False)
+    monkeypatch.setattr("tools.async_delegation.has_live_for_session", lambda **_selectors: False)
+    receipt = await runner.get_execution_lifecycle(session_key=session_key, execution_id=_EXECUTION_ID)
+    assert receipt["occupancy"] == "unknown"
+    assert receipt["tools"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_missing_completed_call_or_checker_error_retains_occupancy(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    session_key = _settled_tool_record(runner, completed=False)
+    monkeypatch.setattr("tools.process_registry.process_registry.has_active_processes", lambda _task: False)
+    monkeypatch.setattr("tools.async_delegation.has_live_for_session", lambda **_selectors: False)
+    receipt = await runner.get_execution_lifecycle(session_key=session_key, execution_id=_EXECUTION_ID)
+    assert receipt["occupancy"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_native_lifetime_checker_error_retains_occupancy(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    session_key = _settled_tool_record(runner)
+    monkeypatch.setattr("tools.process_registry.process_registry.has_active_processes",
+                        lambda _task: (_ for _ in ()).throw(RuntimeError("registry unavailable")))
+    receipt = await runner.get_execution_lifecycle(session_key=session_key, execution_id=_EXECUTION_ID)
+    assert receipt["occupancy"] == "unknown"
 
 
 @pytest.mark.asyncio

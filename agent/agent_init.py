@@ -2209,7 +2209,6 @@ def init_agent(
     checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
     requested_provider: str = None, capabilities: Optional[Dict[str, bool]] = None,
-    cost_budget_policy: Optional[Dict[str, Any]] = None,
 ):
     """Initialize the AI Agent (body of :meth:`AIAgent.__init__`).
 
@@ -2231,9 +2230,6 @@ def init_agent(
         setattr(agent, _name, _params[_name])
     for _name in _GATEWAY_IDENTITY_PARAMS:
         setattr(agent, f"_{_name}", _params[_name])
-    if cost_budget_policy is not None:
-        from agent.cost_budget import configure as _configure_cost_budget
-        _configure_cost_budget(agent, cost_budget_policy)
     # Shared iteration budget: parent creates, children inherit.
     agent._iteration_budget_is_shared = iteration_budget is not None
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)

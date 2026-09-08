@@ -224,6 +224,9 @@ class ToolEntry:
     # — for fields tracking runtime config (delegate_task's description reflects limits).
     dynamic_schema_overrides: Optional[Callable] = None
     inject_invocation_context: bool = False
+    # Lifetime is deliberately separate from handler calling convention.  Only
+    # audited builtins may opt into ``settled``; everything else is unknown.
+    tool_lifetime: str = "unknown"
 
 
 class _PluginOverridePolicy:
@@ -644,7 +647,8 @@ class ToolRegistry:
         check_fn: Callable = None, requires_env: list = None, is_async: bool = False,
         description: str = "", emoji: str = "", max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None, override: bool = False,
-        scope: Optional[str] = None, *, inject_invocation_context: bool = False):
+        scope: Optional[str] = None, *, inject_invocation_context: bool = False,
+        tool_lifetime: str = "unknown"):
         """Register a tool (called at import time by each tool file). ``override=True`` is an
         explicit opt-in for plugins replacing a built-in implementation (e.g. a headed-Chrome
         browser backend); without it, cross-toolset shadowing is rejected.
@@ -653,6 +657,8 @@ class ToolRegistry:
         host-owned :class:`ToolInvocationContext` keyword to the handler. The
         snapshot comes from task-local gateway state, never tool arguments.
         """
+        if tool_lifetime not in {"settled", "may_spawn", "unknown"}:
+            raise ValueError("tool_lifetime must be settled, may_spawn, or unknown")
         handler_owner = self._plugin_owner_of(handler)
         caller_owner = self._plugin_namespace_of_module(self._caller_module())
         owner = caller_owner or handler_owner
@@ -703,7 +709,10 @@ class ToolRegistry:
                 description=description or schema.get("description", ""), emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
-                inject_invocation_context=inject_invocation_context)
+                inject_invocation_context=inject_invocation_context,
+                # Plugins cannot make a lifetime assertion that releases a
+                # gateway execution.  Their contract is always fail-closed.
+                tool_lifetime=tool_lifetime if owner is None else "unknown")
             # Availability is derived per-tool (_toolset_has_exposable_tools), so this map no
             # longer gates a toolset; it still feeds get_toolset_requirements ->
             # TOOLSET_REQUIREMENTS["check_fn"], which banner.py reads (presence only,
@@ -913,6 +922,11 @@ class ToolRegistry:
 
     def get_toolset_for_tool(self, name: str) -> Optional[str]:
         return self._attr(name, "toolset")
+
+    def get_tool_lifetime(self, name: str) -> str:
+        """Return a closed lifetime contract; malformed/missing entries fail closed."""
+        lifetime = self._attr(name, "tool_lifetime")
+        return lifetime if lifetime in {"settled", "may_spawn", "unknown"} else "unknown"
 
     def get_emoji(self, name: str, default: str = "⚡") -> str:
         """Return the emoji for a tool, or *default* if unset."""

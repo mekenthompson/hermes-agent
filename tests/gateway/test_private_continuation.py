@@ -11,6 +11,7 @@ from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource
 
 BINDING = {"profile": "private", "workspace": "w", "issue": "i", "owner": "owner-session"}
+FINITE_CONTROLS = {"max_iterations": 3, "wall_seconds": 45}
 
 
 def test_scope_is_signed_expiring_revocable_and_exactly_bound(tmp_path):
@@ -54,11 +55,14 @@ def _install_owner(gateway, platform):
     return key
 
 
-async def _queued_handle(gateway, platform=Platform.SLACK):
+async def _queued_handle(gateway, platform=Platform.SLACK, execution_policy=None):
     key = _install_owner(gateway, platform)
     token = gateway.mint_private_continuation(binding=BINDING, owner_generation="g", ttl_seconds=60)
     await gateway.enqueue_private_continuation(token=token, binding=BINDING, owner_generation="g", prompt="next", authorize=lambda: True)
-    handle = await gateway.prepare_private_continuation(token=token, binding=BINDING, owner_generation="g", authorize=lambda: True)
+    handle = await gateway.prepare_private_continuation(
+        token=token, binding=BINDING, owner_generation="g", authorize=lambda: True,
+        execution_policy=execution_policy,
+    )
     assert handle.session_key == key
     return token, handle
 
@@ -73,6 +77,21 @@ async def test_prepare_launch_uses_real_runner_normal_handler_and_releases(runne
     assert receipt["state"] == "completed"
     assert receipt["occupancy"] == "released"
     assert all(receipt[k] == "none" for k in ("tools", "children", "processes", "remote"))
+
+
+@pytest.mark.asyncio
+async def test_private_continuation_forwards_the_same_finite_controls(runner):
+    """A continuation does not bypass the bounded execution policy capability."""
+    controls = dict(FINITE_CONTROLS)
+    _, handle = await _queued_handle(runner, Platform.SLACK, execution_policy=controls)
+    controls["max_iterations"] = 999
+
+    assert await runner.launch_private_continuation(handle, authorize=lambda: True) is True
+
+    assert runner._run_agent.await_args.kwargs["internal_plugin_execution_policy"] == {
+        "max_iterations": 3,
+        "wall_seconds": 45.0,
+    }
 
 
 @pytest.mark.asyncio

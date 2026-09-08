@@ -77,8 +77,6 @@ def record_response_usage(
     # must remain observable.
     agent.session_api_calls += 1
     if not (hasattr(response, 'usage') and response.usage):
-        from agent.cost_budget import reconcile as _reconcile_cost_budget
-        _reconcile_cost_budget(agent, None, known=False)
         if getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage -> cannot adjudicate the prior compaction; consume the
             # pending verdict so later readings aren't charged to it and
@@ -237,8 +235,6 @@ def record_response_usage(
             _cost_delta = (_cost_delta or 0.0) + _moa_cost
     agent.session_cost_status = cost_result.status
     agent.session_cost_source = cost_result.source
-    from agent.cost_budget import reconcile as _reconcile_cost_budget
-    _reconcile_cost_budget(agent, _cost_delta, known=_cost_delta is not None)
 
     # Persist per-call token deltas for any session_id so non-CLI runs can't lose
     # accounting; gateway/session-store writes use absolute totals and safely overwrite

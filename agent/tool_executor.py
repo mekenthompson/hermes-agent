@@ -922,7 +922,10 @@ def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -
         except Exception as callback_error:
             logging.debug("Tool progress callback error: %s", callback_error)
         else:
-            _safe_callback(agent.tool_progress_callback, "Tool progress", "tool.started", function_name, preview, display_args)
+            _safe_callback(
+                agent.tool_progress_callback, "Tool progress", "tool.started", function_name, preview, display_args,
+                tool_call_id=tool_call_id, tool_lifetime=_tool_lifetime(function_name),
+            )
     _safe_callback(agent.tool_start_callback, "Tool start", tool_call_id, function_name, display_args)
 
     if not agent._checkpoint_mgr.enabled:
@@ -1034,8 +1037,18 @@ def _commit_tool_result(
         _safe_callback(
             agent.tool_progress_callback, "Tool progress",
             "tool.completed", function_name, None, None, duration=tool_duration, is_error=is_error, result=function_result,
+            tool_call_id=tool_call_id, tool_lifetime=_tool_lifetime(function_name),
         )
     return persisted_result, function_result, tool_message.get("_tool_output_risk")
+
+
+def _tool_lifetime(function_name: str) -> str:
+    """Resolve only registry-declared builtin lifetime metadata; every other path is unknown."""
+    try:
+        from tools.registry import registry
+        return registry.get_tool_lifetime(function_name)
+    except Exception:
+        return "unknown"
 
 
 def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tools: int, budget: BudgetConfig) -> None:

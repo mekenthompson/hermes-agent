@@ -88,7 +88,10 @@ class TurnRunner:
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
         if ctx.internal_plugin_execution_id is not None:
-            self._runner._observe_internal_plugin_tool_event(ctx.internal_plugin_execution_id, event_type)
+            self._runner._observe_internal_plugin_tool_event(
+                ctx.internal_plugin_execution_id, event_type,
+                tool_call_id=kwargs.get("tool_call_id"), tool_lifetime=kwargs.get("tool_lifetime"),
+            )
         # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
         # gate: platforms with tool_progress off must still hear about a dead delegation.
         if event_type == "subagent.complete":
@@ -938,17 +941,9 @@ class TurnRunner:
                     with suppress(KeyError):
                         cache.move_to_end(ctx.session_key)
                 self._runner._init_cached_agent_for_turn(out.agent, ctx._interrupt_depth)
-                # Cached agents retain constructor state. Refresh every per-execution
-                # capability explicitly; no limit may leak into a later execution.
+                # Cached agent may have been created with old config.
                 out.agent.max_iterations = max_iterations
-                policy = ctx.internal_plugin_execution_policy
-                if not hasattr(out.agent, "_gateway_default_run_budget_seconds"):
-                    out.agent._gateway_default_run_budget_seconds = out.agent.run_budget_seconds
-                out.agent.run_budget_seconds = (
-                    policy["wall_seconds"] if policy is not None else out.agent._gateway_default_run_budget_seconds
-                )
-                from agent.cost_budget import configure as _configure_cost_budget
-                _configure_cost_budget(out.agent, policy)
+                out.agent.run_budget_seconds = (ctx.internal_plugin_execution_policy or {}).get("wall_seconds")
                 logger.debug("Reusing cached agent for session %s", ctx.session_key)
                 out.reused = True
                 return out
@@ -972,7 +967,6 @@ class TurnRunner:
             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
             max_iterations=max_iterations, quiet_mode=True, verbose_logging=False,
             run_budget_seconds=(ctx.internal_plugin_execution_policy or {}).get("wall_seconds"),
-            cost_budget_policy=ctx.internal_plugin_execution_policy,
             enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=ctx.disabled_toolsets,
             ephemeral_system_prompt=combined_ephemeral or None,
             prefill_messages=runner._prefill_messages or None,

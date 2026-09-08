@@ -3140,7 +3140,10 @@ class GatewayTurnMixin:
         )
         execution_id = getattr(turn_ctx, "internal_plugin_execution_id", None)
         if execution_id is not None:
-            self._track_internal_plugin_execution_worker(execution_id, worker.worker_done)
+            self._track_internal_plugin_execution_worker(
+                execution_id, worker.worker_done, task_id=_turn_task_id,
+                session_key=session_key, parent_session_id=turn_ctx.session_id or "",
+            )
         return worker
 
     @staticmethod

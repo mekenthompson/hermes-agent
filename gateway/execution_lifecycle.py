@@ -12,7 +12,7 @@ import re
 from typing import Any, Optional
 
 _EXECUTION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_POLICY_FIELDS = {"max_iterations", "wall_seconds", "estimated_cost_limit_usd", "issue_budget_key"}
+_POLICY_FIELDS = {"max_iterations", "wall_seconds"}
 LIFECYCLE_VERSION = "execution-lifecycle/v2"
 
 
@@ -22,19 +22,14 @@ def validate_internal_execution_policy(value: object) -> dict:
         raise ValueError("internal execution policy fields are invalid")
     max_iterations = value["max_iterations"]
     wall_seconds = value["wall_seconds"]
-    cost_limit = value["estimated_cost_limit_usd"]
-    budget_key = value["issue_budget_key"]
     finite_positive = lambda item: (not isinstance(item, bool) and isinstance(item, (int, float))
                                     and math.isfinite(float(item)) and float(item) > 0)
     if (type(max_iterations) is not int or max_iterations < 1
-            or not finite_positive(wall_seconds) or not finite_positive(cost_limit)
-            or not isinstance(budget_key, str) or not budget_key.strip()):
-        raise ValueError("internal execution policy requires positive finite limits and issue_budget_key")
+            or not finite_positive(wall_seconds)):
+        raise ValueError("internal execution policy requires positive finite limits")
     return {
         "max_iterations": max_iterations,
         "wall_seconds": float(wall_seconds),
-        "estimated_cost_limit_usd": float(cost_limit),
-        "issue_budget_key": budget_key.strip(),
     }
 
 
@@ -63,7 +58,8 @@ class GatewayExecutionLifecycleMixin:
             "generation": int(state.persistent.run_generation) + 1 if state else 1,
             "agent": None, "accepted": False, "stop_requested": False,
             "worker_done": None, "worker_started": False, "observed_tool": False,
-            "active_tool_calls": 0, "completed_tool_calls": 0,
+            "tool_calls": {}, "tool_lifetime_evidence_invalid": False,
+            "task_id": "", "parent_session_id": "",
         }
 
     def _bind_internal_plugin_execution(self, execution_id: Optional[str], *, session_key: str,
@@ -96,7 +92,10 @@ class GatewayExecutionLifecycleMixin:
                                                      session_key=session_key,
                                                      run_generation=run_generation, agent=agent)
 
-    def _track_internal_plugin_execution_worker(self, execution_id: Optional[str], worker_done: Any) -> None:
+    def _track_internal_plugin_execution_worker(
+        self, execution_id: Optional[str], worker_done: Any, *, task_id: str = "",
+        session_key: str = "", parent_session_id: str = "",
+    ) -> None:
         """Attach the physical worker completion Event, never an await-wrapper Task.
 
         Cancelling an asyncio wrapper around ``to_thread`` marks its Task done while the OS
@@ -106,16 +105,32 @@ class GatewayExecutionLifecycleMixin:
         if record is not None:
             record["worker_done"] = worker_done
             record["worker_started"] = True
+            if session_key != record["session_key"]:
+                record["tool_lifetime_evidence_invalid"] = True
+            record["task_id"] = task_id
+            record["parent_session_id"] = parent_session_id
 
-    def _observe_internal_plugin_tool_event(self, execution_id: Optional[str], event_type: str) -> None:
+    def _observe_internal_plugin_tool_event(
+        self, execution_id: Optional[str], event_type: str, *, tool_call_id: Optional[str] = None,
+        tool_lifetime: Optional[str] = None,
+    ) -> None:
         record = self._internal_plugin_execution_records().get(execution_id)
-        if record is not None:
-            if event_type == "tool.started":
-                record["observed_tool"] = True
-                record["active_tool_calls"] += 1
-            elif event_type == "tool.completed" and record["active_tool_calls"]:
-                record["active_tool_calls"] -= 1
-                record["completed_tool_calls"] += 1
+        if record is None or event_type not in {"tool.started", "tool.completed"}:
+            return
+        record["observed_tool"] = True
+        if not isinstance(tool_call_id, str) or not tool_call_id or tool_lifetime not in {"settled", "may_spawn", "unknown"}:
+            record["tool_lifetime_evidence_invalid"] = True
+            return
+        calls = record["tool_calls"]
+        if event_type == "tool.started":
+            if tool_call_id in calls:
+                record["tool_lifetime_evidence_invalid"] = True
+                return
+            calls[tool_call_id] = {"lifetime": tool_lifetime, "completed": False}
+        elif tool_call_id not in calls or calls[tool_call_id]["completed"] or calls[tool_call_id]["lifetime"] != tool_lifetime:
+            record["tool_lifetime_evidence_invalid"] = True
+        else:
+            calls[tool_call_id]["completed"] = True
 
     @staticmethod
     def _worker_finished(record: dict) -> bool:
@@ -132,10 +147,7 @@ class GatewayExecutionLifecycleMixin:
             retired[execution_id] = {
                 "session_key": record["session_key"], "execution_id": execution_id,
                 "generation": record["generation"], "state": state, "occupancy": occupancy,
-                "tools": "unknown" if record["observed_tool"] else "none",
-                "children": "unknown" if record["observed_tool"] else "none",
-                "processes": "unknown" if record["observed_tool"] else "none",
-                "remote": "unknown" if record["observed_tool"] else "none",
+                **self._lifetime_dimensions(record, settled=occupancy == "released"),
             }
             # Do not evict unknown receipts: losing this evidence would falsely
             # report a quarantined execution as not_running/not_occupied.
@@ -157,10 +169,51 @@ class GatewayExecutionLifecycleMixin:
         if record is None or (record["worker_started"] and not self._worker_finished(record)) or (
                 not record["worker_started"] and not wrapper_completed):
             return
-        self._retire_internal_plugin_execution(
-            execution_id, state="completed",
-            occupancy="unknown" if record["observed_tool"] else "released",
-        )
+        settled = self._execution_lifetimes_settled(record)
+        self._retire_internal_plugin_execution(execution_id, state="completed",
+                                                occupancy="released" if settled else "unknown")
+
+    @staticmethod
+    def _lifetime_dimensions(record: dict, *, settled: bool) -> dict:
+        if settled:
+            # Receipt v2's "none" means no outstanding lifetime, not no calls observed.
+            return {"tools": "none", "children": "none", "processes": "none", "remote": "none"}
+        return {"tools": "unknown" if record["observed_tool"] else "none",
+                "children": "unknown" if record["observed_tool"] else "none",
+                "processes": "unknown" if record["observed_tool"] else "none",
+                "remote": "unknown" if record["observed_tool"] else "none"}
+
+    def _execution_lifetimes_settled(self, record: dict) -> bool:
+        """Fail closed unless each real call and every native lifetime checker agrees."""
+        if not record["observed_tool"]:
+            return True
+        calls = record["tool_calls"]
+        if record["tool_lifetime_evidence_invalid"] or not calls:
+            return False
+        if any(call["lifetime"] != "settled" or not call["completed"] for call in calls.values()):
+            return False
+        if not record["task_id"] or not record["session_key"] or not record["parent_session_id"]:
+            return False
+        try:
+            agent = record["agent"]
+            children = getattr(agent, "_active_children")
+            if not isinstance(children, (list, tuple, set)):
+                return False
+            lock = getattr(agent, "_active_children_lock", None)
+            if lock is None:
+                return False
+            with lock:
+                if children:
+                    return False
+            from tools.process_registry import process_registry
+            from tools.async_delegation import has_live_for_session
+            if process_registry.has_active_processes(record["task_id"]):
+                return False
+            if has_live_for_session(session_key=record["session_key"], parent_session_id=record["parent_session_id"]):
+                return False
+        except Exception:
+            return False
+        return True
 
     async def dispatch_internal_plugin_event(
         self, event, *, execution_id: Optional[str] = None, execution_policy: Optional[dict] = None,
@@ -184,6 +237,8 @@ class GatewayExecutionLifecycleMixin:
         elif (existing["session_key"] != session_key
               or existing["generation"] != getattr(private_continuation_grant, "generation", None)):
             raise ValueError("internal plugin execution reservation is stale")
+        if self._internal_plugin_execution_records()[execution_id]["stop_requested"]:
+            return None
         try:
             result = await super().dispatch_internal_plugin_event(
                 event, execution_id=execution_id, execution_policy=execution_policy,
@@ -220,7 +275,6 @@ class GatewayExecutionLifecycleMixin:
         if agent is None or agent is _AGENT_PENDING_SENTINEL:
             record["stop_requested"] = True
             record["accepted"] = True
-            self._retire_internal_plugin_execution(execution_id, state="stopped", occupancy="released")
             return {"status": "accepted", **receipt}
         if state.turn.agent is not agent or not request_hard_interrupt(agent, reason):
             return {"status": "not_delivered", **receipt}
@@ -228,7 +282,7 @@ class GatewayExecutionLifecycleMixin:
         return {"status": "accepted", **receipt}
 
     async def get_execution_lifecycle(self, *, session_key: str, execution_id: str) -> dict:
-        """Observation ABI v2; `released` requires actual worker completion and no tool event."""
+        """Observation ABI v2; `released` requires physical completion and proven settled lifetimes."""
         execution_id = self._validate_internal_plugin_execution_id(execution_id)
         receipt = {"lifecycle_version": LIFECYCLE_VERSION, "session_key": session_key, "execution_id": execution_id}
         record = self._internal_plugin_execution_records().get(execution_id)
@@ -245,10 +299,10 @@ class GatewayExecutionLifecycleMixin:
         if record["worker_started"] and self._worker_finished(record):
             self._complete_internal_plugin_execution(execution_id)
             return await self.get_execution_lifecycle(session_key=session_key, execution_id=execution_id)
-        state = "stop_requested" if record["stop_requested"] else ("interrupt_accepted" if record["accepted"] else "running")
-        return {"state": state, "occupancy": "occupied", "generation": record["generation"],
+        stopped_before_agent = record["stop_requested"] and record["agent"] is None
+        state = "stopped" if stopped_before_agent else (
+            "stop_requested" if record["stop_requested"] else ("interrupt_accepted" if record["accepted"] else "running")
+        )
+        return {"state": state, "occupancy": "released" if stopped_before_agent else "occupied", "generation": record["generation"],
                 "agent_bound": record["agent"] is not None,
-                "tools": "unknown" if record["observed_tool"] else "none",
-                "children": "unknown" if record["observed_tool"] else "none",
-                "processes": "unknown" if record["observed_tool"] else "none",
-                "remote": "unknown" if record["observed_tool"] else "none", **receipt}
+                **self._lifetime_dimensions(record, settled=False), **receipt}

@@ -280,10 +280,15 @@ class GatewayPrivateContinuationMixin:
         return event, entry.session_key, grant
 
     async def prepare_private_continuation(self, *, token: str, binding: dict[str, str],
-                                           owner_generation: str, authorize: Callable[[], bool]) -> PrivateContinuationExecution:
+                                           owner_generation: str, authorize: Callable[[], bool],
+                                           execution_policy: dict | None = None) -> PrivateContinuationExecution:
         """Reserve one durable continuation and return its Stop/lifecycle identity before launch."""
         if not callable(authorize) or authorize() is not True:
             raise ContinuationDenied("continuation requester is not authorized")
+        if execution_policy is not None:
+            from gateway.execution_lifecycle import validate_internal_execution_policy
+            # Keep a private canonical copy: callers cannot loosen a reserved execution later.
+            execution_policy = dict(validate_internal_execution_policy(execution_policy))
         store = self._private_continuation_store(binding)
         item = store.take(token=token, binding=binding, owner_generation=owner_generation)
         if item is None:
@@ -300,7 +305,9 @@ class GatewayPrivateContinuationMixin:
             event._internal_plugin_execution_id = execution_id
             self._register_internal_plugin_execution(event, session_key)
             handle = PrivateContinuationExecution(execution_id, session_key, grant.generation)
-            self.__dict__.setdefault("_prepared_private_continuations", {})[id(handle)] = (handle, grant, store)
+            self.__dict__.setdefault("_prepared_private_continuations", {})[id(handle)] = (
+                handle, grant, store, execution_policy,
+            )
             return handle
         except Exception:
             if grant is not None:
@@ -315,7 +322,7 @@ class GatewayPrivateContinuationMixin:
         if (not isinstance(handle, PrivateContinuationExecution) or prepared is None
                 or prepared[0] is not handle):
             raise ContinuationDenied("private continuation handle is unavailable")
-        _, grant, store = prepared
+        _, grant, store, execution_policy = prepared
         if not callable(authorize) or authorize() is not True:
             raise ContinuationDenied("continuation requester is not authorized")
         receipt = await self.get_execution_lifecycle(
@@ -329,7 +336,8 @@ class GatewayPrivateContinuationMixin:
             raise ContinuationDenied("private continuation reservation is stale")
         try:
             await self.dispatch_internal_plugin_event(
-                grant.event, execution_id=handle.execution_id, private_continuation_grant=grant
+                grant.event, execution_id=handle.execution_id, execution_policy=execution_policy,
+                private_continuation_grant=grant,
             )
         except Exception:
             store.mark_ambiguous(grant.item_id)
@@ -350,11 +358,12 @@ class GatewayPrivateContinuationMixin:
         return True
 
     async def drain_private_continuation(self, *, token: str, binding: dict[str, str], owner_generation: str,
-                                         authorize: Callable[[], bool]) -> bool:
+                                         authorize: Callable[[], bool], execution_policy: dict | None = None) -> bool:
         """Compatibility one-shot prepare and launch for a private continuation."""
         try:
             handle = await self.prepare_private_continuation(
-                token=token, binding=binding, owner_generation=owner_generation, authorize=authorize
+                token=token, binding=binding, owner_generation=owner_generation, authorize=authorize,
+                execution_policy=execution_policy,
             )
         except ContinuationDenied as exc:
             if str(exc) == "private continuation is unavailable":
