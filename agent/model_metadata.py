@@ -527,6 +527,28 @@ _ENDPOINT_SCOPED_CONTEXT = (
 )
 
 
+_PROVIDER_SCOPED_CONTEXT = (
+    # Claude ACP emits logical handles, not Anthropic API IDs. The annotation is
+    # meaningful only on this transport, never for another provider's similarly
+    # named model.
+    ("claude-acp", "acp://claude", {"opus[1m]"}, 1_000_000),
+)
+
+
+def _provider_scoped_context_length(model: str, provider: str, base_url: str) -> Optional[int]:
+    """Return a context window confirmed for one provider and transport only."""
+    provider_key = (provider or "").strip().lower()
+    endpoint_key = (base_url or "").strip().rstrip("/").lower()
+    model_key = model.strip().lower()
+    return next(
+        (
+            ctx for scoped_provider, scoped_endpoint, models, ctx in _PROVIDER_SCOPED_CONTEXT
+            if provider_key == scoped_provider and endpoint_key == scoped_endpoint and model_key in models
+        ),
+        None,
+    )
+
+
 def _endpoint_scoped_context_length(model: str, base_url: str) -> Optional[int]:
     """Context confirmed for one provider endpoint only (see _ENDPOINT_SCOPED_CONTEXT): Kimi Coding
     serves K3 at 1 Mi only on the canonical ``api.kimi.com/coding`` host (legacy Moonshot keys do
@@ -1884,6 +1906,9 @@ def get_model_context_length(
     endpoint_context = _endpoint_scoped_context_length(model, base_url)
     if endpoint_context is not None:
         return endpoint_context
+    provider_context = _provider_scoped_context_length(model, provider, base_url)
+    if provider_context is not None:
+        return provider_context
     is_bedrock_context = provider == "bedrock" or (
         base_url and base_url_hostname(base_url).startswith("bedrock-runtime.") and base_url_host_matches(base_url, "amazonaws.com")
     )

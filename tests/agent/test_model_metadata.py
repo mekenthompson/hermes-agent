@@ -1101,6 +1101,21 @@ class TestGetModelContextLength:
 
 
 
+    def test_acp_annotated_model_resolves_declared_context_window(self):
+        """ACP's ``[1m]`` model identifier is adapter metadata, not a quota guess."""
+        assert get_model_context_length(
+            "opus[1m]", provider="claude-acp", base_url="acp://claude"
+        ) == 1_000_000
+
+    @pytest.mark.parametrize("provider", ["openai", "custom", "anthropic"])
+    def test_acp_annotation_does_not_grant_context_to_other_providers(self, provider):
+        """The adapter annotation is valid only for Claude ACP's transport."""
+        with (
+            patch("agent.model_metadata._query_anthropic_context_length", return_value=None),
+            patch("agent.model_metadata._resolve_provider_aware_context_length", return_value=None),
+        ):
+            assert get_model_context_length("opus[1m]", provider=provider) != 1_000_000
+
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_custom_endpoint_falls_back_to_hardcoded_catalog(self, mock_fetch):
         """Custom/proxied endpoint that fails all probes should still resolve
