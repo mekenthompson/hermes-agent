@@ -210,6 +210,7 @@ def _card_state(adapter: _CardAdapter):
         visible_tasks=lambda: [{"text": "step"}],
         fallback_text=lambda: "step",
         adapter=adapter,
+        title="Tasks",
     )
 
 
