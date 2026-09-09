@@ -14,7 +14,9 @@ import queue
 import re
 import shlex
 import subprocess
+import signal
 import threading
+import tempfile
 import time
 from collections import deque
 from pathlib import Path
@@ -23,6 +25,8 @@ from typing import Any
 
 from agent.acp_openai_bridge import (
     completion_to_stream_chunks as _completion_to_stream_chunks,
+    LiveStream,
+    TextProgress,
     extract_tool_calls_from_text as _extract_tool_calls_from_text,
     render_tool_bridge_sections as _render_tool_bridge_sections,
 )
@@ -77,7 +81,7 @@ def _resolve_args() -> list[str]:
     return shlex.split(os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()) or ["--acp", "--stdio"]
 
 
-def _acp_supported(command: str, args: list[str]) -> bool | None:
+def _acp_supported(command: str, args: list[str], timeout: float = 5, cancelled=None) -> bool | None:
     """Tri-state ``--acp`` probe (a CLI without the flag exits 1 and the parent would wait the
     full child timeout for stdout that never arrives). True = help advertises --acp; False =
     help ran cleanly without it (caller fast-fails); None = inconclusive (binary missing /
@@ -87,10 +91,7 @@ def _acp_supported(command: str, args: list[str]) -> bool | None:
     if (cached := _ACP_PROBE_CACHE.get(command)) is not None:
         return cached
     try:
-        probe = subprocess.run(
-            [command, "--help"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
-            stdin=subprocess.DEVNULL,
-        )
+        probe = _probe_help(command, timeout, cancelled)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
     if probe.returncode != 0:
@@ -98,6 +99,32 @@ def _acp_supported(command: str, args: list[str]) -> bool | None:
     # ``--acp`` as a flag token; tolerate spacing and ``[--acp]`` variants.
     verdict = _ACP_PROBE_CACHE[command] = bool(re.search(r"(?:^|[\s\[])--acp(?:[\s=\],]|$)", probe.stdout, re.MULTILINE))
     return verdict
+
+
+def _probe_help(command: str, timeout: float, cancelled=None):
+    """Wait on the leader, never drain inherited pipes after a help timeout."""
+    with tempfile.TemporaryFile() as output:
+        proc = subprocess.Popen([command, "--help"], stdout=output, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=os.name == "posix")
+        try:
+            deadline = time.monotonic() + timeout
+            while proc.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or (cancelled is not None and cancelled.is_set()):
+                    raise subprocess.TimeoutExpired(command, timeout)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=min(0.05, remaining))
+            output.seek(0)
+            return subprocess.CompletedProcess([command, "--help"], proc.returncode,
+                stdout=output.read(1024 * 1024).decode("utf-8", errors="replace"))
+        finally:
+            if os.name == "posix":
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — guarded by os.name == "posix" above
+            elif proc.poll() is None:
+                proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=0.2)
 
 
 def _resolve_home_dir() -> str:
@@ -201,12 +228,19 @@ def _ensure_path_within_cwd(path_text: str, cwd: str) -> Path:
     return resolved
 
 
-def _effective_timeout(timeout: Any) -> float:
-    """Normalise a float or httpx.Timeout-like object to wall-clock seconds (largest component wins)."""
-    if isinstance(timeout, (int, float)):
-        return float(timeout)
-    candidates = [getattr(timeout, attr, None) for attr in ("read", "write", "connect", "pool", "timeout")]
-    return max((float(v) for v in candidates if isinstance(v, (int, float))), default=_DEFAULT_TIMEOUT_SECONDS)
+def _effective_timeout(value: Any) -> float:
+    """Scalar budgets bound the whole call; HTTP objects use their inference/read budget.
+
+    Connect and pool budgets are not model-generation limits. When read is
+    unspecified, an explicit total or write budget wins before the ACP default.
+    """
+    if isinstance(value, (int, float)):
+        return max(0.01, float(value))
+    for field in ("read", "timeout", "write"):
+        seconds = getattr(value, field, None)
+        if isinstance(seconds, (int, float)):
+            return max(0.01, float(seconds))
+    return _DEFAULT_TIMEOUT_SECONDS
 
 
 def _fs_read_text_file(params: dict[str, Any], cwd: str) -> Any:
@@ -260,26 +294,99 @@ class CopilotACPClient:
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat_completion))
         self.is_closed, self._active_process = False, None
-        self._active_process_lock = threading.Lock()
+        self._active_process_lock = threading.RLock()
+        self._request_lock = threading.Lock()
+        self._io_lock = threading.Lock()
+        self._cancelled = threading.Event()
+        self._deadline = float("inf")
+
+    def hermes_abort_request(self) -> None:
+        """Thread-safe process cancellation for the core request lifecycle."""
+        self.close()
 
     def close(self) -> None:
         with self._active_process_lock:
+            self._cancelled.set()
             proc, self._active_process = self._active_process, None
-        self.is_closed = True
-        try:
-            if proc is not None:
-                proc.terminate()
-                proc.wait(timeout=2)
-        except Exception:
+            self.is_closed = True
+        if proc is None:
+            return
+        if os.name == "posix":
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok — guarded by os.name == "posix" above
+        else:
             with contextlib.suppress(Exception):
-                proc.kill()
+                proc.terminate()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=2)
+        if os.name == "posix":
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — guarded by os.name == "posix" above
+        elif proc.poll() is None:
+            proc.kill()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=1)
+        # Readers close their own wrappers: closing from here can wait forever
+        # on a reader lock if a descendant inherited stdout (notably on Windows).
+        if self._io_lock.acquire(blocking=False):
+            try:
+                if proc.stdin:
+                    with contextlib.suppress(Exception):
+                        proc.stdin.close()
+            finally:
+                self._io_lock.release()
+
+    def _send(self, proc, message) -> None:
+        cancelled = self._cancelled
+        done = threading.Event()
+        errors = []
+        def write():
+            try:
+                with self._io_lock:
+                    proc.stdin.write(json.dumps(message) + "\n")
+                    proc.stdin.flush()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                if cancelled.is_set() and proc.stdin:
+                    with contextlib.suppress(Exception):
+                        proc.stdin.close()
+                done.set()
+        if cancelled.is_set() or time.monotonic() >= self._deadline:
+            raise TimeoutError("ACP request cancelled or deadline exceeded")
+        threading.Thread(target=write, daemon=True).start()
+        while not done.wait(min(0.01, max(0, self._deadline - time.monotonic()))):
+            if cancelled.is_set() or time.monotonic() >= self._deadline:
+                raise TimeoutError("ACP write cancelled or deadline exceeded")
+        if errors:
+            raise errors[0]
 
     def _create_chat_completion(
         self, *, model: str | None = None, messages: list[dict[str, Any]] | None = None, timeout: float | None = None,
         tools: list[dict[str, Any]] | None = None, tool_choice: Any = None, stream: bool = False, **_: Any,
     ) -> Any:
+        if not self._request_lock.acquire(blocking=False):
+            raise RuntimeError("ACP client already has an active request")
+        with self._active_process_lock:
+            self._cancelled = cancelled = threading.Event()
+            self._deadline = time.monotonic() + _effective_timeout(timeout)
+
+        def cancel():
+            with self._active_process_lock:
+                if self._cancelled is cancelled:
+                    self.close()
+
+        def complete(publish=None):
+            try:
+                return self._complete(model, messages, tools, tool_choice, publish)
+            finally:
+                self._request_lock.release()
+        return LiveStream(complete, cancel, model or "copilot-acp", self._deadline) if stream else complete()
+
+    def _complete(self, model, messages, tools, tool_choice, publish):
         prompt_text = _format_messages_as_prompt(messages or [], model=model, tools=tools, tool_choice=tool_choice)
-        response_text, reasoning = self._run_prompt(prompt_text, timeout_seconds=_effective_timeout(timeout), model=model)
+        response_text, reasoning = self._run_prompt(prompt_text,
+            timeout_seconds=max(0, self._deadline - time.monotonic()), model=model, publish=publish)
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
         message = SimpleNamespace(
             content=cleaned_text, tool_calls=tool_calls, reasoning=reasoning or None, reasoning_content=reasoning or None,
@@ -290,12 +397,12 @@ class CopilotACPClient:
             usage=SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0, prompt_tokens_details=SimpleNamespace(cached_tokens=0)),
             model=model or "copilot-acp",
         )
-        return _completion_to_stream_chunks(completion) if stream else completion
+        return completion
 
     def _spawn(self) -> subprocess.Popen[str]:
         # Fast-fail when the CLI rejects --acp (else the parent waits the full child timeout for stdout that
         # never arrives). ``None`` falls through to the spawn's established start error.
-        if _acp_supported(self._acp_command, self._acp_args) is False:
+        if _acp_supported(self._acp_command, self._acp_args, timeout=max(0.01, min(5, self._deadline - time.monotonic())), cancelled=self._cancelled) is False:
             preview = " ".join(self._acp_args[:3]) if self._acp_args else "(none)"
             raise RuntimeError(
                 f"ACP transport not supported by '{self._acp_command}': `{preview}` is rejected as an unknown option. This "
@@ -303,6 +410,8 @@ class CopilotACPClient:
                 "install a CLI that ships with --acp support (e.g. `@github/copilot` late 2025+), or set "
                 "HERMES_COPILOT_ACP_COMMAND / HERMES_COPILOT_ACP_ARGS to a working pair."
             )
+        if self._cancelled.is_set() or time.monotonic() >= self._deadline:
+            raise TimeoutError("ACP request cancelled or deadline exceeded")
         try:
             from hermes_cli._subprocess_compat import windows_hide_flags  # hide the Windows console flash (#56747); pipes intact for the ACP wire
 
@@ -311,7 +420,7 @@ class CopilotACPClient:
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding='utf-8', errors='replace', bufsize=1, cwd=self._acp_cwd, env=_build_subprocess_env(),
-                creationflags=windows_hide_flags(),
+                creationflags=windows_hide_flags(), start_new_session=os.name == "posix",
             )
         except FileNotFoundError as exc:
             raise RuntimeError(f"Could not start Copilot ACP command '{self._acp_command}'. Install GitHub Copilot CLI or set "
@@ -322,14 +431,29 @@ class CopilotACPClient:
         self.is_closed = False
         with self._active_process_lock:
             self._active_process = proc
+            cancelled = self._cancelled.is_set()
+        if cancelled:
+            self.close()
+            raise RuntimeError("ACP request cancelled")
         return proc
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None) -> tuple[str, str]:
+    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None, publish=None) -> tuple[str, str]:
         # The CLI's `--model` spawn flag is deliberately NOT used: `copilot --acp` validates it (unknown id
         # aborts the spawn) but ignores it for the session; the model is applied after session/new instead.
         requested_model = str(model or "").strip()
+        self._deadline = min(self._deadline, time.monotonic() + timeout_seconds)
         proc = self._spawn()
-        inbox: queue.Queue[dict[str, Any]] = queue.Queue()
+        stopped = threading.Event()
+        inbox: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=256)
+
+        def enqueue(value):
+            while not stopped.is_set() and not self._cancelled.is_set():
+                try:
+                    inbox.put(value, timeout=0.05)
+                    return True
+                except queue.Full:
+                    continue
+            return False
         stderr_tail: deque[str] = deque(maxlen=40)
 
         def _decode(line: str) -> dict[str, Any]:
@@ -339,25 +463,39 @@ class CopilotACPClient:
                 return {"raw": line.rstrip("\n")}
 
         def _pump(stream, sink) -> None:
-            for line in stream or ():
-                sink(line)
+            try:
+                for line in stream or ():
+                    if stopped.is_set() or sink(line) is False:
+                        return
+            finally:
+                if stream:
+                    stream.close()
 
-        threading.Thread(target=_pump, args=(proc.stdout, lambda line: inbox.put(_decode(line))), daemon=True).start()
-        threading.Thread(target=_pump, args=(proc.stderr, lambda line: stderr_tail.append(line.rstrip("\n"))), daemon=True).start()
+        pumps = [
+            threading.Thread(target=_pump, args=(proc.stdout, lambda line: enqueue(_decode(line))), daemon=True, name="acp-pump"),
+            threading.Thread(target=_pump, args=(proc.stderr, lambda line: stderr_tail.append(line.rstrip("\n"))), daemon=True, name="acp-pump"),
+        ]
+        for thread in pumps:
+            thread.start()
         request_ids = iter(range(1, 1 << 62))
+        text_progress = TextProgress()
+
+        def publish_update(text, reasoning):
+            if publish:
+                publish(text if reasoning else text_progress.feed(text), reasoning)
+
 
         def _request(method: str, params: dict[str, Any], *, text_parts: list[str] | None = None, reasoning_parts: list[str] | None = None) -> Any:
             request_id = next(request_ids)
-            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n")
-            proc.stdin.flush()
-            deadline = time.monotonic() + timeout_seconds
-            while time.monotonic() < deadline and proc.poll() is None:
+            self._send(proc, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+            deadline = self._deadline
+            while time.monotonic() < deadline and proc.poll() is None and not self._cancelled.is_set():
                 try:
-                    msg = inbox.get(timeout=0.1)
+                    msg = inbox.get(timeout=max(0, min(0.05, deadline - time.monotonic())))
                 except queue.Empty:
                     continue
                 if self._handle_server_message(
-                    msg, process=proc, cwd=self._acp_cwd, text_parts=text_parts, reasoning_parts=reasoning_parts
+                    msg, process=proc, cwd=self._acp_cwd, text_parts=text_parts, reasoning_parts=reasoning_parts, publish=publish_update if publish else None
                 ) or msg.get("id") != request_id:
                     continue
                 if "error" in msg:
@@ -391,10 +529,13 @@ class CopilotACPClient:
             _request("session/prompt", prompt, text_parts=text_parts, reasoning_parts=reasoning_parts)
             return "".join(text_parts), "".join(reasoning_parts)
         finally:
+            stopped.set()
             self.close()
+            for thread in pumps:
+                thread.join(timeout=0.2)
 
     def _handle_server_message(
-        self, msg: dict[str, Any], *, process: subprocess.Popen[str], cwd: str, text_parts: list[str] | None, reasoning_parts: list[str] | None,
+        self, msg: dict[str, Any], *, process: subprocess.Popen[str], cwd: str, text_parts: list[str] | None, reasoning_parts: list[str] | None, publish=None,
     ) -> bool:
         """Consume a server->client message; True when handled (notification or request answered)."""
         method = msg.get("method")
@@ -407,6 +548,8 @@ class CopilotACPClient:
             sinks = {"agent_message_chunk": text_parts, "agent_thought_chunk": reasoning_parts}
             if chunk_text and (sink := sinks.get(str(update.get("sessionUpdate") or "").strip())) is not None:
                 sink.append(chunk_text)
+                if publish:
+                    publish(chunk_text, sink is reasoning_parts)
             return True
         if process.stdin is None:
             return True
@@ -420,6 +563,5 @@ class CopilotACPClient:
                 response = _jsonrpc_error(message_id, -32602, str(exc))
         else:
             response = _jsonrpc_error(message_id, -32601, f"ACP client method '{method}' is not supported by Hermes yet.")
-        process.stdin.write(json.dumps(response) + "\n")
-        process.stdin.flush()
+        self._send(process, response)
         return True
