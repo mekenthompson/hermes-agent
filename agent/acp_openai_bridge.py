@@ -233,6 +233,10 @@ class LiveStream:
                 item = self._queue.get(timeout=0.05)
             except queue.Empty:
                 if self._finished.is_set():
+                    # A final put can race the timed get returning Empty. Once
+                    # finished is set the producer cannot append again.
+                    if not self._queue.empty():
+                        continue
                     if self._error is not None:
                         error, self._error = self._error, None
                         raise error

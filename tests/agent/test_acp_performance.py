@@ -33,7 +33,7 @@ class ACPPerformanceTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.script = Path(self.temp.name)/'child.py'
-        self.script.write_text(CHILD)
+        self.script.write_text(CHILD, encoding="utf-8")
         self.old_home = os.environ.get('HERMES_HOME')
         os.environ['HERMES_HOME'] = self.temp.name
         self.addCleanup(self.restore_home)
@@ -114,7 +114,7 @@ class ACPPerformanceTests(unittest.TestCase):
 
     def test_tool_syntax_split_across_chunks_is_not_exposed_as_prose(self):
         text='<tool_call>{"id":"test","type":"function","function":{"name":"read_file","arguments":"{}"}}</tool_call>'
-        self.script.write_text(CHILD.replace("[('agent_message_chunk','hello'), ('agent_thought_chunk','thinking'), ('agent_message_chunk',' world')]",repr([('agent_message_chunk',text[:3]),('agent_message_chunk',text[3:])])) )
+        self.script.write_text(CHILD.replace("[('agent_message_chunk','hello'), ('agent_thought_chunk','thinking'), ('agent_message_chunk',' world')]",repr([('agent_message_chunk',text[:3]),('agent_message_chunk',text[3:])])) , encoding="utf-8")
         client=self.client('stream')
         chunks=list(client.chat.completions.create(messages=[{'role':'user','content':'hello'}],timeout=2,stream=True))
         self.assertFalse(''.join(c.choices[0].delta.content or '' for c in chunks if c.choices))
@@ -137,7 +137,7 @@ class ACPPerformanceTests(unittest.TestCase):
         original=globals_[key]
         def environment():
             env=original();env['ACP_TEST_SCOPE']=scope.get();return env
-        self.script.write_text(CHILD.replace('import json, sys, time','import json, sys, time, os').replace("('agent_message_chunk','hello')","('agent_message_chunk',os.environ['ACP_TEST_SCOPE'])"))
+        self.script.write_text(CHILD.replace('import json, sys, time','import json, sys, time, os').replace("('agent_message_chunk','hello')","('agent_message_chunk',os.environ['ACP_TEST_SCOPE'])"), encoding="utf-8")
         client=self.client('stream')
         token=scope.set('profile-a')
         try:
@@ -150,7 +150,7 @@ class ACPPerformanceTests(unittest.TestCase):
             scope.reset(token)
 
     def test_abandoned_flood_stream_times_out_and_releases_pumps(self):
-        self.script.write_text(CHILD.replace("[('agent_message_chunk','hello'), ('agent_thought_chunk','thinking'), ('agent_message_chunk',' world')]","[('agent_message_chunk','x')]*1000").replace('time.sleep(0.15)','pass'))
+        self.script.write_text(CHILD.replace("[('agent_message_chunk','hello'), ('agent_thought_chunk','thinking'), ('agent_message_chunk',' world')]","[('agent_message_chunk','x')]*1000").replace('time.sleep(0.15)','pass'), encoding="utf-8")
         client=self.client('stream')
         before={t.ident for t in threading.enumerate() if t.name.endswith('acp-pump')}
         stream=client.chat.completions.create(messages=[{'role':'user','content':'hello'}],timeout=0.3,stream=True)
@@ -163,7 +163,7 @@ class ACPPerformanceTests(unittest.TestCase):
     @unittest.skipUnless(os.name == 'posix','POSIX inherited-pipe reproducer')
     def test_help_probe_timeout_does_not_drain_descendant_pipes(self):
         from agent.copilot_acp_client import _acp_supported
-        self.script.write_text('#!'+sys.executable+'\nimport subprocess,sys,time\nsubprocess.Popen([sys.executable,"-c","import time;time.sleep(30)"])\ntime.sleep(30)\n')
+        self.script.write_text('#!'+sys.executable+'\nimport subprocess,sys,time\nsubprocess.Popen([sys.executable,"-c","import time;time.sleep(30)"])\ntime.sleep(30)\n', encoding="utf-8")
         self.script.chmod(0o700)
         start=time.monotonic()
         self.assertIsNone(_acp_supported(str(self.script),['--acp'],timeout=0.15))
@@ -171,10 +171,32 @@ class ACPPerformanceTests(unittest.TestCase):
 
     def test_ordinary_code_braces_resume_visible_streaming(self):
         fragments=[('agent_message_chunk','  def f():\n    return {'),('agent_message_chunk',"'ok': True}  ")]
-        self.script.write_text(CHILD.replace("[('agent_message_chunk','hello'), ('agent_thought_chunk','thinking'), ('agent_message_chunk',' world')]",repr(fragments)))
+        self.script.write_text(CHILD.replace("[('agent_message_chunk','hello'), ('agent_thought_chunk','thinking'), ('agent_message_chunk',' world')]",repr(fragments)), encoding="utf-8")
         client=self.client('stream')
         stream=client.chat.completions.create(messages=[{'role':'user','content':'hello'}],timeout=2,stream=True)
         first=next(stream);second=next(stream)
         self.assertIsNone(second.choices[0].finish_reason)
         self.assertEqual(first.choices[0].delta.content+second.choices[0].delta.content,"def f():\n    return {'ok': True}")
         self.assertFalse(''.join(c.choices[0].delta.content or '' for c in stream if c.choices))
+
+    def test_final_chunk_is_not_lost_when_completion_races_queue_timeout(self):
+        import queue
+        create=Client._create if hasattr(Client,'_create') else Client._create_chat_completion
+        stream_type=create.__globals__['LiveStream']
+        stream=stream_type.__new__(stream_type)
+        stream._stopped=threading.Event()
+        stream._finished=threading.Event()
+        stream._error=None
+        sentinel=object()
+        class RacingQueue(queue.Queue):
+            raced=False
+            def get(self, *args, **kwargs):
+                if not self.raced:
+                    self.raced=True
+                    self.put(sentinel)
+                    stream._finished.set()
+                    raise queue.Empty
+                return super().get(*args, **kwargs)
+        stream._queue=RacingQueue()
+        self.assertIs(next(stream),sentinel)
+        with self.assertRaises(StopIteration): next(stream)

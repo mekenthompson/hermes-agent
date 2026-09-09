@@ -120,7 +120,7 @@ def _probe_help(command: str, timeout: float, cancelled=None):
         finally:
             if os.name == "posix":
                 with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — guarded by os.name == "posix" above
             elif proc.poll() is None:
                 proc.kill()
             with contextlib.suppress(subprocess.TimeoutExpired):
@@ -313,7 +313,7 @@ class CopilotACPClient:
             return
         if os.name == "posix":
             with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(proc.pid, signal.SIGTERM)
+                os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok — guarded by os.name == "posix" above
         else:
             with contextlib.suppress(Exception):
                 proc.terminate()
@@ -321,7 +321,7 @@ class CopilotACPClient:
             proc.wait(timeout=2)
         if os.name == "posix":
             with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(proc.pid, signal.SIGKILL)
+                os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — guarded by os.name == "posix" above
         elif proc.poll() is None:
             proc.kill()
         with contextlib.suppress(Exception):
