@@ -6,12 +6,30 @@ untracked effect) remains unknown rather than being reported released.
 """
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
 import re
+import time
 from typing import Any, Optional
 
 _EXECUTION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 LIFECYCLE_VERSION = "execution-lifecycle/v2"
+
+# Tombstones are evidence, not history: `unknown` receipts are the only proof that a
+# retired execution was never observed released, so they are capped on their own budget
+# instead of pinning the whole list (the old single cap stopped evicting entirely as soon
+# as the oldest receipt was `unknown`, so the list grew for the process lifetime).
+RETIRED_TOMBSTONE_CAP = 256
+UNKNOWN_TOMBSTONE_CAP = 256
+
+# A session quarantined by an execution with unknown occupancy stays fail-closed, but the
+# quarantine is not permanent: it lifts as soon as the worker completion Event proves the
+# execution finished, and otherwise expires after this TTL.  Without a reopen path a single
+# tool-using turn made the session unusable for the rest of the process lifetime.
+QUARANTINE_TTL_SECONDS = 900.0
+
+# Bound the work done by the opportunistic sweep of records whose worker Event is set.
+SWEEP_LIMIT = 64
 
 
 class GatewayExecutionLifecycleMixin:
@@ -26,9 +44,11 @@ class GatewayExecutionLifecycleMixin:
 
     def _register_internal_plugin_execution(self, event, session_key: str) -> None:
         execution_id = self._validate_internal_plugin_execution_id(getattr(event, "_internal_plugin_execution_id", ""))
+        # Opportunistic, bounded: retire records whose worker already finished before
+        # deciding this session is occupied.
+        self._sweep_internal_plugin_executions()
         records = self._internal_plugin_execution_records()
-        quarantined = self.__dict__.get("_internal_plugin_quarantined_sessions", {})
-        if session_key in quarantined:
+        if self._internal_plugin_session_quarantined(session_key):
             raise ValueError("internal plugin session is quarantined by an execution with unknown effects")
         if execution_id in records or any(r["session_key"] == session_key for r in records.values()):
             raise ValueError("internal plugin session already has a live execution")
@@ -101,6 +121,56 @@ class GatewayExecutionLifecycleMixin:
         is_set = getattr(worker_done, "is_set", None)
         return bool(is_set and is_set())
 
+    @staticmethod
+    def _prune_retired_executions(retired: OrderedDict) -> None:
+        """Evict oldest known receipts first, then cap unknown receipts separately.
+
+        Unknown receipts must not be dropped merely because they are old (losing this
+        evidence would falsely report a quarantined execution as not_running/not_occupied),
+        but they cannot pin the list either.
+        """
+        if len(retired) <= RETIRED_TOMBSTONE_CAP:
+            return
+        for old_execution_id, old in list(retired.items()):
+            if len(retired) <= RETIRED_TOMBSTONE_CAP:
+                break
+            if old["occupancy"] != "unknown":
+                retired.pop(old_execution_id)
+        unknown_ids = [i for i, r in retired.items() if r["occupancy"] == "unknown"]
+        for old_execution_id in unknown_ids[: max(0, len(unknown_ids) - UNKNOWN_TOMBSTONE_CAP)]:
+            retired.pop(old_execution_id)
+
+    def _quarantine_internal_plugin_session(self, record: dict, execution_id: Optional[str]) -> None:
+        self.__dict__.setdefault("_internal_plugin_quarantined_sessions", {})[record["session_key"]] = {
+            "execution_id": execution_id,
+            "worker_done": record.get("worker_done"),
+            "worker_started": record.get("worker_started", False),
+            "retired_at": time.monotonic(),
+        }
+
+    def _internal_plugin_session_quarantined(self, session_key: str) -> bool:
+        """Fail-closed while the quarantining execution is unproven, with a reopen path.
+
+        The quarantine lifts when the worker completion Event is observed set (the execution
+        is proven finished) and, when there is no Event to observe at all, when the TTL
+        expires.  Anything else keeps rejecting replacements.
+        """
+        quarantined = self.__dict__.get("_internal_plugin_quarantined_sessions", {})
+        entry = quarantined.get(session_key)
+        if entry is None:
+            return False
+        # Legacy/plain entries (execution_id only) carry no evidence: treat as expired-only.
+        if not isinstance(entry, dict):
+            entry = {"execution_id": entry, "worker_done": None, "worker_started": False,
+                     "retired_at": time.monotonic()}
+            quarantined[session_key] = entry
+        worker_done = entry.get("worker_done")
+        proven_finished = worker_done is not None and self._worker_finished({"worker_done": worker_done})
+        if proven_finished or (time.monotonic() - entry["retired_at"]) >= QUARANTINE_TTL_SECONDS:
+            quarantined.pop(session_key, None)
+            return False
+        return True
+
     def _retire_internal_plugin_execution(self, execution_id: Optional[str], *, state: str, occupancy: str) -> None:
         record = self._internal_plugin_execution_records().pop(execution_id, None)
         if record is not None:
@@ -113,17 +183,42 @@ class GatewayExecutionLifecycleMixin:
                 "processes": "unknown" if record["observed_tool"] else "none",
                 "remote": "unknown" if record["observed_tool"] else "none",
             }
-            # Do not evict unknown receipts: losing this evidence would falsely
-            # report a quarantined execution as not_running/not_occupied.
-            while len(retired) > 256:
-                old_execution_id, old = next(iter(retired.items()))
-                if old["occupancy"] == "unknown":
-                    break
-                retired.pop(old_execution_id)
+            self._prune_retired_executions(retired)
             if occupancy == "unknown":
-                self.__dict__.setdefault("_internal_plugin_quarantined_sessions", {})[
-                    record["session_key"]
-                ] = execution_id
+                self._quarantine_internal_plugin_session(record, execution_id)
+
+    def _fail_internal_plugin_execution(self, execution_id: Optional[str], *, cancelled: bool = False) -> None:
+        """Retire a record whose dispatch raised, so the session is not wedged forever.
+
+        Respects the worker Event: a physically live worker keeps its record (the sweep
+        retires it once its Event is set), and a cancellation that could have outrun worker
+        registration is left alone — cancelling an await-wrapper is not worker completion.
+        """
+        record = self._internal_plugin_execution_records().get(execution_id)
+        if record is None:
+            return
+        if record["worker_started"] and not self._worker_finished(record):
+            return
+        if cancelled and not record["worker_started"]:
+            return
+        self._retire_internal_plugin_execution(
+            execution_id, state="failed",
+            occupancy="unknown" if record["observed_tool"] else "released",
+        )
+
+    def _sweep_internal_plugin_executions(self, *, limit: int = SWEEP_LIMIT) -> int:
+        """Retire up to ``limit`` records whose physical worker Event is already set.
+
+        Nothing else sweeps leaked records, so a dispatch that raised while its worker was
+        still running would otherwise reject every later execution on that session_key.
+        """
+        records = self._internal_plugin_execution_records()
+        swept = 0
+        for execution_id, record in list(records.items())[:limit]:
+            if record["worker_started"] and self._worker_finished(record):
+                self._complete_internal_plugin_execution(execution_id)
+                swept += 1
+        return swept
 
     def _complete_internal_plugin_execution(self, execution_id: Optional[str], *, wrapper_completed: bool = False) -> None:
         record = self._internal_plugin_execution_records().get(execution_id)
@@ -147,8 +242,13 @@ class GatewayExecutionLifecycleMixin:
         self._register_internal_plugin_execution(event, self._session_key_for_source(source))
         try:
             result = await super().dispatch_internal_plugin_event(event)
-        except BaseException:
-            # Wrapper cancellation is not completion evidence for a to_thread worker.
+        except BaseException as exc:
+            # Wrapper cancellation is not completion evidence for a to_thread worker, but a
+            # raising dispatch must not leak the live record either: the session would reject
+            # every later execution with "already has a live execution" and nothing sweeps it.
+            self._fail_internal_plugin_execution(
+                execution_id, cancelled=isinstance(exc, asyncio.CancelledError)
+            )
             raise
         else:
             self._complete_internal_plugin_execution(execution_id, wrapper_completed=True)
