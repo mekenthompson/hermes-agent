@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import json
 import re
+import queue
+import threading
+import time
 from types import SimpleNamespace
 from typing import Any, Iterable
 
@@ -168,3 +171,85 @@ def extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessageT
         parts.append(text[cursor:])
     cleaned = "\n".join(p.strip() for p in parts if p and p.strip()).strip()
     return extracted, cleaned
+
+
+class LiveStream:
+    """Bounded producer stream; closing an abandoned stream cancels its owned call."""
+
+    def __init__(self, complete, cancel, model, deadline):
+        self._queue = queue.Queue(maxsize=64)
+        self._stopped = threading.Event()
+        self._cancel = cancel
+        self._finished = threading.Event()
+        self._error = None
+
+        def put(value):
+            while not self._stopped.is_set():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("ACP stream consumer exceeded request deadline")
+                try:
+                    self._queue.put(value, timeout=0.05)
+                    return
+                except queue.Full:
+                    continue
+            raise RuntimeError("ACP stream closed")
+
+        emitted = [0, 0]
+
+        def publish(text, reasoning):
+            emitted[int(reasoning)] += len(text)
+            delta = SimpleNamespace(role="assistant", content=None if reasoning else text,
+                reasoning=text if reasoning else None, reasoning_content=text if reasoning else None,
+                tool_calls=None)
+            put(SimpleNamespace(choices=[SimpleNamespace(index=0, delta=delta, finish_reason=None)],
+                model=model, usage=None))
+
+        def run():
+            try:
+                completion = complete(publish)
+                message = completion.choices[0].message
+                message.content = (message.content or "")[emitted[0]:] or None
+                message.reasoning = (message.reasoning or "")[emitted[1]:] or None
+                message.reasoning_content = message.reasoning
+                for chunk in completion_to_stream_chunks(completion):
+                    put(chunk)
+            except BaseException as exc:
+                if not self._stopped.is_set():
+                    self._error = exc
+            finally:
+                self._finished.set()
+
+        self._worker = threading.Thread(target=run, daemon=True)
+        self._worker.start()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while not self._stopped.is_set():
+            try:
+                item = self._queue.get(timeout=0.05)
+            except queue.Empty:
+                if self._finished.is_set():
+                    if self._error is not None:
+                        error, self._error = self._error, None
+                        raise error
+                    raise StopIteration
+                continue
+            if isinstance(item, BaseException):
+                raise item
+            return item
+        raise StopIteration
+
+    def close(self):
+        self._stopped.set()
+        if not self._finished.is_set():
+            self._cancel()
+        self._worker.join(timeout=3)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+        return False

@@ -412,7 +412,7 @@ def test_run_prompt_receives_picker_model():
     client = CopilotACPClient(acp_cwd="/tmp")
     seen = {}
 
-    def fake_run_prompt(prompt_text, *, timeout_seconds, model=None):
+    def fake_run_prompt(prompt_text, *, timeout_seconds, model=None, publish=None):
         seen["model"] = model
         return "ok", ""
 
