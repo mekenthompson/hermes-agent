@@ -121,3 +121,60 @@ class ACPPerformanceTests(unittest.TestCase):
         calls=[call for c in chunks if c.choices for call in (c.choices[0].delta.tool_calls or [])]
         self.assertEqual(len(calls),1)
         self.assertEqual(calls[0].function.name,'read_file')
+
+    def test_http_timeout_does_not_turn_connect_budget_into_generation_limit(self):
+        from types import SimpleNamespace
+        helper=Client._create.__globals__['_timeout'] if hasattr(Client,'_create') else Client._create_chat_completion.__globals__['_effective_timeout']
+        self.assertEqual(helper(SimpleNamespace(read=120,write=1800,connect=30,pool=30)),120)
+        self.assertEqual(helper(0.25),0.25)
+
+    def test_stream_worker_inherits_profile_context_for_child_environment(self):
+        import contextvars
+        from unittest.mock import patch
+        scope=contextvars.ContextVar('test_profile_scope',default='missing')
+        globals_=Client._spawn.__globals__
+        key='build_subprocess_env' if 'build_subprocess_env' in globals_ else '_build_subprocess_env'
+        original=globals_[key]
+        def environment():
+            env=original();env['ACP_TEST_SCOPE']=scope.get();return env
+        self.script.write_text(CHILD.replace('import json, sys, time','import json, sys, time, os').replace("('agent_message_chunk','hello')","('agent_message_chunk',os.environ['ACP_TEST_SCOPE'])"))
+        client=self.client('stream')
+        token=scope.set('profile-a')
+        try:
+            with patch.dict(globals_,{key:environment}):
+                stream=client.chat.completions.create(messages=[{'role':'user','content':'hello'}],timeout=2,stream=True)
+                scope.set('profile-b')
+                self.assertEqual(next(stream).choices[0].delta.content,'profile-a')
+                list(stream)
+        finally:
+            scope.reset(token)
+
+    def test_abandoned_flood_stream_times_out_and_releases_pumps(self):
+        self.script.write_text(CHILD.replace("[('agent_message_chunk','hello'), ('agent_thought_chunk','thinking'), ('agent_message_chunk',' world')]","[('agent_message_chunk','x')]*1000").replace('time.sleep(0.15)','pass'))
+        client=self.client('stream')
+        before={t.ident for t in threading.enumerate() if t.name.endswith('acp-pump')}
+        stream=client.chat.completions.create(messages=[{'role':'user','content':'hello'}],timeout=0.3,stream=True)
+        stream._worker.join(1.5)
+        self.assertFalse(stream._worker.is_alive())
+        after={t.ident for t in threading.enumerate() if t.name.endswith('acp-pump')}
+        self.assertEqual(after,before)
+        stream.close()
+
+    @unittest.skipUnless(os.name == 'posix','POSIX inherited-pipe reproducer')
+    def test_help_probe_timeout_does_not_drain_descendant_pipes(self):
+        from agent.copilot_acp_client import _acp_supported
+        self.script.write_text('#!'+sys.executable+'\nimport subprocess,sys,time\nsubprocess.Popen([sys.executable,"-c","import time;time.sleep(30)"])\ntime.sleep(30)\n')
+        self.script.chmod(0o700)
+        start=time.monotonic()
+        self.assertIsNone(_acp_supported(str(self.script),['--acp'],timeout=0.15))
+        self.assertLess(time.monotonic()-start,0.8)
+
+    def test_ordinary_code_braces_resume_visible_streaming(self):
+        fragments=[('agent_message_chunk','  def f():\n    return {'),('agent_message_chunk',"'ok': True}  ")]
+        self.script.write_text(CHILD.replace("[('agent_message_chunk','hello'), ('agent_thought_chunk','thinking'), ('agent_message_chunk',' world')]",repr(fragments)))
+        client=self.client('stream')
+        stream=client.chat.completions.create(messages=[{'role':'user','content':'hello'}],timeout=2,stream=True)
+        first=next(stream);second=next(stream)
+        self.assertIsNone(second.choices[0].finish_reason)
+        self.assertEqual(first.choices[0].delta.content+second.choices[0].delta.content,"def f():\n    return {'ok': True}")
+        self.assertFalse(''.join(c.choices[0].delta.content or '' for c in stream if c.choices))

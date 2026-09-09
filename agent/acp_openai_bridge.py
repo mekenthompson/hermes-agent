@@ -11,6 +11,7 @@ makes Hermes redo finished work.
 from __future__ import annotations
 
 import json
+import contextvars
 import re
 import queue
 import threading
@@ -219,7 +220,8 @@ class LiveStream:
             finally:
                 self._finished.set()
 
-        self._worker = threading.Thread(target=run, daemon=True)
+        context = contextvars.copy_context()
+        self._worker = threading.Thread(target=context.run, args=(run,), daemon=True)
         self._worker.start()
 
     def __iter__(self):
@@ -253,3 +255,47 @@ class LiveStream:
     def __exit__(self, *_):
         self.close()
         return False
+
+
+class TextProgress:
+    """Expose prose while holding possible legacy tool syntax for final parsing.
+
+    Retain only the undecided suffix; scanning the entire response on each ACP
+    delta makes long streams quadratic. Once tool syntax is confirmed, subsequent
+    updates remain progress signals until the complete response is validated.
+    """
+
+    def __init__(self):
+        self.pending = ""
+        self.started = False
+        self.held = False
+
+    def feed(self, text):
+        if self.held:
+            return ""
+        self.pending += text
+        if not self.started:
+            self.pending = self.pending.lstrip()
+        boundary = len(self.pending)
+        for index, char in enumerate(self.pending):
+            if char == "<":
+                tail = self.pending[index:]
+                marker = "<tool_call>"
+                if tail.startswith(marker):
+                    boundary, self.held = index, True
+                    break
+                if marker.startswith(tail):
+                    boundary = index
+                    break
+            elif char == "{":
+                tail = self.pending[index + 1:].lstrip()
+                if tail.startswith('"id"'):
+                    boundary, self.held = index, True
+                    break
+                if '"id"'.startswith(tail):
+                    boundary = index
+                    break
+        visible = self.pending[:boundary].rstrip()
+        self.pending = "" if self.held else self.pending[len(visible):]
+        self.started = self.started or bool(visible)
+        return visible
