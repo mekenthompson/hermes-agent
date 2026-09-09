@@ -28,8 +28,14 @@ UNKNOWN_TOMBSTONE_CAP = 256
 # tool-using turn made the session unusable for the rest of the process lifetime.
 QUARANTINE_TTL_SECONDS = 900.0
 
-# Bound the work done by the opportunistic sweep of records whose worker Event is set.
+# Bound the number of retirements performed by one opportunistic sweep.
 SWEEP_LIMIT = 64
+
+# A record whose dispatch already ended without ever registering a physical worker is
+# unprovable: it is retained (a cancellation can outrun worker registration) but not
+# forever — after this TTL the sweep reclaims it fail-closed, as unknown occupancy, which
+# quarantines the session under the quarantine TTL rather than wedging it permanently.
+UNPROVEN_RECORD_TTL_SECONDS = 900.0
 
 
 class GatewayExecutionLifecycleMixin:
@@ -59,7 +65,7 @@ class GatewayExecutionLifecycleMixin:
             "generation": int(state.persistent.run_generation) + 1 if state else 1,
             "agent": None, "accepted": False, "stop_requested": False,
             "worker_done": None, "worker_started": False, "observed_tool": False,
-            "active_tool_calls": 0, "completed_tool_calls": 0,
+            "active_tool_calls": 0, "completed_tool_calls": 0, "unproven_since": None,
         }
 
     def _bind_internal_plugin_execution(self, execution_id: Optional[str], *, session_key: str,
@@ -159,12 +165,7 @@ class GatewayExecutionLifecycleMixin:
         entry = quarantined.get(session_key)
         if entry is None:
             return False
-        # Legacy/plain entries (execution_id only) carry no evidence: treat as expired-only.
-        if not isinstance(entry, dict):
-            entry = {"execution_id": entry, "worker_done": None, "worker_started": False,
-                     "retired_at": time.monotonic()}
-            quarantined[session_key] = entry
-        worker_done = entry.get("worker_done")
+        worker_done = entry["worker_done"]
         proven_finished = worker_done is not None and self._worker_finished({"worker_done": worker_done})
         if proven_finished or (time.monotonic() - entry["retired_at"]) >= QUARANTINE_TTL_SECONDS:
             quarantined.pop(session_key, None)
@@ -200,6 +201,10 @@ class GatewayExecutionLifecycleMixin:
         if record["worker_started"] and not self._worker_finished(record):
             return
         if cancelled and not record["worker_started"]:
+            # Stamp the retention so the sweep can reclaim it later: with no worker Event to
+            # observe, nothing else would ever free this session_key.
+            if record["unproven_since"] is None:
+                record["unproven_since"] = time.monotonic()
             return
         self._retire_internal_plugin_execution(
             execution_id, state="failed",
@@ -207,16 +212,31 @@ class GatewayExecutionLifecycleMixin:
         )
 
     def _sweep_internal_plugin_executions(self, *, limit: int = SWEEP_LIMIT) -> int:
-        """Retire up to ``limit`` records whose physical worker Event is already set.
+        """Reclaim leaked records, retiring at most ``limit`` of them.
 
         Nothing else sweeps leaked records, so a dispatch that raised while its worker was
-        still running would otherwise reject every later execution on that session_key.
+        still running would otherwise reject every later execution on that session_key.  Two
+        kinds are reclaimable: a record whose physical worker Event is set (proven finished,
+        retired as completed) and a record whose dispatch ended without ever registering a
+        worker and has outlived UNPROVEN_RECORD_TTL_SECONDS (retired fail-closed as unknown,
+        which quarantines the session under the quarantine TTL instead of forever).
         """
         records = self._internal_plugin_execution_records()
         swept = 0
-        for execution_id, record in list(records.items())[:limit]:
-            if record["worker_started"] and self._worker_finished(record):
-                self._complete_internal_plugin_execution(execution_id)
+        now = time.monotonic()
+        for execution_id, record in list(records.items()):
+            if swept >= limit:
+                break
+            if record["worker_started"]:
+                if self._worker_finished(record):
+                    self._complete_internal_plugin_execution(execution_id)
+                    swept += 1
+                continue
+            unproven_since = record["unproven_since"]
+            if unproven_since is not None and (now - unproven_since) >= UNPROVEN_RECORD_TTL_SECONDS:
+                self._retire_internal_plugin_execution(
+                    execution_id, state="failed", occupancy="unknown",
+                )
                 swept += 1
         return swept
 

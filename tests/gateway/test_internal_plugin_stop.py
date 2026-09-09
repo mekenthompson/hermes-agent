@@ -609,3 +609,33 @@ def test_launch_fence_wait_is_bounded_and_fails_closed(monkeypatch):
     ctx.execution_launch_gate.set()
     ctx.execution_launch_allowed = True
     assert fence_runner._await_execution_launch(_EXECUTION_ID) is True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_dispatch_record_is_reclaimed_once_it_is_provably_stale(monkeypatch):
+    """A cancellation that outran worker registration is retained, but not forever.
+
+    Nothing else can free that session_key: there is no worker Event to observe, so the
+    sweep reclaims the record fail-closed after its TTL instead of wedging the session for
+    the process lifetime.
+    """
+    runner = object.__new__(GatewayRunner)
+    session_key = "local:aggie:linear-session-1"
+    event = _event()
+    event._internal_plugin_execution_id = _EXECUTION_ID
+    runner._register_internal_plugin_execution(event, session_key)
+
+    runner._fail_internal_plugin_execution(_EXECUTION_ID, cancelled=True)
+    record = runner._internal_plugin_execution_records()[_EXECUTION_ID]
+    assert record["unproven_since"] is not None
+    assert runner._sweep_internal_plugin_executions() == 0
+
+    monkeypatch.setattr(execution_lifecycle, "UNPROVEN_RECORD_TTL_SECONDS", 0.0)
+    assert runner._sweep_internal_plugin_executions() == 1
+    assert _EXECUTION_ID not in runner._internal_plugin_execution_records()
+    # Fail-closed: reclaiming an unprovable record quarantines the session, and that
+    # quarantine has its own expiry.
+    assert runner._internal_plugin_retired_executions[_EXECUTION_ID]["occupancy"] == "unknown"
+    assert runner._internal_plugin_session_quarantined(session_key)
+    monkeypatch.setattr(execution_lifecycle, "QUARANTINE_TTL_SECONDS", 0.0)
+    assert not runner._internal_plugin_session_quarantined(session_key)
