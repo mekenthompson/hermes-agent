@@ -4,9 +4,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 import asyncio
+import threading
 
 import pytest
 
+from gateway import execution_lifecycle
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
@@ -229,3 +231,92 @@ async def test_profile_services_start_for_every_multiplex_profile(tmp_path, monk
 
     await runner._stop_plugin_profile_services()
     assert runner._profile_service_tasks == []
+
+
+@pytest.mark.asyncio
+async def test_raising_dispatch_leaves_the_session_usable(tmp_path, monkeypatch):
+    """A dispatch that raises must not wedge the session_key forever.
+
+    The live record used to leak, so every later execution on that session was rejected with
+    "already has a live execution" and nothing swept it.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = object.__new__(GatewayRunner)
+
+    async def handler(_event):
+        raise RuntimeError("handler exploded")
+
+    runner._primary_message_handler = lambda: handler
+    event = _event()
+    session_key = runner._session_key_for_source(event.source)
+
+    with pytest.raises(RuntimeError, match="handler exploded"):
+        await runner.dispatch_internal_plugin_event(event, execution_id="plugin-exec-001")
+
+    assert "plugin-exec-001" not in runner._internal_plugin_execution_records()
+    tombstone = runner._internal_plugin_retired_executions["plugin-exec-001"]
+    assert tombstone["state"] == "failed"
+    assert tombstone["occupancy"] == "released"
+
+    # The next execution on the same session is accepted.
+    runner._primary_message_handler = lambda: AsyncMock(return_value="second run")
+    assert await runner.dispatch_internal_plugin_event(
+        _event(), execution_id="plugin-exec-002"
+    ) == "second run"
+
+
+@pytest.mark.asyncio
+async def test_raising_dispatch_with_live_worker_keeps_its_record(tmp_path, monkeypatch):
+    """Respect the worker Event: a physically live worker is still occupying the session."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = object.__new__(GatewayRunner)
+    live = threading.Event()
+
+    async def handler(event):
+        runner._track_internal_plugin_execution_worker(
+            event._internal_plugin_execution_id, live
+        )
+        raise RuntimeError("handler exploded")
+
+    runner._primary_message_handler = lambda: handler
+
+    with pytest.raises(RuntimeError):
+        await runner.dispatch_internal_plugin_event(_event(), execution_id="plugin-exec-001")
+    assert "plugin-exec-001" in runner._internal_plugin_execution_records()
+
+    # Once the worker really finishes, the bounded sweep on the next registration reclaims it.
+    live.set()
+    runner._primary_message_handler = lambda: AsyncMock(return_value="second run")
+    await runner.dispatch_internal_plugin_event(_event(), execution_id="plugin-exec-002")
+    assert "plugin-exec-001" not in runner._internal_plugin_execution_records()
+
+
+@pytest.mark.asyncio
+async def test_raising_dispatch_after_a_tool_quarantines_but_not_forever(tmp_path, monkeypatch):
+    """Unknown effects stay fail-closed; the quarantine still has a reopen path."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = object.__new__(GatewayRunner)
+
+    async def handler(event):
+        runner._observe_internal_plugin_tool_event(
+            event._internal_plugin_execution_id, "tool.started"
+        )
+        raise RuntimeError("handler exploded")
+
+    runner._primary_message_handler = lambda: handler
+
+    with pytest.raises(RuntimeError):
+        await runner.dispatch_internal_plugin_event(_event(), execution_id="plugin-exec-001")
+    assert runner._internal_plugin_retired_executions["plugin-exec-001"]["occupancy"] == "unknown"
+
+    async def ok_handler(_event):
+        return "second run"
+
+    runner._primary_message_handler = lambda: ok_handler
+    with pytest.raises(ValueError, match="quarantined"):
+        await runner.dispatch_internal_plugin_event(_event(), execution_id="plugin-exec-002")
+
+    monkeypatch.setattr(execution_lifecycle, "QUARANTINE_TTL_SECONDS", 0.0)
+    assert await runner.dispatch_internal_plugin_event(
+        _event(), execution_id="plugin-exec-002"
+    ) == "second run"

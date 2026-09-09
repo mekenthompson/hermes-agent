@@ -34,6 +34,10 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Upper bound on the internal-plugin launch fence.  The loop-side promotion poller ticks
+# every 50ms; anything approaching this budget means the tracker task died or was cancelled.
+EXECUTION_LAUNCH_GATE_TIMEOUT = 30.0
+
 
 class _ExecApprovalDeclined(RuntimeError):
     """The connector refused the approval card's destination.
@@ -1691,6 +1695,24 @@ class TurnRunner:
         unique_tags = (["[[audio_as_voice]]"] if has_voice_directive else []) + list(dict.fromkeys(media_tags))
         return final_response + "\n" + "\n".join(unique_tags)
 
+    def _await_execution_launch(self, execution_id: str) -> bool:
+        """Launch fence for an internal-plugin turn: True iff promotion allowed launch.
+
+        A loop-side promotion decides this real thread boundary, so the wait is bounded: the
+        setter lives in a cancellable task (the tracker is cancelled unconditionally during
+        turn cleanup), and an unbounded wait() parks this executor thread for the process
+        lifetime, which shutdown/drain can never quiesce.  A timeout is fail-closed (denied).
+        """
+        ctx = self._ctx
+        if not ctx.execution_launch_gate.wait(timeout=EXECUTION_LAUNCH_GATE_TIMEOUT):
+            logger.warning(
+                "internal plugin launch fence timed out after %.0fs for session=%s execution=%s; "
+                "treating launch as denied",
+                EXECUTION_LAUNCH_GATE_TIMEOUT, ctx.session_key or "", execution_id,
+            )
+            ctx.execution_launch_allowed = False
+        return bool(ctx.execution_launch_allowed)
+
     def run_sync(self):
         """Executor-thread body of the turn; returns the gateway result dict.
 
@@ -1736,13 +1758,9 @@ class TurnRunner:
         )
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
         execution_id = ctx.internal_plugin_execution_id
-        if execution_id is not None:
-            # A loop-side promotion decides this real thread boundary.  Do not
-            # enter run_conversation after a Stop was accepted while preparing.
-            ctx.execution_launch_gate.wait()
-            if not ctx.execution_launch_allowed:
-                return {"final_response": "", "messages": [], "api_calls": 0,
-                        "tools": [], "completed": True, "interrupted": True}
+        if execution_id is not None and not self._await_execution_launch(execution_id):
+            return {"final_response": "", "messages": [], "api_calls": 0,
+                    "tools": [], "completed": True, "interrupted": True}
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)

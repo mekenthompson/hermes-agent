@@ -2930,34 +2930,41 @@ class GatewayTurnMixin:
         """Track this agent as running for the session (interrupt support) once it is created — only
         if this run is still current, else leave the newer run's slot alone."""
         session_key, run_generation, agent_holder = turn_ctx.session_key, turn_ctx.run_generation, turn_ctx.agent_holder
-        while agent_holder[0] is None:
-            await asyncio.sleep(0.05)
-        if not session_key:
-            return
-        if run_generation is not None and not self._is_session_run_current(session_key, run_generation):
-            logger.info(
-                "Skipping stale agent promotion for %s — generation %s is no longer current",
-                session_key or "", run_generation,
-            )
-            if getattr(turn_ctx, "internal_plugin_execution_id", None) is not None:
-                turn_ctx.execution_launch_allowed = False
-                turn_ctx.execution_launch_gate.set()
-            return
         execution_id = getattr(turn_ctx, "internal_plugin_execution_id", None)
-        allowed = self._promote_running_agent(
-            session_key=session_key, run_generation=run_generation, agent=agent_holder[0],
-            internal_plugin_execution_id=execution_id,
-        )
-        # The executor thread waits at TurnRunner's launch fence.  Setting this event is
-        # required on both paths: an accepted Stop before promotion must return without
-        # entering run_conversation, not strand the thread.
-        if execution_id is not None:
-            turn_ctx.execution_launch_allowed = allowed
-            turn_ctx.execution_launch_gate.set()
-        if not allowed:
-            return
-        if self._draining:
-            self._update_runtime_status("draining")
+        gate = getattr(turn_ctx, "execution_launch_gate", None)
+        try:
+            while agent_holder[0] is None:
+                await asyncio.sleep(0.05)
+            if not session_key:
+                return
+            if run_generation is not None and not self._is_session_run_current(session_key, run_generation):
+                logger.info(
+                    "Skipping stale agent promotion for %s — generation %s is no longer current",
+                    session_key or "", run_generation,
+                )
+                if execution_id is not None:
+                    turn_ctx.execution_launch_allowed = False
+                return
+            allowed = self._promote_running_agent(
+                session_key=session_key, run_generation=run_generation, agent=agent_holder[0],
+                internal_plugin_execution_id=execution_id,
+            )
+            # The executor thread waits at TurnRunner's launch fence.  An accepted Stop before
+            # promotion must return without entering run_conversation, not strand the thread.
+            if execution_id is not None:
+                turn_ctx.execution_launch_allowed = allowed
+            if not allowed:
+                return
+            if self._draining:
+                self._update_runtime_status("draining")
+        finally:
+            # Release the parked executor thread on EVERY exit path — the early `not
+            # session_key` return, an exception, and above all cancellation: this task is
+            # cancelled unconditionally in _run_agent_cleanup_turn_tasks, and any cancellation
+            # between spawn and promotion used to park the worker thread forever.
+            # execution_launch_allowed stays False unless promotion explicitly allowed launch.
+            if execution_id is not None and gate is not None:
+                gate.set()
 
     async def _run_agent_fire_pending_interrupt(
         self, adapter: Any, agent: Any, source: SessionSource, session_key: str,

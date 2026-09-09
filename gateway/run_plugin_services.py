@@ -15,6 +15,9 @@ from gateway.session import SessionSource
 
 logger = logging.getLogger("gateway.run")
 
+# Upper bound on waiting for cancelled profile services during shutdown.
+PROFILE_SERVICE_STOP_TIMEOUT = 5.0
+
 
 class GatewayPluginServicesMixin:
     """Keep plugin-owned execution explicitly local to a served profile."""
@@ -137,4 +140,16 @@ class GatewayPluginServicesMixin:
             return
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Bounded: a profile service that swallows CancelledError (or blocks in a finally)
+        # must not hold the whole shutdown path open forever.
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=PROFILE_SERVICE_STOP_TIMEOUT,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.warning(
+                "plugin profile services did not stop within %.0fs: %s",
+                PROFILE_SERVICE_STOP_TIMEOUT,
+                ", ".join(sorted(t.get_name() for t in tasks if not t.done())) or "unknown",
+            )
