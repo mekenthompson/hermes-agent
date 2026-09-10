@@ -35,6 +35,28 @@ def _session_has_live_transport(session: dict | None, *, excluding=None) -> bool
     return any(peer is not excluding for peer in _session_live_transports(session))
 
 
+def _server_verified_transport_owner(transport) -> tuple[str, str] | None:
+    """Return a ticket subject only from the server-stamped WS upgrade claim."""
+    from tui_gateway.browser_handoff_identity import browser_handoff_identity
+    identity = browser_handoff_identity(getattr(transport, "auth_identity", None))
+    return (identity.provider, identity.subject) if identity is not None else None
+
+
+def _session_attachment_error(rid, session: dict, transport) -> dict | None:
+    """Fail closed for a ticketed transport unless it matches the live session owner.
+
+    Local stdio and legacy transports carry no cloud subject and retain their existing
+    attach behavior.  A legacy live session has no trustworthy owner, so a ticketed
+    transport cannot claim it; persisted ownership needs an explicit schema contract.
+    """
+    requester = _server_verified_transport_owner(transport)
+    if requester is None:
+        return None
+    if session.get("transport_owner") == requester:
+        return None
+    return _err(rid, 4013, "session is owned by another authenticated subject")
+
+
 def _attach_session_transport(session: dict | None, transport) -> bool:
     """Add live peers; flatten captured queued fanouts without nesting authority."""
     if not session or transport is None:

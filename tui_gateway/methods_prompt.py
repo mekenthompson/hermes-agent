@@ -561,6 +561,8 @@ def _(rid, params: dict) -> dict:
         # leaves the session untouched.  The reason travels as machine-readable data.
         reason = getattr(limit_message, "reason", None)
         return _err(rid, 4090, str(limit_message), {"reason": reason} if reason else None)
+    if (ownership_error := _session_attachment_error(rid, session, current_transport())) is not None:
+        return ownership_error
     # Rewritten every submit: a session alternates app window / HUD; stale "hud" misinforms.
     session["client_surface"] = "hud" if params.get("surface") == "hud" else ""
     has_truncation = any(params.get(k) is not None for k in _TRUNCATION_PARAMS)

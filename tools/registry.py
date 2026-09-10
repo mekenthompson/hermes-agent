@@ -180,18 +180,24 @@ class ToolInvocationContext:
     session_id: str = ""
     session_key: str = ""
     message_id: str = ""
+    # Desktop browser-control ticket subject. These are copied only from the
+    # authenticated WebSocket transport by tui_gateway.server; tool arguments
+    # cannot populate them.
+    browser_control_provider: str = ""
+    browser_control_subject: str = ""
 
 
 def _current_tool_invocation_context() -> ToolInvocationContext:
     """Snapshot task-local gateway identity for one tool invocation."""
     try:
-        from gateway.session_context import get_session_env
+        from gateway.session_context import browser_control_identity, get_session_env
     except Exception:
         return ToolInvocationContext()
 
     def value(name: str) -> str:
         return str(get_session_env(name, "") or "")
 
+    browser_control_provider, browser_control_subject = browser_control_identity()
     return ToolInvocationContext(
         profile=value("HERMES_SESSION_PROFILE"),
         platform=value("HERMES_SESSION_PLATFORM"),
@@ -203,6 +209,8 @@ def _current_tool_invocation_context() -> ToolInvocationContext:
         session_id=value("HERMES_SESSION_ID"),
         session_key=value("HERMES_SESSION_KEY"),
         message_id=value("HERMES_SESSION_MESSAGE_ID"),
+        browser_control_provider=browser_control_provider,
+        browser_control_subject=browser_control_subject,
     )
 
 

@@ -1210,21 +1210,32 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
         # callers that know the workspace pass it.
         resolved = cwd if cwd is not None else (str(sess.get("cwd") or "") if sess is not None else "")
         source = _resolve_session_platform()
+        profile = ""
         browser_control_principal = browser_control_transport_family = ""
+        browser_control_provider = browser_control_subject = ""
         # Live conversation id for subprocess HERMES_SESSION_ID: an explicitly empty contextvar is authoritative
         # (no os.environ fallback), so never leave it "" — agent's durable session_id, then session_key.
         session_id = session_key
         if sess is not None:
             source = _session_source(sess)
+            profile = profile_name_for_home(sess.get("profile_home")) or _current_profile_name()
             session_id = getattr(sess.get("agent"), "session_id", None) or session_key
             identity = getattr(sess.get("transport"), "auth_identity", None)
             if _methods_browser_control._is_authenticated_identity(identity):
+                assert isinstance(identity, dict)  # validated by _is_authenticated_identity
                 browser_control_principal = _methods_browser_control._principal_digest(identity)
                 browser_control_transport_family = _methods_browser_control._CLOUD_TRANSPORT_FAMILY
+            from tui_gateway.browser_handoff_identity import browser_handoff_identity
+            handoff_identity = browser_handoff_identity(identity)
+            if handoff_identity is not None:
+                browser_control_provider = handoff_identity.provider
+                browser_control_subject = handoff_identity.subject
         return set_session_vars(
-            session_key=session_key, session_id=session_id, source=source,
+            session_key=session_key, session_id=session_id, platform=source, source=source,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family, cwd=resolved,
+            browser_control_provider=browser_control_provider,
+            browser_control_subject=browser_control_subject, profile=profile,
             ui_session_id=ui_session_id, cron_session="")
     return []
 
@@ -2359,6 +2370,7 @@ def _init_session(
             # In-session /model switch, honored on rebuild (/new, resume) — never leaks to siblings via env vars.
             "model_override": None,
             # Async events go to the transport that created the session (stdio for Ink, WS for the dashboard).
+            "transport_owner": _server_verified_transport_owner(current_transport()),
             "transport": current_transport() or _stdio_transport,
         }
         _session_todo_state(_sessions[sid])
@@ -2423,6 +2435,7 @@ def _deferred_session_record(
         "running": False, "session_key": session_key, "show_reasoning": _load_show_reasoning(),
         "slash_worker": None, "source": source, "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {}, "todo_state": todo_state,
+        "transport_owner": _server_verified_transport_owner(current_transport()),
         "transport": current_transport() or _stdio_transport,
     }
 
