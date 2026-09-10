@@ -2370,6 +2370,7 @@ def _init_session(
             # In-session /model switch, honored on rebuild (/new, resume) — never leaks to siblings via env vars.
             "model_override": None,
             # Async events go to the transport that created the session (stdio for Ink, WS for the dashboard).
+            "transport_owner": _server_verified_transport_owner(current_transport()),
             "transport": current_transport() or _stdio_transport,
         }
         _session_todo_state(_sessions[sid])
@@ -2434,6 +2435,7 @@ def _deferred_session_record(
         "running": False, "session_key": session_key, "show_reasoning": _load_show_reasoning(),
         "slash_worker": None, "source": source, "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {}, "todo_state": todo_state,
+        "transport_owner": _server_verified_transport_owner(current_transport()),
         "transport": current_transport() or _stdio_transport,
     }
 

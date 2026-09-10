@@ -13,6 +13,7 @@ import shutil
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -123,8 +124,10 @@ class _FixtureModel:
     session_completion_tokens = session_reasoning_tokens = session_total_tokens = 0
     session_api_calls = 0
 
-    def __init__(self, session_id: str, tool_name: str, scope: str, observed: list[dict]):
+    def __init__(self, session_id: str, tool_name: str, scope: str, observed: list[dict], barrier=None):
         self.session_id, self.tool_name, self.scope, self.observed = session_id, tool_name, scope, observed
+        self.barrier = barrier
+        self.result = None
         self.history = []
 
     def clear_interrupt(self):
@@ -139,9 +142,12 @@ class _FixtureModel:
         import model_tools
         # This is the production model tool-call choke point.  It obtains the
         # invocation context from the live gateway turn; it is not passed here.
+        if self.barrier is not None:
+            self.barrier.wait(timeout=5)
         result = json.loads(model_tools.handle_function_call(
             self.tool_name, {}, task_id=task_id, session_id=self.session_id,
             tool_call_id="fixture-call"))
+        self.result = result
         self.observed.append(result)
         self.history = list(conversation_history or [])
         return {"final_response": json.dumps(result), "messages": self.history, "error": None,
@@ -222,3 +228,129 @@ def test_unmatched_ticket_subject_denies_without_model_identity(monkeypatch, tmp
         subject="unmapped-subject", tool="browser_handoff_end",
     )
     assert result == {"ok": False, "error": "unauthorized_desktop_subject"}
+
+
+def test_ticket_subject_cannot_attach_or_submit_another_subjects_live_session(monkeypatch, tmp_path):
+    """A ticket subject cannot take a live session before it mutates or dispatches."""
+    profile = "default"
+    home, _allowlist_file, cap = _fixture_profile(tmp_path, subjects=[])
+    principals = [{
+        "principal_id": "fixture-principal", "access_email": "fixture@example.test",
+        "routes": [["telegram", "fixture-user", None]], "agents": [profile],
+        "desktop_routes": [["fixture-oidc", "alpha"], ["fixture-oidc", "beta"]],
+    }]
+    httpd, thread = _start_real_broker(monkeypatch, tmp_path, profile=profile, principals=principals)
+    monkeypatch.setenv("BROWSER_HANDOFF_URL", f"http://127.0.0.1:{httpd.server_port}")
+    monkeypatch.setenv("BROWSER_HANDOFF_CAP_FILE", str(cap))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(server, "_hermes_home", str(home))
+    dispatched = []
+    monkeypatch.setattr(server, "_make_agent", lambda sid, key, **_kw: _FixtureModel(
+        sid, "browser_handoff_status", "fixture", dispatched))
+
+    def receive_reply(ws, request_id):
+        return next(frame for _ in range(12)
+                    if (frame := json.loads(ws.receive_text())).get("id") == request_id)
+
+    try:
+        with TestClient(web_server.app) as client:
+            alpha_ticket = mint_ticket(user_id="alpha", provider="fixture-oidc")
+            with client.websocket_connect(f"/api/ws?ticket={alpha_ticket}") as alpha:
+                assert json.loads(alpha.receive_text())["params"]["type"] == "gateway.ready"
+                alpha.send_text(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "session.create",
+                                             "params": {"source": "desktop"}}))
+                created = receive_reply(alpha, 1)["result"]
+                sid, stored_id = created["session_id"], created["stored_session_id"]
+                session = server._sessions[sid]
+                alpha_transport = session["transport"]
+
+                beta_ticket = mint_ticket(user_id="beta", provider="fixture-oidc")
+                with client.websocket_connect(f"/api/ws?ticket={beta_ticket}") as beta:
+                    assert json.loads(beta.receive_text())["params"]["type"] == "gateway.ready"
+                    for request_id, method, params in (
+                        (2, "session.activate", {"session_id": sid, "omit_messages": True}),
+                        (3, "session.resume", {"session_id": stored_id, "omit_messages": True}),
+                        (4, "prompt.submit", {"session_id": sid, "text": "must not run"}),
+                    ):
+                        beta.send_text(json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method,
+                                                    "params": params}))
+                        assert receive_reply(beta, request_id)["error"]["code"] == 4013
+                assert session["transport"] is alpha_transport
+                assert session["history"] == []
+                assert not dispatched
+                # A reconnect with the exact server-verified owner remains a
+                # shared live-session viewer and can use the resume fast path.
+                alpha_reconnect_ticket = mint_ticket(user_id="alpha", provider="fixture-oidc")
+                with client.websocket_connect(f"/api/ws?ticket={alpha_reconnect_ticket}") as alpha_reconnect:
+                    assert json.loads(alpha_reconnect.receive_text())["params"]["type"] == "gateway.ready"
+                    for request_id, method, params in (
+                        (5, "session.activate", {"session_id": sid, "omit_messages": True}),
+                        (6, "session.resume", {"session_id": stored_id, "omit_messages": True}),
+                    ):
+                        alpha_reconnect.send_text(json.dumps({
+                            "jsonrpc": "2.0", "id": request_id, "method": method, "params": params}))
+                        assert "result" in receive_reply(alpha_reconnect, request_id)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+
+def test_concurrent_ticket_subjects_do_not_cross_attach_or_leak_context(monkeypatch, tmp_path):
+    """Concurrent ticketed turns retain their own server-stamped identity."""
+    profile = "default"
+    home, _allowlist_file, cap = _fixture_profile(
+        tmp_path,
+        subjects=[{"profile": profile, "provider": "fixture-oidc", "subject": "alpha"}],
+    )
+    principals = [{
+        "principal_id": "fixture-principal", "access_email": "fixture@example.test",
+        "routes": [["telegram", "fixture-user", None]], "agents": [profile],
+        # The broker itself recognizes both subjects. Only alpha is in the
+        # generated profile projection, so a cross-attached alpha transport
+        # would incorrectly authorize beta.
+        "desktop_routes": [["fixture-oidc", "alpha"], ["fixture-oidc", "beta"]],
+    }]
+    httpd, thread = _start_real_broker(monkeypatch, tmp_path, profile=profile, principals=principals)
+    monkeypatch.setenv("BROWSER_HANDOFF_URL", f"http://127.0.0.1:{httpd.server_port}")
+    monkeypatch.setenv("BROWSER_HANDOFF_CAP_FILE", str(cap))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(server, "_hermes_home", str(home))
+    plugins.discover_plugins(force=True)
+    barrier, observed, models = threading.Barrier(2), [], {}
+    scope = plugins.get_plugin_manager().scope_key
+
+    def make_agent(sid, key, **_kw):
+        model = _FixtureModel(sid, "browser_handoff_status", scope, observed, barrier)
+        models[sid] = model
+        return model
+
+    monkeypatch.setattr(server, "_make_agent", make_agent)
+
+    def submit(subject):
+        ticket = mint_ticket(user_id=subject, provider="fixture-oidc")
+        with TestClient(web_server.app) as client:
+            with client.websocket_connect(f"/api/ws?ticket={ticket}") as ws:
+                assert json.loads(ws.receive_text())["params"]["type"] == "gateway.ready"
+                ws.send_text(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "session.create",
+                                         "params": {"source": "desktop"}}))
+                created = next(frame for _ in range(12)
+                               if (frame := json.loads(ws.receive_text())).get("id") == 1)
+                sid = created["result"]["session_id"]
+                ws.send_text(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "prompt.submit",
+                                         "params": {"session_id": sid, "text": "FIXTURE_CALL"}}))
+                deadline = time.monotonic() + 10
+                while models.get(sid) is None or models[sid].result is None:
+                    assert time.monotonic() < deadline, "concurrent fixture model did not dispatch"
+                    ws.receive_text()
+                return models[sid].result
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            alpha, beta = list(executor.map(submit, ("alpha", "beta")))
+        assert alpha != {"ok": False, "error": "unauthorized_desktop_subject"}
+        assert beta == {"ok": False, "error": "unauthorized_desktop_subject"}
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
