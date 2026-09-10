@@ -1223,12 +1223,13 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
                 assert isinstance(identity, dict)  # validated by _is_authenticated_identity
                 browser_control_principal = _methods_browser_control._principal_digest(identity)
                 browser_control_transport_family = _methods_browser_control._CLOUD_TRANSPORT_FAMILY
-                # Preserve the ticket's verified provider subject for opt-in
-                # tools. This is host state from WSTransport, never RPC data.
-                browser_control_provider = str(identity["provider"])
-                browser_control_subject = str(identity["user_id"])
+            from tui_gateway.browser_handoff_identity import browser_handoff_identity
+            handoff_identity = browser_handoff_identity(identity)
+            if handoff_identity is not None:
+                browser_control_provider = handoff_identity.provider
+                browser_control_subject = handoff_identity.subject
         return set_session_vars(
-            session_key=session_key, session_id=session_id, source=source,
+            session_key=session_key, session_id=session_id, platform=source, source=source,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family, cwd=resolved,
             browser_control_provider=browser_control_provider,

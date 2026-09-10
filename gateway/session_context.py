@@ -183,6 +183,15 @@ def get_session_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def browser_control_identity() -> tuple[str, str]:
+    """Return gateway-projected browser identity without an environment fallback."""
+    provider = _BROWSER_CONTROL_PROVIDER.get()
+    subject = _BROWSER_CONTROL_SUBJECT.get()
+    if provider is _UNSET or subject is _UNSET:
+        return "", ""
+    return str(provider or ""), str(subject or "")
+
+
 # Surfaces that are not a human chat channel (gateway binds HERMES_SESSION_PLATFORM, CLI/TUI/
 # desktop bind HERMES_SESSION_SOURCE, so both are consulted).  Default-deny: an unrecognized
 # identity counts as messaging.  Mirrors LOCAL_SESSION_SOURCE_IDS in apps/desktop session-source.ts.

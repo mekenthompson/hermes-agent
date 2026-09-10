@@ -114,6 +114,39 @@ def test_cloud_agent_context_binds_registration_principal_and_transport_family()
         server._sessions.pop("context-session-fixture", None)
 
 
+def test_desktop_session_context_sets_platform_and_preserves_only_ticket_identity(monkeypatch):
+    """A Desktop session reaches policy as Desktop, not merely as a source string."""
+    from gateway.session_context import clear_session_vars
+    from tools.registry import ToolRegistry
+
+    identity = {"user_id": "ticket-subject", "provider": "ticket-provider"}
+    server._sessions["desktop-platform-context"] = {
+        "transport": WSTransport(SimpleNamespace(), SimpleNamespace(), auth_identity=identity),
+        "session_key": "desktop-platform-session-key",
+        "source": "desktop",
+        "profile": "marko",
+        "agent": SimpleNamespace(session_id="desktop-platform-context"),
+    }
+    registry = ToolRegistry()
+    seen = []
+    registry.register(
+        name="desktop_platform_probe", toolset="test",
+        schema={"name": "desktop_platform_probe", "description": "", "parameters": {"type": "object"}},
+        handler=lambda args, *, invocation_context: seen.append(invocation_context) or "{}",
+        inject_invocation_context=True,
+    )
+    tokens = []
+    try:
+        tokens = server._set_session_context("desktop-platform-session-key")
+        registry.dispatch("desktop_platform_probe", {})
+        assert seen[0].platform == "desktop"
+        assert seen[0].browser_control_provider == "ticket-provider"
+        assert seen[0].browser_control_subject == "ticket-subject"
+    finally:
+        clear_session_vars(tokens)
+        server._sessions.pop("desktop-platform-context", None)
+
+
 def test_desktop_tool_dispatch_receives_ticket_subject_not_forged_rpc_identity():
     """The real desktop session bridge must preserve the server-minted ticket subject.
 
