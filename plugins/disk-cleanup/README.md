@@ -14,7 +14,39 @@ never needs to remember to call a tool.
 | Hook | Behaviour |
 |---|---|
 | `post_tool_call` | When `write_file` / `terminal` / `patch` creates a file matching `test_*`, `tmp_*`, or `*.test.*` inside `HERMES_HOME`, track it silently as `test` / `temp` / `cron-output`. |
-| `on_session_end` | If any test files were auto-tracked during this turn, run `quick` cleanup (no prompts). |
+| `on_session_end` | If any test files were auto-tracked during this turn, follow `session_end_mode`. |
+
+## Session-end mode
+
+Configure the automatic hook under `plugins.config.disk-cleanup.session_end_mode`:
+
+```yaml
+plugins:
+  config:
+    disk-cleanup:
+      session_end_mode: report_only
+```
+
+| Value | Automatic session-end behavior |
+|---|---|
+| `report_only` | Query `dry-run` candidates and log/return bounded counts only; no deletion, directory sweep, registry write/prune, or reclaimed-byte estimate. |
+| `cleanup` | Run the historical automatic `quick` cleanup. This remains the default when the setting is absent. |
+| `disabled` | Drain this turn's auto-track state without querying or deleting. |
+
+Unknown, malformed, or unreadable configured modes fail closed as `disabled`. This setting affects only
+the automatic lifecycle hook; explicit `/disk-cleanup quick` and `/disk-cleanup deep` commands retain
+their existing behavior.
+
+For this hook, a missing `config.yaml` retains the historical `cleanup` default. A present file must
+parse to a YAML mapping before that default can be used: malformed YAML, a null/non-mapping root, an
+unreadable file, or a malformed `plugins` subtree disables automatic action. This is a plugin-local
+safety check; once the user file is valid, the final value is read through Hermes's normal merged
+configuration, so a managed `report_only` overlay overrides the user value.
+
+`report_only` is not a general no-I/O promise: the earlier `post_tool_call` hook may already have
+created/updated `disk-cleanup/tracked.json` when it auto-tracked a test file. At session end the
+report-only branch only reads that registry through `dry_run()` and emits an application log count;
+it does not save/prune the registry, sweep empty directories, or delete tracked paths.
 
 Deletion rules (same as the original PR):
 
