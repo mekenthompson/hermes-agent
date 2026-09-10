@@ -25,18 +25,6 @@ from hermes_cli.dashboard_auth.ws_tickets import _reset_for_tests, mint_ticket
 from tui_gateway import server
 
 
-# KEN534 acceptance is blocked at the real startup boundary: a ticketed
-# WebSocket creates a session and enters prompt.submit, but the fixture model's
-# production tool-call choke point receives an empty ToolInvocationContext.
-# The direct `_sessions` + `_set_session_context` unit path masks that loss.
-# Keep this strict reproduction executable until prompt startup propagates the
-# authenticated WSTransport identity into the turn worker.
-pytestmark = pytest.mark.xfail(
-    strict=True,
-    reason="prompt.submit loses ticket transport identity before model tool dispatch",
-)
-
-
 def _fleet_source_root() -> Path:
     """Return the explicit test-only fleet checkout used by this cross-repo probe."""
     configured = os.environ.get("HERMES_BROWSER_HANDOFF_TEST_FLEET_ROOT")
@@ -166,7 +154,7 @@ def _run_ticketed_tool(monkeypatch, tmp_path, *, allowlist, subject: str, tool: 
     principals = [{
         "principal_id": "fixture-principal", "access_email": "fixture@example.test",
         "routes": [["telegram", "fixture-user", None]], "agents": [profile],
-        "desktop_routes": [["fixture-oidc", "fixture-subject"]],
+        "desktop_routes": [["fixture-oidc", subject]],
     }]
     httpd, thread = _start_real_broker(monkeypatch, tmp_path, profile=profile, principals=principals)
     monkeypatch.setenv("BROWSER_HANDOFF_URL", f"http://127.0.0.1:{httpd.server_port}")
@@ -215,8 +203,10 @@ def test_ticket_subject_maps_through_real_ws_profile_plugin_and_broker(monkeypat
         allowlist=[{"profile": "default", "provider": "fixture-oidc", "subject": "mapped-subject"}],
         subject="mapped-subject", tool="browser_handoff_start",
     )
-    assert result["ok"] is True
+    # A successful start returns the broker handoff payload (rather than an
+    # ``ok`` envelope); authorization failures below remain explicit envelopes.
     assert result["session_id"]
+    assert result["url"].startswith("https://browser.switchroom.ai/default/")
 
 
 def test_empty_generated_allowlist_denies_without_model_identity(monkeypatch, tmp_path):

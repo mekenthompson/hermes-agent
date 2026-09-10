@@ -1210,6 +1210,7 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
         # callers that know the workspace pass it.
         resolved = cwd if cwd is not None else (str(sess.get("cwd") or "") if sess is not None else "")
         source = _resolve_session_platform()
+        profile = ""
         browser_control_principal = browser_control_transport_family = ""
         browser_control_provider = browser_control_subject = ""
         # Live conversation id for subprocess HERMES_SESSION_ID: an explicitly empty contextvar is authoritative
@@ -1217,6 +1218,7 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
         session_id = session_key
         if sess is not None:
             source = _session_source(sess)
+            profile = profile_name_for_home(sess.get("profile_home")) or _current_profile_name()
             session_id = getattr(sess.get("agent"), "session_id", None) or session_key
             identity = getattr(sess.get("transport"), "auth_identity", None)
             if _methods_browser_control._is_authenticated_identity(identity):
@@ -1233,7 +1235,7 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family, cwd=resolved,
             browser_control_provider=browser_control_provider,
-            browser_control_subject=browser_control_subject,
+            browser_control_subject=browser_control_subject, profile=profile,
             ui_session_id=ui_session_id, cron_session="")
     return []
 
