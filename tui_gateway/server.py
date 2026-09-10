@@ -1211,6 +1211,7 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
         resolved = cwd if cwd is not None else (str(sess.get("cwd") or "") if sess is not None else "")
         source = _resolve_session_platform()
         browser_control_principal = browser_control_transport_family = ""
+        browser_control_provider = browser_control_subject = ""
         # Live conversation id for subprocess HERMES_SESSION_ID: an explicitly empty contextvar is authoritative
         # (no os.environ fallback), so never leave it "" — agent's durable session_id, then session_key.
         session_id = session_key
@@ -1219,12 +1220,19 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             session_id = getattr(sess.get("agent"), "session_id", None) or session_key
             identity = getattr(sess.get("transport"), "auth_identity", None)
             if _methods_browser_control._is_authenticated_identity(identity):
+                assert isinstance(identity, dict)  # validated by _is_authenticated_identity
                 browser_control_principal = _methods_browser_control._principal_digest(identity)
                 browser_control_transport_family = _methods_browser_control._CLOUD_TRANSPORT_FAMILY
+                # Preserve the ticket's verified provider subject for opt-in
+                # tools. This is host state from WSTransport, never RPC data.
+                browser_control_provider = str(identity["provider"])
+                browser_control_subject = str(identity["user_id"])
         return set_session_vars(
             session_key=session_key, session_id=session_id, source=source,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family, cwd=resolved,
+            browser_control_provider=browser_control_provider,
+            browser_control_subject=browser_control_subject,
             ui_session_id=ui_session_id, cron_session="")
     return []
 

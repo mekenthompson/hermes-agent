@@ -114,6 +114,91 @@ def test_cloud_agent_context_binds_registration_principal_and_transport_family()
         server._sessions.pop("context-session-fixture", None)
 
 
+def test_desktop_tool_dispatch_receives_ticket_subject_not_forged_rpc_identity():
+    """The real desktop session bridge must preserve the server-minted ticket subject.
+
+    Before the browser-handoff bridge this regression failed: ToolInvocationContext
+    carried neither provider nor subject, so the fleet plugin could not authorize a
+    desktop caller without treating a dashboard token as a human identity.
+    """
+    from gateway.session_context import clear_session_vars
+    from tools.registry import ToolRegistry
+
+    identity = {"user_id": "ticket-subject", "provider": "ticket-provider"}
+    transport = WSTransport(SimpleNamespace(), SimpleNamespace(), auth_identity=identity)
+    server._sessions["desktop-tool-context"] = {
+        "transport": transport,
+        "session_key": "desktop-tool-session-key",
+        "profile": "marko",
+        "agent": SimpleNamespace(session_id="desktop-tool-context"),
+    }
+    server._sessions["other-desktop-tool-context"] = {
+        "transport": WSTransport(
+            SimpleNamespace(), SimpleNamespace(),
+            auth_identity={"user_id": "other-ticket-subject", "provider": "other-ticket-provider"},
+        ),
+        "session_key": "other-desktop-tool-session-key",
+        "profile": "marko",
+        "agent": SimpleNamespace(session_id="other-desktop-tool-context"),
+    }
+    seen = []
+    registry = ToolRegistry()
+    registry.register(
+        name="desktop_context_probe",
+        toolset="test",
+        schema={"name": "desktop_context_probe", "description": "", "parameters": {"type": "object"}},
+        handler=lambda args, *, invocation_context: seen.append(invocation_context) or "{}",
+        inject_invocation_context=True,
+    )
+    tokens = []
+    try:
+        tokens = server._set_session_context("desktop-tool-session-key")
+        registry.dispatch(
+            "desktop_context_probe",
+            {"provider": "forged-provider", "subject": "forged-subject", "session_id": "other-desktop-tool-context"},
+            invocation_context={"provider": "also-forged"},
+        )
+        assert seen[0].browser_control_provider == "ticket-provider"
+        assert seen[0].browser_control_subject == "ticket-subject"
+    finally:
+        clear_session_vars(tokens)
+        server._sessions.pop("desktop-tool-context", None)
+        server._sessions.pop("other-desktop-tool-context", None)
+
+
+def test_internal_device_credential_never_reaches_tool_invocation_context():
+    from gateway.session_context import clear_session_vars
+    from tools.registry import ToolRegistry
+
+    transport = WSTransport(
+        SimpleNamespace(), SimpleNamespace(),
+        auth_identity={"user_id": "server-internal", "provider": "server-internal"},
+    )
+    server._sessions["internal-tool-context"] = {
+        "transport": transport,
+        "session_key": "internal-tool-session-key",
+        "profile": "marko",
+        "agent": SimpleNamespace(session_id="internal-tool-context"),
+    }
+    seen = []
+    registry = ToolRegistry()
+    registry.register(
+        name="internal_context_probe", toolset="test",
+        schema={"name": "internal_context_probe", "description": "", "parameters": {"type": "object"}},
+        handler=lambda args, *, invocation_context: seen.append(invocation_context) or "{}",
+        inject_invocation_context=True,
+    )
+    tokens = []
+    try:
+        tokens = server._set_session_context("internal-tool-session-key")
+        registry.dispatch("internal_context_probe", {})
+        assert seen[0].browser_control_provider == ""
+        assert seen[0].browser_control_subject == ""
+    finally:
+        clear_session_vars(tokens)
+        server._sessions.pop("internal-tool-context", None)
+
+
 def test_cloud_event_writer_surfaces_closed_or_failed_transport_immediately():
     class RaisingTransport:
         def write(self, _frame):

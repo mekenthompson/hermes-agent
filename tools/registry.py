@@ -180,6 +180,11 @@ class ToolInvocationContext:
     session_id: str = ""
     session_key: str = ""
     message_id: str = ""
+    # Desktop browser-control ticket subject. These are copied only from the
+    # authenticated WebSocket transport by tui_gateway.server; tool arguments
+    # cannot populate them.
+    browser_control_provider: str = ""
+    browser_control_subject: str = ""
 
 
 def _current_tool_invocation_context() -> ToolInvocationContext:
@@ -203,6 +208,8 @@ def _current_tool_invocation_context() -> ToolInvocationContext:
         session_id=value("HERMES_SESSION_ID"),
         session_key=value("HERMES_SESSION_KEY"),
         message_id=value("HERMES_SESSION_MESSAGE_ID"),
+        browser_control_provider=value("HERMES_BROWSER_CONTROL_PROVIDER"),
+        browser_control_subject=value("HERMES_BROWSER_CONTROL_SUBJECT"),
     )
 
 
