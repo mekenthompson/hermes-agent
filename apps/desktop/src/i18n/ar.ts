@@ -1779,6 +1779,7 @@ export const ar = defineLocale({
     noSessions: 'لا توجد جلسات بعد',
     noFilterMatches: 'لا توجد جلسات تطابق عوامل التصفية هذه',
     projects: {
+      showAllSessions: 'عرض جميع الجلسات',
       sectionLabel: 'المشاريع',
       home: 'الرئيسية',
       autoDiscovered: 'مكتشف تلقائيًا',
@@ -2700,6 +2701,9 @@ export const ar = defineLocale({
       errorRetry: 'إعادة المحاولة',
       errorStartNewSession: 'بدء جلسة جديدة',
       errorSwitchProvider: 'تبديل المزوّد',
+      errorSignInAgain: provider => `تسجيل الدخول إلى ${provider} مجدداً`,
+      errorOauthExpired: provider =>
+        `انتهت صلاحية تسجيل دخولك إلى ${provider} أو تم إلغاؤه. سجّل الدخول مجدداً لمتابعة المحادثة.`,
       errorOpenLogs: 'فتح السجلات',
       errorOpenLogsFailed: 'تعذّر فتح مجلد السجلات',
       errorOpenDesktopLogs: 'فتح سجلات سطح المكتب',

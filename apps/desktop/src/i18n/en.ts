@@ -2437,6 +2437,7 @@ export const en: Translations = {
     noSessions: 'No sessions yet',
     noFilterMatches: 'No sessions match these filters',
     projects: {
+      showAllSessions: 'Show all sessions',
       sectionLabel: 'Projects',
       home: 'Home',
       autoDiscovered: 'Auto-discovered',
@@ -3578,6 +3579,9 @@ export const en: Translations = {
       errorRetry: 'Retry',
       errorStartNewSession: 'Start new session',
       errorSwitchProvider: 'Switch provider',
+      errorSignInAgain: provider => `Sign in to ${provider} again`,
+      errorOauthExpired: provider =>
+        `Your ${provider} sign-in has expired or was revoked. Sign in again to keep chatting.`,
       errorOpenLogs: 'Open logs',
       errorOpenLogsFailed: 'Could not open the logs folder',
       errorOpenDesktopLogs: 'Open Desktop logs',
