@@ -328,19 +328,161 @@ class TestPostToolCallHook:
 
 
 class TestOnSessionEndHook:
-    def test_runs_quick_when_test_files_tracked(self, _isolate_env):
-        pi = _load_plugin_init()
-        p = _isolate_env / "test_cleanup.py"
-        p.write_text("x")
+    @staticmethod
+    def _track_test(pi, hermes_home, session_id="s1"):
+        path = hermes_home / "test_cleanup.py"
+        path.write_text("x")
         pi._on_post_tool_call(
-            tool_name="write_file",
-            args={"path": str(p), "content": "x"},
-            result="OK",
-            task_id="", session_id="s1",
+            tool_name="write_file", args={"path": str(path), "content": "x"},
+            result="OK", task_id="", session_id=session_id,
         )
-        assert p.exists()
+        return path
+
+    @staticmethod
+    def _set_session_end_mode(hermes_home, mode):
+        (hermes_home / "config.yaml").write_text(
+            "plugins:\n  config:\n    disk-cleanup:\n      session_end_mode: " + mode + "\n"
+        )
+
+    def test_missing_mode_preserves_historical_quick_cleanup(self, _isolate_env):
+        pi = _load_plugin_init()
+        p = self._track_test(pi, _isolate_env)
         pi._on_session_end(session_id="s1", completed=True, interrupted=False)
-        assert not p.exists(), "test file should be auto-deleted"
+        assert not p.exists(), "default must retain upstream cleanup behaviour"
+
+    def test_report_only_uses_dry_run_without_deleting(self, _isolate_env, monkeypatch):
+        self._set_session_end_mode(_isolate_env, "report_only")
+        pi = _load_plugin_init()
+        path = self._track_test(pi, _isolate_env)
+        calls = {"dry_run": 0, "quick": 0}
+        original_dry_run = pi.dg.dry_run
+        def dry_run():
+            calls["dry_run"] += 1
+            return original_dry_run()
+        def quick():
+            calls["quick"] += 1
+            raise AssertionError("report-only hook must not call quick cleanup")
+        monkeypatch.setattr(pi.dg, "dry_run", dry_run)
+        monkeypatch.setattr(pi.dg, "quick", quick)
+        report = pi._on_session_end(session_id="s1", completed=True, interrupted=False)
+        assert path.exists()
+        assert calls == {"dry_run": 1, "quick": 0}
+        assert report["mode"] == "report_only"
+        assert report["auto_candidates"] == 1
+        assert "freed" not in report
+
+    @pytest.mark.parametrize("mode", ["disabled", "typo", "cleanup-now", "null"])
+    def test_disabled_or_invalid_mode_fails_closed_without_deletion(self, _isolate_env, monkeypatch, mode):
+        self._set_session_end_mode(_isolate_env, mode)
+        pi = _load_plugin_init()
+        path = self._track_test(pi, _isolate_env)
+        monkeypatch.setattr(pi.dg, "quick", lambda: pytest.fail("must not delete"))
+        monkeypatch.setattr(pi.dg, "dry_run", lambda: pytest.fail("must not inspect"))
+        report = pi._on_session_end(session_id="s1", completed=True, interrupted=False)
+        assert path.exists()
+        assert report["mode"] == "disabled"
+
+    @pytest.mark.parametrize("raw_config", [
+        "plugins: [\n",  # invalid YAML must not collapse into the cleanup default
+        "plugins:\n",  # a null top-level section is ambiguous for this safety policy
+        "- not-a-mapping\n",
+        "null\n",
+    ])
+    def test_ambiguous_config_fails_closed_without_deletion(
+        self, _isolate_env, monkeypatch, raw_config,
+    ):
+        (_isolate_env / "config.yaml").write_text(raw_config)
+        pi = _load_plugin_init()
+        path = self._track_test(pi, _isolate_env)
+        monkeypatch.setattr(pi.dg, "quick", lambda: pytest.fail("must not delete"))
+        monkeypatch.setattr(pi.dg, "dry_run", lambda: pytest.fail("must not inspect"))
+
+        assert pi._on_session_end(session_id="s1") == {"mode": "disabled"}
+        assert path.exists()
+
+    def test_unreadable_config_fails_closed_without_deletion(self, _isolate_env, monkeypatch):
+        self._set_session_end_mode(_isolate_env, "cleanup")
+        pi = _load_plugin_init()
+        path = self._track_test(pi, _isolate_env)
+        config_path = _isolate_env / "config.yaml"
+        original_open = open
+
+        def denied_open(pathname, *args, **kwargs):
+            if Path(pathname) == config_path:
+                raise PermissionError("not readable")
+            return original_open(pathname, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", denied_open)
+        monkeypatch.setattr(pi.dg, "quick", lambda: pytest.fail("must not delete"))
+        monkeypatch.setattr(pi.dg, "dry_run", lambda: pytest.fail("must not inspect"))
+
+        assert pi._on_session_end(session_id="s1") == {"mode": "disabled"}
+        assert path.exists()
+
+    @pytest.mark.parametrize("managed_text", ["plugins: [", "null\n", "plugins: null\n"])
+    def test_malformed_managed_scope_cannot_fall_back_to_user_cleanup(self, _isolate_env, monkeypatch, managed_text):
+        self._set_session_end_mode(_isolate_env, "cleanup")
+        managed_dir = _isolate_env.parent / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(managed_text)
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        from hermes_cli import managed_scope
+        managed_scope.invalidate_managed_cache()
+        pi = _load_plugin_init()
+        path = self._track_test(pi, _isolate_env)
+        monkeypatch.setattr(pi.dg, "quick", lambda: pytest.fail("invalid managed scope must not delete"))
+        monkeypatch.setattr(pi.dg, "dry_run", lambda: pytest.fail("invalid managed scope must not inspect"))
+        assert pi._on_session_end(session_id="s1") == {"mode": "disabled"}
+        assert path.exists()
+
+    def test_loaded_report_only_takes_precedence_over_user_cleanup(self, _isolate_env, monkeypatch):
+        self._set_session_end_mode(_isolate_env, "cleanup")
+        managed_dir = _isolate_env.parent / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(
+            "plugins:\n  config:\n    disk-cleanup:\n      session_end_mode: report_only\n",
+        )
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        from hermes_cli import managed_scope
+        managed_scope.invalidate_managed_cache()
+        pi = _load_plugin_init()
+        path = self._track_test(pi, _isolate_env)
+
+        monkeypatch.setattr(pi.dg, "quick", lambda: pytest.fail("managed overlay must win"))
+        monkeypatch.setattr(pi.dg, "dry_run", lambda: ([], []))
+
+        assert pi._on_session_end(session_id="s1")["mode"] == "report_only"
+        assert path.exists()
+
+    def test_report_only_dry_run_error_does_not_log_exception_details(
+        self, _isolate_env, monkeypatch, caplog,
+    ):
+        self._set_session_end_mode(_isolate_env, "report_only")
+        pi = _load_plugin_init()
+        self._track_test(pi, _isolate_env)
+
+        class SensitiveFailure(RuntimeError):
+            pass
+
+        monkeypatch.setattr(pi.dg, "dry_run", lambda: (_ for _ in ()).throw(
+            SensitiveFailure("SECRET-SENTINEL"),
+        ))
+        with caplog.at_level("DEBUG", logger=pi.logger.name):
+            assert pi._on_session_end(session_id="s1") == {
+                "mode": "report_only", "status": "unavailable",
+            }
+        assert "SensitiveFailure" in caplog.text
+        assert "SECRET-SENTINEL" not in caplog.text
+
+    def test_report_only_bounds_candidate_counts(self, _isolate_env, monkeypatch):
+        self._set_session_end_mode(_isolate_env, "report_only")
+        pi = _load_plugin_init()
+        self._track_test(pi, _isolate_env)
+        monkeypatch.setattr(pi.dg, "dry_run", lambda: ([{}] * 101, [{}] * 102))
+        assert pi._on_session_end(session_id="s1") == {
+            "mode": "report_only", "auto_candidates": 100, "prompt_candidates": 100,
+            "truncated": True,
+        }
 
     def test_noop_when_no_test_tracked(self, _isolate_env):
         pi = _load_plugin_init()

@@ -1,7 +1,7 @@
 """disk-cleanup plugin — auto-cleanup of ephemeral Hermes session files.
 
 ``post_tool_call`` silently tracks test/temp paths created by write_file/patch/terminal;
-``on_session_end`` runs :func:`disk_cleanup.quick` when any test file was tracked this turn;
+``on_session_end`` follows the configured cleanup/report-only mode when any test file was tracked;
 ``/disk-cleanup`` exposes status / dry-run / quick / deep / track / forget.
 """
 
@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 # decide whether to run cleanup. Locked: post_tool_call fires concurrently on parallel calls.
 _recent_test_tracks: Dict[str, Set[str]] = {}
 _lock = threading.Lock()
+_SESSION_END_MODES = frozenset({"report_only", "cleanup", "disabled"})
+_MAX_REPORTED_CANDIDATES = 100
 
 _TERMINAL_PATH_REGEX = re.compile(r"(?:^|\s)(/[^\s'\"`]+|\~/[^\s'\"`]+)")
 
@@ -70,15 +72,104 @@ def _on_post_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = Non
                 _recent_test_tracks.setdefault(task_id or session_id or "default", set()).add(str(p))
 
 
+def _session_end_mode() -> str:
+    """Read the legacy plugin config; absent preserves the historical cleanup default.
+
+    A present but malformed value is deliberately disabled rather than silently becoming
+    destructive. Before using the canonical merged config, validate the user and managed files themselves:
+    the general loader deliberately recovers from invalid YAML with defaults, which would
+    otherwise make an ambiguous configured state look like an absent setting. The strict
+    check establishes only whether the files are unambiguous; the final mode still comes
+    from ``load_config_readonly`` so managed overlays retain their normal precedence.
+    """
+    try:
+        from hermes_cli.config import get_config_path, load_config_readonly
+        from utils import fast_safe_load
+
+        from hermes_cli.managed_scope import get_managed_dir
+
+        config_paths = [get_config_path()]
+        managed_dir = get_managed_dir()
+        if managed_dir is not None:
+            config_paths.append(managed_dir / "config.yaml")
+        for config_path in config_paths:
+            try:
+                with open(config_path, encoding="utf-8") as f:
+                    user_config = fast_safe_load(f)
+            except FileNotFoundError:
+                pass  # No user config is the historical cleanup-default state.
+            except Exception:
+                return "disabled"
+            else:
+                if not isinstance(user_config, dict):
+                    return "disabled"
+                # Validate the relevant raw shape without reading its value for precedence.
+                # ``_deep_merge`` intentionally fills a null plugin block from defaults, but this
+                # destructive lifecycle hook must treat such an explicit ambiguity as disabled.
+                raw_plugins = user_config.get("plugins", {})
+                if not isinstance(raw_plugins, dict):
+                    return "disabled"
+                raw_plugin_config = raw_plugins.get("config", {})
+                if not isinstance(raw_plugin_config, dict):
+                    return "disabled"
+                if "disk-cleanup" in raw_plugin_config and not isinstance(
+                    raw_plugin_config["disk-cleanup"], dict,
+                ):
+                    return "disabled"
+        plugins = (load_config_readonly() or {}).get("plugins", {})
+        if not isinstance(plugins, dict):
+            return "disabled"
+        config = plugins.get("config", {})
+        if config is None:
+            return "disabled"
+        if not isinstance(config, dict):
+            return "disabled"
+        if "disk-cleanup" not in config:
+            return "cleanup"
+        disk_cleanup = config["disk-cleanup"]
+        if not isinstance(disk_cleanup, dict):
+            return "disabled"
+        if "session_end_mode" not in disk_cleanup:
+            return "cleanup"
+        mode = disk_cleanup["session_end_mode"]
+    except Exception:
+        return "disabled"
+    return mode if isinstance(mode, str) and mode in _SESSION_END_MODES else "disabled"
+
+
+def _report_session_end_candidates() -> Dict[str, Any]:
+    """Return bounded candidate counts only; dry-run never mutates tracked files or paths."""
+    try:
+        auto, prompt = dg.dry_run()
+        auto_count, prompt_count = len(auto), len(prompt)
+    except Exception as exc:
+        logger.debug("disk-cleanup report-only candidate query failed: %s", type(exc).__name__)
+        return {"mode": "report_only", "status": "unavailable"}
+    report = {
+        "mode": "report_only",
+        "auto_candidates": min(auto_count, _MAX_REPORTED_CANDIDATES),
+        "prompt_candidates": min(prompt_count, _MAX_REPORTED_CANDIDATES),
+        "truncated": auto_count > _MAX_REPORTED_CANDIDATES or prompt_count > _MAX_REPORTED_CANDIDATES,
+    }
+    logger.info("disk-cleanup AUTO_REPORT (session_end): auto=%d prompt=%d truncated=%s",
+                report["auto_candidates"], report["prompt_candidates"], report["truncated"])
+    return report
+
+
 def _on_session_end(
-    session_id: str = "", completed: bool = True, interrupted: bool = False, **_: Any) -> None:
-    """Run quick cleanup if any test files were tracked during this turn."""
+    session_id: str = "", completed: bool = True, interrupted: bool = False, **_: Any) -> Optional[Dict[str, Any]]:
+    """Apply the configured automatic lifecycle mode after draining tracked test paths."""
     # Drain the session bucket plus every task-scoped bucket (subagents record into their own).
     with _lock:
         had_tracks = bool(_recent_test_tracks.pop(session_id or "default", None) or _recent_test_tracks)
         _recent_test_tracks.clear()
     if not had_tracks:
         return
+    mode = _session_end_mode()
+    if mode == "disabled":
+        return {"mode": "disabled"}
+    if mode == "report_only":
+        return _report_session_end_candidates()
     try:
         summary = dg.quick()
     except Exception as exc:
