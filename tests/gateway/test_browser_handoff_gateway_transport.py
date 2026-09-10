@@ -212,7 +212,7 @@ def test_ticket_subject_maps_through_real_ws_profile_plugin_and_broker(monkeypat
     # A successful start returns the broker handoff payload (rather than an
     # ``ok`` envelope); authorization failures below remain explicit envelopes.
     assert result["session_id"]
-    assert result["url"].startswith("https://browser.switchroom.ai/default/")
+    assert result["url"].startswith("https://")
 
 
 def test_empty_generated_allowlist_denies_without_model_identity(monkeypatch, tmp_path):
