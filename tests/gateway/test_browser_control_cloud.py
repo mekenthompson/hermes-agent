@@ -14,6 +14,7 @@ from hermes_cli.dashboard_auth.ws_tickets import _reset_for_tests, mint_ticket
 from tui_gateway import server
 from tui_gateway.ws import WSTransport
 from tui_gateway.methods_browser_control import _broker_event_writer, _principal_digest
+from tui_gateway.browser_handoff_identity import browser_handoff_identity
 
 
 def _fake_ticket_ws(ticket):
@@ -37,6 +38,26 @@ def _fake_ticket_subprotocol_ws(ticket):
         client=SimpleNamespace(host="203.0.113.7"),
         url=SimpleNamespace(path="/api/ws"),
     )
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"user_id": "", "provider": "oidc"},
+        {"user_id": "subject with space", "provider": "oidc"},
+        {"user_id": "subject", "provider": "*"},
+        {"user_id": "dashboard-session-token", "provider": "dashboard-session-token"},
+        {"user_id": "server-internal", "provider": "server-internal"},
+    ],
+)
+def test_browser_handoff_identity_rejects_wildcard_malformed_and_synthetic_claims(identity):
+    assert browser_handoff_identity(identity) is None
+
+
+def test_browser_handoff_identity_preserves_an_exact_ticket_claim():
+    identity = browser_handoff_identity({"user_id": "fixture-subject", "provider": "fixture-oidc"})
+    assert identity is not None
+    assert (identity.provider, identity.subject) == ("fixture-oidc", "fixture-subject")
 
 
 @pytest.fixture
