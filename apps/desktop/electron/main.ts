@@ -110,7 +110,6 @@ import {
   cookiesHavePrivyAccessToken,
   cookiesHavePrivySession,
   cookiesHaveSession,
-  gatewayTicketFailure,
   gatewayWsAuthTransport,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
