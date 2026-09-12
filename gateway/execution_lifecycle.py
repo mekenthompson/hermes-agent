@@ -302,7 +302,20 @@ class GatewayExecutionLifecycleMixin:
         if state.turn.agent is not agent or not request_hard_interrupt(agent, reason):
             return {"status": "not_delivered", **receipt}
         record["accepted"] = True
+        self._reap_internal_plugin_turn_processes(agent)
         return {"status": "accepted", **receipt}
+
+    def _reap_internal_plugin_turn_processes(self, agent) -> None:
+        """Kill background processes this plugin turn started. Not occupancy proof."""
+        from gateway import run as gateway_run
+        reap = getattr(gateway_run, "_reap_gateway_turn_processes", None)
+        if not callable(reap):
+            return
+        task_id = getattr(agent, "_gateway_turn_process_task_id", "") or ""
+        baseline = getattr(agent, "_gateway_turn_process_baseline", None)
+        if not task_id or baseline is None:
+            return
+        reap(task_id, baseline, source="internal_plugin_stop")
 
     async def get_execution_lifecycle(self, *, session_key: str, execution_id: str) -> dict:
         """Observation ABI v2; `released` requires actual worker completion and no tool event."""

@@ -106,6 +106,47 @@ async def test_stop_interrupts_only_exact_bound_agent_without_releasing_turn_sta
 
 
 @pytest.mark.asyncio
+async def test_plugin_stop_reaps_bound_turn_background_processes():
+    """Accepted Stop must kill this turn's background processes, not just interrupt."""
+    runner = object.__new__(GatewayRunner)
+    session_key = "local:aggie:linear-session-1"
+
+    class Agent:
+        _gateway_turn_process_task_id = session_key
+        _gateway_turn_process_baseline = frozenset({"proc_existing"})
+
+    agent = Agent()
+    event = _event()
+    event._internal_plugin_execution_id = _EXECUTION_ID
+    state = runner._session_state(session_key)
+    state.persistent.run_generation = 6
+    runner._register_internal_plugin_execution(event, session_key)
+    state.persistent.run_generation = 7
+    state.turn.agent = agent
+    runner._bind_internal_plugin_execution(
+        event, session_key=session_key, run_generation=7, agent=agent
+    )
+
+    reaped = []
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("gateway.run.request_hard_interrupt", lambda *args, **kwargs: True)
+        monkeypatch.setattr(
+            "gateway.run._reap_gateway_turn_processes",
+            lambda task_id, baseline, *, source, is_still_current=None: reaped.append(
+                (task_id, baseline, source)
+            ) or 1,
+        )
+        receipt = await runner.request_stop(
+            session_key=session_key,
+            expected_execution_id=_EXECUTION_ID,
+            reason="plugin requested stop",
+        )
+
+    assert receipt["status"] == "accepted"
+    assert reaped == [(session_key, frozenset({"proc_existing"}), "internal_plugin_stop")]
+
+
+@pytest.mark.asyncio
 async def test_promoted_execution_stop_acknowledges_interrupt_without_claiming_worker_stopped():
     """A Stop delivery is cooperative: a live worker may still be draining."""
     runner = object.__new__(GatewayRunner)
