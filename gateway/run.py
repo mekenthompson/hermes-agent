@@ -1605,7 +1605,12 @@ def _reload_runtime_env_preserving_config_authority() -> None:
 
 
 def _bridge_max_turns_from_config(home: "Path") -> None:
-    """Re-bridge agent.max_turns (+ sessions.*) per turn; managed overlay applies or it reverts."""
+    """Re-bridge agent.max_turns (+ sessions.*) per turn; managed overlay applies or it reverts.
+    Skipped inside a served secondary's scope: the env slots are the launch profile's and
+    hermes_state reads the routed profile's ``sessions.*`` from its own config under scope."""
+    from gateway.platforms._shared import profile_scoped
+    if profile_scoped():
+        return
     config_path = home / 'config.yaml'
     if not config_path.exists():
         return
@@ -1658,15 +1663,14 @@ class HygieneTurnHoldExceeded(Exception):
 def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     """Return the authoritative profile set for one multiplex gateway config."""
     from hermes_cli.profiles import profiles_to_serve
-    return list(profiles_to_serve(
-        multiplex=True, profile_allowlist=getattr(config, "multiplex_profile_allowlist", None)))
+    return list(profiles_to_serve(multiplex=True))
 
 
 def _cron_tick_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     """Profile homes the in-process ticker visits under multiplex: the served set PLUS the
-    process-active profile. ``profiles_to_serve`` starts at default + allowlist, so a
-    ``--profile <name>`` multiplexer was omitted unless allowlisted — and allowlisting it would
-    start a second adapter on its own bot token. Adapter startup already skips ``active``."""
+    process-active profile: ``profiles_to_serve`` lists default + every live named profile, but a
+    ``--profile <name>`` multiplexer's own profile may sit outside ``profiles/`` (custom
+    HERMES_HOME). Adapter startup already skips ``active``."""
     from hermes_cli.profiles import get_active_profile_name, get_profile_dir
 
     homes = _multiplex_profile_homes(config)
@@ -2564,6 +2568,7 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
 _INTERRUPT_REASON_STOP = "Stop requested"
 _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
+_INTERRUPT_REASON_EVICTED = "Session ended while the turn was running"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
@@ -2697,7 +2702,8 @@ def _watch_gateway_turn_inactivity(
 _CONTROL_INTERRUPT_MESSAGES = frozenset({
     _INTERRUPT_REASON_STOP.lower(), _INTERRUPT_REASON_RESET.lower(),
     _INTERRUPT_REASON_TIMEOUT.lower(), _INTERRUPT_REASON_SSE_DISCONNECT.lower(),
-    _INTERRUPT_REASON_GATEWAY_SHUTDOWN.lower(), _INTERRUPT_REASON_GATEWAY_RESTART.lower()})
+    _INTERRUPT_REASON_EVICTED.lower(), _INTERRUPT_REASON_GATEWAY_SHUTDOWN.lower(),
+    _INTERRUPT_REASON_GATEWAY_RESTART.lower()})
 
 
 def _is_control_interrupt_message(message: Optional[str]) -> bool:
@@ -3518,11 +3524,8 @@ class GatewayRunner(
         # to one session_id (switch_session's many-to-one mapping), which routing-key guards cannot see.
         self._turn_leases = SessionTurnLeaseRegistry()
         # Stall-notified keys clear when pending clears / activity resumes / conversation boundary.
-        # Tokens for held turn leases, keyed by (routing key, run generation) so release is granted per-turn
-        # and a stale unwind can never free a newer turn's lease (#28686 ownership lesson). Held turn-lease
-        # tokens live on SessionState.turn.lease_token / .lease_generation (the old dict was keyed (routing
-        # key, generation) so a stale unwind could never free a newer turn's lease — the generation field
-        # preserves that ownership check, #28686). Runner-level queued interrupt text lives on
+        # Held turn-lease tokens live on SessionState.turn.lease_tokens keyed by run generation, so a
+        # stale unwind can never free a newer turn's lease (#28686). Runner-level queued interrupt text lives on
         # SessionState.persistent.pending_command_text (NOTE: distinct from the adapter-level
         # _pending_messages Dict[str, MessageEvent] in gateway/platforms/base.py, which shares the legacy
         # name). Last successfully-resolved (non-empty) model, keyed by session. Used as a fallback when a
