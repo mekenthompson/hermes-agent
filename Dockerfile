@@ -71,6 +71,8 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 RUN apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils && \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends --only-upgrade \
+        libglib2.0-0t64 libmbedcrypto16 perl perl-base libperl5.40 perl-modules-5.40 && \
     rm -rf /var/lib/apt/lists/*
 
 # Prefer the fixed SQLite over Debian's vulnerable libsqlite3.so.0. Keep the
