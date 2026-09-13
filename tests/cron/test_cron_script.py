@@ -107,6 +107,76 @@ class TestRunJobScript:
         assert success is True
         assert output == "relative works"
 
+    def test_script_receives_its_exact_execution_id(self, cron_env, monkeypatch):
+        from cron.scheduler_script import _run_job_script
+
+        monkeypatch.setenv("HERMES_CRON_EXECUTION_ID", "stale-parent-value")
+        script = cron_env / "scripts" / "execution_id.py"
+        script.write_text(
+            "import os; print(os.environ.get('HERMES_CRON_EXECUTION_ID', 'missing'))\n"
+        )
+
+        success, output = _run_job_script(
+            "execution_id.py", execution_id="execution-123"
+        )
+
+        assert success is True
+        assert output == "execution-123"
+
+    def test_script_removes_stale_execution_id_without_current_execution(self, cron_env, monkeypatch):
+        from cron.scheduler_script import _run_job_script
+
+        monkeypatch.setenv("HERMES_CRON_EXECUTION_ID", "stale-parent-value")
+        script = cron_env / "scripts" / "execution_id_missing.py"
+        script.write_text(
+            "import os; print(os.environ.get('HERMES_CRON_EXECUTION_ID', 'missing'))\n"
+        )
+
+        success, output = _run_job_script("execution_id_missing.py")
+
+        assert success is True
+        assert output == "missing"
+
+    def test_scheduler_wrapper_passes_job_execution_id(self, cron_env):
+        from cron.scheduler_script import _run_job_script_with_claim_heartbeat
+
+        script = cron_env / "scripts" / "scheduled_execution_id.py"
+        script.write_text(
+            "import os; print(os.environ.get('HERMES_CRON_EXECUTION_ID', 'missing'))\n"
+        )
+        job = {
+            "id": "job-123",
+            "execution_id": "execution-456",
+            "schedule": {"kind": "interval"},
+        }
+
+        success, output = _run_job_script_with_claim_heartbeat(
+            job, "scheduled_execution_id.py"
+        )
+
+        assert success is True
+        assert output == "execution-456"
+
+    def test_claimed_once_wrapper_passes_job_execution_id(self, cron_env):
+        from cron.scheduler_script import _run_job_script_with_claim_heartbeat
+
+        script = cron_env / "scripts" / "once_execution_id.py"
+        script.write_text(
+            "import os; print(os.environ.get('HERMES_CRON_EXECUTION_ID', 'missing'))\n"
+        )
+        job = {
+            "id": "job-once-123",
+            "execution_id": "execution-once-456",
+            "schedule": {"kind": "once"},
+            "run_claim": {"by": "scheduler-owner"},
+        }
+
+        success, output = _run_job_script_with_claim_heartbeat(
+            job, "once_execution_id.py"
+        )
+
+        assert success is True
+        assert output == "execution-once-456"
 
     def test_script_subprocess_env_sanitized(self, cron_env, monkeypatch):
         """Cron scripts must not inherit Hermes provider env (SECURITY.md §2.3)."""
