@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -75,7 +76,7 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             secret_file = root / "config.env"
-            secret_file.write_text("OPENAI_API_KEY=sk-proj-abc123def456ghi789jkl012", encoding="utf-8")
+            secret_file.write_text("OPENAI_API_KEY=sk-proj-abc123def456ghi789jkl012")
 
             # agent.redact snapshots HERMES_REDACT_SECRETS at import time into
             # _REDACT_ENABLED, so patching os.environ is a no-op. Flip the
@@ -214,7 +215,7 @@ def test_run_prompt_preserves_real_home_when_profile_home_available(monkeypatch,
     # Hermeticity: the --acp support probe (PR #87308) calls subprocess.run
     # before Popen; stub it inconclusive so no real CLI on the host box can
     # flip the resolution this test asserts.
-    with _patch("agent.copilot_acp_client._probe_help", side_effect=FileNotFoundError):
+    with _patch("agent.copilot_acp_client.subprocess.run", side_effect=FileNotFoundError):
         with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
             with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
                 client._run_prompt("hello", timeout_seconds=1)
@@ -233,7 +234,7 @@ def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
     # Hermeticity: the --acp support probe (PR #87308) calls subprocess.run
     # before Popen; stub it inconclusive so no real CLI on the host box can
     # flip the resolution this test asserts.
-    with _patch("agent.copilot_acp_client._probe_help", side_effect=FileNotFoundError):
+    with _patch("agent.copilot_acp_client.subprocess.run", side_effect=FileNotFoundError):
         with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
             with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
                 client._run_prompt("hello", timeout_seconds=1)
@@ -262,7 +263,7 @@ def _completed(returncode=0, stdout=""):
 
 def test_probe_true_when_help_advertises_acp():
     with _patch(
-        "agent.copilot_acp_client._probe_help",
+        "agent.copilot_acp_client.subprocess.run",
         return_value=_completed(stdout="Usage: copilot [--acp] [--stdio]"),
     ):
         assert _acp_supported("copilot", ["--acp", "--stdio"]) is True
@@ -271,7 +272,7 @@ def test_probe_true_when_help_advertises_acp():
 def test_probe_false_when_help_lacks_acp_and_run_prompt_fast_fails(tmp_path):
     client = _make_home_client(tmp_path)
     with _patch(
-        "agent.copilot_acp_client._probe_help",
+        "agent.copilot_acp_client.subprocess.run",
         return_value=_completed(stdout="Usage: claude [--print] [--model]"),
     ):
         with pytest.raises(RuntimeError, match="ACP transport not supported"):
@@ -282,7 +283,7 @@ def test_probe_inconclusive_falls_through_to_spawn_error(tmp_path):
     """Missing binary: probe must NOT mask the established spawn error."""
     client = _make_home_client(tmp_path)
     with _patch(
-        "agent.copilot_acp_client._probe_help",
+        "agent.copilot_acp_client.subprocess.run",
         side_effect=FileNotFoundError("copilot not found"),
     ):
         with _patch(
@@ -295,7 +296,7 @@ def test_probe_inconclusive_falls_through_to_spawn_error(tmp_path):
 
 def test_probe_result_cached_per_binary_path():
     with _patch(
-        "agent.copilot_acp_client._probe_help",
+        "agent.copilot_acp_client.subprocess.run",
         return_value=_completed(stdout="Usage: copilot [--acp]"),
     ) as run_mock:
         assert _acp_supported("copilot", ["--acp"]) is True
@@ -305,7 +306,7 @@ def test_probe_result_cached_per_binary_path():
 
 def test_probe_inconclusive_not_cached():
     with _patch(
-        "agent.copilot_acp_client._probe_help",
+        "agent.copilot_acp_client.subprocess.run",
         side_effect=FileNotFoundError,
     ) as run_mock:
         assert _acp_supported("copilot", ["--acp"]) is None
@@ -314,7 +315,7 @@ def test_probe_inconclusive_not_cached():
 
 
 def test_probe_skipped_for_custom_args_without_acp():
-    with _patch("agent.copilot_acp_client._probe_help") as run_mock:
+    with _patch("agent.copilot_acp_client.subprocess.run") as run_mock:
         assert _acp_supported("mycli", ["--custom-transport"]) is True
     run_mock.assert_not_called()
 
@@ -412,7 +413,7 @@ def test_run_prompt_receives_picker_model():
     client = CopilotACPClient(acp_cwd="/tmp")
     seen = {}
 
-    def fake_run_prompt(prompt_text, *, timeout_seconds, model=None, publish=None):
+    def fake_run_prompt(prompt_text, *, timeout_seconds, model=None):
         seen["model"] = model
         return "ok", ""
 
@@ -421,6 +422,75 @@ def test_run_prompt_receives_picker_model():
             model="gpt-5.6-terra", messages=[{"role": "user", "content": "hi"}]
         )
     assert seen["model"] == "gpt-5.6-terra"
+
+
+def test_list_models_reads_enabled_session_config_options(tmp_path):
+    server = tmp_path / "fake_copilot_acp.py"
+    server.write_text(
+        """import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": 1}
+    elif method == "session/new":
+        result = {
+            "sessionId": "catalog-session",
+            "configOptions": [{
+                "id": "model",
+                "category": "model",
+                "options": [
+                    {"value": "auto"},
+                    {"value": "gpt-5.6-terra"},
+                    {"value": "gpt-5.6-terra"},
+                    {"value": "claude-fable-5", "_meta": {"copilotEnablement": "disabled"}},
+                ],
+            }],
+            "models": {"availableModels": [{"modelId": "stale-legacy-model"}]},
+        }
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    client = CopilotACPClient(
+        command=sys.executable,
+        args=[str(server)],
+        acp_cwd=str(tmp_path),
+    )
+
+    assert client.list_models(timeout_seconds=30) == ["auto", "gpt-5.6-terra"]
+    assert client.is_closed is True
+
+
+def test_model_discovery_does_not_allow_file_requests(tmp_path):
+    target = tmp_path / "should-not-be-read.txt"
+    target.write_text("private", encoding="utf-8")
+    server = tmp_path / "fake_copilot_acp_fs_request.py"
+    server.write_text(
+        f"""import json
+import sys
+
+initialize = json.loads(sys.stdin.readline())
+print(json.dumps({{"jsonrpc": "2.0", "id": initialize["id"], "result": {{"protocolVersion": 1}}}}), flush=True)
+session = json.loads(sys.stdin.readline())
+print(json.dumps({{"jsonrpc": "2.0", "id": 99, "method": "fs/read_text_file", "params": {{"path": {str(target)!r}}}}}), flush=True)
+file_response = json.loads(sys.stdin.readline())
+assert file_response["error"]["code"] == -32601
+print(json.dumps({{"jsonrpc": "2.0", "id": session["id"], "result": {{"sessionId": "catalog-session", "configOptions": [{{"id": "model", "options": [{{"value": "gpt-5.6-sol"}}]}}]}}}}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    client = CopilotACPClient(
+        command=sys.executable,
+        args=[str(server)],
+        acp_cwd=str(tmp_path),
+    )
+
+    assert client.list_models(timeout_seconds=30) == ["gpt-5.6-sol"]
 
 def test_empty_explicit_args_do_not_inject_copilot_acp_flags():
     """Claude ACP passes process_args=(). Empty list is explicit, not omitted."""
@@ -432,6 +502,8 @@ def test_empty_explicit_args_do_not_inject_copilot_acp_flags():
     assert client._acp_command == "/usr/local/bin/hermes-claude-acp-subscription"
     assert client._acp_args == []
 
+
 def test_omitted_args_still_default_to_copilot_acp_stdio():
     client = CopilotACPClient(command="copilot", acp_cwd="/tmp")
     assert client._acp_args == ["--acp", "--stdio"]
+

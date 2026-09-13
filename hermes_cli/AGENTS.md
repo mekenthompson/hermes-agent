@@ -67,9 +67,13 @@ Do not add a surface-specific goal parser. ACP has no goal command or goal loop 
   (`gateway_timeout`; `terminal.cwd` → `TERMINAL_CWD`). `MESSAGING_CWD` is removed and `TERMINAL_CWD`
   in `.env` is deprecated — the loader warns; canonical is `terminal.cwd`.
 - **Three loaders — know which you're in:** `load_cli_config()` (CLI, `cli.py`); `load_config()`
-  (`hermes tools/setup`, most subcommands, `hermes_cli/config.py`, merges `DEFAULT_CONFIG`); raw
-  YAML (gateway runtime, `gateway/run.py` + `gateway/config.py`). If the CLI sees a key and the
-  gateway doesn't (or vice versa), you're on the wrong loader — check `DEFAULT_CONFIG` coverage.
+  (`hermes tools/setup`, most subcommands, `hermes_cli/config.py`, merges `DEFAULT_CONFIG`);
+  `hermes_cli/config_effective.py::load_user_config_effective()` (gateway runtime via
+  `gateway/run.py::_load_gateway_config`, TUI gateway `_load_cfg`, cron, `hermes send`, doctor,
+  `hermes_time`/`hermes_logging`: user file + managed overlay + `${VAR}` expansion + model-key
+  canon, NO defaults — for presence-sensitive readers). If the CLI sees a key and the gateway
+  doesn't (or vice versa), you're on the wrong loader — check `DEFAULT_CONFIG` coverage. Never
+  hand-roll raw-read → overlay → expand; `read_user_config_raw` is for write-back round-trips only.
 - **Working directory:** CLI uses `os.getcwd()`; messaging uses `terminal.cwd`, bridged to
   `TERMINAL_CWD` for child tools.
 
@@ -129,8 +133,13 @@ matchers; parser-derived flag sets; never blanket-exclude gateway ancestors, #87
 `_apply_profile_override()` in `hermes_cli/main.py` sets `HERMES_HOME` before any module import, so
 every `get_hermes_home()` scopes to the active profile (rules in root). Profiles are independent
 islands by design — no live config inheritance; `--clone` copies at creation, minus messaging
-channels (`profile_channels.py` derives the token/allowlist/platform-section key set from the adapter
-registry + `gateway/config_env._ENV_STEPS`, never a hand list; `--clone-channels` opts in). Multiplex
+channels (`profile_channels.py`: ownership-based inventory evaluated in the SOURCE's plugin scope —
+adapter-declared keys + canonical/alias prefixes + `GATEWAY_ALLOW*`/`GATEWAY_RELAY_*`; prefixes shared
+with tools (`HASS_`/`TWILIO_`/`EMAIL_`) are stripped only when the source runs that adapter; never a hand
+list). `--clone-channels` opts in and its live-multiplexer refusal lives in `create_profile` (CLI, REST
+and TUI all go through it). Clones are built in `profiles/.<name>.staging-<pid>` (hidden → invisible to
+`_iter_named_profile_dirs` and the hot-serve rescan) and published by one `os.rename` after the strip;
+symlinked `.env`/`config.yaml` are materialized first so a clone never writes through to its source. Multiplex
 (`gateway.multiplex_profiles`) secret-scope rules: `gateway/AGENTS.md`. The served set is
 `profiles.py::profiles_to_serve(multiplex=True)` = default + every live (non-tombstoned) dir under
 `profiles/` — there is no allowlist (`gateway.multiplex_profile_allowlist` was retired in config v43).

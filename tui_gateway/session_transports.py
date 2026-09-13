@@ -56,70 +56,13 @@ def _session_attachment_error(rid, session: dict, transport) -> dict | None:
         return None
     return _err(rid, 4013, "session is owned by another authenticated subject")
 
-
-def _attach_session_transport(session: dict | None, transport) -> bool:
-    """Add live peers; flatten captured queued fanouts without nesting authority."""
-    if not session or transport is None:
-        return False
-    with _session_transport_lock:
-        if isinstance(transport, FanoutTransport):
-            # Snapshot and attach share detach's lock: a queued fanout cannot
-            # resurrect a still-open peer removed during flattening.
-            attached = [_attach_session_transport(session, peer) for peer in transport.transports()]
-            return any(attached)
-        existing = session.get("transport")
-        if _transport_is_dead(transport):
-            if isinstance(existing, FanoutTransport):
-                existing.detach(transport)
-            return False
-        if not _transport_is_live_peer(transport):
-            if _session_has_live_transport(session):
-                return False
-            session["transport"] = transport
-            return True
-        if existing is transport:
-            return True
-        if isinstance(existing, FanoutTransport):
-            existing.attach(transport)
-            return existing.contains(transport)
-        elif _transport_is_live_peer(existing):
-            session["transport"] = FanoutTransport(existing, transport)
-        else:
-            session["transport"] = transport
-        return True
-
-
-def _detach_session_transport(session: dict | None, transport) -> bool:
-    """Remove membership; return whether another live client prevents parking."""
-    if not session:
-        return False
-    with _session_transport_lock:
-        (session.get("viewers") or {}).pop(transport, None)
-        existing = session.get("transport")
-        if isinstance(existing, FanoutTransport):
-            existing.detach(transport)
-            viewers = session.get("viewers") or {}
-            for viewer in list(viewers):
-                if not existing.contains(viewer) or _transport_is_dead(viewer):
-                    viewers.pop(viewer, None)
-            # Keep the surviving mailbox: collapsing to a bare transport lets
-            # new frames overtake its already queued terminal/control events.
-        return _session_has_live_transport(session, excluding=transport)
-
-
-def _detach_transport_from_sessions(transport) -> list[tuple[str, dict]]:
-    """Remove even closed/pruned peers' viewer entries; return clientless slots."""
-    with _sessions_lock:
-        attached = []
-        for sid, session in _sessions.items():
-            existing = session.get("transport")
-            if (existing is transport
-                    or isinstance(existing, FanoutTransport) and existing.contains(transport)
-                    or transport in (session.get("viewers") or {})):
-                attached.append((sid, session))
-    return [(sid, session) for sid, session in attached
-            if not _detach_session_transport(session, transport)]
-
-
-def register(server) -> None:
-    bind_module(globals(), server)
+def _warn_foreign_login(session: dict, transport) -> None:
+    """Ownership is not enforced; a second login sharing a session is only logged, and the agent keeps the
+    creator's user id."""
+    attaching = _transport_auth_user_id(transport)
+    if attaching is None:
+        return
+    creator = _session_auth_user_id(session)
+    if creator != attaching:
+        logger.warning("Session %s keeps the user id %s it was created with; a client logged in as %s attached",
+                       session.get("session_key"), creator or "(none)", attaching)
