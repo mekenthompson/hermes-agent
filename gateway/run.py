@@ -5303,10 +5303,23 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # Duplicate-instance guard scoped to HERMES_HOME; distinct-home multi-profile setups coexist.
     from gateway.status import get_running_pid
+    from gateway.session_db_writers import (
+        quiesce_session_db_writers_for_replace,
+        release_supervised_dashboard,
+        wait_deleted_sidecar_holders_gone,
+    )
+    held_dashboard = []
+    if replace:
+        # Dashboard is a separate s6 service; replacing only the gateway PID leaves it holding
+        # deleted WAL/SHM inodes and the new gateway refuses SQLite. Hold it down first.
+        held_dashboard = quiesce_session_db_writers_for_replace(get_hermes_home())
     existing_pid = get_running_pid()
     if (existing_pid is not None and existing_pid != os.getpid()
             and not await _start_gateway_replace_existing_instance(existing_pid, replace)):
+        release_supervised_dashboard(held_dashboard)
         return False
+    if replace:
+        wait_deleted_sidecar_holders_gone(get_hermes_home() / "state.db")
 
     _start_gateway_configure_logging(verbosity)
 
@@ -5369,6 +5382,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # PID file BEFORE adapters: of two concurrent `run --replace`, only the O_EXCL winner opens sockets.
     if not _start_gateway_claim_pid_file():
+        release_supervised_dashboard(held_dashboard)
         return False
 
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
@@ -5402,10 +5416,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         success = await runner.start()
     except BaseException:
         _shutdown_gateway_health_export(runner)
+        release_supervised_dashboard(held_dashboard)
         raise
     if not success:
         _shutdown_gateway_health_export(runner)
+        release_supervised_dashboard(held_dashboard)
         return False
+    release_supervised_dashboard(held_dashboard)
 
     def _recover_pending() -> None:
         from gateway.shutdown_flush import recover_pending_to_db
