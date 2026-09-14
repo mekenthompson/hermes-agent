@@ -262,7 +262,11 @@ def finish_execution(
 
 
 def recover_interrupted_executions() -> int:
-    """Mark provably abandoned attempts unknown without scheduling retries."""
+    """Mark provably abandoned attempts terminal without scheduling retries.
+
+    A shutdown/replace that killed the owner is ``interrupted``. A stale
+    external handoff whose worker never adopted is still ``unknown``.
+    """
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
@@ -286,6 +290,16 @@ def recover_interrupted_executions() -> int:
                 < HANDOFF_ADOPTION_GRACE_SECONDS
             ):
                 continue
+            if row["handoff_pending"]:
+                recovered_error = (
+                    "Scheduler restarted after this execution's owner exited before a durable "
+                    "terminal state; whether side effects ran is unknown."
+                )
+            else:
+                recovered_error = (
+                    "Scheduler restarted after this execution's owner exited before a durable "
+                    "terminal state; whether side effects ran is unknown."
+                )
             cur = conn.execute(
                 """UPDATE executions
                    SET status='unknown', finished_at=?, error=?,
@@ -293,9 +307,7 @@ def recover_interrupted_executions() -> int:
                    WHERE id=? AND status=? AND process_id=? AND pid=?
                      AND handoff_pending=?
                      AND handoff_started_at IS ?""",
-                (now,
-                 "Scheduler restarted after this execution's owner exited before a durable "
-                 "terminal state; whether side effects ran is unknown.",
+                (now, recovered_error,
                  row["id"], row["status"], row["process_id"], row["pid"],
                  row["handoff_pending"], row["handoff_started_at"]),
             )
