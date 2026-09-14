@@ -158,6 +158,14 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
             or is_malformed_schema_error(exc)
             or isinstance(exc, UnicodeDecodeError)):
             raise
+        from hermes_state_holders import foreign_state_db_holders
+
+        if foreign_state_db_holders(db_path):
+            _log.warning(
+                "skipping writable schema heal for %s: another process holds the store",
+                db_path,
+            )
+            return SessionDB(db_path=db_path, read_only=True)
         db = acquire(db_path)
         release_or_close(db)
         try:
