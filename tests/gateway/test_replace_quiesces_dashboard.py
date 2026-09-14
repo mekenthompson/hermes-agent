@@ -69,3 +69,28 @@ def test_fail_closed_if_deleted_holders_aborts_replace(monkeypatch, tmp_path):
 def test_fail_closed_if_deleted_holders_allows_open(monkeypatch, tmp_path):
     monkeypatch.setattr(writers, "wait_deleted_sidecar_holders_gone", lambda db_path, timeout_s=10.0: True)
     assert writers.fail_closed_if_deleted_holders(tmp_path) is True
+
+
+def test_wait_deleted_sidecar_holders_gone_false_when_scanner_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(writers, "_deleted_sidecar_holder_iter", lambda: None)
+    assert writers.wait_deleted_sidecar_holders_gone(tmp_path / "state.db") is False
+
+
+def test_hold_supervised_dashboard_ignores_run_only_dir(monkeypatch, tmp_path):
+    service = tmp_path / "dashboard"
+    service.mkdir()
+    (service / "run").write_text("#!/bin/sh\n")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        result = MagicMock()
+        result.returncode = 0
+        result.stderr = b""
+        result.stdout = b""
+        return result
+
+    monkeypatch.setattr(writers, "_DASHBOARD_SERVICE_CANDIDATES", (service,))
+    monkeypatch.setattr(writers.subprocess, "run", fake_run)
+    assert writers.hold_supervised_dashboard_down() == []
+    assert calls == []
