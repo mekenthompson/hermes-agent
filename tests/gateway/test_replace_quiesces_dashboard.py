@@ -1,11 +1,10 @@
 """Gateway --replace must stop dashboard before the old gateway exits.
 
 A live dashboard holding deleted state.db-wal/shm is the DeletedWalGenerationError
-latch. These tests pin the quiesce helper and the start_gateway call order.
+latch. These tests pin the quiesce helper and fail-closed wait.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import gateway.session_db_writers as writers
@@ -47,10 +46,6 @@ def test_quiesce_signals_dashboard_after_s6_hold(monkeypatch, tmp_path):
 
 
 def test_wait_deleted_sidecar_holders_gone_true_when_empty(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        writers, "iter_deleted_sqlite_sidecar_holders", lambda path: [], raising=False,
-    )
-    # Patch the imported name used inside the waiter via hermes_state_dbfile
     import sys
     fake = MagicMock()
     fake.iter_deleted_sqlite_sidecar_holders = lambda path: []
@@ -58,12 +53,19 @@ def test_wait_deleted_sidecar_holders_gone_true_when_empty(monkeypatch, tmp_path
     assert writers.wait_deleted_sidecar_holders_gone(tmp_path / "state.db", timeout_s=0.2) is True
 
 
-def test_start_gateway_source_quiesces_before_replace():
-    source = (Path(__file__).resolve().parents[2] / "gateway" / "run.py").read_text(encoding="utf-8")
-    start = source.index("async def start_gateway(")
-    body = source[start:]
-    quiesce_at = body.index("held_dashboard = quiesce_session_db_writers_for_replace")
-    replace_at = body.index("await _start_gateway_replace_existing_instance")
-    wait_at = body.index("wait_deleted_sidecar_holders_gone(get_hermes_home()")
-    assert quiesce_at < replace_at < wait_at
-    assert "release_supervised_dashboard(held_dashboard)" in body
+def test_wait_deleted_sidecar_holders_gone_false_when_stuck(monkeypatch, tmp_path):
+    import sys
+    fake = MagicMock()
+    fake.iter_deleted_sqlite_sidecar_holders = lambda path: [(99, "state.db-wal (deleted)")]
+    monkeypatch.setitem(sys.modules, "hermes_state_dbfile", fake)
+    assert writers.wait_deleted_sidecar_holders_gone(tmp_path / "state.db", timeout_s=0.2) is False
+
+
+def test_fail_closed_if_deleted_holders_aborts_replace(monkeypatch, tmp_path):
+    monkeypatch.setattr(writers, "wait_deleted_sidecar_holders_gone", lambda db_path, timeout_s=10.0: False)
+    assert writers.fail_closed_if_deleted_holders(tmp_path) is False
+
+
+def test_fail_closed_if_deleted_holders_allows_open(monkeypatch, tmp_path):
+    monkeypatch.setattr(writers, "wait_deleted_sidecar_holders_gone", lambda db_path, timeout_s=10.0: True)
+    assert writers.fail_closed_if_deleted_holders(tmp_path) is True

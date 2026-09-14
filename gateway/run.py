@@ -5304,9 +5304,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Duplicate-instance guard scoped to HERMES_HOME; distinct-home multi-profile setups coexist.
     from gateway.status import get_running_pid
     from gateway.session_db_writers import (
+        fail_closed_if_deleted_holders,
         quiesce_session_db_writers_for_replace,
         release_supervised_dashboard,
-        wait_deleted_sidecar_holders_gone,
     )
     held_dashboard = []
     if replace:
@@ -5318,8 +5318,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             and not await _start_gateway_replace_existing_instance(existing_pid, replace)):
         release_supervised_dashboard(held_dashboard)
         return False
-    if replace:
-        wait_deleted_sidecar_holders_gone(get_hermes_home() / "state.db")
+    if replace and not fail_closed_if_deleted_holders(get_hermes_home()):
+        return False
 
     _start_gateway_configure_logging(verbosity)
 
