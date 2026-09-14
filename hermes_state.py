@@ -55,6 +55,7 @@ from hermes_state_dbfile import (
 from hermes_state_messages import SessionMessagesMixin
 from hermes_state_wal import (
     _WAL_INCOMPAT_MARKERS, _on_disk_journal_mode, apply_database_pragmas, apply_wal_with_fallback,
+    disable_close_time_wal_reset,
 )
 from hermes_state_repair import _claim_repair_attempt, preflight_db_writability, repair_state_db_schema
 from hermes_state_titles import SessionTitlesMixin
@@ -456,6 +457,7 @@ class SessionDB(
         if conn is None:
             return
         try:
+            disable_close_time_wal_reset(conn)
             conn.close()
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
@@ -463,6 +465,7 @@ class SessionDB(
     def _close_conn_logged(self, conn, label: str) -> None:
         """Close *conn*; a failing close leaks a tracked fd: logged at WARNING, never swallowed."""
         try:
+            disable_close_time_wal_reset(conn)
             conn.close()
         except Exception as exc:
             logger.warning("%s close failed for %s: %s", label, self.db_path, exc)
