@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 _DASHBOARD_SERVICE_CANDIDATES = (
     Path("/run/service/dashboard"),
     Path("/run/s6-rc/servicedirs/dashboard"),
-    Path("/etc/s6-overlay/s6-rc.d/dashboard"),
 )
 
 
