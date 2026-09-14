@@ -122,10 +122,10 @@ def iter_same_home_dashboard_pids(hermes_home: Path, *, except_pids: Iterable[in
 
 
 def terminate_pids(pids: Sequence[int], *, force: bool = False) -> None:
-    sig = signal.SIGKILL if force else signal.SIGTERM
+    sig = getattr(signal, 'SIGKILL', signal.SIGTERM) if force else signal.SIGTERM  # windows-footgun: ok
     for pid in pids:
         try:
-            os.kill(pid, sig)
+            os.kill(pid, sig)  # windows-footgun: ok — POSIX /proc dashboard PIDs only
         except ProcessLookupError:
             continue
         except PermissionError:

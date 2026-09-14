@@ -297,9 +297,8 @@ def recover_interrupted_executions() -> int:
                 )
             else:
                 recovered_error = (
-                    "Scheduler restarted: gateway SIGTERM/replace/rollout stopped this "
-                    "execution's owner; the run was not retried. Ledger status stays "
-                    "unknown because side effects are not confirmed."
+                    "Scheduler restarted after this execution's owner exited before a durable "
+                    "terminal state; whether side effects ran is unknown."
                 )
             cur = conn.execute(
                 """UPDATE executions
