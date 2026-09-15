@@ -405,6 +405,21 @@ class TestSaveAndLoadRoundtrip:
         assert config_path.read_text(encoding="utf-8") == original
         assert list((tmp_path / "backups" / "config").glob("config.yaml.corrupt.*"))
 
+class TestLoadEnvInlineComments:
+    def test_unquoted_hash_is_a_comment_quoted_hash_is_data(self, tmp_path):
+        """load_env is the one dotenv reader (agent.secret_scope.load_env_file): an unquoted ` #...` tail
+        is a comment, a quoted value keeps its hash. Hermes' own writer (_quote_env_value) always quotes
+        values containing `#`, so a saved secret round-trips."""
+        from hermes_cli.config import invalidate_env_cache
+
+        (tmp_path / ".env").write_text('PASSWORD=abc #123\nPASSWORD2="abc #123"\n', encoding="utf-8")
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            invalidate_env_cache()
+            env = load_env()
+        assert env["PASSWORD"] == "abc"
+        assert env["PASSWORD2"] == "abc #123"
+
+
 class TestSaveEnvValueSecure:
 
     def test_secure_save_returns_metadata_only(self, tmp_path):
@@ -1918,5 +1933,11 @@ def test_gateway_multiplex_keys_are_recognized_config_keys():
     from hermes_cli.config import _validate_config_key
     from hermes_cli.config_defaults import DEFAULT_CONFIG
     assert DEFAULT_CONFIG["gateway"]["multiplex_profiles"] is False
+    assert DEFAULT_CONFIG["gateway"]["auto_multiplex_migration"] is True
+    assert "auto_migrate" not in DEFAULT_CONFIG["gateway"]
     assert _validate_config_key("gateway.multiplex_profiles") == (True, None)
     assert _validate_config_key("gateway.profile_routes") == (True, None)
+    assert _validate_config_key("gateway.auto_multiplex_migration") == (True, None)
+    known, suggestion = _validate_config_key("gateway.auto_migrate")
+    assert known is False
+    assert suggestion == "gateway.auto_multiplex_migration"
