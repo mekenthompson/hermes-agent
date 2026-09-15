@@ -237,8 +237,13 @@ def test_detect_and_aggregate_can_never_be_skipped():
     # Every lane job feeds the gate, so a skipped lane is counted (as a pass).
     gated = {name for name, job in jobs.items() if "needs.detect.outputs" in (job.get("if") or "")}
     # infographic-check has never been in the gate's needs upstream (it runs
-    # but is not required); the fork does not change that.
-    assert gated - set(jobs["all-checks-pass"]["needs"]) <= {"infographic-check"}
+    # but is not required); the fork does not change that. osv-scanner is
+    # now advisory-only upstream (fail-on-vuln: false) so it must not gate
+    # merges either.
+    assert gated - set(jobs["all-checks-pass"]["needs"]) <= {
+        "infographic-check",
+        "osv-scanner",
+    }
 
 
 def test_all_checks_pass_treats_a_fully_skipped_run_as_green(tmp_path):
