@@ -4402,6 +4402,11 @@ class GatewayRunner(
             explicit_profile = name or None
             if not name:
                 name = get_active_profile_name() or "default"
+            runtime_profile = (
+                os.getenv("HERMES_PROFILE") or os.getenv("HERMES_AGENT_PROFILE") or ""
+            ).strip()
+            if explicit_profile and name == runtime_profile:
+                return get_hermes_home()
             profile_dir = get_profile_dir(name)
             if explicit_profile and not profile_exists(name):
                 logger.warning(

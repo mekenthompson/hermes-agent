@@ -224,6 +224,25 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
 
 
 @pytest.mark.asyncio
+async def test_local_watch_event_without_transport_is_terminal_not_requeued(monkeypatch, tmp_path):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    completion_queue = queue.Queue()
+    completion_queue.put({
+        "type": "watch_match",
+        "session_id": "linear-proc",
+        "session_key": "linear:ken-research:session-id",
+        "platform": "local",
+        "chat_type": "dm",
+        "chat_id": "linear:ken-research:session-id",
+        "profile": "klanker",
+    })
+
+    await runner._drain_watch_notifications(completion_queue)
+
+    assert completion_queue.empty()
+
+
+@pytest.mark.asyncio
 async def test_post_turn_watch_drain_off_consumes_without_injecting(monkeypatch, tmp_path):
     runner = _build_runner(monkeypatch, tmp_path, "off")
     adapter = runner.adapters[Platform.TELEGRAM]
