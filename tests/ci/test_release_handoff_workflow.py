@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github/workflows"
 WORKFLOW = WORKFLOWS / "release-handoff.yml"
 SCRIPT = ROOT / "scripts/ci/open_fleet_pin_pr.py"
-DOC = ROOT / "docs/fork-agent-image.md"
+DOC = ROOT / "website/docs/developer-guide/fork-agent-image.md"
 
 
 def workflow_text() -> str:

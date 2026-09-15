@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/fork-agent-image.yml"
-DOC = ROOT / "docs/fork-agent-image.md"
+DOC = ROOT / "website/docs/developer-guide/fork-agent-image.md"
 MANIFEST = ROOT / "scripts/emit-image-manifest.py"
 COMPACT_SBOM = ROOT / "scripts/compact-spdx-sbom.py"
 REMOTE_CONFIG = ROOT / "scripts/verify-remote-image-config.py"
