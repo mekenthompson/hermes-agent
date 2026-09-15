@@ -33,6 +33,17 @@ def _stub(platform, runner, label):
     return adapter
 
 
+def test_completion_scope_skips_profile_resolution_when_multiplex_is_off(monkeypatch, tmp_path):
+    """Single-profile internal events share the running profile's state.db directly."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=False)
+    runner._build_process_event_source = lambda evt: (_ for _ in ()).throw(AssertionError("must not resolve"))  # type: ignore[method-assign]
+
+    assert runner._completion_event_scope({"type": "watch_match"}).__class__.__name__ == "nullcontext"
+
+
 @pytest.fixture
 def mux(tmp_path, monkeypatch):
     """Default home allows user 777; profile ``ops`` is a shared-bot satellite; ``team_b`` owns a bot."""

@@ -75,6 +75,20 @@ class TestResolutionOrder:
     
 
 
+class TestRuntimeProfileAlias:
+    """Container profile names can name the current custom HERMES_HOME."""
+
+    def test_runtime_profile_name_resolves_to_current_home_without_named_dir(
+        self, mock_runner, discord_source, monkeypatch
+    ):
+        discord_source.profile = "klanker"
+        monkeypatch.setenv("HERMES_PROFILE", "klanker")
+        with patch("hermes_constants.get_hermes_home", return_value=Path("/opt/data")), \
+             patch("hermes_cli.profiles.profile_exists", return_value=False) as exists:
+            assert mock_runner._resolve_profile_home_for_source(discord_source) == Path("/opt/data")
+        exists.assert_not_called()
+
+
 class TestMissingProfileWarning:
     """Tests for warning when a profile doesn't exist on disk."""
     

@@ -1061,6 +1061,12 @@ class GatewayNotificationsMixin:
             )
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+        if source.platform is Platform.LOCAL:
+            logger.debug(
+                "Dropping local watch notification with no messaging transport for session %s",
+                evt.get("session_id", "unknown"),
+            )
+            return None
         adapter = self._resolve_injection_adapter(platform_name, source)
         if not adapter:
             return False
@@ -1300,6 +1306,8 @@ class GatewayNotificationsMixin:
         state.db — classified ``terminal`` and dropped, its ledger row stranded ``pending`` forever."""
         from gateway.run import _async_profile_runtime_scope
         from hermes_constants import get_hermes_home_override
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return contextlib.nullcontext()
         source = self._build_process_event_source(evt)
         if source is None or not getattr(source, "profile", None):
             return contextlib.nullcontext()
