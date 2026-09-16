@@ -22,6 +22,7 @@ name: OSV-Scanner
 # vulnerabilities in pinned deps that we may need to patch deliberately.
 
 on:
+  workflow_call:
   schedule:
     # Weekly scan against main — catches CVEs published after merge for
     # deps that haven't changed since.
