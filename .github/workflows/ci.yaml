@@ -234,15 +234,6 @@ jobs:
       mcp_catalog: ${{ needs.detect.outputs.mcp_catalog == 'true' }}
       supply_chain: ${{ needs.supply-chain.outputs.critical_findings == 'true' }}
 
-  osv-scanner:
-    name: OSV scan
-    needs: detect
-    # Fork: only when a lockfile or pyproject changed. The pinned set cannot
-    # gain a CVE from a diff that does not touch it; osv-scanner.yml's weekly
-    # schedule still covers newly published advisories against main.
-    if: github.repository != 'mekenthompson/hermes-agent' || needs.detect.outputs.uv_lock == 'true' || needs.detect.outputs.npm_lock == 'true' || needs.detect.outputs.deps == 'true'
-    uses: ./.github/workflows/osv-scanner.yml
-
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
   # status even when some deps were skipped. ``success`` and ``skipped`` are
