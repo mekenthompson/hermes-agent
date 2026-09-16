@@ -372,6 +372,7 @@ export const zh = defineLocale({
       'view.toggleReview': '切换审查面板',
       'view.toggleStatusbar': '切换状态栏',
       'view.toggleTabStrip': '切换标签',
+      'view.toggleProfileRail': '切换配置档案栏',
       'view.showFiles': '显示文件浏览器',
       'view.showBrowser': '打开浏览器',
       'view.showTerminal': '显示终端',
@@ -686,7 +687,7 @@ export const zh = defineLocale({
       sessionDensityComfortable: '舒适',
       sessionDensityDetailed: '详细',
       tabStripTitle: '标签栏',
-      tabStripDesc: '在分区上方显示标签。自动模式会在分区只有一个面板时隐藏标签。',
+      tabStripDesc: '在分区上方显示标签。自动模式会在分区只有一个面板时隐藏标签，除非还开着其他聊天或磁贴分区。',
       tabStripAuto: '自动',
       tabStripAlways: '始终',
       tabStripNever: '从不',
@@ -965,6 +966,7 @@ export const zh = defineLocale({
       compression: {
         enabled: '自动压缩',
         threshold: '压缩阈值',
+        codexGpt55Autoraise: 'Codex 压缩自动提高',
         targetRatio: '压缩目标',
         protectLastN: '保护最近消息'
       },
@@ -1029,7 +1031,8 @@ export const zh = defineLocale({
         engine: '在接近上下文上限时管理长对话的策略。'
       },
       compression: {
-        enabled: '当对话变大时对较早的上下文进行摘要。'
+        enabled: '当对话变大时对较早的上下文进行摘要。',
+        codexGpt55Autoraise: '为受支持的 ChatGPT Codex OAuth 模型将压缩阈值提高到 85%。'
       },
       browser: {
         useRealProfile:
@@ -2812,6 +2815,7 @@ export const zh = defineLocale({
   },
 
   sidebar: {
+    profileRail: '配置档案栏',
     gatewayGroups: {
       grouping: '网关与配置',
       rename: '重命名分组',

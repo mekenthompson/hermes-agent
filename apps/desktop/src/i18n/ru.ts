@@ -334,6 +334,7 @@ export const ru = defineLocale({
       'view.toggleReview': 'Показать / скрыть панель ревью',
       'view.toggleStatusbar': 'Показать / скрыть строку состояния',
       'view.toggleTabStrip': 'Показать / скрыть вкладки',
+      'view.toggleProfileRail': 'Показать / скрыть панель профилей',
       'view.showFiles': 'Показать браузер файлов',
       'view.showBrowser': 'Открыть браузер',
       'view.toggleHud': 'Включить / выключить режим HUD',
@@ -566,7 +567,7 @@ export const ru = defineLocale({
       sessionDensityComfortable: 'Комфортно',
       sessionDensityDetailed: 'Подробно',
       tabStripTitle: 'Панель вкладок',
-      tabStripDesc: 'Показывать вкладки над зоной. Автоматически скрываются, когда в зоне только одна панель.',
+      tabStripDesc: 'Показывать вкладки над зоной. Автоматически скрываются для одной панели, если не открыта другая зона чата или плитки.',
       tabStripAuto: 'Авто',
       tabStripAlways: 'Всегда',
       tabStripNever: 'Никогда',
@@ -838,6 +839,7 @@ export const ru = defineLocale({
       compression: {
         enabled: 'Авто-сжатие',
         threshold: 'Порог сжатия',
+        codexGpt55Autoraise: 'Автоповышение сжатия Codex',
         targetRatio: 'Целевое сжатие',
         protectLastN: 'Защищённые недавние сообщения'
       },
@@ -903,7 +905,8 @@ export const ru = defineLocale({
         engine: 'Стратегия управления длинными диалогами у предела контекста.'
       },
       compression: {
-        enabled: 'Сжимать более старый контекст, когда диалоги становятся большими.'
+        enabled: 'Сжимать более старый контекст, когда диалоги становятся большими.',
+        codexGpt55Autoraise: 'Повышает порог сжатия до 85% для поддерживаемых моделей ChatGPT Codex OAuth.'
       },
       voice: {
         autoTts: 'Автоматически зачитывать ответы ассистента.'
