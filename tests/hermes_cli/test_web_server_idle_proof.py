@@ -101,7 +101,7 @@ def test_queued_prompts_and_unwinding_workers_are_not_idle(monkeypatch):
 
 pytestmark_live = pytest.mark.skipif(sys.platform == "win32", reason="POSIX serve-runner path under test")
 
-TOKEN = "idle-proof-live-token"
+TOKEN = "idle-proof-live-token-0000000000"  # 32 chars: fork validates explicit token length
 
 
 def _spawn_desktop_child(tmp_path: Path, name: str, *, busy: bool) -> subprocess.Popen:
