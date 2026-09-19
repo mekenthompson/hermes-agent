@@ -330,14 +330,22 @@ class CopilotACPClient:
         # child — a single slot would let one session's teardown kill a sibling's process
         # while its own leaked.
         self._active_processes: set[subprocess.Popen[str]] = set()
-        self._active_process_lock = threading.Lock()
+        self._active_process_lock = threading.RLock()
+        self._request_lock = threading.Lock()
+        self._io_lock = threading.Lock()
+        self._cancelled = threading.Event()
+        self._deadline = float("inf")
 
-    @staticmethod
-    def _terminate_process(proc: subprocess.Popen[str]) -> None:
-        try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except Exception:
+    def hermes_abort_request(self) -> None:
+        """Thread-safe process cancellation for the core request lifecycle."""
+        self.close()
+
+    def _terminate_process(self, proc: subprocess.Popen[str]) -> None:
+        """Tear down one ACP child: process-group SIGTERM, wait, SIGKILL, stdin close."""
+        if os.name == "posix":
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok — guarded by os.name == "posix" above
+        else:
             with contextlib.suppress(Exception):
                 proc.terminate()
         with contextlib.suppress(Exception):
@@ -394,13 +402,10 @@ class CopilotACPClient:
                 self.is_closed = True
         self._terminate_process(proc)
 
-    def hermes_abort_request(self) -> None:
-        """Thread-safe process cancellation for the core request lifecycle."""
-        self.close()
-
     def close(self) -> None:
         with self._active_process_lock:
             procs, self._active_processes = tuple(self._active_processes), set()
+            self._cancelled.set()  # abort any in-flight _send write loop for this instance
         self.is_closed = True
         for proc in procs:
             self._terminate_process(proc)
@@ -475,6 +480,10 @@ class CopilotACPClient:
         with self._active_process_lock:
             self._active_processes.add(proc)
             self.is_closed = False
+            cancelled = self._cancelled.is_set()
+        if cancelled:
+            self.close()
+            raise RuntimeError("ACP request cancelled")
         return proc
 
     @contextlib.contextmanager
@@ -562,7 +571,10 @@ class CopilotACPClient:
                 raise RuntimeError("Copilot ACP did not return a sessionId.")
             yield session, _request
         finally:
+            stopped.set()
             self._release_process(proc)
+            for thread in pumps:
+                thread.join(timeout=0.2)
 
     def list_models(self, *, timeout_seconds: float = 15.0) -> list[str]:
         """Return the enabled models advertised by a short-lived authenticated ACP session."""
