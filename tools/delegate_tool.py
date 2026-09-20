@@ -263,6 +263,11 @@ def _build_child_agent(
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
+    # This marker comes only from the production constructor.  _run_single_child
+    # also has direct helper seams used by non-launching tests and read-only
+    # callers, which must not be mistaken for a live source writer merely
+    # because they supply a subagent-shaped test double.
+    setattr(child, "_delegate_admission_required", True)
     _apply_child_compression_cap(child, delegation_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
@@ -292,6 +297,42 @@ def _build_child_agent(
             child_role=effective_role, child_goal=goal,
         )
     return child
+
+
+_SOURCE_WRITING_TOOLS = frozenset({"terminal", "execute_code", "write_file", "patch"})
+
+
+def _requires_writer_admission(child: Any) -> bool:
+    """Whether this direct helper invocation can launch a source-writing child.
+
+    Production construction stamps every delegate child explicitly.  The
+    fallback covers a direct call with a concrete AIAgent that exposes a
+    source-writing tool, while preserving non-launching test doubles and
+    read-only direct helper callers.
+    """
+    if getattr(child, "_delegate_admission_required", False) is True:
+        return True
+    try:
+        from run_agent import AIAgent
+    except Exception:
+        return False
+    if not isinstance(child, AIAgent):
+        return False
+    tool_names = {
+        name for name in (getattr(child, "valid_tool_names", ()) or ()) if isinstance(name, str)
+    }
+    for tool in getattr(child, "tools", ()) or ():
+        if isinstance(tool, dict):
+            function = tool.get("function")
+            name = tool.get("name")
+            if isinstance(name, str):
+                tool_names.add(name)
+            if isinstance(function, dict):
+                name = function.get("name")
+                if isinstance(name, str):
+                    tool_names.add(name)
+    return bool(_SOURCE_WRITING_TOOLS & tool_names)
+
 
 def _run_single_child(
     task_index: int, goal: str, child=None, parent_agent=None, *, owner_session_id: Optional[str] = None,
@@ -323,20 +364,12 @@ def _run_single_child(
             task_index, "error", f"admission path rejected: {launch_route.reason}", child, 0.0,
         )
     child_progress_cb = getattr(child, "tool_progress_callback", None)
-    # Worktree creation is a preflight, not child execution.  A delegated child
-    # is write-capable by construction, so it must show a real isolated linked
-    # worktree before heartbeat/registry/conversation startup.  In particular,
-    # do not quietly downgrade a failed worktree setup to "read-only".
+    # Worktree creation is a preflight, not child execution.  A launch-capable
+    # source writer must show a real isolated linked worktree before
+    # heartbeat/registry/conversation startup.  In particular, do not quietly
+    # downgrade a failed worktree setup to "read-only".
     _preflight_id = getattr(child, "_subagent_id", None)
-    # `_run_single_child` is also a unit-test seam; only the concrete AIAgent
-    # constructed by delegate_task is a launch-capable child.  Mock objects do
-    # not create a process or source-writing workspace and must not be treated
-    # as a runtime launch.
-    enforce_admission = (
-        isinstance(_preflight_id, str)
-        and bool(_preflight_id)
-        and type(child).__module__ != "unittest.mock"
-    )
+    enforce_admission = _requires_writer_admission(child)
     _preflight_id = _preflight_id if enforce_admission else f"delegate:{task_index}"
     run = _ChildRun(child, parent_agent, task_index, goal, _preflight_id, child_progress_cb)
     admission = None

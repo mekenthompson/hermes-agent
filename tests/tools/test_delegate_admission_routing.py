@@ -72,3 +72,22 @@ def test_direct_child_helper_rejects_before_child_execution(monkeypatch):
 
     assert result == {"status": "error"}
     assert len(started) == 1
+
+
+def test_writer_admission_boundary_preserves_direct_read_only_seams():
+    """Only production-stamped or concrete source-writing children are writers."""
+    from run_agent import AIAgent
+
+    direct_writer = object.__new__(AIAgent)
+    setattr(direct_writer, "valid_tool_names", {"write_file"})
+    direct_reader = object.__new__(AIAgent)
+    setattr(direct_reader, "valid_tool_names", {"read_file"})
+
+    assert delegate_tool._requires_writer_admission(
+        SimpleNamespace(_delegate_admission_required=True)
+    )
+    assert delegate_tool._requires_writer_admission(direct_writer)
+    assert not delegate_tool._requires_writer_admission(direct_reader)
+    assert not delegate_tool._requires_writer_admission(
+        SimpleNamespace(_subagent_id="subagent-test", valid_tool_names={"terminal"})
+    )
