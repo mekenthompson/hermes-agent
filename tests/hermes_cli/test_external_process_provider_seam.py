@@ -86,7 +86,7 @@ def test_provider_registered_after_auth_import_resolves_from_profile(fake_cli):
     )
     register_provider(late)
 
-    assert "late-acp" not in auth.PROVIDER_REGISTRY
+    assert auth.PROVIDER_REGISTRY["late-acp"].auth_type == "external_process"
     creds = auth.resolve_external_process_provider_credentials("late-acp")
     assert (creds["command"], creds["args"], creds["base_url"]) == (
         str(fake_cli / "acme-cli"),
