@@ -3,11 +3,55 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import pytest
 
 from hermes_cli import projects_cmd
 from hermes_cli import projects_db as pdb
+from hermes_cli import kanban_db as kb
+
+
+@pytest.fixture(autouse=True)
+def isolated_project_home(tmp_path, monkeypatch):
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_HOME", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_WORKSPACES_ROOT"):
+        monkeypatch.delenv(key, raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    pdb._INITIALIZED_PATHS.clear()
+
+
+@pytest.mark.parametrize("board", ["missing-board", "bad/board"])
+def test_create_rejects_bad_board_without_creating_project(tmp_path, board):
+    assert _run(["create", "Widget", str(tmp_path), "--board", board]) != 0
+    with pdb.connect_closing() as conn:
+        assert pdb.get_project(conn, "widget") is None
+
+
+@pytest.mark.parametrize("board", ["missing-board", "bad/board"])
+def test_failed_bind_preserves_existing_binding(tmp_path, board):
+    assert _run(["create", "Widget", str(tmp_path), "--board", "default"]) == 0
+    assert _run(["bind-board", "widget", board]) != 0
+    with pdb.connect_closing() as conn:
+        assert pdb.get_project(conn, "widget").board_slug == "default"
+
+
+@pytest.mark.parametrize("board", ["default", "named-board"])
+def test_valid_binding_and_explicit_unbind(tmp_path, board):
+    if board != "default":
+        kb.create_board(board)
+    assert _run(["create", "Widget", str(tmp_path)]) == 0
+    assert _run(["bind-board", "widget", board]) == 0
+    with pdb.connect_closing() as conn:
+        assert pdb.get_project(conn, "widget").board_slug == board
+    assert kb.read_board_metadata(board)["default_workdir"] == str(tmp_path.resolve())
+    assert _run(["bind-board", "widget"]) == 0
+    with pdb.connect_closing() as conn:
+        assert pdb.get_project(conn, "widget").board_slug is None
+
 
 
 def _run(argv):
