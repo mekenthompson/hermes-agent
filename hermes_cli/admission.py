@@ -17,6 +17,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
+from hermes_cli.admission_contract import AdmissionCaller, AdmissionErrorCode, AdmissionRequest
+
 
 _ACTIVE_STATES = ("queued", "running")
 
@@ -49,6 +51,9 @@ class Admission:
     lease_id: str | None
     lease_expires_at: int | None
     reason: str | None = None
+    priority: int = 0
+    writer_id: str | None = None
+    write_targets: tuple[str, ...] = ()
 
 
 class AdmissionController:
@@ -78,6 +83,10 @@ class AdmissionController:
         request_id: str | None = None,
         dependencies_satisfied: bool = True,
         lease_seconds: int = 300,
+        priority: int = 0,
+        writer_id: str | None = None,
+        write_targets: tuple[str, ...] | None = None,
+        dependency_reason: str = "dependencies",
     ) -> Admission:
         """Create or resume an idempotent admission request.
 
@@ -92,6 +101,12 @@ class AdmissionController:
         request_id = request_id or f"admit_{secrets.token_hex(12)}"
         request_id = _nonempty(request_id, "request_id")
         lease_seconds = _positive_int(lease_seconds, "lease_seconds")
+        priority = _priority(priority)
+        if (writer_id is None) != (write_targets is None):
+            raise ValueError("writer_id and write_targets must be supplied together")
+        if writer_id is not None:
+            writer_id = _nonempty(writer_id, "writer_id")
+            write_targets = _normalized_write_targets(write_targets)
         now = int(self._now())
         with self._write():
             self._expire_leases(now)
@@ -101,13 +116,18 @@ class AdmissionController:
                 if admission.source != source or admission.dimensions != dims:
                     raise ValueError(f"request_id {request_id!r} does not match its original source and dimensions")
                 return admission
+            if writer_id is not None and self._has_writer_conflict(write_targets or ()):
+                return Admission(
+                    request_id, source, "rejected", dims, bool(dependencies_satisfied), None, None,
+                    AdmissionErrorCode.CONFLICTING_WRITER.value, priority, writer_id, write_targets or (),
+                )
             unschedulable = [
                 name for name, units in dims.items() if units > self.limits.running[name]
             ]
             if unschedulable:
                 return Admission(
                     request_id, source, "rejected", dims, bool(dependencies_satisfied), None, None,
-                    "running_capacity",
+                    "running_capacity", priority, writer_id, write_targets or (),
                 )
             can_run = dependencies_satisfied and self._fits("running", dims)
             queue_ahead = self._has_eligible_queue()
@@ -115,18 +135,53 @@ class AdmissionController:
                 admission = Admission(
                     request_id, source, "running", dims, bool(dependencies_satisfied),
                     f"lease_{secrets.token_hex(16)}", now + lease_seconds,
+                    priority=priority, writer_id=writer_id, write_targets=write_targets or (),
                 )
                 self._insert(admission, now)
                 return admission
-            if not self._fits("queued", dims):
+            if not self._fits("queued", dims) and not self._preempt_lower_priority(dims, priority):
                 return Admission(
                     request_id, source, "rejected", dims, bool(dependencies_satisfied), None, None,
-                    "queue_capacity",
+                    "queue_capacity", priority, writer_id, write_targets or (),
                 )
-            reason = "dependencies" if not dependencies_satisfied else ("queue_ahead" if queue_ahead else "capacity")
-            admission = Admission(request_id, source, "queued", dims, bool(dependencies_satisfied), None, None, reason)
+            reason = (
+                dependency_reason
+                if not dependencies_satisfied
+                else ("queue_ahead" if queue_ahead else "capacity")
+            )
+            admission = Admission(
+                request_id, source, "queued", dims, bool(dependencies_satisfied), None, None, reason,
+                priority, writer_id, write_targets or (),
+            )
             self._insert(admission, now)
             return admission
+
+    def admit(self, request: AdmissionRequest) -> Admission:
+        """Validate typed writer evidence, then reserve it in this shared ledger.
+
+        The request object is deliberately the only entrypoint that evaluates
+        caller identity, dependency readiness, ancestry, linked-worktree proof,
+        and writer targets together.  A failed proof returns a durable-looking
+        rejection without consuming resource capacity.
+        """
+        if not isinstance(request, AdmissionRequest):
+            raise TypeError("request must be an AdmissionRequest")
+        try:
+            caller = AdmissionCaller(request.caller)
+        except (TypeError, ValueError):
+            return self._rejected(request, AdmissionErrorCode.UNSUPPORTED_CALLER)
+        if not self._has_consistent_worktree_evidence(request):
+            return self._rejected(request, AdmissionErrorCode.UNSAFE_ANCESTRY)
+        return self.request(
+            f"{caller.value}:{request.writer.writer_id}",
+            request.aggregate_demand,
+            request_id=request.request_id,
+            dependencies_satisfied=not request.dependencies.unresolved_dependency_ids,
+            priority=request.priority,
+            writer_id=request.writer.writer_id,
+            write_targets=request.writer.write_targets,
+            dependency_reason=AdmissionErrorCode.DEPENDENCIES_UNSATISFIED.value,
+        )
 
     def set_dependencies_satisfied(self, request_id: str, satisfied: bool = True) -> bool:
         """Mark a queued request eligible after its external dependency graph settles."""
@@ -146,7 +201,7 @@ class AdmissionController:
             self._expire_leases(now)
             rows = self.connection.execute(
                 "SELECT * FROM admission_requests WHERE state = 'queued' "
-                "AND dependencies_satisfied = 1 ORDER BY created_at, rowid"
+                "AND dependencies_satisfied = 1 ORDER BY priority DESC, created_at, rowid"
             ).fetchall()
             for row in rows:
                 candidate = self._admission(row)
@@ -155,6 +210,8 @@ class AdmissionController:
                 promoted = Admission(
                     candidate.request_id, candidate.source, "running", candidate.dimensions, True,
                     f"lease_{secrets.token_hex(16)}", now + lease_seconds,
+                    priority=candidate.priority, writer_id=candidate.writer_id,
+                    write_targets=candidate.write_targets,
                 )
                 self.connection.execute(
                     "UPDATE admission_requests SET state = 'running', lease_id = ?, lease_expires_at = ?, reason = NULL "
@@ -218,10 +275,21 @@ class AdmissionController:
                 lease_id TEXT UNIQUE,
                 lease_expires_at INTEGER,
                 reason TEXT,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 0,
+                writer_id TEXT,
+                write_targets_json TEXT
             )
             """
         )
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(admission_requests)")}
+        for name, definition in (
+            ("priority", "INTEGER NOT NULL DEFAULT 0"),
+            ("writer_id", "TEXT"),
+            ("write_targets_json", "TEXT"),
+        ):
+            if name not in columns:
+                self.connection.execute(f"ALTER TABLE admission_requests ADD COLUMN {name} {definition}")
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS admission_configuration (
@@ -233,6 +301,10 @@ class AdmissionController:
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS admission_requests_queue "
             "ON admission_requests(state, dependencies_satisfied, created_at)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS admission_requests_queue_priority "
+            "ON admission_requests(state, dependencies_satisfied, priority DESC, created_at)"
         )
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS admission_requests_lease "
@@ -282,13 +354,15 @@ class AdmissionController:
     def _insert(self, admission: Admission, now: int) -> None:
         self.connection.execute(
             "INSERT INTO admission_requests "
-            "(request_id, source, state, dimensions_json, dependencies_satisfied, lease_id, lease_expires_at, reason, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(request_id, source, state, dimensions_json, dependencies_satisfied, lease_id, lease_expires_at, reason, created_at, priority, writer_id, write_targets_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 admission.request_id, admission.source, admission.state,
                 json.dumps(admission.dimensions, sort_keys=True, separators=(",", ":")),
                 1 if admission.dependencies_satisfied else 0, admission.lease_id,
-                admission.lease_expires_at, admission.reason, now,
+                admission.lease_expires_at, admission.reason, now, admission.priority,
+                admission.writer_id,
+                json.dumps(admission.write_targets, separators=(",", ":")) if admission.writer_id else None,
             ),
         )
 
@@ -297,6 +371,7 @@ class AdmissionController:
             str(row["request_id"]), str(row["source"]), str(row["state"]),
             _normalized_dimensions(json.loads(row["dimensions_json"]), label="stored dimensions"),
             bool(row["dependencies_satisfied"]), row["lease_id"], row["lease_expires_at"], row["reason"],
+            int(row["priority"]), row["writer_id"], tuple(json.loads(row["write_targets_json"] or "[]")),
         )
 
     def _usage(self, state: str) -> dict[str, int]:
@@ -319,6 +394,70 @@ class AdmissionController:
             "SELECT 1 FROM admission_requests WHERE state = 'queued' "
             "AND dependencies_satisfied = 1 LIMIT 1"
         ).fetchone() is not None
+
+    def _preempt_lower_priority(self, dimensions: dict[str, int], priority: int) -> bool:
+        """Make room only by rejecting strictly lower-priority queued work.
+
+        The mutation and subsequent capacity check run in the controller's
+        existing write transaction. A displaced request expires explicitly, so
+        its caller can retry after the competing claim has been released.
+        """
+        rows = self.connection.execute(
+            "SELECT request_id FROM admission_requests WHERE state = 'queued' "
+            "AND priority < ? ORDER BY priority ASC, created_at, rowid",
+            (priority,),
+        ).fetchall()
+        for row in rows:
+            self.connection.execute(
+                "UPDATE admission_requests SET state = 'expired', reason = 'priority_preempted' "
+                "WHERE request_id = ? AND state = 'queued'",
+                (row["request_id"],),
+            )
+            if self._fits("queued", dimensions):
+                return True
+        return self._fits("queued", dimensions)
+
+    def _has_writer_conflict(self, write_targets: tuple[str, ...]) -> bool:
+        """Reject overlap, missing, or malformed evidence in active ledger rows.
+
+        A legacy row without writer proof cannot safely coexist with a new
+        writer.  Treating it as free would reopen the parallel-writer race this
+        ledger exists to close.
+        """
+        rows = self.connection.execute(
+            "SELECT writer_id, write_targets_json FROM admission_requests "
+            "WHERE state IN ('queued', 'running')"
+        ).fetchall()
+        requested = set(write_targets)
+        for row in rows:
+            if not row["writer_id"] or not row["write_targets_json"]:
+                return True
+            try:
+                existing = _normalized_write_targets(tuple(json.loads(row["write_targets_json"])))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return True
+            if requested.intersection(existing):
+                return True
+        return False
+
+    @staticmethod
+    def _has_consistent_worktree_evidence(request: AdmissionRequest) -> bool:
+        ancestry = request.ancestry
+        worktree = request.worktree
+        return (
+            ancestry.branch == worktree.branch
+            and ancestry.head_sha == worktree.head_sha
+            and ancestry.base_sha == worktree.base_sha
+            and ancestry.base_sha in ancestry.ancestor_shas
+        )
+
+    @staticmethod
+    def _rejected(request: AdmissionRequest, code: AdmissionErrorCode) -> Admission:
+        return Admission(
+            request.request_id, str(request.caller), "rejected", dict(request.aggregate_demand),
+            not request.dependencies.unresolved_dependency_ids, None, None, code.value,
+            request.priority, request.writer.writer_id, request.writer.write_targets,
+        )
 
     def _expire_leases(self, now: int) -> None:
         self.connection.execute(
@@ -348,4 +487,19 @@ def _normalized_dimensions(values: Mapping[str, int], *, label: str) -> dict[str
     for raw_name, raw_units in values.items():
         name = _nonempty(str(raw_name), f"{label} resource name")
         normalized[name] = _positive_int(raw_units, f"{label} values")
+    return normalized
+
+
+def _priority(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("priority must be an integer")
+    return value
+
+
+def _normalized_write_targets(values: tuple[str, ...] | None) -> tuple[str, ...]:
+    if not isinstance(values, tuple) or not values:
+        raise ValueError("write_targets must be a non-empty tuple")
+    normalized = tuple(_nonempty(value, "write_target") for value in values)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("write_targets must not contain duplicates")
     return normalized
