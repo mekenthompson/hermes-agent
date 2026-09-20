@@ -130,7 +130,7 @@ def _probe_help(command: str, timeout: float, cancelled=None):
 
 
 def _resolve_home_dir() -> str:
-    """Stable HOME for child ACP processes; /tmp as a last resort so the child never starts HOME-less."""
+    """Stable HOME for child ACP processes; the temp dir as a last resort so the child never starts HOME-less."""
     if home := os.environ.get("HOME", "").strip():
         return home
     if (expanded := os.path.expanduser("~")) and expanded != "~":
@@ -138,9 +138,9 @@ def _resolve_home_dir() -> str:
     try:
         import pwd
 
-        return pwd.getpwuid(os.getuid()).pw_dir.strip() or "/tmp"  # windows-footgun: ok — POSIX fallback inside try/except (pwd import fails on Windows)
+        return pwd.getpwuid(os.getuid()).pw_dir.strip() or tempfile.gettempdir()  # windows-footgun: ok — POSIX fallback inside try/except (pwd import fails on Windows)
     except Exception:
-        return "/tmp"
+        return tempfile.gettempdir()
 
 
 def _build_subprocess_env() -> dict[str, str]:
