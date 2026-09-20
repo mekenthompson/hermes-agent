@@ -67,6 +67,10 @@ _monitor_stop = threading.Event()
 
 _LIVE_STATES = {"running", "stalling", "finalizing"}
 _ACTIVE_STATES = ("running", "stalling")
+# A finalizer remains cancelable until its terminal SQLite transaction commits.
+# It is not _ACTIVE_STATES: callers must not run a second finalizer, sample its
+# progress, or consume a new dispatch slot while it is publishing.
+_STOPPABLE_STATES = _LIVE_STATES
 # Routing origin persisted at dispatch so a restart-recovered completion can
 # reconstruct a full SessionSource (scope_id drives relay tenant egress).
 _ROUTING_KEYS = ("scope_id", "user_id", "user_name")
@@ -1103,7 +1107,7 @@ def interrupt_all(reason: str = "shutdown") -> int:
     many. The child still emits a completion event (status='interrupted') via the
     normal finalize path."""
     with _records_lock:
-        targets = [r for r in _records.values() if r.get("status") in _ACTIVE_STATES]
+        targets = [r for r in _records.values() if r.get("status") in _STOPPABLE_STATES]
     return _interrupt_records(targets, "interrupt_all", reason, "Interrupted %d async delegation(s) (%s)")
 
 
@@ -1112,7 +1116,7 @@ def interrupt_for_session(
 ) -> int:
     """Signal running async delegations owned by ONE ending session to stop (any
     selector matches, see ``_session_records``). Returns how many."""
-    targets = _session_records(_ACTIVE_STATES, session_key, origin_ui_session_id, parent_session_id)
+    targets = _session_records(_STOPPABLE_STATES, session_key, origin_ui_session_id, parent_session_id)
     return _interrupt_records(
         targets, "interrupt_for_session", reason, "Interrupted %d async delegation(s) for ending session (%s)")
 

@@ -362,6 +362,60 @@ def test_durable_stop_commit_wins_over_stale_in_memory_finalize(tmp_path, monkey
     assert ad._records[record["delegation_id"]]["status"] == "interrupted"
 
 
+def test_stop_admission_fences_a_finalizing_delegation(tmp_path, monkeypatch):
+    """A stop admitted after finalization starts still wins its SQLite decision.
+
+    The finalizer snapshots before its durable write, exactly where a real
+    caller can observe ``finalizing`` while the worker is about to publish a
+    successful return.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "deleg_finalizing_stop", "goal": "race", "context": None,
+        "toolsets": None, "role": "leaf", "model": "m", "session_key": "owner",
+        "origin_ui_session_id": "", "origin_session_id": "", "parent_session_id": "parent",
+        "status": "running", "dispatched_at": time.time(), "completed_at": None,
+        "interrupt_fn": lambda: None, "progress_fn": None,
+    }
+    ad._persist_dispatch(record)
+    with ad._records_lock:
+        ad._records[record["delegation_id"]] = record
+
+    entered, release = threading.Event(), threading.Event()
+    original_push = ad._push_completion_event
+
+    def held_push(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=10)
+        return original_push(*args, **kwargs)
+
+    monkeypatch.setattr(ad, "_push_completion_event", held_push)
+    finalizer = threading.Thread(
+        target=ad._finalize,
+        args=(record["delegation_id"], {"status": "completed", "summary": "late success"}, "completed"),
+    )
+    finalizer.start()
+    assert entered.wait(timeout=10)
+    assert ad._records[record["delegation_id"]]["status"] == "finalizing"
+
+    # The child closure is intentionally already gone, so no OS signal is
+    # possible. The durable stop admission itself must fence the completion.
+    assert ad.interrupt_for_session(parent_session_id="parent", reason="finalizing_stop") == 0
+    durable = ad.get_durable_delegation(record["delegation_id"])
+    assert durable is not None and durable["stop_state"] == "cancel_requested"
+
+    release.set()
+    finalizer.join(timeout=10)
+    assert not finalizer.is_alive()
+    evt = _drain_for(record["delegation_id"])
+    assert evt is not None and evt["status"] == "interrupted"
+    assert "cancel" in (evt["error"] or "").lower()
+    durable = ad.get_durable_delegation(record["delegation_id"])
+    assert durable is not None
+    assert durable["state"] == "interrupted"
+    assert durable["stop_state"] == "acknowledged"
+
+
 def test_recovery_blocks_unacknowledged_stop_from_resurrection(tmp_path, monkeypatch):
     """Crash after stop action but before child acknowledgement is terminally
     reconciled as unknown, not retried or silently admitted again."""
