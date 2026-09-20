@@ -2020,15 +2020,25 @@ class TestAsyncDelegationsSchemaAgreement:
             ref.close()
 
     def _legacy_db(self, db_path):
-        """A database created before origin_session_id existed, carrying a
-        pre-existing delegation row that must survive every opening order."""
+        """A database created before later async-delegation columns existed.
+
+        Its pre-existing row must survive every opening order and receive the
+        canonical defaults for every additive migration.
+        """
         import sqlite3
 
         from hermes_state_common import SCHEMA_SQL
 
-        legacy_sql = SCHEMA_SQL.replace(
-            "    origin_session_id TEXT NOT NULL DEFAULT ''\n", ""
-        ).replace(
+        legacy_sql = SCHEMA_SQL
+        for column in (
+            "    origin_session_id TEXT NOT NULL DEFAULT ''\n",
+            "    stop_state TEXT NOT NULL DEFAULT '',\n",
+            "    stop_reason TEXT,\n",
+            "    stop_requested_at REAL,\n",
+            "    stop_acknowledged_at REAL,\n",
+        ):
+            legacy_sql = legacy_sql.replace(column, "")
+        legacy_sql = legacy_sql.replace(
             "    delivery_claimed_at REAL,\n",
             "    delivery_claimed_at REAL\n",
         )
@@ -2054,13 +2064,16 @@ class TestAsyncDelegationsSchemaAgreement:
         }
         assert live_indexes == expected_indexes
         row = conn.execute(
-            "SELECT delegation_id, IFNULL(origin_session_id, '<null>') FROM async_delegations WHERE delegation_id='legacy-1'"
+            """SELECT delegation_id, IFNULL(origin_session_id, '<null>'),
+                      stop_state, stop_reason, stop_requested_at,
+                      stop_acknowledged_at
+               FROM async_delegations WHERE delegation_id='legacy-1'"""
         ).fetchone()
         if row is not None:
-            # The legacy row survived and the canonical '' default
-            # backfilled the added column (SQLite ADD COLUMN ... DEFAULT
-            # populates existing rows with the default).
+            # The legacy row survived and canonical defaults backfilled the
+            # additive NOT NULL columns. Nullable stop metadata stays absent.
             assert row[1] == ""
+            assert row[2:] == ("", None, None, None)
 
     def test_fresh_session_db_then_tool(self, tmp_path):
         import sqlite3
