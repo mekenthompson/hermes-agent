@@ -215,3 +215,32 @@ def test_shared_controller_queues_dependency_blocked_work_and_promotes_the_highe
     assert high.state == "queued"
     assert controller.release(running.lease_id) is True
     assert controller.promote_next().request_id == "high"
+
+
+def test_launch_path_router_rejects_an_unknown_parallel_writer_path():
+    from hermes_cli.admission_contract import route_launch_path
+
+    result = route_launch_path("delegate.legacy_helper", AdmissionCaller.DELEGATE, request_id="deleg_123")
+
+    assert result.state == "rejected"
+    assert result.reason == AdmissionErrorCode.UNSUPPORTED_PATH.value
+
+
+@pytest.mark.parametrize(
+    ("path", "caller"),
+    [
+        ("kanban.dispatch_lane", AdmissionCaller.KANBAN),
+        ("kanban.worker_process", AdmissionCaller.KANBAN),
+        ("delegate.batch", AdmissionCaller.DELEGATE),
+        ("delegate.child_process", AdmissionCaller.DELEGATE),
+    ],
+)
+def test_launch_path_router_accepts_only_its_declared_caller(path, caller):
+    from hermes_cli.admission_contract import route_launch_path
+
+    routed = route_launch_path(path, caller, request_id="request_123")
+    wrong_caller = route_launch_path(path, AdmissionCaller.DELEGATE if caller is AdmissionCaller.KANBAN else AdmissionCaller.KANBAN, request_id="request_456")
+
+    assert routed.state == "routed"
+    assert wrong_caller.state == "rejected"
+    assert wrong_caller.reason == AdmissionErrorCode.UNSUPPORTED_PATH.value
