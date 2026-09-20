@@ -130,11 +130,24 @@ def _print_project(proj) -> None:
             print(f"   {' *' if f.is_primary else '  '} {f.path}{f' ({f.label})' if f.label else ''}")
 
 
+def _existing_board_slug(board: str | None) -> str | None:
+    """Validate a non-empty board binding before mutating a project."""
+    if not board or not board.strip():
+        return None
+    from hermes_cli import kanban_db as kb
+
+    slug = kb._normalize_board_slug(board)
+    if not slug or not kb.board_exists(slug):
+        raise ValueError(f"no such kanban board: {board}")
+    return slug
+
+
 @_db_command
 def _cmd_create(args, conn) -> int:
+    board_slug = _existing_board_slug(args.board)
     pid = pdb.create_project(
         conn, name=args.name, slug=args.slug, folders=args.folders, primary_path=args.primary,
-        description=args.description, icon=args.icon, color=args.color, board_slug=args.board,
+        description=args.description, icon=args.icon, color=args.color, board_slug=board_slug,
     )
     if args.use:
         pdb.set_active(conn, pid)
@@ -210,19 +223,18 @@ def _flag_command(op: str, verb: str):
 
 @_with_project
 def _cmd_bind_board(args, conn, proj) -> str:
-    pdb.update_project(conn, proj.id, board_slug=args.board)
-    if not args.board.strip():
+    slug = _existing_board_slug(args.board)
+    pdb.update_project(conn, proj.id, board_slug=slug or "")
+    if slug is None:
         return f"Unbound board from {proj.slug}"
     if proj.primary_path:  # best-effort: point the bound board's default_workdir at the primary repo
         try:
             from hermes_cli import kanban_db as kb
 
-            slug = kb._normalize_board_slug(args.board)
-            if slug and (slug == kb.DEFAULT_BOARD or kb.board_exists(slug)):
-                kb.write_board_metadata(slug, default_workdir=proj.primary_path)
+            kb.write_board_metadata(slug, default_workdir=proj.primary_path)
         except Exception:
             pass
-    return f"Bound {proj.slug} -> board {args.board}"
+    return f"Bound {proj.slug} -> board {slug}"
 
 
 _HANDLERS = {
