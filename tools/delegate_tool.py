@@ -323,6 +323,39 @@ def _run_single_child(
             task_index, "error", f"admission path rejected: {launch_route.reason}", child, 0.0,
         )
     child_progress_cb = getattr(child, "tool_progress_callback", None)
+    # Worktree creation is a preflight, not child execution.  A delegated child
+    # is write-capable by construction, so it must show a real isolated linked
+    # worktree before heartbeat/registry/conversation startup.  In particular,
+    # do not quietly downgrade a failed worktree setup to "read-only".
+    _preflight_id = getattr(child, "_subagent_id", None)
+    # `_run_single_child` is also a unit-test seam; only the concrete AIAgent
+    # constructed by delegate_task is a launch-capable child.  Mock objects do
+    # not create a process or source-writing workspace and must not be treated
+    # as a runtime launch.
+    enforce_admission = (
+        isinstance(_preflight_id, str)
+        and bool(_preflight_id)
+        and type(child).__module__ != "unittest.mock"
+    )
+    _preflight_id = _preflight_id if enforce_admission else f"delegate:{task_index}"
+    run = _ChildRun(child, parent_agent, task_index, goal, _preflight_id, child_progress_cb)
+    admission = None
+    if enforce_admission:
+        assert isinstance(_preflight_id, str)
+        run.seed_workspace()
+        from hermes_cli.admission_runtime import admit_writer
+        admission = admit_writer(
+            request_id=_preflight_id,
+            caller=AdmissionCaller.DELEGATE,
+            workspace=(run.worktree_info or {}).get("path"),
+            priority=0,
+            writer_id=f"delegate:{_preflight_id}",
+        )
+        if admission.state != "running":
+            entry = _fabricated_entry(
+                task_index, "error", f"admission rejected: {admission.reason or 'not_running'}", child, run.elapsed(),
+            )
+            return run.attach_worktree(entry)
     child_pool, leased_cred_id = _lease_child_credential(child)
     # Heartbeat keeps the parent's _last_activity_ts moving so the gateway inactivity timeout doesn't fire while the
     # child works; once the child looks stale (see _HEARTBEAT_STALE_CYCLES_*) it also ends await_child's wait.
@@ -333,14 +366,16 @@ def _run_single_child(
         child, parent_agent, goal, owner_session_id=owner_session_id, owner_transport=owner_transport,
         owner_session_record=owner_session_record,
     )
-    run = _ChildRun(child, parent_agent, task_index, goal, _subagent_id, child_progress_cb, heartbeat=heartbeat)
+    run.subagent_id = _subagent_id
+    run.heartbeat = heartbeat
     # Set when a timed-out Future still owns the child: closing it from this
     # thread before the worker settles races the conversation's finally path.
     _child_close_deferred = False
     try:
         heartbeat.start()
         _safe_progress(child_progress_cb, "subagent.start", preview=goal)
-        run.seed_workspace()
+        if not enforce_admission:
+            run.seed_workspace()
         result, failure_entry, _child_close_deferred = run.await_child()
         if failure_entry is not None:
             return failure_entry
@@ -369,6 +404,9 @@ def _run_single_child(
         )
     finally:
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
+        if admission is not None:
+            from hermes_cli.admission_runtime import release_admission
+            release_admission(admission.lease_id)
 
 
 def _build_children(

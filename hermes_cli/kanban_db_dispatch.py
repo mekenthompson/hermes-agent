@@ -1991,6 +1991,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    gateway_cap: Optional[int],
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2071,6 +2072,39 @@ def _dispatch_lane_task(
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+    # ``spawn_fn`` is an in-process test seam.  The production launch path is
+    # the default subprocess spawner; only that path is a real worker launch.
+    admission = None
+    if spawn_fn is None:
+        # A source-writing worker is not allowed to rely on this dispatcher's local
+    # counters alone.  It must first reserve the runtime-wide ledger with
+    # linked-worktree and main-line ancestry proof.  This is deliberately after
+    # workspace resolution (the facts do not exist before it), but still before
+    # any process creation.
+        from hermes_cli.admission_runtime import admit_writer
+        parent_ids = tuple(_kb.parent_ids(conn, claimed.id))
+        unresolved_parent_ids = tuple(
+            parent_id for parent_id in parent_ids
+            if (parent := _kb.get_task(conn, parent_id)) is None or parent.status not in ("done", "archived")
+        )
+        admission = admit_writer(
+            request_id=claimed.id,
+            caller=AdmissionCaller.KANBAN,
+            workspace=str(workspace) if claimed.workspace_kind == "worktree" else None,
+            priority=claimed.priority,
+            writer_id=f"kanban:{board or 'default'}:{claimed.id}",
+            dependencies=parent_ids,
+            unresolved_dependencies=unresolved_parent_ids,
+            kanban_cap=gateway_cap,
+        )
+    if admission is not None and admission.state != "running":
+        reason = admission.reason or "admission_not_running"
+        if _record_task_failure(
+            conn, claimed.id, f"admission: {reason}", outcome="spawn_failed",
+            failure_limit=failure_limit, release_claim=True, end_run=True,
+        ):
+            result.auto_blocked.append(claimed.id)
+        return False
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
@@ -2088,6 +2122,11 @@ def _dispatch_lane_task(
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
+        # The process never started, so its cross-launcher reservation must not
+        # survive as phantom capacity.
+        from hermes_cli.admission_runtime import release_admission
+        if admission is not None:
+            release_admission(admission.lease_id)
         from tools.process_registry import RestartSafeScopeUnavailable
 
         # The host refused the spawn (no restart-safe scope): nothing about the
@@ -2349,6 +2388,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        gateway_cap=max_in_progress,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
