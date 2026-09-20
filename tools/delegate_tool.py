@@ -310,6 +310,18 @@ def _run_single_child(
 
     * ``"completed"``       — normal finish. See #97655.
     """
+    # Defense in depth for direct helper/eval callers that bypass
+    # delegate_task. This check runs before registration, heartbeat, workspace
+    # setup, or the child conversation.
+    from hermes_cli.admission_contract import AdmissionCaller, route_launch_path
+    launch_route = route_launch_path(
+        "delegate.child_process", AdmissionCaller.DELEGATE,
+        request_id=getattr(child, "_subagent_id", None) or f"delegate:{task_index}",
+    )
+    if launch_route.state != "routed":
+        return _fabricated_entry(
+            task_index, "error", f"admission path rejected: {launch_route.reason}", child, 0.0,
+        )
     child_progress_cb = getattr(child, "tool_progress_callback", None)
     child_pool, leased_cred_id = _lease_child_credential(child)
     # Heartbeat keeps the parent's _last_activity_ts moving so the gateway inactivity timeout doesn't fire while the
@@ -505,6 +517,18 @@ def delegate_task(
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
     if err:
         return tool_error(err)
+
+    # The public tool entry is the common chokepoint for direct calls,
+    # run_agent tool dispatch, and /review. It runs before live-log creation
+    # and child construction so an unsupported path cannot start a parallel
+    # writer as a side effect.
+    from hermes_cli.admission_contract import AdmissionCaller, route_launch_path
+    launch_route = route_launch_path(
+        "delegate.batch", AdmissionCaller.DELEGATE,
+        request_id=getattr(parent_agent, "session_id", "delegate") or "delegate",
+    )
+    if launch_route.state != "routed":
+        return tool_error(f"admission path rejected: {launch_route.reason}")
 
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message

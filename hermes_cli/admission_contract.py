@@ -26,6 +26,7 @@ class AdmissionErrorCode(str, Enum):
     MISSING_EVIDENCE = "missing_evidence"
     MALFORMED_EVIDENCE = "malformed_evidence"
     UNSUPPORTED_CALLER = "unsupported_caller"
+    UNSUPPORTED_PATH = "unsupported_path"
     CONFLICTING_WRITER = "conflicting_writer"
     UNSAFE_ANCESTRY = "unsafe_ancestry"
     DEPENDENCIES_UNSATISFIED = "dependencies_unsatisfied"
@@ -154,6 +155,43 @@ class AdmissionResult:
     reason: str | None = None
     lease_id: str | None = None
     lease_expires_at: int | None = None
+
+
+_SUPPORTED_LAUNCH_PATHS: dict[str, AdmissionCaller] = {
+    # These are the only process-creation chokepoints.  Ingress callers such
+    # as the CLI, dashboard, daemon, gateway, and /review all funnel through
+    # one of them instead of obtaining an independent bypass.
+    "kanban.dispatch_lane": AdmissionCaller.KANBAN,
+    "kanban.worker_process": AdmissionCaller.KANBAN,
+    "delegate.batch": AdmissionCaller.DELEGATE,
+    "delegate.child_process": AdmissionCaller.DELEGATE,
+}
+
+
+def route_launch_path(path: str, caller: AdmissionCaller | str, *, request_id: str) -> AdmissionResult:
+    """Validate a process-creation path before its controller admission.
+
+    This is deliberately policy-free: it does not reserve capacity or invent
+    resource, dependency, priority, ancestry, worktree, or writer evidence.
+    The launch adapter that has verified those facts presents an
+    :class:`AdmissionRequest` to the controller.  Unknown paths are rejected
+    here, rather than silently becoming a parallel-writer bypass.
+    """
+    try:
+        resolved_caller = AdmissionCaller(caller)
+    except (TypeError, ValueError):
+        return AdmissionResult(
+            request_id=request_id,
+            state="rejected",
+            reason=AdmissionErrorCode.UNSUPPORTED_CALLER.value,
+        )
+    if _SUPPORTED_LAUNCH_PATHS.get(path) is not resolved_caller:
+        return AdmissionResult(
+            request_id=request_id,
+            state="rejected",
+            reason=AdmissionErrorCode.UNSUPPORTED_PATH.value,
+        )
+    return AdmissionResult(request_id=request_id, state="routed")
 
 
 def _nonempty(value: str, label: str) -> str:

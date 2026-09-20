@@ -2048,6 +2048,19 @@ def _dispatch_lane_task(
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
+    # Every production Kanban ingress funnels through this pre-claim choke
+    # point. Keep it before claim_task: an unsupported launch path must not
+    # create a run or let a caller consume a parallel-writer slot.
+    from hermes_cli.admission_contract import AdmissionCaller, route_launch_path
+    launch_route = route_launch_path(
+        "kanban.dispatch_lane", AdmissionCaller.KANBAN, request_id=task_id,
+    )
+    if launch_route.state != "routed":
+        _kb._log.warning(
+            "kanban dispatcher: admission path rejected task %s: %s",
+            task_id, launch_route.reason,
+        )
+        return False
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
@@ -2739,6 +2752,15 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     """
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+
+    # Defense in depth for direct/helper callers: the physical process launch
+    # remains covered even if it is invoked without dispatch_once.
+    from hermes_cli.admission_contract import AdmissionCaller, route_launch_path
+    launch_route = route_launch_path(
+        "kanban.worker_process", AdmissionCaller.KANBAN, request_id=task.id,
+    )
+    if launch_route.state != "routed":
+        raise RuntimeError(f"admission path rejected: {launch_route.reason}")
 
     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
 
