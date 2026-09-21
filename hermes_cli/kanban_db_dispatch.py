@@ -2103,12 +2103,14 @@ def _dispatch_lane_task(
     # ``spawn_fn`` is an in-process test seam.  The production launch path is
     # the default subprocess spawner; only that path is a real worker launch.
     admission = None
-    if spawn_fn is None:
+    if spawn_fn is None and claimed.workspace_kind == "worktree":
         # A source-writing worker is not allowed to rely on this dispatcher's local
-    # counters alone.  It must first reserve the runtime-wide ledger with
-    # linked-worktree and main-line ancestry proof.  This is deliberately after
-    # workspace resolution (the facts do not exist before it), but still before
-    # any process creation.
+        # counters alone. It must first reserve the runtime-wide ledger with
+        # linked-worktree and main-line ancestry proof. This is deliberately after
+        # workspace resolution (the facts do not exist before it), but still before
+        # any process creation. Generic scratch/dir workers retain their existing
+        # production spawn path: they are not source writers and must not reserve
+        # a source-writer admission lease.
         if claimed.current_run_id is None:
             if _record_task_failure(
                 conn, claimed.id, "admission: claimed worker has no run id", outcome="spawn_failed",
@@ -2125,7 +2127,7 @@ def _dispatch_lane_task(
         admission = admit_writer(
             request_id=kanban_request_id(claimed.id, claimed.current_run_id),
             caller=AdmissionCaller.KANBAN,
-            workspace=str(workspace) if claimed.workspace_kind == "worktree" else None,
+            workspace=str(workspace),
             priority=claimed.priority,
             writer_id=f"kanban:{board or 'default'}:{claimed.id}",
             dependencies=parent_ids,

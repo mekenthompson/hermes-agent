@@ -1,6 +1,8 @@
 """Kanban worker admission-route coverage."""
 from __future__ import annotations
 
+import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -21,12 +23,40 @@ def conn(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.delenv("HERMES_ADMISSION_LEDGER", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     db_path = kb.kanban_db_path(board="default")
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     kb.init_db()
     with kbc.connect() as connection:
         yield connection
+
+
+def _make_writer_repo(tmp_path: Path) -> Path:
+    """Create a repository whose advertised main ref can anchor admission."""
+    repo = tmp_path / "writer-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Test User",
+            "-c", "user.email=test@example.com", "add", "README.md",
+        ],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Test User",
+            "-c", "user.email=test@example.com", "commit", "-m", "init",
+        ],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "update-ref", "refs/remotes/origin/main", "HEAD"],
+        check=True, capture_output=True, text=True,
+    )
+    return repo
 
 
 def test_rejected_kanban_route_happens_before_claim_or_spawn(conn, monkeypatch):
@@ -74,8 +104,55 @@ def test_kanban_route_precedes_the_parallel_writer(conn, monkeypatch):
     assert order == ["route", "spawn"]
 
 
-def test_queued_kanban_admission_is_cancelled_before_spawn_retry(conn, monkeypatch):
-    task_id = kb.create_task(conn, title="queued admission", assignee="default")
+def test_scratch_task_reaches_production_spawner_without_writer_admission(conn, monkeypatch):
+    """Scratch workers are not source writers and must not touch the shared ledger."""
+    task_id = kb.create_task(conn, title="generic task", assignee="default", workspace_kind="scratch")
+    spawned: list[tuple[str, str, str | None]] = []
+
+    def production_spawner(task, workspace, *, board=None, admission_ledger=None):
+        spawned.append((task.id, workspace, admission_ledger))
+        return 4242
+
+    monkeypatch.setattr(kbd, "_default_spawn", production_spawner)
+    result = kbd.dispatch_once(conn)
+
+    assert [entry[0] for entry in result.spawned] == [task_id]
+    assert spawned == [(task_id, str(kb.workspaces_root() / task_id), str(admission_runtime.ledger_path()))]
+    assert not admission_runtime.ledger_path().exists()
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "running"
+
+
+def test_worktree_source_writer_is_admitted_before_production_spawner(conn, monkeypatch, tmp_path):
+    """The no-seam dispatch path still reserves a real worktree admission lease."""
+    repo = _make_writer_repo(tmp_path)
+    task_id = kb.create_task(
+        conn, title="source task", assignee="default", workspace_kind="worktree", workspace_path=str(repo),
+    )
+    spawned: list[str] = []
+
+    def production_spawner(task, _workspace, *, board=None, admission_ledger=None):
+        spawned.append(task.id)
+        return 4243
+
+    monkeypatch.setattr(kbd, "_default_spawn", production_spawner)
+    result = kbd.dispatch_once(conn, max_in_progress=1)
+
+    assert [entry[0] for entry in result.spawned] == [task_id]
+    assert spawned == [task_id]
+    with sqlite3.connect(admission_runtime.ledger_path()) as ledger:
+        row = ledger.execute(
+            "SELECT state FROM admission_requests WHERE request_id LIKE ?",
+            (f"kanban:{task_id}:run:%",),
+        ).fetchone()
+    assert row == ("running",)
+
+
+def test_queued_kanban_admission_is_cancelled_before_spawn_retry(conn, monkeypatch, tmp_path):
+    task_id = kb.create_task(
+        conn, title="queued admission", assignee="default", workspace_kind="worktree",
+        workspace_path=str(_make_writer_repo(tmp_path)),
+    )
     cancelled: list[str] = []
 
     monkeypatch.setattr(
