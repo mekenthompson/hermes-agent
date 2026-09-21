@@ -31,7 +31,58 @@ _LEDGER_NAME = "admission.db"
 
 def ledger_path(home: Path | None = None) -> Path:
     """The one admission ledger for a runtime Hermes home."""
+    inherited = os.environ.get("HERMES_ADMISSION_LEDGER", "").strip()
+    if inherited:
+        candidate = Path(inherited).expanduser()
+        if candidate.is_absolute():
+            return candidate
     return (home or get_hermes_home()).expanduser() / _LEDGER_NAME
+
+
+def kanban_request_id(task_id: str, run_id: int) -> str:
+    """Stable, attempt-scoped admission identity for one Kanban worker."""
+    return f"kanban:{task_id}:run:{int(run_id)}"
+
+
+def release_kanban_admission(task_id: str, run_id: int | None) -> bool:
+    """Release one terminal worker's reservation exactly once, if it has one."""
+    if run_id is None:
+        return False
+    path = ledger_path()
+    if not path.exists():
+        return False
+    with sqlite3.connect(path, isolation_level=None) as connection:
+        result = connection.execute(
+            "UPDATE admission_requests SET state = 'released', lease_id = NULL, lease_expires_at = NULL "
+            "WHERE request_id = ? AND state = 'running'",
+            (kanban_request_id(task_id, run_id),),
+        )
+    return result.rowcount == 1
+
+
+def renew_kanban_admission(task_id: str, run_id: int | None) -> bool:
+    """Renew a live worker using its original durable lease span, never reviving one."""
+    if run_id is None:
+        return False
+    path = ledger_path()
+    if not path.exists():
+        return False
+    now = int(time.time())
+    with sqlite3.connect(path, isolation_level=None) as connection:
+        row = connection.execute(
+            "SELECT created_at, lease_expires_at FROM admission_requests "
+            "WHERE request_id = ? AND state = 'running'",
+            (kanban_request_id(task_id, run_id),),
+        ).fetchone()
+        if row is None or row[1] is None or int(row[1]) <= now:
+            return False
+        lease_span = max(1, int(row[1]) - int(row[0]))
+        result = connection.execute(
+            "UPDATE admission_requests SET lease_expires_at = ? "
+            "WHERE request_id = ? AND state = 'running' AND lease_expires_at > ?",
+            (now + lease_span, kanban_request_id(task_id, run_id), now),
+        )
+    return result.rowcount == 1
 
 
 def configured_gateway_capacity(*, kanban_cap: int | None = None, delegate_cap: int | None = None) -> int | None:

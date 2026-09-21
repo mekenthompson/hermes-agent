@@ -2800,6 +2800,7 @@ def complete_task(
             run_id=run_id,
         )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
+    _release_kanban_admission(task_id, run_id)
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
     recompute_ready(conn)  # separate txn so children see ``done``
@@ -2808,6 +2809,15 @@ def complete_task(
     if fire_lifecycle_hook:
         _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
     return True
+
+
+def _release_kanban_admission(task_id: str, run_id: Optional[int]) -> None:
+    """Best-effort post-commit release bound to this completed worker run."""
+    try:
+        from hermes_cli.admission_runtime import release_kanban_admission
+        release_kanban_admission(task_id, run_id)
+    except Exception:
+        _log.warning("kanban: admission release failed for %s run %s", task_id, run_id, exc_info=True)
 
 
 _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
@@ -3236,10 +3246,13 @@ def block_task(
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
+        dependency_block = kind == "dependency"
+        if dependency_block:
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
+    _release_kanban_admission(task_id, run_id)
+    if dependency_block:
+        return True
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
 
@@ -3398,6 +3411,7 @@ def request_review(
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
         raise
+    _release_kanban_admission(task_id, run_id)
     return _ret(True)
 
 
@@ -3488,6 +3502,7 @@ def request_changes(
             },
             run_id=run_id,
         )
+    _release_kanban_admission(task_id, run_id)
     return True, implementer
 
 
