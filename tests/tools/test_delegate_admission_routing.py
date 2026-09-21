@@ -11,6 +11,7 @@ from hermes_cli import admission_runtime
 from hermes_cli.admission import Admission
 from hermes_cli.admission_contract import AdmissionErrorCode, AdmissionResult
 from tools import delegate_tool
+from tools.delegate_tool_child_run import _Heartbeat
 
 
 def _rejected(request_id: str) -> AdmissionResult:
@@ -113,6 +114,21 @@ def test_queued_delegate_admission_is_cancelled_before_child_execution(monkeypat
 
     assert result == {"status": "error"}
     assert cancelled == ["delegate-queued"]
+
+
+def test_live_delegate_heartbeat_renews_its_admission_lease(monkeypatch):
+    renewed: list[str] = []
+    child = SimpleNamespace(
+        get_activity_summary=lambda: {"api_call_count": 1, "current_tool": None, "max_iterations": 2},
+    )
+    parent = SimpleNamespace(_touch_activity=lambda _desc: None)
+    heartbeat = _Heartbeat(child, parent, 0)
+    heartbeat.admission_lease_id = "lease-live-delegate"
+    monkeypatch.setattr(admission_runtime, "renew_admission", lambda lease_id: renewed.append(lease_id) or True)
+
+    heartbeat.tick()
+
+    assert renewed == ["lease-live-delegate"]
 
 
 def test_unisolated_delegate_rejection_is_schema_safe_before_child_start(tmp_path, monkeypatch):

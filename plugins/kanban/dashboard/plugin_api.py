@@ -705,6 +705,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
     running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
     so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    admission_releases: list[tuple[str, Optional[int]]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
         prev = conn.execute(
@@ -737,6 +738,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
                 conn, task_id, outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {effective_status} (dashboard/direct)")
             terminations.append((prev["worker_pid"], prev["claim_lock"], prev["worker_started_at"]))
+            admission_releases.append((task_id, run_id))
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'status', ?, ?)",
             (task_id, run_id, json.dumps({"status": effective_status, "requested_status": new_status}), int(time.time())))
@@ -745,6 +747,9 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             # back worker terminations to perform post-commit.
             result = kanban_db.invalidate_descendants_for_parent_reopen(conn, task_id, author="dashboard")
             terminations.extend(result["terminations"])
+            admission_releases.extend(result["admission_releases"])
+    for released_task_id, run_id in admission_releases:
+        kanban_db._release_kanban_admission(released_task_id, run_id)
     for pid, claim_lock, started_at in terminations:
         kanban_db._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
     # Re-opening something may have made children stale.

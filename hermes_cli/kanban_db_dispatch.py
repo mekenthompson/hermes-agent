@@ -705,6 +705,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 killed = _sigkill(kill, pid)
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
+        run_id = None
         with _kb.write_txn(conn):
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -733,6 +734,9 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         # own. If the breaker trips this flips the task to ``blocked`` and emits
         # ``gave_up`` on top of the ``timed_out`` already emitted.
         if cur.rowcount == 1:
+            # The durable task transition has committed.  Drop only this
+            # attempt's reservation before retry accounting can requeue it.
+            _kb._release_kanban_admission(tid, run_id)
             _record_task_failure(
                 conn, tid,
                 error=error,
@@ -807,6 +811,7 @@ def detect_stale_running(
             )
             continue
 
+        run_id = None
         with _kb.write_txn(conn):
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -842,6 +847,9 @@ def detect_stale_running(
             )
             _kb._append_event(conn, tid, "stale", payload, run_id=run_id)
             reclaimed.append(tid)
+        # Release after the task/run transition commits, never while a live
+        # worker is being deferred above.
+        _kb._release_kanban_admission(tid, run_id)
 
     return reclaimed
 
@@ -905,6 +913,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             )
             _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
             reconciled.append(tid)
+        _kb._release_kanban_admission(tid, run_id)
         _kb._log.info(
             "kanban reconcile: requeued orphaned running task %s "
             "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
@@ -1207,9 +1216,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
-    from hermes_cli.admission_runtime import release_kanban_admission
     for task_id, run_id in released_admissions:
-        release_kanban_admission(task_id, run_id)
+        _kb._release_kanban_admission(task_id, run_id)
     return sweep
 
 
