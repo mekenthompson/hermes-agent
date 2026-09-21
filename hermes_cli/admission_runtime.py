@@ -271,6 +271,15 @@ def cancel_admission_request(request_id: str | None) -> bool:
         return False
     connection = _connect()
     try:
+        tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('admission_configuration', 'admission_requests')"
+            )
+        }
+        if tables != {"admission_configuration", "admission_requests"}:
+            return False
         row = connection.execute(
             "SELECT limits_json FROM admission_configuration WHERE singleton = 1"
         ).fetchone()
