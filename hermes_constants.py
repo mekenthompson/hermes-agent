@@ -277,6 +277,8 @@ def named_profile_is_deleted(profile_home: str | Path) -> bool:
 # none of these; a pre-tombstone ghost shell or a stray infrastructure dir must never be
 # listed, served, ticked, or seeded with the default install's credentials.
 _PROFILE_IDENTITY_MARKERS = ("config.yaml", ".env", "SOUL.md", "profile.yaml", "auth.json", "state.db")
+# Canonical named-profile id grammar; every profile-directory gate imports this one object.
+PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 def named_profile_has_identity(profile_home: str | Path) -> bool:
@@ -284,6 +286,28 @@ def named_profile_has_identity(profile_home: str | Path) -> bool:
     # ``is_file()`` follows links, so it alone would make such a profile unlistable.
     home = Path(profile_home)
     return any((home / marker).is_file() or (home / marker).is_symlink() for marker in _PROFILE_IDENTITY_MARKERS)
+
+
+def named_profile_has_servable_identity(profile_home: str | Path) -> bool:
+    """Stricter than :func:`named_profile_has_identity`: is this dir a profile a host should change
+    its own posture for?
+
+    An EMPTY ``.env`` is all a crashed ``hermes profile create`` leaves behind, and it is enough for
+    ``named_profile_has_identity``. Listing such a shell is harmless; counting it as a second tenant
+    is not — it flips the whole host's credential reads fail-closed at the next boot. Every other
+    marker, and a non-empty or symlinked ``.env``, still counts.
+    """
+    home = Path(profile_home)
+    for marker in _PROFILE_IDENTITY_MARKERS:
+        path = home / marker
+        if path.is_symlink():
+            return True
+        try:
+            if path.is_file() and (marker != ".env" or path.stat().st_size > 0):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def named_profile_is_live(profile_home: str | Path) -> bool:
