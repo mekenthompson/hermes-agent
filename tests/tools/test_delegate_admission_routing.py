@@ -4,6 +4,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from hermes_cli import admission_contract
+from hermes_cli import admission_runtime
+from hermes_cli.admission import Admission
 from hermes_cli.admission_contract import AdmissionErrorCode, AdmissionResult
 from tools import delegate_tool
 
@@ -72,6 +74,42 @@ def test_direct_child_helper_rejects_before_child_execution(monkeypatch):
 
     assert result == {"status": "error"}
     assert len(started) == 1
+
+
+def test_queued_delegate_admission_is_cancelled_before_child_execution(monkeypatch):
+    cancelled: list[str] = []
+
+    class Run:
+        worktree_info = {"path": "/isolated/worktree"}
+
+        def __init__(self, *_args):
+            pass
+
+        def seed_workspace(self):
+            return None
+
+        def elapsed(self):
+            return 0.0
+
+        def attach_worktree(self, entry):
+            return entry
+
+    monkeypatch.setattr(delegate_tool, "_ChildRun", Run)
+    monkeypatch.setattr(
+        admission_runtime,
+        "admit_writer",
+        lambda **kwargs: Admission(
+            kwargs["request_id"], "delegate:test", "queued", {"gateway": 1}, True, None, None, "capacity",
+        ),
+    )
+    monkeypatch.setattr(admission_runtime, "cancel_admission_request", lambda request_id: cancelled.append(request_id) or True)
+    monkeypatch.setattr(delegate_tool, "_fabricated_entry", lambda *_args: {"status": "error"})
+    child = SimpleNamespace(_delegate_admission_required=True, _subagent_id="delegate-queued")
+
+    result = delegate_tool._run_single_child(0, "do not run", child=child)
+
+    assert result == {"status": "error"}
+    assert cancelled == ["delegate-queued"]
 
 
 def test_writer_admission_boundary_preserves_direct_read_only_seams():

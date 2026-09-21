@@ -399,6 +399,11 @@ def _run_single_child(
             writer_id=f"delegate:{_preflight_id}",
         )
         if admission.state != "running":
+            # Delegation does not have a durable queue consumer. A queued
+            # preflight must be cancelled by request ID before this child is
+            # rejected, because queued admissions have no lease to release.
+            from hermes_cli.admission_runtime import cancel_admission_request
+            cancel_admission_request(admission.request_id)
             entry = _fabricated_entry(
                 task_index, "error", f"admission rejected: {admission.reason or 'not_running'}", child, run.elapsed(),
             )

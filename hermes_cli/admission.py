@@ -246,6 +246,25 @@ class AdmissionController:
             )
             return result.rowcount == 1
 
+    def cancel(self, request_id: str) -> bool:
+        """Discard a queued request that will not be promoted by its caller.
+
+        Production pre-spawn adapters are immediate-only: a queued result is a
+        failed launch attempt, not a promise that an unrelated future process
+        will execute it. Cancellation is request-scoped because queued work has
+        no lease to release.
+        """
+        request_id = _nonempty(request_id, "request_id")
+        now = int(self._now())
+        with self._write():
+            self._expire_leases(now)
+            result = self.connection.execute(
+                "UPDATE admission_requests SET state = 'released', lease_id = NULL, lease_expires_at = NULL, "
+                "reason = 'cancelled_before_spawn' WHERE request_id = ? AND state = 'queued'",
+                (request_id,),
+            )
+            return result.rowcount == 1
+
     def get(self, request_id: str) -> Admission | None:
         """Return current state after lazily reclaiming expired running leases."""
         now = int(self._now())

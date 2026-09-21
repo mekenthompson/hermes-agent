@@ -256,3 +256,30 @@ def release_admission(lease_id: str | None) -> None:
         ).release(lease_id)
     finally:
         connection.close()
+
+
+def cancel_admission_request(request_id: str | None) -> bool:
+    """Cancel an immediate-only pre-spawn request if it was queued.
+
+    Queued requests have no lease, so cleanup uses their durable request ID. A
+    missing ledger or an already-terminal request is an idempotent no-op.
+    """
+    if not request_id:
+        return False
+    path = ledger_path()
+    if not path.exists():
+        return False
+    connection = _connect()
+    try:
+        row = connection.execute(
+            "SELECT limits_json FROM admission_configuration WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            return False
+        limits = json.loads(row["limits_json"])
+        return AdmissionController(
+            connection,
+            AdmissionLimits(running=limits["running"], queued=limits["queued"]),
+        ).cancel(request_id)
+    finally:
+        connection.close()
