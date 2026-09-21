@@ -277,6 +277,7 @@ class _Heartbeat:
         # activity_ts) all froze; thresholds differ idle vs in-tool.
         self.last_seen = {"iter": 0, "tool": None, "ts": None, "stale": 0}
         self.handle = None
+        self.admission_lease_id: Optional[str] = None
         # Set on the stale verdict; ``await_child`` waits on it (its worker's done-callback
         # sets it too) so a wedged child ends the wait instead of only ending the heartbeat.
         self.settled = threading.Event()
@@ -298,6 +299,11 @@ class _Heartbeat:
         """Returning False stops the periodic callback."""
         from tools.delegate_tool import _HEARTBEAT_INTERVAL, _HEARTBEAT_STALE_CYCLES_IDLE, _HEARTBEAT_STALE_CYCLES_IN_TOOL
         child, parent_agent, task_index, last_seen = self.child, self.parent_agent, self.task_index, self.last_seen
+        lease_id = getattr(self, "admission_lease_id", None)
+        if lease_id:
+            with _quiet(None):
+                from hermes_cli.admission_runtime import renew_admission
+                renew_admission(lease_id)
         touch = getattr(parent_agent, "_touch_activity", None) if parent_agent is not None else None
         if not touch:
             return None

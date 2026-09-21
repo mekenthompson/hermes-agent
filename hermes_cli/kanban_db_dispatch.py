@@ -642,6 +642,10 @@ def heartbeat_worker(
             {"note": note} if note else None,
             run_id=run_id,
         )
+    # A terminal transition releases this reservation.  While the worker is
+    # healthy, retain its original lease span instead of letting it expire.
+    from hermes_cli.admission_runtime import renew_kanban_admission
+    renew_kanban_admission(task_id, run_id)
     return True
 
 
@@ -701,6 +705,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 killed = _sigkill(kill, pid)
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
+        run_id = None
         with _kb.write_txn(conn):
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -729,6 +734,9 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         # own. If the breaker trips this flips the task to ``blocked`` and emits
         # ``gave_up`` on top of the ``timed_out`` already emitted.
         if cur.rowcount == 1:
+            # The durable task transition has committed.  Drop only this
+            # attempt's reservation before retry accounting can requeue it.
+            _kb._release_kanban_admission(tid, run_id)
             _record_task_failure(
                 conn, tid,
                 error=error,
@@ -803,6 +811,7 @@ def detect_stale_running(
             )
             continue
 
+        run_id = None
         with _kb.write_txn(conn):
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -838,6 +847,9 @@ def detect_stale_running(
             )
             _kb._append_event(conn, tid, "stale", payload, run_id=run_id)
             reclaimed.append(tid)
+        # Release after the task/run transition commits, never while a live
+        # worker is being deferred above.
+        _kb._release_kanban_admission(tid, run_id)
 
     return reclaimed
 
@@ -901,6 +913,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             )
             _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
             reconciled.append(tid)
+        _kb._release_kanban_admission(tid, run_id)
         _kb._log.info(
             "kanban reconcile: requeued orphaned running task %s "
             "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
@@ -1137,6 +1150,7 @@ class _CrashSweep:
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
+    released_admissions: list[tuple[str, int | None]] = []
     with _kb.write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
@@ -1175,6 +1189,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 error=dead.error_text,
                 metadata=dict(dead.event_payload),
             )
+            released_admissions.append((row["id"], run_id))
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
             sweep.exited_hook_payloads.append({
                 "task_id": row["id"],
@@ -1201,6 +1216,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+    for task_id, run_id in released_admissions:
+        _kb._release_kanban_admission(task_id, run_id)
     return sweep
 
 
@@ -2002,6 +2019,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    gateway_cap: Optional[int],
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2048,6 +2066,19 @@ def _dispatch_lane_task(
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
+    # Every production Kanban ingress funnels through this pre-claim choke
+    # point. Keep it before claim_task: an unsupported launch path must not
+    # create a run or let a caller consume a parallel-writer slot.
+    from hermes_cli.admission_contract import AdmissionCaller, route_launch_path
+    launch_route = route_launch_path(
+        "kanban.dispatch_lane", AdmissionCaller.KANBAN, request_id=task_id,
+    )
+    if launch_route.state != "routed":
+        _kb._log.warning(
+            "kanban dispatcher: admission path rejected task %s: %s",
+            task_id, launch_route.reason,
+        )
+        return False
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
@@ -2069,12 +2100,65 @@ def _dispatch_lane_task(
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+    # ``spawn_fn`` is an in-process test seam.  The production launch path is
+    # the default subprocess spawner; only that path is a real worker launch.
+    admission = None
+    if spawn_fn is None and claimed.workspace_kind == "worktree":
+        # A source-writing worker is not allowed to rely on this dispatcher's local
+        # counters alone. It must first reserve the runtime-wide ledger with
+        # linked-worktree and main-line ancestry proof. This is deliberately after
+        # workspace resolution (the facts do not exist before it), but still before
+        # any process creation. Generic scratch/dir workers retain their existing
+        # production spawn path: they are not source writers and must not reserve
+        # a source-writer admission lease.
+        if claimed.current_run_id is None:
+            if _record_task_failure(
+                conn, claimed.id, "admission: claimed worker has no run id", outcome="spawn_failed",
+                failure_limit=failure_limit, release_claim=True, end_run=True,
+            ):
+                result.auto_blocked.append(claimed.id)
+            return False
+        from hermes_cli.admission_runtime import admit_writer, kanban_request_id
+        parent_ids = tuple(_kb.parent_ids(conn, claimed.id))
+        unresolved_parent_ids = tuple(
+            parent_id for parent_id in parent_ids
+            if (parent := _kb.get_task(conn, parent_id)) is None or parent.status not in ("done", "archived")
+        )
+        admission = admit_writer(
+            request_id=kanban_request_id(claimed.id, claimed.current_run_id),
+            caller=AdmissionCaller.KANBAN,
+            workspace=str(workspace),
+            priority=claimed.priority,
+            writer_id=f"kanban:{board or 'default'}:{claimed.id}",
+            dependencies=parent_ids,
+            unresolved_dependencies=unresolved_parent_ids,
+            kanban_cap=gateway_cap,
+        )
+    if admission is not None and admission.state != "running":
+        # This launch path is immediate-only. A queued result has no process
+        # that could promote it, so remove the request by its durable identity
+        # before this claimed run is returned for retry.
+        from hermes_cli.admission_runtime import cancel_admission_request
+        cancel_admission_request(admission.request_id)
+        reason = admission.reason or "admission_not_running"
+        if _record_task_failure(
+            conn, claimed.id, f"admission: {reason}", outcome="spawn_failed",
+            failure_limit=failure_limit, release_claim=True, end_run=True,
+        ):
+            result.auto_blocked.append(claimed.id)
+        return False
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        if spawn_fn is None:
+            from hermes_cli.admission_runtime import ledger_path
+            pid = _default_spawn(
+                claimed, str(workspace), board=board, admission_ledger=str(ledger_path()),
+            )
+        else:
+            pid = _call_spawn_fn(spawn_fn, claimed, str(workspace), board)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
@@ -2086,6 +2170,11 @@ def _dispatch_lane_task(
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
+        # The process never started, so its cross-launcher reservation must not
+        # survive as phantom capacity.
+        from hermes_cli.admission_runtime import release_admission
+        if admission is not None:
+            release_admission(admission.lease_id)
         from tools.process_registry import RestartSafeScopeUnavailable
 
         # The host refused the spawn (no restart-safe scope): nothing about the
@@ -2347,6 +2436,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        gateway_cap=max_in_progress,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
@@ -2728,7 +2818,9 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
-def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+def _default_spawn(
+    task: Task, workspace: str, *, board: Optional[str] = None, admission_ledger: Optional[str] = None,
+) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the child's PID so the dispatcher can detect crashes before the
@@ -2739,6 +2831,15 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     """
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+
+    # Defense in depth for direct/helper callers: the physical process launch
+    # remains covered even if it is invoked without dispatch_once.
+    from hermes_cli.admission_contract import AdmissionCaller, route_launch_path
+    launch_route = route_launch_path(
+        "kanban.worker_process", AdmissionCaller.KANBAN, request_id=task.id,
+    )
+    if launch_route.state != "routed":
+        raise RuntimeError(f"admission path rejected: {launch_route.reason}")
 
     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
 
@@ -2810,6 +2911,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    if admission_ledger:
+        env["HERMES_ADMISSION_LEDGER"] = admission_ledger
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode (Ralph-style /goal judge loop in cli.py quiet-mode path).
