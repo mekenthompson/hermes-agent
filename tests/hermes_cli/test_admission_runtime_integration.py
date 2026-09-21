@@ -8,7 +8,7 @@ from pathlib import Path
 
 from hermes_cli.admission import AdmissionController, AdmissionLimits
 from hermes_cli.admission_contract import AdmissionCaller, AdmissionErrorCode
-from hermes_cli.admission_runtime import admit_writer, ledger_path, release_admission
+from hermes_cli.admission_runtime import admit_writer, cancel_admission_request, ledger_path, release_admission
 
 
 def _git(path: Path, *args: str) -> str:
@@ -135,3 +135,34 @@ def test_dependencies_do_not_consume_running_capacity(tmp_path, monkeypatch):
     assert blocked.state == "queued"
     assert blocked.reason == AdmissionErrorCode.DEPENDENCIES_UNSATISFIED.value
     assert admitted.state == "running"
+
+
+def test_capacity_blocked_retries_are_cancelled_without_queued_occupancy(tmp_path, monkeypatch):
+    """Immediate pre-spawn callers cannot strand capacity-one queue entries."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _repo, first, second, third, fourth = _worktrees(tmp_path)
+
+    running = admit_writer(
+        request_id="kanban-running", caller=AdmissionCaller.KANBAN, workspace=str(first), priority=0,
+        writer_id="kanban:kanban-running", kanban_cap=1, delegate_cap=1,
+    )
+    assert running.state == "running"
+    for request_id, caller, workspace in (
+        ("delegate-queued", AdmissionCaller.DELEGATE, second),
+        ("kanban-retry", AdmissionCaller.KANBAN, third),
+        ("delegate-retry", AdmissionCaller.DELEGATE, fourth),
+    ):
+        queued = admit_writer(
+            request_id=request_id, caller=caller, workspace=str(workspace), priority=0,
+            writer_id=f"{caller.value}:{request_id}", kanban_cap=1, delegate_cap=1,
+        )
+        assert queued.state == "queued"
+        assert cancel_admission_request(queued.request_id) is True
+        assert cancel_admission_request(queued.request_id) is False
+        with sqlite3.connect(ledger_path(), isolation_level=None) as connection:
+            controller = AdmissionController(
+                connection, AdmissionLimits(running={"gateway": 1}, queued={"gateway": 1}),
+            )
+            assert controller.usage("queued") == {"gateway": 0}

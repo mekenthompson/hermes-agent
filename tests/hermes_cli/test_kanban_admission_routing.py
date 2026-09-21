@@ -6,10 +6,12 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import admission_contract
+from hermes_cli import admission_runtime
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 
+from hermes_cli.admission import Admission
 from hermes_cli.admission_contract import AdmissionErrorCode, AdmissionResult
 
 
@@ -70,6 +72,27 @@ def test_kanban_route_precedes_the_parallel_writer(conn, monkeypatch):
 
     assert [entry[0] for entry in result.spawned] == [task_id]
     assert order == ["route", "spawn"]
+
+
+def test_queued_kanban_admission_is_cancelled_before_spawn_retry(conn, monkeypatch):
+    task_id = kb.create_task(conn, title="queued admission", assignee="default")
+    cancelled: list[str] = []
+
+    monkeypatch.setattr(
+        admission_runtime,
+        "admit_writer",
+        lambda **kwargs: Admission(
+            kwargs["request_id"], "kanban:test", "queued", {"gateway": 1}, True, None, None, "capacity",
+        ),
+    )
+    monkeypatch.setattr(admission_runtime, "cancel_admission_request", lambda request_id: cancelled.append(request_id) or True)
+    monkeypatch.setattr(kbd, "_default_spawn", lambda *_args, **_kwargs: pytest.fail("spawn must not follow queued admission"))
+
+    result = kbd.dispatch_once(conn, max_in_progress=1)
+
+    assert result.spawned == []
+    assert len(cancelled) == 1
+    assert cancelled[0].startswith(f"kanban:{task_id}:run:")
 
 
 def test_direct_worker_helper_rejects_before_popen(monkeypatch, tmp_path):

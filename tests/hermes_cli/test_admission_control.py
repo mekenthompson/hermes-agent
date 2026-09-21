@@ -62,6 +62,17 @@ def test_releasing_a_lease_promotes_the_oldest_eligible_queue_entry(controller):
     assert controller.get(second_waiter.request_id).state == "queued"
 
 
+def test_cancelling_queued_request_is_request_scoped_and_idempotent(controller):
+    controller.request("kanban:t1", {"cpu": 2, "model": 1})
+    queued = controller.request("delegate:d1", {"cpu": 1, "model": 1}, request_id="queued")
+
+    assert queued.state == "queued"
+    assert controller.cancel(queued.request_id) is True
+    assert controller.cancel(queued.request_id) is False
+    assert controller.get(queued.request_id).state == "released"
+    assert controller.usage("queued") == {"cpu": 0, "model": 0}
+
+
 def test_expired_lease_is_reclaimed_before_a_new_admission(controller):
     clock = [100]
     connection = sqlite3.connect(":memory:", isolation_level=None)

@@ -2114,6 +2114,11 @@ def _dispatch_lane_task(
             kanban_cap=gateway_cap,
         )
     if admission is not None and admission.state != "running":
+        # This launch path is immediate-only. A queued result has no process
+        # that could promote it, so remove the request by its durable identity
+        # before this claimed run is returned for retry.
+        from hermes_cli.admission_runtime import cancel_admission_request
+        cancel_admission_request(admission.request_id)
         reason = admission.reason or "admission_not_running"
         if _record_task_failure(
             conn, claimed.id, f"admission: {reason}", outcome="spawn_failed",
