@@ -306,7 +306,13 @@ def get_board(
             _attach_diagnostics(d, diagnostics_per_task.get(t.id))
             columns[t.status if t.status in columns else "todo"].append(d)
 
-        # Per-column ordering (priority DESC, created_at ASC) comes from list_tasks.
+        # Queue lanes keep the list_tasks dispatch order; the done column is
+        # history, so order it newest-completed-first. Two stable sorts compose
+        # into the "completed_at DESC NULLS LAST, id DESC" SQL key.
+        columns["done"].sort(key=lambda d: d["id"], reverse=True)
+        columns["done"].sort(key=lambda d: (d["completed_at"] is None, -(d["completed_at"] or 0)))
+
+        # Queue columns keep list_tasks' dispatch order (priority DESC, created_at ASC).
         tenants = [r["tenant"] for r in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
         assignees = [r["assignee"] for r in conn.execute(
             "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND status != 'archived' ORDER BY assignee")]
@@ -572,13 +578,7 @@ def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
 
 
 def _set_priority(conn, task_id: str, priority: int, board: Optional[str]) -> None:
-    with kanban_db.write_txn(conn):
-        conn.execute("UPDATE tasks SET priority = ? WHERE id = ?", (int(priority), task_id))
-        conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'reprioritized', ?, ?)",
-            (task_id, json.dumps({"priority": int(priority)}), int(time.time())))
-    # Mutation-boundary observer (post-commit): this direct-SQL write bypasses every kanban_db mutator.
-    kanban_db.notify_task_updated(conn, task_id, ("priority",), board=board)
+    kanban_db.edit_task(conn, task_id, priority=int(priority), board=board)
 
 
 def _apply_model_override(conn, task_id: str, p) -> bool:
@@ -705,6 +705,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
     running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
     so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    admission_releases: list[tuple[str, Optional[int]]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
         prev = conn.execute(
@@ -737,6 +738,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
                 conn, task_id, outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {effective_status} (dashboard/direct)")
             terminations.append((prev["worker_pid"], prev["claim_lock"], prev["worker_started_at"]))
+            admission_releases.append((task_id, run_id))
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'status', ?, ?)",
             (task_id, run_id, json.dumps({"status": effective_status, "requested_status": new_status}), int(time.time())))
@@ -745,6 +747,9 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             # back worker terminations to perform post-commit.
             result = kanban_db.invalidate_descendants_for_parent_reopen(conn, task_id, author="dashboard")
             terminations.extend(result["terminations"])
+            admission_releases.extend(result["admission_releases"])
+    for released_task_id, run_id in admission_releases:
+        kanban_db._release_kanban_admission(released_task_id, run_id)
     for pid, claim_lock, started_at in terminations:
         kanban_db._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
     # Re-opening something may have made children stale.

@@ -70,6 +70,11 @@ def _admission_row() -> tuple[str, int | None]:
     return row[0], row[1]
 
 
+def _running_occupancy() -> int:
+    with sqlite3.connect(ar.ledger_path()) as conn:
+        return conn.execute("SELECT COUNT(*) FROM admission_requests WHERE state = 'running'").fetchone()[0]
+
+
 def test_normal_completion_releases_once(lifecycle):
     conn, task_id, run_id = lifecycle
 
@@ -92,6 +97,19 @@ def test_heartbeat_renews_without_premature_release(lifecycle, monkeypatch):
     assert renewed_expiry == int(old_expiry) + 10
 
 
+def test_repeated_heartbeat_renewals_preserve_the_immutable_lease_span(lifecycle, monkeypatch):
+    conn, task_id, run_id = lifecycle
+    with sqlite3.connect(ar.ledger_path(), isolation_level=None) as ledger:
+        created_at = ledger.execute("SELECT created_at FROM admission_requests").fetchone()[0]
+
+    monkeypatch.setattr(ar.time, "time", lambda: int(created_at) + 10)
+    assert kbd.heartbeat_worker(conn, task_id, expected_run_id=run_id)
+    assert _admission_row()[1] == int(created_at) + 310
+    monkeypatch.setattr(ar.time, "time", lambda: int(created_at) + 20)
+    assert kbd.heartbeat_worker(conn, task_id, expected_run_id=run_id)
+    assert _admission_row()[1] == int(created_at) + 320
+
+
 def test_dead_worker_reclaim_releases_reservation(lifecycle, monkeypatch):
     conn, task_id, _run_id = lifecycle
     task = kb.get_task(conn, task_id)
@@ -104,3 +122,115 @@ def test_dead_worker_reclaim_releases_reservation(lifecycle, monkeypatch):
 
     assert kbd._reclaim_dead_workers(conn).crashed == [task_id]
     assert _admission_row()[0] == "released"
+
+
+@pytest.mark.parametrize("terminal", ["manual_reclaim", "archive", "schedule", "delete"])
+def test_explicit_terminal_transitions_release_reservation(lifecycle, terminal):
+    conn, task_id, _run_id = lifecycle
+
+    if terminal == "manual_reclaim":
+        assert kb.reclaim_task(conn, task_id, signal_fn=lambda *_args: None)
+    elif terminal == "archive":
+        assert kb.archive_task(conn, task_id, signal_fn=lambda *_args: None)
+    elif terminal == "schedule":
+        assert kb.schedule_task(conn, task_id, reason="operator pause")
+    else:
+        assert kb.delete_task(conn, task_id)
+
+    assert _admission_row()[0] == "released"
+
+
+def test_timeout_releases_attempt_scoped_reservation(lifecycle, monkeypatch):
+    conn, task_id, run_id = lifecycle
+    old = int(time.time()) - 30
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET worker_pid = ?, started_at = ? WHERE id = ?", (987654, old, task_id))
+        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (old, run_id))
+        conn.execute("UPDATE tasks SET max_runtime_seconds = 1 WHERE id = ?", (task_id,))
+    monkeypatch.setattr(kbd, "_worker_alive", lambda *_args: False)
+
+    assert task_id in kbd.enforce_max_runtime(conn, signal_fn=lambda *_args: None)
+    assert _admission_row()[0] == "released"
+
+
+def test_stale_and_orphan_reclaims_release_reservation(lifecycle, monkeypatch):
+    conn, task_id, run_id = lifecycle
+    old = int(time.time()) - 1_000
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET started_at = ?, last_heartbeat_at = NULL WHERE id = ?", (old, task_id))
+        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (old, run_id))
+    assert kbd.detect_stale_running(conn, stale_timeout_seconds=1) == [task_id]
+    assert _admission_row()[0] == "released"
+
+    retried = kb.claim_task(conn, task_id)
+    assert retried is not None and retried.current_run_id is not None
+    admission = ar.admit_writer(
+        request_id=ar.kanban_request_id(task_id, retried.current_run_id), caller=AdmissionCaller.KANBAN,
+        workspace=str(_worktree(Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent)), priority=0,
+        writer_id=f"kanban:{task_id}", kanban_cap=1,
+    )
+    assert admission.state == "running"
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET claim_lock = NULL, claim_expires = NULL WHERE id = ?", (task_id,))
+    assert kbd.reconcile_orphaned_running(conn) == [task_id]
+    assert _admission_row()[0] == "released"
+
+
+def test_heartbeat_noops_for_uninitialized_inherited_ledger(lifecycle, monkeypatch):
+    conn, task_id, run_id = lifecycle
+    empty_ledger = ar.ledger_path().with_name("empty-admission.db")
+    empty_ledger.touch()
+    monkeypatch.setenv("HERMES_ADMISSION_LEDGER", str(empty_ledger))
+
+    assert kbd.heartbeat_worker(conn, task_id, expected_run_id=run_id)
+    assert ar.renew_kanban_admission(task_id, run_id) is False
+    assert ar.release_kanban_admission(task_id, run_id) is False
+
+
+def test_expired_claim_reclaim_releases_and_allows_a_new_admission(lifecycle):
+    conn, task_id, _run_id = lifecycle
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (int(time.time()) - 1, task_id))
+
+    assert kb.release_stale_claims(conn) == 1
+    assert _admission_row()[0] == "released"
+    assert _running_occupancy() == 0
+    retried = kb.claim_task(conn, task_id)
+    assert retried is not None and retried.current_run_id is not None
+    admission = ar.admit_writer(
+        request_id=ar.kanban_request_id(task_id, retried.current_run_id), caller=AdmissionCaller.KANBAN,
+        workspace=str(_worktree(Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent)), priority=0,
+        writer_id=f"kanban:{task_id}", kanban_cap=1,
+    )
+    assert admission.state == "running"
+
+
+@pytest.mark.parametrize("reclaim_path", ["manual", "expired_claim", "stale_heartbeat", "orphan"])
+def test_every_reclaim_path_frees_capacity_for_the_next_attempt(lifecycle, reclaim_path):
+    conn, task_id, run_id = lifecycle
+    if reclaim_path == "manual":
+        assert kb.reclaim_task(conn, task_id, signal_fn=lambda *_args: None)
+    elif reclaim_path == "expired_claim":
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (int(time.time()) - 1, task_id))
+        assert kb.release_stale_claims(conn) == 1
+    elif reclaim_path == "stale_heartbeat":
+        old = int(time.time()) - 1_000
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET started_at = ?, last_heartbeat_at = NULL WHERE id = ?", (old, task_id))
+            conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (old, run_id))
+        assert kbd.detect_stale_running(conn, stale_timeout_seconds=1) == [task_id]
+    else:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET claim_lock = NULL, claim_expires = NULL WHERE id = ?", (task_id,))
+        assert kbd.reconcile_orphaned_running(conn) == [task_id]
+
+    assert _running_occupancy() == 0
+    retried = kb.claim_task(conn, task_id)
+    assert retried is not None and retried.current_run_id is not None
+    next_admission = ar.admit_writer(
+        request_id=ar.kanban_request_id(task_id, retried.current_run_id), caller=AdmissionCaller.KANBAN,
+        workspace=str(_worktree(Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent)), priority=0,
+        writer_id=f"kanban:{task_id}", kanban_cap=1,
+    )
+    assert next_admission.state == "running"

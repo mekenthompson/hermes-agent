@@ -3261,6 +3261,7 @@ class GatewayTurnMixin:
                 turn_ctx.execution_launch_allowed = allowed
             if not allowed:
                 return
+            self._session_state(session_key).turn.ctx = turn_ctx
             if self._draining:
                 self._update_runtime_status("draining")
         finally:

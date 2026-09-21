@@ -44,6 +44,18 @@ def kanban_request_id(task_id: str, run_id: int) -> str:
     return f"kanban:{task_id}:run:{int(run_id)}"
 
 
+def _has_admission_requests_table(connection: sqlite3.Connection) -> bool:
+    """Whether this inherited ledger was initialized by the admission controller.
+
+    Kanban terminal transitions and heartbeats are deliberately best-effort
+    against an inherited ledger.  An empty or legacy sqlite file must not turn
+    a completed/heartbeat board transition into a tool failure.
+    """
+    return connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'admission_requests'"
+    ).fetchone() is not None
+
+
 def release_kanban_admission(task_id: str, run_id: int | None) -> bool:
     """Release one terminal worker's reservation exactly once, if it has one."""
     if run_id is None:
@@ -52,6 +64,8 @@ def release_kanban_admission(task_id: str, run_id: int | None) -> bool:
     if not path.exists():
         return False
     with sqlite3.connect(path, isolation_level=None) as connection:
+        if not _has_admission_requests_table(connection):
+            return False
         result = connection.execute(
             "UPDATE admission_requests SET state = 'released', lease_id = NULL, lease_expires_at = NULL "
             "WHERE request_id = ? AND state = 'running'",
@@ -69,14 +83,19 @@ def renew_kanban_admission(task_id: str, run_id: int | None) -> bool:
         return False
     now = int(time.time())
     with sqlite3.connect(path, isolation_level=None) as connection:
+        if not _has_admission_requests_table(connection):
+            return False
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(admission_requests)")}
+        if "lease_seconds" not in columns:
+            connection.execute("ALTER TABLE admission_requests ADD COLUMN lease_seconds INTEGER NOT NULL DEFAULT 300")
         row = connection.execute(
-            "SELECT created_at, lease_expires_at FROM admission_requests "
+            "SELECT lease_seconds, lease_expires_at FROM admission_requests "
             "WHERE request_id = ? AND state = 'running'",
             (kanban_request_id(task_id, run_id),),
         ).fetchone()
         if row is None or row[1] is None or int(row[1]) <= now:
             return False
-        lease_span = max(1, int(row[1]) - int(row[0]))
+        lease_span = max(1, int(row[0]))
         result = connection.execute(
             "UPDATE admission_requests SET lease_expires_at = ? "
             "WHERE request_id = ? AND state = 'running' AND lease_expires_at > ?",
@@ -258,6 +277,42 @@ def release_admission(lease_id: str | None) -> None:
         connection.close()
 
 
+def renew_admission(lease_id: str | None) -> bool:
+    """Extend one running lease under its stored admission limits.
+
+    Delegated source writers may outlive the controller's default lease, so
+    their periodic liveness heartbeat owns renewal until the child exits.
+    """
+    if not lease_id:
+        return False
+    path = ledger_path()
+    if not path.exists():
+        return False
+    connection = _connect()
+    try:
+        tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('admission_configuration', 'admission_requests')"
+            )
+        }
+        if tables != {"admission_configuration", "admission_requests"}:
+            return False
+        row = connection.execute(
+            "SELECT limits_json FROM admission_configuration WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            return False
+        limits = json.loads(row["limits_json"])
+        return AdmissionController(
+            connection,
+            AdmissionLimits(running=limits["running"], queued=limits["queued"]),
+        ).renew(lease_id)
+    finally:
+        connection.close()
+
+
 def cancel_admission_request(request_id: str | None) -> bool:
     """Cancel an immediate-only pre-spawn request if it was queued.
 
@@ -271,6 +326,15 @@ def cancel_admission_request(request_id: str | None) -> bool:
         return False
     connection = _connect()
     try:
+        tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('admission_configuration', 'admission_requests')"
+            )
+        }
+        if tables != {"admission_configuration", "admission_requests"}:
+            return False
         row = connection.execute(
             "SELECT limits_json FROM admission_configuration WHERE singleton = 1"
         ).fetchone()

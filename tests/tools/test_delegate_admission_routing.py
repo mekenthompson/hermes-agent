@@ -1,13 +1,17 @@
 """Delegation launch routes run before a child can become a writer."""
 from __future__ import annotations
 
+import sqlite3
 from types import SimpleNamespace
+
+import pytest
 
 from hermes_cli import admission_contract
 from hermes_cli import admission_runtime
 from hermes_cli.admission import Admission
 from hermes_cli.admission_contract import AdmissionErrorCode, AdmissionResult
 from tools import delegate_tool
+from tools.delegate_tool_child_run import _Heartbeat
 
 
 def _rejected(request_id: str) -> AdmissionResult:
@@ -110,6 +114,72 @@ def test_queued_delegate_admission_is_cancelled_before_child_execution(monkeypat
 
     assert result == {"status": "error"}
     assert cancelled == ["delegate-queued"]
+
+
+def test_live_delegate_heartbeat_renews_its_admission_lease(monkeypatch):
+    renewed: list[str] = []
+    child = SimpleNamespace(
+        get_activity_summary=lambda: {"api_call_count": 1, "current_tool": None, "max_iterations": 2},
+    )
+    parent = SimpleNamespace(_touch_activity=lambda _desc: None)
+    heartbeat = _Heartbeat(child, parent, 0)
+    heartbeat.admission_lease_id = "lease-live-delegate"
+    monkeypatch.setattr(admission_runtime, "renew_admission", lambda lease_id: renewed.append(lease_id) or True)
+
+    heartbeat.tick()
+
+    assert renewed == ["lease-live-delegate"]
+
+
+def test_unisolated_delegate_rejection_is_schema_safe_before_child_start(tmp_path, monkeypatch):
+    """A fail-closed pre-spawn rejection must not need controller tables to clean up."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_ADMISSION_LEDGER", raising=False)
+
+    class Run:
+        worktree_info = None
+
+        def __init__(self, *_args):
+            pass
+
+        def seed_workspace(self):
+            return None
+
+        def elapsed(self):
+            return 0.0
+
+        def attach_worktree(self, entry):
+            return entry
+
+        def await_child(self):
+            pytest.fail("rejected admission must not start a child")
+
+    monkeypatch.setattr(delegate_tool, "_ChildRun", Run)
+    monkeypatch.setattr(
+        delegate_tool,
+        "_fabricated_entry",
+        lambda *_args: {"status": "error", "error": "admission rejected: unsupported_path"},
+    )
+
+    result = delegate_tool._run_single_child(
+        0,
+        "do not run",
+        child=SimpleNamespace(_delegate_admission_required=True, _subagent_id="delegate-unisolated"),
+    )
+
+    assert result == {"status": "error", "error": "admission rejected: unsupported_path"}
+    with sqlite3.connect(admission_runtime.ledger_path()) as connection:
+        rejection = connection.execute(
+            "SELECT caller, reason FROM admission_rejections WHERE request_id = ?",
+            ("delegate-unisolated",),
+        ).fetchone()
+        active_requests = connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'admission_requests'"
+        ).fetchone()[0]
+    assert rejection == ("delegate", AdmissionErrorCode.UNSUPPORTED_PATH.value)
+    assert active_requests == 0
 
 
 def test_writer_admission_boundary_preserves_direct_read_only_seams():

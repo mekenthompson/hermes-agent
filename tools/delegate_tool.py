@@ -412,6 +412,10 @@ def _run_single_child(
     # Heartbeat keeps the parent's _last_activity_ts moving so the gateway inactivity timeout doesn't fire while the
     # child works; once the child looks stale (see _HEARTBEAT_STALE_CYCLES_*) it also ends await_child's wait.
     heartbeat = _start_heartbeat(child, parent_agent, task_index)
+    if admission is not None:
+        # The shared heartbeat is the child liveness owner. Keep the exact
+        # admission lease alive until this function's finally releases it.
+        heartbeat.admission_lease_id = admission.lease_id
     # TUI/RPC registry entry (kill/pause/status by subagent_id); None for test
     # doubles without a stable id. Unregistered in the finally block.
     _subagent_id = _register_child(

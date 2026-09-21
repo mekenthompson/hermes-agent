@@ -56,8 +56,14 @@ TERMINAL_WORKER_REAP_GRACE_SECONDS = 120
 
 # Patterns in last_failure_error that indicate a quota / auth blocker.
 # These errors won't resolve by retrying immediately — auto-block instead.
+# The auth family is a curated list, not an open `auth\w*` stem: that stem
+# also matched ordinary English words like "author"/"authored"/"authoring"/
+# "authoritative" in worker progress prose, parking a healthy card forever
+# (#117009).
 _RESPAWN_BLOCKER_RE = re.compile(
-    r"\b(quota|rate[\s_\-]?limit|429|403|auth\w*|"
+    r"\b(quota|rate[\s_\-]?limit|429|403|"
+    r"auth|authenticat(?:e|es|ed|ing|ion)|authoriz(?:e|es|ed|ing|ation)|"
+    r"authoris(?:e|es|ed|ing|ation)|authz|"
     r"unauthorized|forbidden|billing|subscription|"
     r"access[\s_]denied|permission[\s_]denied|"
     r"invalid[\s_]api[\s_]key)\b",
@@ -699,6 +705,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 killed = _sigkill(kill, pid)
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
+        run_id = None
         with _kb.write_txn(conn):
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -727,6 +734,9 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         # own. If the breaker trips this flips the task to ``blocked`` and emits
         # ``gave_up`` on top of the ``timed_out`` already emitted.
         if cur.rowcount == 1:
+            # The durable task transition has committed.  Drop only this
+            # attempt's reservation before retry accounting can requeue it.
+            _kb._release_kanban_admission(tid, run_id)
             _record_task_failure(
                 conn, tid,
                 error=error,
@@ -801,6 +811,7 @@ def detect_stale_running(
             )
             continue
 
+        run_id = None
         with _kb.write_txn(conn):
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -836,6 +847,9 @@ def detect_stale_running(
             )
             _kb._append_event(conn, tid, "stale", payload, run_id=run_id)
             reclaimed.append(tid)
+        # Release after the task/run transition commits, never while a live
+        # worker is being deferred above.
+        _kb._release_kanban_admission(tid, run_id)
 
     return reclaimed
 
@@ -899,6 +913,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             )
             _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
             reconciled.append(tid)
+        _kb._release_kanban_admission(tid, run_id)
         _kb._log.info(
             "kanban reconcile: requeued orphaned running task %s "
             "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
@@ -1201,9 +1216,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
-    from hermes_cli.admission_runtime import release_kanban_admission
     for task_id, run_id in released_admissions:
-        release_kanban_admission(task_id, run_id)
+        _kb._release_kanban_admission(task_id, run_id)
     return sweep
 
 
@@ -1551,9 +1565,13 @@ def check_respawn_guard(
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
-    err = row["last_failure_error"]
-    if err and _RESPAWN_BLOCKER_RE.search(err):
+    # 2. Quota / auth blocker: retrying immediately will not help.  A plain
+    # crash is different: its persisted error includes the worker's last
+    # captured output, which is context rather than a diagnosis and may contain
+    # benign commands such as ``claude auth status`` (#117097).
+    err = _kb._lossy_text(row["last_failure_error"])
+    latest_outcome = latest_run["outcome"] if latest_run is not None else None
+    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
@@ -1596,7 +1614,8 @@ def check_respawn_guard(
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
-        if not (c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])):
+        body = _kb._lossy_text(c["body"])
+        if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
             continue
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
@@ -2084,12 +2103,14 @@ def _dispatch_lane_task(
     # ``spawn_fn`` is an in-process test seam.  The production launch path is
     # the default subprocess spawner; only that path is a real worker launch.
     admission = None
-    if spawn_fn is None:
+    if spawn_fn is None and claimed.workspace_kind == "worktree":
         # A source-writing worker is not allowed to rely on this dispatcher's local
-    # counters alone.  It must first reserve the runtime-wide ledger with
-    # linked-worktree and main-line ancestry proof.  This is deliberately after
-    # workspace resolution (the facts do not exist before it), but still before
-    # any process creation.
+        # counters alone. It must first reserve the runtime-wide ledger with
+        # linked-worktree and main-line ancestry proof. This is deliberately after
+        # workspace resolution (the facts do not exist before it), but still before
+        # any process creation. Generic scratch/dir workers retain their existing
+        # production spawn path: they are not source writers and must not reserve
+        # a source-writer admission lease.
         if claimed.current_run_id is None:
             if _record_task_failure(
                 conn, claimed.id, "admission: claimed worker has no run id", outcome="spawn_failed",
@@ -2106,7 +2127,7 @@ def _dispatch_lane_task(
         admission = admit_writer(
             request_id=kanban_request_id(claimed.id, claimed.current_run_id),
             caller=AdmissionCaller.KANBAN,
-            workspace=str(workspace) if claimed.workspace_kind == "worktree" else None,
+            workspace=str(workspace),
             priority=claimed.priority,
             writer_id=f"kanban:{board or 'default'}:{claimed.id}",
             dependencies=parent_ids,

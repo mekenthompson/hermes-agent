@@ -137,7 +137,7 @@ class AdmissionController:
                     f"lease_{secrets.token_hex(16)}", now + lease_seconds,
                     priority=priority, writer_id=writer_id, write_targets=write_targets or (),
                 )
-                self._insert(admission, now)
+                self._insert(admission, now, lease_seconds)
                 return admission
             if not self._fits("queued", dims) and not self._preempt_lower_priority(dims, priority):
                 return Admission(
@@ -153,7 +153,7 @@ class AdmissionController:
                 request_id, source, "queued", dims, bool(dependencies_satisfied), None, None, reason,
                 priority, writer_id, write_targets or (),
             )
-            self._insert(admission, now)
+            self._insert(admission, now, lease_seconds)
             return admission
 
     def admit(self, request: AdmissionRequest) -> Admission:
@@ -214,9 +214,10 @@ class AdmissionController:
                     write_targets=candidate.write_targets,
                 )
                 self.connection.execute(
-                    "UPDATE admission_requests SET state = 'running', lease_id = ?, lease_expires_at = ?, reason = NULL "
+                    "UPDATE admission_requests SET state = 'running', lease_id = ?, lease_expires_at = ?, "
+                    "lease_seconds = ?, reason = NULL "
                     "WHERE request_id = ? AND state = 'queued'",
-                    (promoted.lease_id, promoted.lease_expires_at, promoted.request_id),
+                    (promoted.lease_id, promoted.lease_expires_at, lease_seconds, promoted.request_id),
                 )
                 return promoted
         return None
@@ -293,6 +294,7 @@ class AdmissionController:
                 dependencies_satisfied INTEGER NOT NULL CHECK (dependencies_satisfied IN (0, 1)),
                 lease_id TEXT UNIQUE,
                 lease_expires_at INTEGER,
+                lease_seconds INTEGER NOT NULL DEFAULT 300,
                 reason TEXT,
                 created_at INTEGER NOT NULL,
                 priority INTEGER NOT NULL DEFAULT 0,
@@ -303,6 +305,7 @@ class AdmissionController:
         )
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(admission_requests)")}
         for name, definition in (
+            ("lease_seconds", "INTEGER NOT NULL DEFAULT 300"),
             ("priority", "INTEGER NOT NULL DEFAULT 0"),
             ("writer_id", "TEXT"),
             ("write_targets_json", "TEXT"),
@@ -370,16 +373,16 @@ class AdmissionController:
             "SELECT * FROM admission_requests WHERE request_id = ?", (request_id,)
         ).fetchone()
 
-    def _insert(self, admission: Admission, now: int) -> None:
+    def _insert(self, admission: Admission, now: int, lease_seconds: int) -> None:
         self.connection.execute(
             "INSERT INTO admission_requests "
-            "(request_id, source, state, dimensions_json, dependencies_satisfied, lease_id, lease_expires_at, reason, created_at, priority, writer_id, write_targets_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(request_id, source, state, dimensions_json, dependencies_satisfied, lease_id, lease_expires_at, lease_seconds, reason, created_at, priority, writer_id, write_targets_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 admission.request_id, admission.source, admission.state,
                 json.dumps(admission.dimensions, sort_keys=True, separators=(",", ":")),
                 1 if admission.dependencies_satisfied else 0, admission.lease_id,
-                admission.lease_expires_at, admission.reason, now, admission.priority,
+                admission.lease_expires_at, lease_seconds, admission.reason, now, admission.priority,
                 admission.writer_id,
                 json.dumps(admission.write_targets, separators=(",", ":")) if admission.writer_id else None,
             ),
