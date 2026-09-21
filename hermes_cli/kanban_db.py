@@ -1131,6 +1131,7 @@ def _resolve_project_link(
     creator's per-profile projects.db, but the stored repo path is absolute so
     the cross-profile dispatcher needs no projects.db access. ``project_repo``
     is set when the worktree path must still be derived from the new task id.
+    An unresolvable project_id raises rather than silently creating scratch.
     """
     project_id = (str(project_id).strip() or None) if project_id is not None else None
     if not project_id:
@@ -1150,9 +1151,9 @@ def _resolve_project_link(
         if project_obj is not None and workspace_kind == "scratch":
             workspace_kind = "worktree"
     if project_obj is None:
-        # Unresolvable id/slug: drop the link (never a dangling reference,
-        # never a crash) and create an ordinary scratch task.
-        return None, None, None, workspace_kind
+        raise ValueError(
+            f"unresolvable project {project_id!r}; refusing silent scratch fallback"
+        )
     # Canonicalise (a slug may have been passed) and anchor the worktree
     # under the project's primary repo.
     if workspace_kind == "scratch" and project_obj.primary_path:
