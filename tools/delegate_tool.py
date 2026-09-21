@@ -266,8 +266,10 @@ def _build_child_agent(
     # This marker comes only from the production constructor.  _run_single_child
     # also has direct helper seams used by non-launching tests and read-only
     # callers, which must not be mistaken for a live source writer merely
-    # because they supply a subagent-shaped test double.
-    setattr(child, "_delegate_admission_required", True)
+    # because they supply a subagent-shaped test double.  Do not stamp a mocked
+    # constructor result as a writer: a production AIAgent is checked below for
+    # the source-writing tools it can actually invoke.
+    setattr(child, "_delegate_admission_required", _is_concrete_source_writer(child))
     _apply_child_compression_cap(child, delegation_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
@@ -302,6 +304,37 @@ def _build_child_agent(
 _SOURCE_WRITING_TOOLS = frozenset({"terminal", "execute_code", "write_file", "patch"})
 
 
+def _source_writing_tool_names(child: Any) -> set[str]:
+    """Concrete tool names exposed by a child, never mock-shaped attributes."""
+    tool_names: set[str] = set()
+    names = getattr(child, "valid_tool_names", ())
+    if isinstance(names, (list, tuple, set, frozenset)):
+        tool_names.update(name for name in names if isinstance(name, str))
+    tools = getattr(child, "tools", ())
+    if isinstance(tools, (list, tuple)):
+        for tool in tools:
+            if isinstance(tool, dict):
+                function = tool.get("function")
+                name = tool.get("name")
+                if isinstance(name, str):
+                    tool_names.add(name)
+                if isinstance(function, dict):
+                    name = function.get("name")
+                    if isinstance(name, str):
+                        tool_names.add(name)
+    return tool_names
+
+
+def _is_concrete_source_writer(child: Any) -> bool:
+    """True only for a real AIAgent that exposes a source-writing tool."""
+    try:
+        from run_agent import AIAgent
+        is_agent = isinstance(child, AIAgent)
+    except (Exception, TypeError):
+        return False
+    return is_agent and bool(_SOURCE_WRITING_TOOLS & _source_writing_tool_names(child))
+
+
 def _requires_writer_admission(child: Any) -> bool:
     """Whether this direct helper invocation can launch a source-writing child.
 
@@ -312,26 +345,7 @@ def _requires_writer_admission(child: Any) -> bool:
     """
     if getattr(child, "_delegate_admission_required", False) is True:
         return True
-    try:
-        from run_agent import AIAgent
-    except Exception:
-        return False
-    if not isinstance(child, AIAgent):
-        return False
-    tool_names = {
-        name for name in (getattr(child, "valid_tool_names", ()) or ()) if isinstance(name, str)
-    }
-    for tool in getattr(child, "tools", ()) or ():
-        if isinstance(tool, dict):
-            function = tool.get("function")
-            name = tool.get("name")
-            if isinstance(name, str):
-                tool_names.add(name)
-            if isinstance(function, dict):
-                name = function.get("name")
-                if isinstance(name, str):
-                    tool_names.add(name)
-    return bool(_SOURCE_WRITING_TOOLS & tool_names)
+    return _is_concrete_source_writer(child)
 
 
 def _run_single_child(
