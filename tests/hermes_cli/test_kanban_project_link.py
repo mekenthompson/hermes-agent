@@ -4,6 +4,7 @@ worktree path + branch instead of the random ``wt/<task-id>`` fallback."""
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -13,8 +14,21 @@ from hermes_cli import projects_db as pdb
 
 
 @pytest.fixture
-def kanban_conn(tmp_path):
-    c = kbc.connect(db_path=tmp_path / "kanban.db")
+def kanban_conn(tmp_path, monkeypatch):
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_HOME", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(var, raising=False)
+    try:
+        import hermes_constants
+        hermes_constants._cached_default_hermes_root = None  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    kb._INITIALIZED_PATHS.clear()
+    pdb._INITIALIZED_PATHS.clear()
+    c = kbc.connect()
     try:
         yield c
     finally:
@@ -63,5 +77,24 @@ def test_unlinked_task_unchanged(kanban_conn):
     # No branch is persisted — the worker still owns the wt/<id> fallback for
     # genuinely ad-hoc worktree tasks, but unlinked scratch tasks have none.
     assert task.branch_name is None
+
+
+def _task_count(conn):
+    return conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+
+def test_unresolvable_project_refuses_silent_scratch(kanban_conn):
+    before = _task_count(kanban_conn)
+    with pytest.raises(ValueError, match="unresolvable project"):
+        kb.create_task(kanban_conn, title="ghost", project_id="missing-project")
+    assert _task_count(kanban_conn) == before
+
+
+def test_unresolvable_board_project_refuses_silent_scratch(kanban_conn):
+    kb.write_board_metadata("default", project_id="ghost-project")
+    before = _task_count(kanban_conn)
+    with pytest.raises(ValueError, match="unresolvable project"):
+        kb.create_task(kanban_conn, title="inherit ghost", board="default")
+    assert _task_count(kanban_conn) == before
 
 

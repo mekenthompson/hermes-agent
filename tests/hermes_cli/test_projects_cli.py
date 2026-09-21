@@ -48,9 +48,12 @@ def test_valid_binding_and_explicit_unbind(tmp_path, board):
     with pdb.connect_closing() as conn:
         assert pdb.get_project(conn, "widget").board_slug == board
     assert kb.read_board_metadata(board)["default_workdir"] == str(tmp_path.resolve())
+    with pdb.connect_closing() as conn:
+        assert kb.read_board_metadata(board)["project_id"] == pdb.get_project(conn, "widget").id
     assert _run(["bind-board", "widget"]) == 0
     with pdb.connect_closing() as conn:
         assert pdb.get_project(conn, "widget").board_slug is None
+    assert kb.read_board_metadata(board).get("project_id") is None
 
 
 
@@ -99,6 +102,42 @@ def test_rename_and_archive(tmp_path):
     assert _run(["restore", "old-name"]) == 0
     with pdb.connect_closing() as conn:
         assert len(pdb.list_projects(conn)) == 1
+
+
+def test_create_with_board_sets_board_project_id(tmp_path):
+    kb.create_board("named-board")
+    assert _run(["create", "Widget", str(tmp_path), "--board", "named-board"]) == 0
+    with pdb.connect_closing() as conn:
+        proj = pdb.get_project(conn, "widget")
+        assert proj is not None
+        assert proj.board_slug == "named-board"
+        assert kb.read_board_metadata("named-board")["project_id"] == proj.id
+
+
+def test_bind_board_refuses_foreign_project(tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    assert _run(["create", "First", str(tmp_path), "--board", "default"]) == 0
+    assert _run(["create", "Second", str(other)]) == 0
+    assert _run(["bind-board", "second", "default"]) != 0
+    with pdb.connect_closing() as conn:
+        first = pdb.get_project(conn, "first")
+        second = pdb.get_project(conn, "second")
+        assert first is not None and second is not None
+        assert kb.read_board_metadata("default")["project_id"] == first.id
+        assert second.board_slug is None
+
+
+def test_bind_board_metadata_failure_does_not_claim_success(tmp_path, monkeypatch):
+    assert _run(["create", "Widget", str(tmp_path)]) == 0
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("board metadata write failed")
+
+    monkeypatch.setattr(kb, "write_board_metadata", boom)
+    assert _run(["bind-board", "widget", "default"]) != 0
+    with pdb.connect_closing() as conn:
+        assert pdb.get_project(conn, "widget").board_slug is None
 
 
 
