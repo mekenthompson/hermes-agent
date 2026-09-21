@@ -846,12 +846,12 @@ class GatewayAdapterLifecycleMixin:
         from gateway.run import MultiplexConfigError, _multiplex_profile_homes
         from gateway.run_profile_reconcile import profile_serve_signature
         if not self._multiplex_on():
-            # ``write_runtime_status`` re-stamps the previous writer's record in place, so a multiplexer's
+            # Runtime-status publication re-stamps the previous writer's record in place, so a multiplexer's
             # ``served_profiles`` would outlive it into this single-profile run and `hermes -p X ...`
             # would keep refusing (exit 78) / reporting "served" for profiles nobody serves.
             with _log_suppressed(logging.DEBUG, "could not clear served_profiles", exc_info=True):
-                from gateway.status import write_runtime_status
-                write_runtime_status(served_profiles=[])
+                from gateway.status import publish_runtime_status
+                publish_runtime_status(served_profiles=[])
             return 0
         try:
             from hermes_cli.profiles import get_active_profile_name
@@ -862,18 +862,27 @@ class GatewayAdapterLifecycleMixin:
         claimed = self._primary_resource_claims(active)
         profile_homes = _multiplex_profile_homes(self.config)
         self._served_profile_signatures = {}
+        transient_failed = set()
         for profile_name, profile_home in profile_homes:
             if profile_name == active:
                 continue  # handled by the primary startup loop
             # Preserve changes made while the initial connection is awaiting I/O.
-            self._served_profile_signatures[profile_name] = profile_serve_signature(profile_home)
+            scan_signature = profile_serve_signature(profile_home)
             try:
                 connected += await self._start_one_profile_adapters(profile_name, profile_home, claimed)
             except MultiplexConfigError:
                 raise
             except Exception as e:
                 logger.error("Failed to start adapters for profile '%s': %s", profile_name, e, exc_info=True)
+                # Not acknowledged: the reconcile watcher retries a transiently-failed profile.
+                transient_failed.add(profile_name)
+            else:
+                self._served_profile_signatures[profile_name] = scan_signature
         self._record_served_profiles(active, profile_homes)
+        # ``_note_served_profiles`` fills a missing signature with the current one; that refill
+        # would park a transiently-failed profile before the first watcher tick can retry it.
+        for profile_name in transient_failed:
+            self._served_profile_signatures.pop(profile_name, None)
         self._restore_secondary_completion_ledgers(profile_homes)
         return connected
 
@@ -897,7 +906,7 @@ class GatewayAdapterLifecycleMixin:
         """Record the served set (eligible for routing/HTTP prefixes/cron/runtime scope — broader
         than "has a connected adapter") for `hermes status`; seed per-profile PairingStores."""
         with _log_suppressed(logging.DEBUG, "could not record served_profiles", exc_info=True):
-            from gateway.status import write_runtime_status
+            from gateway.status import publish_runtime_status
             from gateway.pairing import PairingStore
             served = [active] + sorted(name for name, _home in profile_homes if name != active)
             self._note_served_profiles(profile_homes)
@@ -906,7 +915,7 @@ class GatewayAdapterLifecycleMixin:
                     self.pairing_stores[name] = (
                         self.pairing_store if name == active else PairingStore(profile=name)
                     )
-            write_runtime_status(served_profiles=served)
+            publish_runtime_status(served_profiles=served)
 
     async def _load_secondary_profile_config(self, profile_name: str, profile_home: "Path"):
         """Hydrate + enter ``profile_home``'s scope once; return its gateway config. Raises
