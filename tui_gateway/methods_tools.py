@@ -111,10 +111,29 @@ def _mcp_rpc(name: str, required=_NAME):
     return _scoped_rpc(f"mcp.servers.{name}", required=required, catch_resolve=False)
 
 
+def _mcp_server_rows():
+    config_servers = _tools_mod("hermes_cli.mcp_config")._get_mcp_servers()
+    return _tools_mod("tui_gateway.mcp_rpc_helpers").server_configs_with_sources(config_servers)
+
+
 def _mcp_named_server(rid, params):
     """(name, servers, None) for a configured server, else (name, servers, 4064 error)."""
-    name, servers = _str_arg(params, "name"), _tools_mod("hermes_cli.mcp_config")._get_mcp_servers()
+    name, servers = _str_arg(params, "name"), _mcp_server_rows()[0]
     return name, servers, None if name in servers else _err(rid, 4064, f"server '{name}' not found")
+
+
+def _mcp_plugin_write_error(rid, name: str, plugins: dict):
+    plugin = plugins.get(name)
+    if plugin is not None:
+        return _err(rid, 4090, f"server '{name}' is provided by plugin '{plugin}' and cannot be modified")
+    return None
+
+
+def _mcp_config_server_or_error(rid, params):
+    name, servers, err = _mcp_named_server(rid, params)
+    if err:
+        return name, servers, err
+    return name, servers, _mcp_plugin_write_error(rid, name, _mcp_server_rows()[1])
 
 
 def _busy_error(rid, session, cmd: str):
@@ -1119,6 +1138,11 @@ def _configure_session_tools(rid, params: dict, sid: str, session) -> dict:
     toolset_targets = [name for name in targets if ":" not in name and name in valid_toolsets]
     if toolset_targets:
         tc._apply_toolset_change(cfg, "cli", toolset_targets, action)
+    plugins = _mcp_server_rows()[1]
+    for target in mcp_targets:
+        server_name = target.split(":", 1)[0]
+        if err := _mcp_plugin_write_error(rid, server_name, plugins):
+            return err
     missing_servers = tc._apply_mcp_change(cfg, mcp_targets, action) if mcp_targets else set()
     hc.save_config(cfg)
     info = _reset_session_agent(sid, session) if session else None
@@ -1262,6 +1286,7 @@ def _(rid, params: dict) -> dict:
         transport = getattr(entry, "transport", None)  # TransportSpec → its kind string
         out.append({
             "name": entry.name, "description": getattr(entry, "description", "") or "",
+            "connector_slug": getattr(entry, "connector_slug", None),
             "installed": bool(mcp_catalog.is_installed(entry.name)),
             "enabled": bool(mcp_catalog.is_enabled(entry.name)), "requires": requires,
             "transport": str(getattr(transport, "kind", "") or transport or "stdio")})
@@ -1272,8 +1297,10 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     """``{servers: [{name, transport, url, command, args, env (key names), auth, oauth_tokens_present,
     enabled, tools}]}``"""
-    servers = _tools_mod("hermes_cli.mcp_config")._get_mcp_servers()
-    return _ok(rid, {"servers": [_mcp_summarize_server(name, cfg) for name, cfg in sorted(servers.items())]})
+    servers, plugins = _mcp_server_rows()
+    return _ok(rid, {"servers": [
+        _mcp_summarize_server(name, cfg, plugins[name]) for name, cfg in sorted(servers.items())
+    ]})
 
 
 @_mcp_rpc("status", required=())
@@ -1283,13 +1310,15 @@ def _(rid, params: dict) -> dict:
     scoped profile's; otherwise it is shown only when ``profile`` is the launch profile."""
     import time
     hc = _tools_mod("hermes_constants")
-    configured = _tools_mod("hermes_cli.mcp_config")._get_mcp_servers()
+    configured, plugins = _mcp_server_rows()
     include_runtime = (_tools_mod("agent.secret_scope").is_multiplex_active()
                        or hc.hermes_home_key() == hc.hermes_home_key(hc.get_process_hermes_home()))
     safe = ("name", "transport", "tools", "connected", "disabled", "status")
     servers = _tools_mod("tools.mcp_tool_discovery").get_mcp_status(configured, include_runtime=include_runtime)
-    return _ok(rid, {"servers": [{k: e[k] for k in safe if k in e} for e in servers],
-                     "checked_at": int(time.time() * 1000)})
+    return _ok(rid, {"servers": [
+        {**{k: e[k] for k in safe if k in e}, "source": "plugin" if plugins[e["name"]] is not None else "config",
+         "plugin": plugins[e["name"]]} for e in servers
+    ], "checked_at": int(time.time() * 1000)})
 
 
 @_mcp_rpc("add")
@@ -1298,7 +1327,10 @@ def _(rid, params: dict) -> dict:
     tools); ``bearer_token`` goes to the profile's .env (only the header template persists). Dup → 4090."""
     mc = _tools_mod("hermes_cli.mcp_config")
     name, preset = _str_arg(params, "name"), _str_arg(params, "preset")
-    if name in mc._get_mcp_servers():
+    servers, plugins = _mcp_server_rows()
+    if err := _mcp_plugin_write_error(rid, name, plugins):
+        return err
+    if name in servers:
         return _err(rid, 4090, f"server '{name}' already exists")
     raw_cfg = params.get("config")
     server_config: dict = dict(raw_cfg) if isinstance(raw_cfg, dict) else {}
@@ -1321,7 +1353,7 @@ def _(rid, params: dict) -> dict:
     """Secret → profile .env under ``env_var`` (default ``MCP_<NAME>_API_KEY``); config.yaml gets only
     a ``${ENV}`` reference (Bearer header for http, ``env`` entry for stdio)."""
     hc, mc = _tools_mod("hermes_cli.config"), _tools_mod("hermes_cli.mcp_config")
-    name, servers, err = _mcp_named_server(rid, params)
+    name, servers, err = _mcp_config_server_or_error(rid, params)
     if err:
         return err
     value = params.get("value")
@@ -1382,6 +1414,8 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     """Remove a server from the profile's config.yaml → ``{ok: true, removed: true}``."""
     name = _str_arg(params, "name")
+    if err := _mcp_plugin_write_error(rid, name, _mcp_server_rows()[1]):
+        return err
     if not _tools_mod("hermes_cli.mcp_config")._remove_mcp_server(name):
         return _err(rid, 4064, f"server '{name}' not found")
     return _ok(rid, {"ok": True, "removed": True})
@@ -1395,7 +1429,7 @@ def _(rid, params: dict) -> dict:
     on different machines). Runs on the RPC pool (_LONG_HANDLERS)."""
     client_redirect_uri = _str_arg(params, "client_redirect_uri") or None
     try:
-        name, servers, err = _mcp_named_server(rid, params)
+        name, servers, err = _mcp_config_server_or_error(rid, params)
         if err:
             return err
         cfg = dict(servers[name])
@@ -1438,6 +1472,40 @@ def _(rid, params: dict) -> dict:
 
 
 # ─── Plugins ─────────────────────────────────────────────────────────────────
+def _plugin_server_rows(plugin_dir: Path | None, key: str, *, portable: bool) -> list[dict]:
+    if not portable or plugin_dir is None:
+        return []
+    package = _tools_mod("hermes_cli.agent_plugins").load_agent_plugin(plugin_dir, plugin_dir)
+    namespace = package.manifest.get("extensions", {}).get("com.nousresearch.hermes", {})
+    declared = namespace.get("servers", {})
+    if not isinstance(declared, dict):
+        return []
+    server_name_for = _tools_mod("hermes_cli.plugins_manifest").portable_mcp_server_name
+    liveness = _tools_mod("tools.mcp_liveness")
+    core = _tools_mod("tools.mcp_tool_common")._core
+    resolve_key = _tools_mod("tools.mcp_tool_scope")._resolve_server_key
+    rows = []
+    for name in sorted(declared):
+        internal_name = server_name_for(key, name)
+        connection_key = resolve_key(internal_name)
+        server = core._servers.get(connection_key)
+        connected = server is not None and (server.session is not None or server._is_recycled_stdio())
+        if connected:
+            rows.append({"name": name, "state": "connected", "sentence": ""})
+            continue
+        decl = _tools_mod("hermes_platform.declaration").lookup(internal_name)
+        status = liveness.status(internal_name)
+        if decl is None or status is None:
+            rows.append({"name": name, "state": "unknown", "sentence": ""})
+            continue
+        rows.append({
+            "name": name,
+            "state": status.state,
+            "sentence": liveness.describe(decl, status.availability, status.state),
+        })
+    return rows
+
+
 def _plugin_rows() -> list[dict]:
     pc = _tools_mod("hermes_cli.plugins_cmd")
     cat = _tools_mod("hermes_cli.plugins_cmd_catalog")
@@ -1455,16 +1523,47 @@ def _plugin_rows() -> list[dict]:
         # ``has_desktop_half``: the package also ships a Desktop UI half (``desktop/plugin.js``). The
         # desktop app pairs its app-level copy of that half with this row so one package is ONE row.
         _dir_path = Path(str(_dir)) if _dir else None
+        portable = pc._is_portable_plugin_dir(_dir)
         out.append({
             "name": name, "key": key, "version": str(version or ""), "description": desc or "",
-            "source": source, "status": status, "portable": pc._is_portable_plugin_dir(_dir),
+            "source": source, "status": status, "portable": portable,
             "install_dir": str(_dir_path) if _dir_path else "",
             "has_desktop_half": bool(_dir_path and (_dir_path / "desktop" / "plugin.js").is_file()),
             # Manifest ``config_schema`` + current values: the Plugins hub renders these as a form.
             "settings_schema": _tools_mod("hermes_cli.plugins_settings").plugin_settings_fields(key, _dir_path),
+            "servers": _plugin_server_rows(_dir_path, key, portable=portable),
             **cat.catalog_row_fields(_dir, pins, versions),
             **({"pinned_sha": sha} if (sha := pc.pinned_revision(name, ref_pins)) else {})})
     return out
+
+
+# Latest ``on_plugin_loaded`` summaries by plugin name — the TUI server's own subscription, so an
+# install/toggle/update result reports what the load actually activated (#87770). One listener per manager.
+_plugin_activations: dict = {}
+_plugin_activation_subscribed: set = set()
+
+
+def _ensure_plugin_activation_listener() -> None:
+    from hermes_cli.plugins import get_plugin_manager
+    manager = get_plugin_manager()
+    if manager.scope_key in _plugin_activation_subscribed:
+        return
+    _plugin_activation_subscribed.add(manager.scope_key)
+
+    def _on_loaded(summaries) -> None:
+        for entry in summaries:
+            _plugin_activations[entry["name"]] = entry
+            _plugin_activations[entry["key"]] = entry
+    manager.on_plugin_loaded(_on_loaded)
+
+
+def _with_activation(result: dict, name: str) -> dict:
+    """Prefer the summary this process's listener captured over the core's own copy."""
+    for key in (name, result.get("plugin_name"), result.get("name")):
+        if key and key in _plugin_activations:
+            result["activation"] = _plugin_activations[key]
+            break
+    return result
 
 
 def _plugins_list(rid, params):
@@ -1478,6 +1577,7 @@ def _plugins_toggle(rid, params):
     ident = (params.get("key") or params.get("name") or "").strip()
     if not ident:
         return _err(rid, 4019, "plugins.toggle requires a 'key' or 'name'")
+    _ensure_plugin_activation_listener()
     toggle = _tools_mod("hermes_cli.plugins_cmd").dashboard_set_agent_plugin_enabled
     result = toggle(ident, enabled=bool(params.get("enable")))
     if not result.get("ok"):
@@ -1485,8 +1585,11 @@ def _plugins_toggle(rid, params):
     # The toggle resolves a bare leaf / manifest name to the canonical key it wrote; report that key.
     key = result.get("name") or ident
     row = next((r for r in _plugin_rows() if key in (r["key"], r["name"])), None)
-    return _ok(rid, {"ok": True, "unchanged": bool(result.get("unchanged")),
-                     "restart_required": bool(result.get("restart_required")), "name": key, "plugin": row})
+    return _ok(rid, _with_activation({
+        "ok": True, "unchanged": bool(result.get("unchanged")),
+        "restart_required": bool(result.get("restart_required")),
+        "gateway_reloaded": bool(result.get("gateway_reloaded")), "activation": result.get("activation"),
+        "name": key, "plugin": row}, key))
 
 
 def _plugins_install(rid, params):
@@ -1496,10 +1599,13 @@ def _plugins_install(rid, params):
     catalog_name = str(params.get("catalog_name") or "").strip()
     if not ident and not catalog_name:
         return _err(rid, 4019, "plugins.install requires 'identifier', 'repo', or 'catalog_name'")
+    _ensure_plugin_activation_listener()
     result = _tools_mod("hermes_cli.plugins_cmd").dashboard_install_plugin(
         ident, force=bool(params.get("force")), enable=params.get("enable", True), catalog_name=catalog_name or None,
         ref=str(params.get("ref") or "").strip() or None)
-    return _ok(rid, result) if result.get("ok") else _err(rid, 5026, result.get("error") or "install failed")
+    if not result.get("ok"):
+        return _err(rid, 5026, result.get("error") or "install failed")
+    return _ok(rid, _with_activation(result, str(result.get("plugin_name") or "")) if result.get("enabled") else result)
 
 
 def _plugins_update(rid, params):
@@ -1523,8 +1629,13 @@ def _plugins_update(rid, params):
                          "delta_lines": cat.surface_delta_lines(e.delta), "error": str(e)})
     except pc.PluginOperationError as e:
         return _err(rid, 4021, str(e))
-    return _ok(rid, {"ok": True, "unchanged": not result.changed, "sha": result.sha, "name": result.installed_name,
-                     "warnings": list(result.warnings)})
+    payload = {"ok": True, "unchanged": not result.changed, "sha": result.sha, "name": result.installed_name,
+               "warnings": list(result.warnings)}
+    if result.changed:
+        _ensure_plugin_activation_listener()
+        activate = _tools_mod("hermes_cli.plugins_activation").activate_plugin_now
+        payload = _with_activation({**payload, **activate(result.installed_name)}, result.installed_name)
+    return _ok(rid, payload)
 
 
 def _plugins_remove(rid, params):

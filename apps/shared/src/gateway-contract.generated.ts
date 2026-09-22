@@ -1624,6 +1624,7 @@ export interface ProfileRow {
   display_name?: string
   skill_count?: number
   previous_names?: string[]
+  role?: 'setup' | null
   last_session?: ProfileSessionPreview | null
   worker_session?: ProfileWorkerSession | null
   canonical_session?: ProfileCanonicalSession | null
@@ -1807,6 +1808,20 @@ export interface ProfilesRememberOnboardingResult {
   saved?: boolean
   profile?: string
   target?: string
+}
+/** Client→server method params / server→client request params. Unknown keys are rejected. */
+export type Params = Record<string, never>
+/** ``created`` is false when an existing setup profile was found (and returned untouched). */
+export interface OnboardingEnsureSetupProfileResult {
+  name: string
+  path: string
+  created: boolean
+  role?: 'setup'
+}
+export interface OnboardingResetSetupProfileResult {
+  name: string
+  path: string
+  reset?: boolean
 }
 export interface VaultListResult {
   items?: VaultItem[]
@@ -3700,6 +3715,7 @@ export interface McpCatalogResult {
 export interface McpCatalogEntry {
   name: string
   description: string
+  connector_slug?: string | null
   installed: boolean
   enabled: boolean
   requires: string[]
@@ -3720,7 +3736,10 @@ export interface McpServerSummary {
   oauth_tokens_present?: boolean | null
   enabled: boolean
   tools?: unknown | null
+  source: McpServerSource
+  plugin?: string | null
 }
+export type McpServerSource = 'config' | 'plugin'
 export interface McpServersStatusResult {
   servers: McpServerRuntimeRow[]
   checked_at: number
@@ -3733,6 +3752,8 @@ export interface McpServerRuntimeRow {
   connected: boolean
   disabled: boolean
   status: McpRuntimeStatus
+  source: McpServerSource
+  plugin?: string | null
 }
 export type McpRuntimeStatus = 'connected' | 'disabled' | 'connecting' | 'failed' | 'lazy' | 'configured'
 /** ``preset`` (catalog id) and/or ``config`` (url/command/args/env/headers/auth/tools); a ``bearer_token`` is written to the profile's .env, only the header template persists. */
@@ -3853,7 +3874,7 @@ export interface PluginsManageParams {
   values?: Record<string, unknown> | null
 }
 export type PluginsAction = 'list' | 'toggle' | 'install' | 'update' | 'remove' | 'settings'
-/** ``list`` → ``plugins`` + counts; ``toggle`` → ``ok``/``unchanged``/``restart_required``/``name`` (the canonical key written)/``plugin``; ``install`` → ``hermes_cli.plugins_cmd.dashboard_install_plugin``'s ok payload; ``update`` → ``ok``/``unchanged``/``sha``, or ``ok=false`` + ``consent_required`` with the ``delta`` (``{surface: [added...]}``) / ``delta_lines`` a widened pin adds — nothing changed until the client retries with ``accept_capabilities``; ``remove`` → ``ok``/``name`` plus ``cleared_memory_provider`` when the removed plugin was the live ``memory.provider``. */
+/** ``list`` → ``plugins`` + counts; ``toggle`` → ``ok``/``unchanged``/``restart_required``/``name`` (the canonical key written)/``plugin``; ``install`` → ``hermes_cli.plugins_cmd.dashboard_install_plugin``'s ok payload; ``toggle``/``install``/``update`` that loaded a plugin also carry ``gateway_reloaded`` (the running gateway picked it up and re-wired its handlers) and ``activation`` — the honest split of what is live now vs deferred, so ``restart_required`` is True only when no gateway answered; ``update`` → ``ok``/``unchanged``/``sha``, or ``ok=false`` + ``consent_required`` with the ``delta`` (``{surface: [added...]}``) / ``delta_lines`` a widened pin adds — nothing changed until the client retries with ``accept_capabilities``; ``remove`` → ``ok``/``name`` plus ``cleared_memory_provider`` when the removed plugin was the live ``memory.provider``. */
 export interface PluginsManageResult {
   plugins?: AgentPluginRow[] | null
   user_count?: number | null
@@ -3861,12 +3882,15 @@ export interface PluginsManageResult {
   ok?: boolean | null
   unchanged?: boolean | null
   restart_required?: boolean | null
+  gateway_reloaded?: boolean | null
+  activation?: PluginActivation | null
   cleared_memory_provider?: boolean | null
   name?: string | null
   plugin?: AgentPluginRow | null
   plugin_name?: string | null
   warnings?: string[] | null
   missing_env?: string[] | null
+  python_dependencies?: string[] | null
   after_install_path?: string | null
   enabled?: boolean | null
   sha?: string | null
@@ -3887,6 +3911,7 @@ export interface AgentPluginRow {
   portable: boolean
   install_dir: string
   has_desktop_half: boolean
+  servers: PluginServerRow[]
   catalog_name?: string | null
   catalog_tier?: string | null
   installed_sha?: string | null
@@ -3896,6 +3921,12 @@ export interface AgentPluginRow {
   pinned_sha?: string | null
   settings_schema?: PluginSettingField[] | null
 }
+export interface PluginServerRow {
+  name: string
+  state: PluginServerState
+  sentence: string
+}
+export type PluginServerState = 'connected' | 'app_not_running' | 'endpoint_unavailable' | 'no_interactive_session' | 'version_too_old' | 'missing_app' | 'unknown'
 /** One ``config_schema`` key of a plugin manifest, rendered by the Plugins hub (``hermes_cli.plugins_settings.plugin_settings_fields``). ``secret`` fields carry no value: ``env`` names the ``.env`` variable and ``has_value`` whether it is set. */
 export interface PluginSettingField {
   key: string
@@ -3910,6 +3941,13 @@ export interface PluginSettingField {
   has_value?: boolean | null
 }
 export type PluginSettingFieldType = 'string' | 'number' | 'boolean' | 'enum' | 'secret' | 'json'
+/** What a plugin loaded mid-run does NOW vs later (``hermes_cli.plugins_activation``), ``{kind: [names]}`` with only non-empty kinds present. ``activated_now`` kinds: ``gateway_commands`` (slash names), ``gateway_transforms`` / ``hooks`` (hook names), ``callbacks`` (platforms / ``slack:<action_id>``) — live in the running gateway once it reloaded (``gateway_reloaded``). ``deferred`` kinds: ``tools`` (tool names) and ``prompt`` (section ids) apply from the next session; ``mcp_servers`` lists the plugin's mcp.json server names (exactly as ``mcp.servers.*`` know them) — not connected until ``mcp.reload``. The Desktop "Installed. Connect its servers now" card reads exactly ``deferred.mcp_servers``. */
+export interface PluginActivation {
+  name: string
+  key: string
+  activated_now?: Record<string, string[]>
+  deferred?: Record<string, string[]>
+}
 /** Single question: ``question`` / ``choices`` (/ ``multi_select``); batch: ``questions``. ``answers`` rides only on a reconnect replay (locks the server already accepted). */
 export interface ClarifyRequestParams {
   session_id: string
@@ -4599,6 +4637,10 @@ export interface RpcMethods {
   'model.options': { params: ModelOptionsParams; result: ModelOptionsResult }
   /** Save an API key for a provider and return its refreshed inventory row. */
   'model.save_key': { params: ModelSaveKeyParams; result: ModelSaveKeyResult }
+  /** Create-or-read the backend-owned setup profile; the backend picks the name and finds it by role. */
+  'onboarding.ensure_setup_profile': { params: Params; result: OnboardingEnsureSetupProfileResult }
+  /** Restore the setup profile to its created state in place (soul, memories, skills, sessions). */
+  'onboarding.reset_setup_profile': { params: Params; result: OnboardingResetSetupProfileResult }
   /** Spill a large paste to a file and hand back the inline placeholder. */
   'paste.collapse': { params: PasteCollapseParams; result: PasteCollapseResult }
   /** Render a PDF's pages to PNG and queue them as images for the next turn. */
@@ -4955,6 +4997,8 @@ export const RPC_METHODS = [
   'model.disconnect',
   'model.options',
   'model.save_key',
+  'onboarding.ensure_setup_profile',
+  'onboarding.reset_setup_profile',
   'paste.collapse',
   'pdf.attach',
   'pet.cancel',
