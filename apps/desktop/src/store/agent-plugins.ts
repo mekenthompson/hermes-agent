@@ -15,6 +15,21 @@ import { notifyError } from '@/store/notifications'
  * (local spawn, SSH, URL+token) because it rides the session's own transport.
  */
 
+export type AgentPluginServerState =
+  | 'connected'
+  | 'app_not_running'
+  | 'endpoint_unavailable'
+  | 'no_interactive_session'
+  | 'version_too_old'
+  | 'missing_app'
+  | 'unknown'
+
+export interface AgentPluginServer {
+  name: string
+  state: AgentPluginServerState
+  sentence: string
+}
+
 export interface AgentPluginRow {
   name: string
   /** Canonical registry key (e.g. `image_gen/fal`) — absent on legacy backends. */
@@ -44,6 +59,8 @@ export interface AgentPluginRow {
   install_dir?: string
   /** Manifest `config_schema` rendered as a settings form (with current values). */
   settings_schema?: PluginSettingField[]
+  /** Full snapshot of declared application-backed MCP servers. */
+  servers?: AgentPluginServer[]
 }
 
 export type PluginSettingFieldType = 'boolean' | 'enum' | 'json' | 'number' | 'secret' | 'string'
@@ -62,6 +79,11 @@ export interface PluginSettingField {
   env?: string
   has_value?: boolean
 }
+
+export const normalizeAgentPluginRow = (row: AgentPluginRow): AgentPluginRow => ({
+  ...row,
+  servers: row.servers ?? []
+})
 
 /** A `--ref` pin is a full 40-hex commit SHA; branches and tags are refused server-side. */
 export const COMMIT_SHA_RE = /^[0-9a-f]{40}$/i
@@ -139,7 +161,7 @@ export function loadAgentPlugins(request: GatewayRequest, profile?: string | nul
         return
       }
 
-      $agentPlugins.set(result?.plugins ?? [])
+      $agentPlugins.set((result?.plugins ?? []).map(normalizeAgentPluginRow))
       $agentPluginsStatus.set('ready')
       $agentPluginsError.set(null)
     } catch (e) {
@@ -196,7 +218,9 @@ export async function toggleAgentPlugin(
     const refreshed = result.plugin
 
     if (refreshed) {
-      $agentPlugins.set($agentPlugins.get().map(row => (row.key === key ? { ...row, ...refreshed } : row)))
+      const snapshot = normalizeAgentPluginRow(refreshed)
+
+      $agentPlugins.set($agentPlugins.get().map(row => (row.key === key ? { ...row, ...snapshot } : row)))
     } else {
       await loadAgentPlugins(request, profile)
     }
@@ -217,6 +241,10 @@ export interface AgentPluginInstallResult {
   warnings?: string[]
   missingEnv?: string[]
   error?: string
+  /** Plugin MCP servers not connected yet (`activation.deferred.mcp_servers`). */
+  deferredMcpServers: string[]
+  /** A running gateway already re-wired the plugin's handlers. */
+  gatewayReloaded: boolean
 }
 
 export async function installAgentPlugin(
@@ -240,6 +268,8 @@ export async function installAgentPlugin(
       plugin_name?: string
       warnings?: string[]
       missing_env?: string[]
+      activation?: { activated_now?: Record<string, string[]>; deferred?: Record<string, string[]> } | null
+      gateway_reloaded?: boolean
       error?: string
     }>(
       'plugins.manage',
@@ -257,17 +287,24 @@ export async function installAgentPlugin(
     )
 
     if (!result?.ok) {
-      return { ok: false, error: result?.error || 'Install failed' }
+      return { ok: false, error: result?.error || 'Install failed', deferredMcpServers: [], gatewayReloaded: false }
     }
 
     return {
       ok: true,
       pluginName: result.plugin_name,
       warnings: result.warnings,
-      missingEnv: result.missing_env
+      missingEnv: result.missing_env,
+      deferredMcpServers: result.activation?.deferred?.mcp_servers ?? [],
+      gatewayReloaded: Boolean(result.gateway_reloaded)
     }
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    return {
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+      deferredMcpServers: [],
+      gatewayReloaded: false
+    }
   }
 }
 

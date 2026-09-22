@@ -2197,6 +2197,7 @@ from gateway.run_goals import GatewayGoalsMixin
 from gateway.run_agent_cache import GatewayAgentCacheMixin
 from gateway.run_plugin_services import GatewayPluginServicesMixin
 from gateway.run_profile_reconcile import GatewayProfileReconcileMixin
+from gateway.run_plugin_rewire import GatewayPluginRewireMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
     _reply_anchor_for_event,
@@ -3391,7 +3392,7 @@ class GatewayRunner(
     GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
     GatewayAgentCacheMixin, GatewayExecutionLifecycleMixin, GatewayPluginServicesMixin,
-    GatewayProfileReconcileMixin):
+    GatewayProfileReconcileMixin, GatewayPluginRewireMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
@@ -5557,6 +5558,7 @@ async def _start_gateway_start_control_socket(runner):
         # this feature. See #92091.
         from gateway.control_socket import GatewayControlServer
         from gateway.run_profile_reconcile import migrate_profile_identity_verb, purge_profile_identity_verb
+        from gateway.run_plugin_rewire import reload_plugins_verb
         # pause-for-update: the updater asks us to drain + exit (freeing venv handles) vs. a tree-kill
         # (same path as SIGUSR1). Handler runs on the socket executor thread, so marshal onto the loop.
         # pause-for-update (#92091 step 2): the updater asks this gateway to drain in-flight turns and exit
@@ -5606,7 +5608,10 @@ async def _start_gateway_start_control_socket(runner):
             verb_handlers={"pause-for-update": _pause_for_update_handler,
                            "rescan-profiles": _rescan_profiles_handler,
                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
-                           "purge-profile-identity": purge_profile_identity_verb(runner)})
+                           "purge-profile-identity": purge_profile_identity_verb(runner),
+                           # A plugin installed/enabled by another process loads now and re-wires the
+                           # live adapters' handlers (#87770); tools/prompt still wait for the next session.
+                           "reload-plugins": reload_plugins_verb(runner, _main_loop)})
         if not await _control_server.start():
             _control_server = None
         else:
