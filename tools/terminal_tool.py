@@ -267,6 +267,58 @@ def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
         return _session_cwd.get(str(session_key or "default"))
 
 
+def resolve_recorded_session_cwd(task_id: Optional[str] = None) -> Optional[str]:
+    """Cwd recorded for this execution.
+
+    A delegate child's own ``task_id`` record wins. Children inherit the
+    parent's gateway session key via ``copy_context``; preferring that key
+    would run the child in the parent's checkout. The session key is only the
+    fallback for a gateway parent whose shell recorded under that key and
+    whose Hermes session id has no record yet. No ``TERMINAL_CWD`` fallback.
+    Empty keys are skipped so a miss does not read the shared ``default``
+    bucket.
+    """
+    from tools.approval_context import get_current_session_key
+
+    task = str(task_id).strip() if task_id else ""
+    if task:
+        recorded = get_session_cwd(task)
+        if recorded:
+            return recorded
+    session_key = get_current_session_key(default="") or ""
+    if session_key and session_key != task:
+        return get_session_cwd(session_key)
+    return None
+
+
+def _is_delegated_child_task(task_id: str) -> bool:
+    """True when *task_id* is a delegate child sharing the parent's container."""
+    if not task_id:
+        return False
+    with _container_alias_lock:
+        return task_id in _container_aliases
+
+
+def record_execution_cwd(task_id: Optional[str], cwd: Optional[str]) -> None:
+    """Record a completed command's cwd for the identity that ran it.
+
+    ``task_id`` is the executing Hermes session or delegate child. A gateway
+    parent also updates the platform session key, because that is the key the
+    shell historically recorded under. A delegate child inherits that key via
+    ``copy_context`` and must not move the parent's directory.
+    """
+    from tools.approval_context import get_current_session_key
+
+    task = str(task_id).strip() if task_id else ""
+    if task:
+        record_session_cwd(task, cwd)
+    live = get_current_session_key(default="") or ""
+    if live and live != task and not _is_delegated_child_task(task):
+        record_session_cwd(live, cwd)
+    elif not task and not live:
+        record_session_cwd(None, cwd)
+
+
 def clear_session_cwd(session_key: str) -> None:
     """Drop a session's cwd record (session teardown)."""
     with _session_cwd_lock:
@@ -806,21 +858,21 @@ def _resolve_command_cwd(
     default_cwd: str,
     session_key: Optional[str] = None,
     env_type: Optional[str] = None,
+    task_id: Optional[str] = None,
 ) -> str:
-    """cwd for a command: explicit ``workdir`` > the session's own cwd record >
+    """cwd for a command: explicit ``workdir`` > this execution's cwd record >
     ``default_cwd``.
 
-    The record is written after every completed command of THIS session, so
-    it is the session's ``cd`` state with no shared-env ambiguity. On
-    container backends a recorded HOST path (a desktop/TUI surface registering
-    its workspace) is unusable in the sandbox — ``cd <host path>`` fails with
-    exit 126 — so it is discarded in favor of ``default_cwd``.
-
-    Same guard class as the env-creation sanitizers (#50636, #54447); this is the per-command sibling site.
+    ``task_id`` wins when it has a record, so a delegate child runs in its
+    worktree instead of the gateway session key it inherited. Callers that
+    only have a session key, and no task id, still resolve that key. A set
+    ``task_id`` does not fall through to an inherited session key.
     """
     if workdir:
         return workdir
-    recorded = get_session_cwd(session_key)
+    recorded = resolve_recorded_session_cwd(task_id)
+    if not recorded and not task_id and session_key:
+        recorded = get_session_cwd(session_key)
     if recorded and _is_container_backend(env_type) and _is_unusable_container_cwd(recorded):
         logger.info(
             "Ignoring recorded session cwd %r for %s backend "
@@ -980,7 +1032,7 @@ def _plan_execution(
     overrides = resolve_task_overrides(task_id)
     image = _select_image(env_type, overrides, config)
 
-    cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
+    cwd = overrides.get("cwd") or resolve_recorded_session_cwd(task_id) or config["cwd"]
     host_cwd = _resolve_task_host_cwd(config, task_id)
     # config["cwd"] was sanitized for container backends in _get_env_config
     # but an override / session record is raw: a host path would reach
@@ -1122,7 +1174,8 @@ def _run_foreground(
     for retry_count in range(max_retries + 1):
         try:
             command_cwd = _resolve_command_cwd(
-                workdir=workdir, default_cwd=plan.cwd, session_key=session_key, env_type=env_type,
+                workdir=workdir, default_cwd=plan.cwd, session_key=session_key,
+                env_type=env_type, task_id=task_id,
             )
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
@@ -1168,7 +1221,7 @@ _PRE_EXEC_GUARD_MIN_TIMEOUT_S = 30
 
 def _pre_exec_block(
     command: str, *, env: Any, env_type: str, cwd: str,
-    workdir: Optional[str], session_key: str,
+    workdir: Optional[str], session_key: str, task_id: Optional[str] = None,
 ) -> None:
     """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
 
@@ -1176,7 +1229,8 @@ def _pre_exec_block(
     then the dangerous-workdir check, then the self-repo guard (local only).
     """
     blocked = gateway_lifecycle_block(
-        command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+        command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir,
+        session_key=session_key, task_id=task_id,
     )
     if blocked:
         raise _Rejected(blocked)
@@ -1187,7 +1241,9 @@ def _pre_exec_block(
                            workdir[:200], _safe_command_preview(command))
             raise _Rejected(_error_json(workdir_error, status="blocked"))
     if env_type == "local":
-        blocked = self_repo_block(command=command, cwd=cwd, workdir=workdir, session_key=session_key)
+        blocked = self_repo_block(
+            command=command, cwd=cwd, workdir=workdir, session_key=session_key, task_id=task_id,
+        )
         if blocked:
             raise _Rejected(blocked)
 
@@ -1285,7 +1341,8 @@ def terminal_tool(
         try:
             bounded_guard = run_bounded_sync(
                 lambda: _pre_exec_block(
-                    command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+                    command, env=env, env_type=env_type, cwd=cwd, workdir=workdir,
+                    session_key=session_key, task_id=task_id,
                 ),
                 guard_timeout,
                 label="terminal.pre-exec-guard",

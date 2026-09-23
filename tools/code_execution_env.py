@@ -266,8 +266,8 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
         return staging_dir
     if task_id:
         try:
-            from tools.terminal_tool import get_session_cwd
-            recorded = get_session_cwd(task_id)
+            from tools.terminal_tool import resolve_recorded_session_cwd
+            recorded = resolve_recorded_session_cwd(task_id)
         except Exception:
             recorded = None
         if recorded and os.path.isdir(recorded):

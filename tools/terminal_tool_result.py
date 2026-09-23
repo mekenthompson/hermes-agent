@@ -209,7 +209,6 @@ def finalize_foreground_result(
     workdir: Optional[str], command_cwd: Optional[str], approval_note: Optional[str],
 ) -> str:
     """Turn a raw ``env.execute`` result into the tool's JSON result string."""
-    from tools.terminal_tool import record_session_cwd
 
     # Record the cwd this command finished in as THIS session's durable cwd —
     # only when the command actually reported it (an interrupted/killed command
@@ -221,7 +220,8 @@ def finalize_foreground_result(
     if (result or {}).get("cwd_observed"):
         observed_cwd = (result or {}).get("cwd") or getattr(env, "cwd", None)
     if not workdir and observed_cwd:
-        record_session_cwd(session_key, observed_cwd)
+        from tools.terminal_tool import record_execution_cwd
+        record_execution_cwd(task_id, observed_cwd)
 
     output = result.get("output", "")
     returncode = result.get("returncode", 0)

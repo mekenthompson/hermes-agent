@@ -267,13 +267,13 @@ def _create_terminal_env_for_file_ops(raw_task_id: str, task_id: str):
     from tools.terminal_tool_config import _is_container_backend
     from tools.terminal_tool import (
         _create_configured_env, _get_env_config, _is_unusable_container_cwd,
-        _resolve_task_host_cwd, _select_image, get_session_cwd, resolve_task_overrides)
+        _resolve_task_host_cwd, _select_image, resolve_recorded_session_cwd, resolve_task_overrides)
 
     config = _get_env_config()
     env_type = config["env_type"]
     overrides = resolve_task_overrides(raw_task_id)
     try:
-        recorded_cwd = get_session_cwd(raw_task_id)
+        recorded_cwd = resolve_recorded_session_cwd(raw_task_id)
     except Exception:
         recorded_cwd = None
     cwd = overrides.get("cwd") or recorded_cwd or config["cwd"]
