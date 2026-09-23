@@ -266,3 +266,35 @@ def test_child_worktree_wins_over_inherited_gateway_key(tmp_path, cwd_keys, monk
             _container_aliases.pop(child_id, None)
 
 
+def test_child_terminal_tool_runs_in_its_worktree(tmp_path, cwd_keys, monkeypatch):
+    import json
+
+    from tools.terminal_tool import register_container_alias, terminal_tool
+
+    session_key, _session_id = cwd_keys
+    parent = tmp_path / "parent"
+    worktree = tmp_path / "wt"
+    (parent / "only-parent").mkdir(parents=True)
+    (worktree / "sub").mkdir(parents=True)
+    child_id = "subagent-0-pwd"
+    record_session_cwd(session_key, str(parent))
+    record_session_cwd(child_id, str(worktree))
+    register_container_alias(child_id, "parent-session")
+    monkeypatch.setenv("TERMINAL_CWD", str(parent))
+    token = set_current_session_key(session_key)
+    try:
+        first = json.loads(terminal_tool("pwd", task_id=child_id))
+        assert first["exit_code"] == 0
+        assert first["output"].strip() == str(worktree)
+        moved = json.loads(terminal_tool("cd sub && pwd", task_id=child_id))
+        assert moved["exit_code"] == 0
+        assert moved["output"].strip() == str(worktree / "sub")
+        assert get_session_cwd(session_key) == str(parent)
+        assert get_session_cwd(child_id) == str(worktree / "sub")
+    finally:
+        reset_current_session_key(token)
+        from tools.terminal_tool import _container_alias_lock, _container_aliases
+        with _container_alias_lock:
+            _container_aliases.pop(child_id, None)
+
+

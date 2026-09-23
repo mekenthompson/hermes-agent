@@ -157,7 +157,7 @@ def spawn_background_process(
     )
 
     effective_cwd = _resolve_command_cwd(
-        workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
+        workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type, task_id=task_id,
     )
     try:
         proc_session = _spawn(

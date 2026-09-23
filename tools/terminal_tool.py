@@ -858,21 +858,21 @@ def _resolve_command_cwd(
     default_cwd: str,
     session_key: Optional[str] = None,
     env_type: Optional[str] = None,
+    task_id: Optional[str] = None,
 ) -> str:
-    """cwd for a command: explicit ``workdir`` > the session's own cwd record >
+    """cwd for a command: explicit ``workdir`` > this execution's cwd record >
     ``default_cwd``.
 
-    The record is written after every completed command of THIS session, so
-    it is the session's ``cd`` state with no shared-env ambiguity. On
-    container backends a recorded HOST path (a desktop/TUI surface registering
-    its workspace) is unusable in the sandbox — ``cd <host path>`` fails with
-    exit 126 — so it is discarded in favor of ``default_cwd``.
-
-    Same guard class as the env-creation sanitizers (#50636, #54447); this is the per-command sibling site.
+    ``task_id`` wins when it has a record, so a delegate child runs in its
+    worktree instead of the gateway session key it inherited. Callers that
+    only have a session key, and no task id, still resolve that key. A set
+    ``task_id`` does not fall through to an inherited session key.
     """
     if workdir:
         return workdir
-    recorded = get_session_cwd(session_key)
+    recorded = resolve_recorded_session_cwd(task_id)
+    if not recorded and not task_id and session_key:
+        recorded = get_session_cwd(session_key)
     if recorded and _is_container_backend(env_type) and _is_unusable_container_cwd(recorded):
         logger.info(
             "Ignoring recorded session cwd %r for %s backend "
@@ -1174,7 +1174,8 @@ def _run_foreground(
     for retry_count in range(max_retries + 1):
         try:
             command_cwd = _resolve_command_cwd(
-                workdir=workdir, default_cwd=plan.cwd, session_key=session_key, env_type=env_type,
+                workdir=workdir, default_cwd=plan.cwd, session_key=session_key,
+                env_type=env_type, task_id=task_id,
             )
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
@@ -1220,7 +1221,7 @@ _PRE_EXEC_GUARD_MIN_TIMEOUT_S = 30
 
 def _pre_exec_block(
     command: str, *, env: Any, env_type: str, cwd: str,
-    workdir: Optional[str], session_key: str,
+    workdir: Optional[str], session_key: str, task_id: Optional[str] = None,
 ) -> None:
     """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
 
@@ -1228,7 +1229,8 @@ def _pre_exec_block(
     then the dangerous-workdir check, then the self-repo guard (local only).
     """
     blocked = gateway_lifecycle_block(
-        command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+        command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir,
+        session_key=session_key, task_id=task_id,
     )
     if blocked:
         raise _Rejected(blocked)
@@ -1239,7 +1241,9 @@ def _pre_exec_block(
                            workdir[:200], _safe_command_preview(command))
             raise _Rejected(_error_json(workdir_error, status="blocked"))
     if env_type == "local":
-        blocked = self_repo_block(command=command, cwd=cwd, workdir=workdir, session_key=session_key)
+        blocked = self_repo_block(
+            command=command, cwd=cwd, workdir=workdir, session_key=session_key, task_id=task_id,
+        )
         if blocked:
             raise _Rejected(blocked)
 
@@ -1337,7 +1341,8 @@ def terminal_tool(
         try:
             bounded_guard = run_bounded_sync(
                 lambda: _pre_exec_block(
-                    command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+                    command, env=env, env_type=env_type, cwd=cwd, workdir=workdir,
+                    session_key=session_key, task_id=task_id,
                 ),
                 guard_timeout,
                 label="terminal.pre-exec-guard",
