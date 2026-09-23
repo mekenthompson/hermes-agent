@@ -121,14 +121,15 @@ def _registered_task_cwd_override(task_id: str = "default") -> str | None:
 def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     """Best-effort absolute workspace root, or ``None`` when no reliable anchor exists.
 
-    Order: (1) the session's own cwd record (per-session, so one session's
-    ``cd`` never leaks into another); (2) a registered raw-keyed cwd override
-    (TUI/Desktop/ACP); (3) a sentinel-free absolute ``$TERMINAL_CWD``.
+    Order: (1) the session's recorded cwd, resolved across the gateway session
+    key and the Hermes session id so one profile's ``cd`` is visible to file
+    tools; (2) a registered raw-keyed cwd override (TUI/Desktop/ACP); (3) a
+    sentinel-free absolute ``$TERMINAL_CWD``.
     """
     try:
-        from tools.terminal_tool import get_session_cwd
+        from tools.terminal_tool import resolve_recorded_session_cwd
 
-        recorded = get_session_cwd(task_id)
+        recorded = resolve_recorded_session_cwd(task_id)
     except Exception:
         recorded = None
     return recorded or _registered_task_cwd_override(task_id) or _configured_terminal_cwd()

@@ -267,6 +267,34 @@ def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
         return _session_cwd.get(str(session_key or "default"))
 
 
+def resolve_recorded_session_cwd(task_id: Optional[str] = None) -> Optional[str]:
+    """Cwd the terminal recorded for this turn.
+
+    Messaging gateways record under the platform session key
+    (``get_current_session_key``). Tool ``task_id`` is the Hermes session id.
+    Those strings differ on every gateway profile, so a lookup that only has
+    ``task_id`` misses the directory a ``cd`` just entered. CLI and cron with
+    no session key record under ``task_id``. Try the live session key first,
+    then ``task_id``. No ``TERMINAL_CWD`` fallback — callers decide what
+    absence means. Empty keys are skipped so a miss does not read the shared
+    ``default`` bucket.
+    """
+    from tools.approval_context import get_current_session_key
+
+    keys: list[str] = []
+    session_key = get_current_session_key(default="") or ""
+    if session_key:
+        keys.append(session_key)
+    task = str(task_id).strip() if task_id else ""
+    if task and task not in keys:
+        keys.append(task)
+    for key in keys:
+        recorded = get_session_cwd(key)
+        if recorded:
+            return recorded
+    return None
+
+
 def clear_session_cwd(session_key: str) -> None:
     """Drop a session's cwd record (session teardown)."""
     with _session_cwd_lock:
@@ -980,7 +1008,7 @@ def _plan_execution(
     overrides = resolve_task_overrides(task_id)
     image = _select_image(env_type, overrides, config)
 
-    cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
+    cwd = overrides.get("cwd") or resolve_recorded_session_cwd(task_id) or config["cwd"]
     host_cwd = _resolve_task_host_cwd(config, task_id)
     # config["cwd"] was sanitized for container backends in _get_env_config
     # but an override / session record is raw: a host path would reach
