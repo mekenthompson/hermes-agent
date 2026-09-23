@@ -268,31 +268,55 @@ def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
 
 
 def resolve_recorded_session_cwd(task_id: Optional[str] = None) -> Optional[str]:
-    """Cwd the terminal recorded for this turn.
+    """Cwd recorded for this execution.
 
-    Messaging gateways record under the platform session key
-    (``get_current_session_key``). Tool ``task_id`` is the Hermes session id.
-    Those strings differ on every gateway profile, so a lookup that only has
-    ``task_id`` misses the directory a ``cd`` just entered. CLI and cron with
-    no session key record under ``task_id``. Try the live session key first,
-    then ``task_id``. No ``TERMINAL_CWD`` fallback — callers decide what
-    absence means. Empty keys are skipped so a miss does not read the shared
-    ``default`` bucket.
+    A delegate child's own ``task_id`` record wins. Children inherit the
+    parent's gateway session key via ``copy_context``; preferring that key
+    would run the child in the parent's checkout. The session key is only the
+    fallback for a gateway parent whose shell recorded under that key and
+    whose Hermes session id has no record yet. No ``TERMINAL_CWD`` fallback.
+    Empty keys are skipped so a miss does not read the shared ``default``
+    bucket.
     """
     from tools.approval_context import get_current_session_key
 
-    keys: list[str] = []
-    session_key = get_current_session_key(default="") or ""
-    if session_key:
-        keys.append(session_key)
     task = str(task_id).strip() if task_id else ""
-    if task and task not in keys:
-        keys.append(task)
-    for key in keys:
-        recorded = get_session_cwd(key)
+    if task:
+        recorded = get_session_cwd(task)
         if recorded:
             return recorded
+    session_key = get_current_session_key(default="") or ""
+    if session_key and session_key != task:
+        return get_session_cwd(session_key)
     return None
+
+
+def _is_delegated_child_task(task_id: str) -> bool:
+    """True when *task_id* is a delegate child sharing the parent's container."""
+    if not task_id:
+        return False
+    with _container_alias_lock:
+        return task_id in _container_aliases
+
+
+def record_execution_cwd(task_id: Optional[str], cwd: Optional[str]) -> None:
+    """Record a completed command's cwd for the identity that ran it.
+
+    ``task_id`` is the executing Hermes session or delegate child. A gateway
+    parent also updates the platform session key, because that is the key the
+    shell historically recorded under. A delegate child inherits that key via
+    ``copy_context`` and must not move the parent's directory.
+    """
+    from tools.approval_context import get_current_session_key
+
+    task = str(task_id).strip() if task_id else ""
+    if task:
+        record_session_cwd(task, cwd)
+    live = get_current_session_key(default="") or ""
+    if live and live != task and not _is_delegated_child_task(task):
+        record_session_cwd(live, cwd)
+    elif not task and not live:
+        record_session_cwd(None, cwd)
 
 
 def clear_session_cwd(session_key: str) -> None:

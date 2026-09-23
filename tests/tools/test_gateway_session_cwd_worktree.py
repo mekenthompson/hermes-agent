@@ -193,7 +193,7 @@ def test_admitted_writer_worktree_is_the_cd_repo(
         release_admission(admission.lease_id)
 
 
-def test_resolver_prefers_live_session_key_then_task_id(tmp_path, cwd_keys):
+def test_resolver_prefers_task_record_then_gateway_session_key(tmp_path, cwd_keys):
     from tools.terminal_tool import resolve_recorded_session_cwd
 
     session_key, session_id = cwd_keys
@@ -205,10 +205,13 @@ def test_resolver_prefers_live_session_key_then_task_id(tmp_path, cwd_keys):
     record_session_cwd(session_id, str(other))
     token = set_current_session_key(session_key)
     try:
+        assert resolve_recorded_session_cwd(session_id) == str(other)
+        clear_session_cwd(session_id)
         assert resolve_recorded_session_cwd(session_id) == str(repo)
     finally:
         reset_current_session_key(token)
 
+    record_session_cwd(session_id, str(other))
     assert resolve_recorded_session_cwd(session_id) == str(other)
 
 
@@ -229,5 +232,37 @@ def test_sibling_readers_use_the_gateway_session_key(tmp_path, cwd_keys, monkeyp
         assert _resolve_child_cwd("project", str(plain), session_id) == str(repo)
     finally:
         reset_current_session_key(token)
+
+
+def test_child_worktree_wins_over_inherited_gateway_key(tmp_path, cwd_keys, monkeypatch):
+    from tools.terminal_tool import _plan_execution, record_execution_cwd, register_container_alias
+
+    session_key, _session_id = cwd_keys
+    parent_repo = tmp_path / "parent-repo"
+    worktree = tmp_path / "child-worktree"
+    moved = tmp_path / "child-cd"
+    parent_repo.mkdir()
+    worktree.mkdir()
+    moved.mkdir()
+    child_id = "subagent-0-abc"
+    record_session_cwd(session_key, str(parent_repo))
+    record_session_cwd(child_id, str(worktree))
+    register_container_alias(child_id, "parent-session")
+    monkeypatch.setenv("TERMINAL_CWD", str(parent_repo))
+    token = set_current_session_key(session_key)
+    try:
+        from tools.file_tools_paths import _authoritative_workspace_root
+
+        assert _authoritative_workspace_root(child_id) == str(worktree)
+        plan = _plan_execution("pwd", task_id=child_id, timeout=30, background=False, _host_local=False)
+        assert plan.cwd == str(worktree)
+        record_execution_cwd(child_id, str(moved))
+        assert get_session_cwd(session_key) == str(parent_repo)
+        assert get_session_cwd(child_id) == str(moved)
+    finally:
+        reset_current_session_key(token)
+        from tools.terminal_tool import _container_alias_lock, _container_aliases
+        with _container_alias_lock:
+            _container_aliases.pop(child_id, None)
 
 
