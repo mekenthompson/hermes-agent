@@ -21,6 +21,7 @@ import importlib.metadata
 import json
 import queue
 import re
+import secrets
 import socket
 import subprocess
 import threading
@@ -90,7 +91,8 @@ def _port_open(port: int) -> bool:
 
 def _spawn_serve(home: WinHome) -> subprocess.Popen:
     # Desktop spawn shape (electron/main.ts): token + desktop flag in env, stdin closed.
-    env = {"HERMES_DESKTOP": "1", "HERMES_DASHBOARD_SESSION_TOKEN": nonce("tok"),
+    # serve rejects an explicit session token shorter than 32 characters.
+    env = {"HERMES_DESKTOP": "1", "HERMES_DASHBOARD_SESSION_TOKEN": secrets.token_urlsafe(32),
            "TERMINAL_CWD": str(home.project)}
     return subprocess.Popen(
         hermes_argv("serve", "--host", "127.0.0.1", "--port", "0"), cwd=home.profile, env=home.env(env),
