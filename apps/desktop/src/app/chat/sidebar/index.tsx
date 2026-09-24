@@ -96,6 +96,7 @@ import {
   ALL_PROJECTS,
   enterProject,
   exitProjectScope,
+  followEnteredProjectCwd,
   openProjectCreate,
   refreshProjects,
   refreshProjectTree,
@@ -113,7 +114,6 @@ import {
 import { openRouteTile } from '@/store/route-tiles'
 import {
   $cronSessions,
-  $currentCwd,
   $gatewayState,
   $messagingPlatformTotals,
   $messagingSessions,
@@ -123,8 +123,7 @@ import {
   $sessionsLoading,
   $unreadFinishedSessionIds,
   markAllSessionsRead,
-  sessionPinId,
-  setCurrentCwd
+  sessionPinId
 } from '@/store/session'
 import { $sessionDotStateById, sessionStatusBucket } from '@/store/session-dot-state'
 import { $unconfirmedPinWrites } from '@/store/session-pin-sync'
@@ -181,7 +180,8 @@ import {
   SidebarBlankState,
   SidebarLoadErrorState,
   SidebarPinnedEmptyState,
-  SidebarSessionSkeletons
+  SidebarSessionSkeletons,
+  SidebarStorageCorruptNotice
 } from './section-states'
 import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
@@ -521,7 +521,6 @@ export function ChatSidebar({
   const reposScanning = useStore($reposScanning)
   const activeProjectId = useStore($activeProjectId)
   const projectScope = useStore($projectScope)
-  const currentCwd = useStore($currentCwd)
   const gatewayState = useStore($gatewayState)
   const dismissedAutoProjects = useStore($dismissedAutoProjectIds)
   const newSessionCombo = useStore($bindings)['session.new']?.[0]
@@ -1165,16 +1164,13 @@ export function ChatSidebar({
 
   const lastProjectCwdSyncRef = useRef<null | string>(null)
 
-  const syncProjectCwd = useCallback(
-    (project: SidebarProjectTree) => {
-      const target = projectTreeCwd(project)
+  const syncProjectCwd = useCallback((project: SidebarProjectTree) => {
+    const target = projectTreeCwd(project)
 
-      if (target && target !== currentCwd) {
-        setCurrentCwd(target)
-      }
-    },
-    [currentCwd]
-  )
+    if (target) {
+      followEnteredProjectCwd(target)
+    }
+  }, [])
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
@@ -1686,6 +1682,8 @@ export function ChatSidebar({
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
+
+        <SidebarStorageCorruptNotice />
 
         {showSessionSections && (
           <div className="shrink-0 px-2 pb-1 pt-1">

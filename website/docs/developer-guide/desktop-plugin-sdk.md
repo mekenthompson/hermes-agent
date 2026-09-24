@@ -407,10 +407,165 @@ plugin is the worked example (it is also a complete, installable disk plugin).
 
 ### Composer extensions
 
-`COMPOSER_AREAS` (`top`, `bottom`, `leading`, `actions`, `attachments`,
-`middleware`) let a plugin add controls around the message composer, provide an
-attachment source, or transform a draft before it is sent (`ComposerMiddleware`
-with a `handler(draft) => draft | null`).
+`COMPOSER_AREAS` (`top`, `bottom`, `underside`, `leading`, `actions`,
+`attachments`, `middleware`) let a plugin add controls around the message
+composer, provide an attachment source, or transform a draft before it is sent
+(`ComposerMiddleware` with a `handler(draft) => draft | null`). `top` is a
+banner strip above the input and `bottom` a row below the input grid, both
+inside the composer chrome; `underside` is the floating strip BELOW the whole
+composer with no chrome of its own — the seat for a suggestion pill or a status
+hint that should sit outside the input frame (the next-prompt plugin renders its
+"next prompt" pill there).
+
+### Composer draft API — read and write the live input
+
+For everything the composer areas can't do — put text INTO the input, replace
+what's there, read the current draft, or send it — use `host.composer`. This
+is the supported door; reaching for the ProseMirror DOM, `[data-composer-target]`
+lookups, or synthetic `InputEvent`s is out of the plugin surface (catalog rule 8)
+and breaks the moment the app's markup moves. Addressing: `null` = the composer
+the user is typing in; a session id (stored or runtime) = that session's
+composer, in the primary pane or a tile; `'new'` = the fresh draft that has no
+session id yet.
+
+```javascript
+import { host } from '@hermes/plugin-sdk'
+
+// Append to the active composer (modes: 'block' | 'inline' | 'prefix';
+// 'prefix' seats a slash command at the start). Acknowledged like setDraft:
+// true when a mounted surface applied the text, false when the text is blank
+// or no live surface answers for the address.
+const inserted = await host.composer.insertText(null, 'draft note', { mode: 'inline' })
+
+// Replace a session's whole draft — '@'-ref and '/command' tokens hydrate
+// into chips exactly like an official paste. False when no mounted surface
+// answers (an unmounted session is never half-written).
+const ok = await host.composer.setDraft('sess-1', 'plan:\n- @file:src/app.ts')
+
+// Read the live draft: the mounted surface's in-DOM text (unsaved keystrokes
+// included), falling back to the debounced persisted stash. Null when nothing
+// holds it.
+const text = await host.composer.getDraft('sess-1')
+
+// Send as if the user typed + pressed Enter. Fail-closed like the app's own
+// panels: no visible surface for the address → false, never a broadcast.
+const sent = host.composer.submit('sess-1', 'ship it')
+
+// Put the caret in a composer (same addressing). insertText/setDraft already
+// focus a visible surface they paint; use this to return the caret after a
+// plugin popover closes or from a "go to input" keybind.
+host.composer.focus(null)
+```
+
+```ts
+host.composer: {
+  getDraft(sessionId: string | null): Promise<string | null>
+  setDraft(sessionId: string | null, text: string): Promise<boolean>
+  insertText(sessionId: string | null, text: string, opts?: { mode?: 'block' | 'inline' | 'prefix' }): Promise<boolean>
+  submit(sessionId: string | null, text: string): boolean
+  focus(sessionId: string | null): void
+}
+```
+
+**Arbitration.** Every verb is fail-closed on its address: a request is
+answered only by the mounted composer that owns that session (its tile, or the
+primary pane when it shows that session); `null` is answered only by the surface
+the app's focus bus currently routes to; `'new'` only by the primary pane while it
+shows no session — it never falls through to the active composer. No exact
+surface → `null`/`false`, never
+a broadcast into whichever pane happens to be mounted. Writes go through the
+app's own paint path, so `@`-ref / `/`-command tokens hydrate as chips and the
+result is byte-for-byte what the user would get by pasting. These are discrete,
+user-triggered actions with the same authority as typing — no plugin "owns" the
+draft afterwards, so there is **nothing to tear down** on disable; a plugin that
+wants a persistent presence around the input uses a `COMPOSER_AREAS` slot instead.
+
+A multi-session plugin keeps its per-session state on its side (which session
+its panel is editing) and passes that id here; the bus guarantees one
+plugin write can never land in another session's composer.
+
+**Migrating off DOM reach-in** (the held catalog plugins that motivated this API):
+
+| Plugin | Was | Now |
+|---|---|---|
+| next-prompt (#120660) | `window.dispatchEvent(new CustomEvent('hermes:composer-insert', …))` + a `setTimeout` `hermes:composer-focus`; `[data-composer-target]`/`[data-pane-hidden]` scan for the visible target | `await host.composer.insertText(null, suggestion.text, { mode: 'block' })`, then `host.composer.focus(null)` if the pill lost the caret |
+| prompt-snippets (#116030) | same `hermes:composer-insert` event; `[data-slot="composer-input"]`/ProseMirror `textContent` + synthetic `InputEvent` fallback; `surfaceEditorEl().focus()` | `host.composer.insertText(sid, text, { mode: 'block' })`; `setDraft(sid, (await getDraft(sid) ?? '') + '\n' + text)` replaces the fallback; `host.composer.focus(sid)` — `sid = host.state.focusedSessionId.get()` |
+| prompt-enhancer (#116031) | walks the editor's child nodes to serialize, rebuilds chip DOM, `replaceChildren` + synthetic `InputEvent` | `const draft = await host.composer.getDraft(sid)` → transform → `await host.composer.setDraft(sid, enhanced)` (chips hydrate app-side); revert is another `setDraft` |
+| memory-review (#115966) | `host.request('slash.exec', { session_id, command })` for `/memory …` — already SDK-only | optional: `host.composer.insertText(sid, '/memory pending', { mode: 'prefix' })` to seat the command for the user instead of executing it |
+| intelligent-tool-break (#115964) | "Message" button only toasts "type /break" (no composer write) | `host.composer.setDraft(host.state.focusedSessionId.get(), '/break ')` then `host.composer.focus(null)` restores the intended behaviour |
+
+`sessionId` in the table is the id the plugin's UI is bound to; for a composer
+slot render it is `host.state.focusedSessionId.get()`.
+
+### Session rows — decorations + the session list API
+
+`SESSION_ROW_AREAS` (`leading`, `trailing`) let a plugin decorate sidebar
+session rows. Register a `data` contribution whose `render({ sessionId })`
+returns a small element (a badge, a swatch, a tag) or `null` for rows you don't
+own — registering costs nothing on every other row:
+
+```ts
+import { SESSION_ROW_AREAS, type SessionRowSlotContribution } from '@hermes/plugin-sdk'
+
+ctx.register({
+  area: SESSION_ROW_AREAS.trailing,
+  id: 'my-tag',
+  data: {
+    render: ({ sessionId }) => (owned.has(sessionId) ? <span className="my-tag">★</span> : null)
+  } satisfies SessionRowSlotContribution
+})
+```
+
+Pair it with the session list API, which writes the same stores the app's own
+controls write (so a plugin action and a hand click can never disagree):
+
+```ts
+host.sessions.pin(storedSessionId: string, pinned?: boolean, index?: number): void
+host.sessions.reorder(storedSessionIds: string[]): void   // Recents; [] = clear manual order → default sort
+host.sessions.reorderPinned(storedSessionIds: string[]): void  // Pinned section; omitted pins keep their slot
+host.sessions.setColor(storedSessionId: string, color: string | null): void
+```
+
+Ids are STORED session ids: a live id is resolved to its durable lineage root,
+so pins and colours survive compression's id rotation — and the row-decoration
+slots hand your render that same durable id (`_lineage_root_id ?? id`), never
+the live one. Resolution goes through the rows this window has loaded; an id
+that matches no loaded row is written as given, so pass the slot's durable id
+(not a live id you remembered) for a session that may have scrolled out of the
+list. `reorder` accepts the same ids and maps each to its row's live id
+internally — the Recents order store is keyed by the live id, like the drag
+path. `pin(id, true, index)` slots the pin at that position in the
+Pinned list (a drop target between two pins); without `index` it appends, like
+the row's ⇧-click.
+
+**Arbitration.** The verbs are discrete user-triggered edits of user data —
+last write wins, exactly as if the user had clicked, and no plugin owns the
+result afterwards. Slot contributions are ALL mounted (registration order, not
+first-wins), each inside its own error boundary: a plugin that throws or
+returns `null` for a row cannot suppress another plugin's decoration on it, and
+two decorations on one row render side by side. Core keeps the row's layout,
+gestures and title — slots augment, never replace.
+
+**Teardown.** The verbs need none. Slot contributions are removed by the
+`ctx.register` disposer (disable/reload drops them and the row re-renders
+without the decoration).
+
+Migration for the held catalog plugins:
+
+- **drag-to-pin-session** — replace the `__reactFiber$*` walk for `onTogglePin`
+  / `onReorderSessions` / `session._lineage_root_id` with the row's slot id
+  (`render: ({ sessionId }) => …` under `SESSION_ROW_AREAS.leading` gives you
+  the durable id per row), then `host.sessions.pin(sessionId, true, dropIndex)`
+  for a drop into the Pinned section, `host.sessions.pin(sessionId, false)` for
+  a drop back into Recents, `host.sessions.reorderPinned(ids)` for a drag
+  within the Pinned section, and `host.sessions.reorder([])` for its
+  "reset manual order" path.
+- **better-session-appearance** — replace the `localStorage`
+  `hermes.desktop.sessionColors` write and the fiber-harvested `onChange` with
+  `host.sessions.setColor(sessionId, hex)` (`null` clears), and render its
+  per-row glyph through `SESSION_ROW_AREAS.leading` instead of mutating the
+  row's status dot (the durable id it needed from `_lineage_root_id` is the
+  slot's `sessionId`).
 
 ### Transcript directives — inline components the model addresses
 
@@ -539,9 +694,14 @@ host.logs(...)                             // tail an app log file
 host.status()                              // one-shot system status snapshot
 host.restartGateway()                      // restart the backend gateway
 host.profileRoutes()                       // [{ profile, targetProfile, connectionId, mode }]
-host.requestProfile<T>(route, method, params?)   // registry-routed RPC; no foreground swap
+host.requestProfile<T>(route, method, params?, timeoutMs?, { spawnPriority? })   // registry-routed RPC; no foreground swap
 host.requestProfile<T>(profile, method, params?) // legacy v1/local overload
 host.request<T>(method, params?)           // active-gateway JSON-RPC — the real power
+host.sessions.pin(storedSessionId, pinned?, index?)  // pin/unpin (default pinned=true); index = slot in Pinned;
+                                           //   same store the row's ⇧-click / drop writes
+host.sessions.reorder(ids)                 // replace the manual Recents order (what a drag persists); [] resets
+host.sessions.reorderPinned(ids)           // permute the Pinned section (the pinned drag path)
+host.sessions.setColor(storedSessionId, color | null)  // per-session colour override; null clears
 ```
 
 `host.request` is the same JSON-RPC the app itself uses (sessions, config, skills,
@@ -550,6 +710,13 @@ cron, kanban, …). `host.requestProfile` accepts a descriptor from
 profile without changing the active chat or gateway. The profile-only overload is
 retained only for the sole-local/legacy topology; registry-aware plugins should pass
 the descriptor so two sources exposing the same profile name cannot collide.
+
+A call that may cold-start a pooled profile backend dials at background priority by
+default, and background dials never get the slot the pool keeps free for user actions.
+When the call IS a user action (a save, a button press, a dialog opening), pass
+`host.requestProfile(route, method, params, undefined, { spawnPriority: 'foreground' })`;
+otherwise, with the pool full of warm backends, it waits out the 30-second slot timeout
+and fails. Keep the background default for polling and roster warming.
 
 `host.openWorkspace(id, { render, title?, minWidth?, onClose? })` docks a
 plugin-rendered view into the **main workspace zone** — the same center area
@@ -654,6 +821,81 @@ happens on user click — never from a background event alone.
 The other doors (`openExternal`, `revealPath`, `writeClipboard`) resolve
 `false` instead of throwing when the capability isn't available (older desktop
 shell, plain browser) — branch on the result rather than sniffing the bridge.
+
+### Desktop appearance settings — `host.settings`
+
+`host.settings` is the supported door for the small set of Desktop-local
+appearance preferences plugins may share with the native Settings page. Every
+key is bound to the store atom + setter the Settings page itself uses, so a
+plugin write is exactly a user click on that control: it takes effect at once,
+persists through the preference's existing storage schema, and the last write
+wins (no plugin "owns" the value afterwards, nothing to tear down for `set`).
+
+```ts
+type DesktopSettingValues = {
+  'backdrop.v1': boolean
+  'composerPopout.gesturesEnabled': boolean
+  'intro-splash.v1': boolean
+  'reasoning.collapsedByDefault': boolean
+  sessionListDensity: 'compact' | 'comfortable' | 'detailed'
+  tabStripDefault: 'auto' | 'always' | 'never'
+}
+host.settings.get<K extends DesktopSettingKey>(key: K): DesktopSettingValues[K]
+host.settings.set<K extends DesktopSettingKey>(key: K, value: DesktopSettingValues[K]): void
+host.settings.subscribe<K extends DesktopSettingKey>(key: K, fn: (value: DesktopSettingValues[K]) => void): () => void
+```
+
+```ts
+register(ctx) {
+  host.settings.set('sessionListDensity', 'detailed')
+
+  // subscribe emits the current value now, then after every native or plugin write.
+  const dispose = host.settings.subscribe('backdrop.v1', enabled => { /* … */ })
+  // Teardown rule: `host` is a module singleton and cannot tell which plugin
+  // subscribed, so YOU retire the listener — otherwise it outlives a disable/reload.
+  ctx.onDispose(dispose)
+}
+```
+
+Arbitration: the allowlist above is closed. An unknown key or a value outside
+the key's type throws **synchronously** (`Unsupported desktop setting: …` /
+`Invalid value for desktop setting: …`) and nothing is written — `host.settings`
+never touches `localStorage` directly, so it cannot bypass a store's schema or
+migration. Feature-detect `host.settings` when supporting older Desktop builds.
+
+Deliberately **not** keys, and why:
+
+| Wanted | Use instead | Why not a raw key |
+|--------|-------------|-------------------|
+| keybind map (`hermes.desktop.keybinds`) | `KEYBINDS_AREA` contribution | a raw map write rebinds every other plugin's shortcuts; the area merges per plugin and is torn down with it |
+| active theme / mode record | `THEMES_AREA` (register a theme; the user selects it) | theme selection is per window/profile and arbitrated by the app, not a flat preference |
+| `pluginDecisions` (desktop plugin on/off) | the app's Plugins tab (a read-only view is a separate SDK hook) | a plugin toggling another plugin's enable state is plugins interfering with each other |
+| `toolView.technical`, `embed-mode`, `titlebarAppActions`, `translucency.v2`, `user-bubble-transparency.v1`, `hermesDesktop.zoom.*` | follow-up keys after each store is audited | some drive the main process or window chrome; each needs its own guard and ownership review before it becomes plugin-writable |
+
+Migration — `hermes-appearance-hub`, which today does
+`localStorage.setItem('hermes.desktop.sessionListDensity', id)` followed by
+`window.dispatchEvent(new StorageEvent('storage', …))` to wake the app's store
+(`readSimpleKey`/`writeSimpleKey`, `readBoolKey`/`writeBoolKey`):
+
+```ts
+// before
+localStorage.setItem('hermes.desktop.backdrop.v1', String(on))
+window.dispatchEvent(new StorageEvent('storage', { key: 'hermes.desktop.backdrop.v1', newValue: String(on) }))
+// after — the store notifies its own subscribers; no synthetic StorageEvent
+host.settings.set('backdrop.v1', on)
+host.settings.set('sessionListDensity', id)          // was hermes.desktop.sessionListDensity
+host.settings.set('tabStripDefault', id)             // was hermes.desktop.tabStripDefault
+host.settings.set('reasoning.collapsedByDefault', on) // was hermes.desktop.reasoning.collapsedByDefault
+host.settings.set('composerPopout.gesturesEnabled', on)
+host.settings.set('intro-splash.v1', mode !== 'off') // replaces clicking #setting-field-appearance.intro-splash
+```
+
+Reads become `host.settings.get(key)`; its `MutationObserver` on the Settings
+page's intro-splash switch becomes `host.settings.subscribe('intro-splash.v1', fn)`
+(disposer → `ctx.onDispose`). `prompt-snippets` reads
+`localStorage.getItem('hermes.desktop.keybinds')` to back up its shortcut — that
+is the keybind-map row above: contribute the default through `KEYBINDS_AREA` and
+keep the user's override in `ctx.storage`, not in the app's map.
 
 ## Data layer — React Query + nanostores
 
@@ -959,10 +1201,10 @@ pipeline as a trust boundary.
 
 | Category | Exports |
 |----------|---------|
-| Host | `host` (`.state.*`, `.notify`, `.notifyError`, `.navigate`, `.onEvent`, `.logs`, `.status`, `.restartGateway`, `.request`) |
+| Host | `host` (`.state.*`, `.settings`, `.notify`, `.notifyError`, `.navigate`, `.onEvent`, `.logs`, `.status`, `.restartGateway`, `.request`, `.composer`, `.sessions`) |
 | Plugin contract | `HermesPlugin`, `PluginContext`, `PluginContribution`, `PluginStorage`, `PluginOs`, `PluginRestOptions`, `PluginNativeNotificationInput`, `PluginNotificationAction`, `HermesOpenTarget`, `Contribution` |
-| Area constants | `PANES_AREA`, `ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `STATUSBAR_AREAS`, `TITLEBAR_AREAS`, `WORKSPACE_PAGE_HEADER_AREA`, `PALETTE_AREA`, `KEYBINDS_AREA`, `THEMES_AREA`, `COMPOSER_AREAS` |
-| Area payloads | `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerMiddleware`, `ComposerAttachmentProvider` |
+| Area constants | `PANES_AREA`, `ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `STATUSBAR_AREAS`, `TITLEBAR_AREAS`, `WORKSPACE_PAGE_HEADER_AREA`, `PALETTE_AREA`, `KEYBINDS_AREA`, `THEMES_AREA`, `COMPOSER_AREAS`, `SESSION_ROW_AREAS` |
+| Area payloads | `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerMiddleware`, `ComposerAttachmentProvider`, `SessionRowSlotContribution` |
 | React / state | `useValue`, `atom`, `computed`, `useQuery`, `useMutation`, `useQueryClient`, `queryClient`, `Contribute` |
 | Theming | `useTheme`, `requestTheme`, `setAccentOverride`, `$accentOverride`, `retintTheme`, `themeHue`, `DesktopTheme`, `DesktopThemeColors`, plus OKLCH math (`hexToOklch`, `oklchToHex`, `oklchToSrgb255`, `mixOklab`, `maxChroma`, `hueDelta`, `normalizeHex`) and sRGB measures (`contrastRatio` — `number | null`, null for unparseable input — `readableOn`) |
 | UI kit | `Button`, `Input`, `Textarea`, `Select*`, `Switch`, `Checkbox`, `SegmentedControl`, `Tabs*`, `Dialog*`, `ConfirmDialog`, `DropdownMenu*`, `ContextMenu*`, `Popover*`, `Tip`/`Tooltip*`, `Badge`, `Kbd`/`KbdGroup`, `SearchField`, `ScrollArea`, `Separator`, `Skeleton`, `GlyphSpinner`, `Loader`, `EmptyState`, `ErrorState`, `CopyButton`, `StatusDot`, `LogView`, `Codicon`, `DecodeText` |

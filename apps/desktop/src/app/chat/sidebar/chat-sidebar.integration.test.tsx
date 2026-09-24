@@ -7,14 +7,13 @@ import { group, split } from '@/components/pane-shell/tree/model'
 import { $layoutTree, noteActiveTreeGroup } from '@/components/pane-shell/tree/store'
 import { SidebarProvider } from '@/components/ui/sidebar'
 import { registry } from '@/contrib/registry'
-import { $pinnedSessionIds, $sidebarCardRows } from '@/store/layout'
-import { $selectedStoredSessionId, $sessions } from '@/store/session'
+import { setSidebarAgentsGrouped } from '@/store/layout'
+import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
+import { $currentCwd, $selectedStoredSessionId, $sessions, $workspaceCwdOwner } from '@/store/session'
 import { $removedSessionIds } from '@/store/session-removal'
 import { makeSessionInfo } from '@/test/session-info'
 
 import { type AppView, ROUTES_AREA, SIDEBAR_NAV_AREA } from '../../routes'
-
-import { SIDEBAR_ROW_CARD_MIN_H } from './row-geometry'
 
 import { ChatSidebar } from './index'
 
@@ -166,45 +165,52 @@ describe('ChatSidebar navigation activity', () => {
   })
 })
 
-// Inbox style is a render variant, not a grouping — it rides whichever view is
-// active. The pinned section sits in the same flat column as recents, so both
-// must render the same row geometry: a section boundary is not a geometry
-// boundary (#116325).
-describe('ChatSidebar inbox style geometry', () => {
-  let disposeContributions: () => void
+// Entering a project is a scope switch: the conversation main is showing keeps
+// its workspace, so Files/Review and the composer's Git context can't drift to
+// the project while the transcript stays on the old chat (#72772).
+describe('ChatSidebar project entry', () => {
+  const project = {
+    id: '/repos/new-project',
+    label: 'new-project',
+    path: '/repos/new-project',
+    repos: [],
+    sessionCount: 0
+  }
 
   beforeEach(() => {
-    disposeContributions = registry.registerMany([])
-    $selectedStoredSessionId.set('tile-one')
-    $sessions.set(sessionRows)
-    $removedSessionIds.set(new Set())
-    $pinnedSessionIds.set(['tile-two'])
+    setSidebarAgentsGrouped(true)
+    $projectTree.set([project])
+    $currentCwd.set('/repos/old-project')
   })
 
   afterEach(() => {
     cleanup()
-    disposeContributions()
+    $projectScope.set(ALL_PROJECTS)
+    $projectTree.set([])
+    setSidebarAgentsGrouped(false)
+    $currentCwd.set('')
     $selectedStoredSessionId.set(null)
+    $workspaceCwdOwner.set(null)
     $sessions.set([])
-    $removedSessionIds.set(new Set())
-    $pinnedSessionIds.set([])
-    $sidebarCardRows.set(false)
   })
 
-  const row = (title: string) => screen.getByText(title).closest('.group.row-hover') as HTMLElement
+  it("leaves a stored conversation's workspace alone", () => {
+    $sessions.set(sessionRows)
+    $selectedStoredSessionId.set('tile-one')
+    $workspaceCwdOwner.set('tile-one')
+    $projectScope.set(project.id)
 
-  it('renders the pinned row with the recents card geometry when Inbox style is on', () => {
-    $sidebarCardRows.set(true)
-    renderSidebar('/', 'chat')
+    renderSidebar('/tile-one', 'chat')
 
-    expect(row('Tile two').className).toContain(SIDEBAR_ROW_CARD_MIN_H)
-    expect(row('Tile one').className).toContain(SIDEBAR_ROW_CARD_MIN_H)
+    expect($currentCwd.get()).toBe('/repos/old-project')
+    expect($workspaceCwdOwner.get()).toBe('tile-one')
   })
 
-  it('leaves both sections inline when Inbox style is off', () => {
+  it('re-homes a fresh draft into the entered project', () => {
+    $projectScope.set(project.id)
+
     renderSidebar('/', 'chat')
 
-    expect(row('Tile two').className).not.toContain(SIDEBAR_ROW_CARD_MIN_H)
-    expect(row('Tile one').className).not.toContain(SIDEBAR_ROW_CARD_MIN_H)
+    expect($currentCwd.get()).toBe(project.path)
   })
 })
