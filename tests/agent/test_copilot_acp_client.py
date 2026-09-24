@@ -314,6 +314,9 @@ def test_probe_inconclusive_not_cached():
     assert run_mock.call_count == 2  # inconclusive verdicts retry
 
 
+
+
+
 def test_probe_skipped_for_custom_args_without_acp():
     with _patch("agent.copilot_acp_client._probe_help") as run_mock:
         assert _acp_supported("mycli", ["--custom-transport"]) is True
