@@ -48,7 +48,9 @@ jobs:
   detect:
     name: Detect affected areas
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    # Full-history checkout of a large upstream alignment can exceed one minute
+    # on hosted runners before classification even starts.
+    timeout-minutes: 10
     outputs:
       python: ${{ steps.classify.outputs.python }}
       python_prod: ${{ steps.classify.outputs.python_prod }}
