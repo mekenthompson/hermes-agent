@@ -388,24 +388,27 @@ def _register_child(
     })
     return _subagent_id
 
-def _create_isolated_worktree(parent_agent: Any, parent_task_id: Any, subagent_id: Optional[str]):
-    """Opt-in worktree isolation: own git worktree off the parent's HEAD (the
-    child's terminal starts there). Git-only, local-backend-only; failures
-    degrade silently to the shared workspace. Returns the worktree info or None.
+def _create_isolated_worktree(
+    parent_agent: Any, parent_task_id: Any, subagent_id: Optional[str], repo_root: Optional[str] = None,
+):
+    """Own linked worktree for a coding child. ``git worktree add``, never a clone.
 
-    The parent cwd is the directory the shell recorded, resolved by
-    ``resolve_recorded_session_cwd``. Gateway turns record that under the
-    platform session key, while ``parent_task_id`` is the Hermes session id.
-    Reading only the session id misses and falls through to TERMINAL_CWD.
+    An explicit ``repo_root`` is the checkout to branch from, even when the
+    global isolation flag is off. Without one, isolation stays opt-in and uses
+    the recorded parent cwd. Gateway turns record that under the platform
+    session key, while ``parent_task_id`` is the Hermes session id.
     """
     from tools.delegate_tool import _get_worktree_isolation, _resolve_workspace_hint
-    if not _get_worktree_isolation():
+    from tools import subagent_worktree
+    explicit = repo_root.strip() if isinstance(repo_root, str) else ""
+    if not explicit and not _get_worktree_isolation():
         return None
     with _quiet("worktree isolation setup failed: %s"):
-        from tools import subagent_worktree
         if not subagent_worktree.local_backend_active():
             logger.debug("worktree isolation skipped: non-local terminal backend")
             return None
+        if explicit:
+            return subagent_worktree.create_subagent_worktree(explicit, subagent_id=subagent_id)
         _parent_cwd = None
         with _quiet(None):
             from tools.terminal_tool import resolve_recorded_session_cwd
@@ -771,7 +774,10 @@ class _ChildRun:
             record_session_cwd(self.child_task_id, resolve_recorded_session_cwd(self.parent_task_id))
             register_container_alias(self.child_task_id, self.parent_task_id)
 
-        self.worktree_info = _create_isolated_worktree(self.parent_agent, self.parent_task_id, self.subagent_id)
+        self.worktree_info = _create_isolated_worktree(
+            self.parent_agent, self.parent_task_id, self.subagent_id,
+            repo_root=getattr(self.child, "_delegate_repo_root", None),
+        )
         if self.worktree_info is not None:
             with _quiet("worktree cwd seed failed: %s"):
                 from tools.terminal_tool import record_session_cwd as _rsc

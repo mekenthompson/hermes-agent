@@ -183,7 +183,7 @@ def test_unisolated_delegate_rejection_is_schema_safe_before_child_start(tmp_pat
 
 
 def test_writer_admission_boundary_preserves_direct_read_only_seams():
-    """Only production-stamped or concrete source-writing children are writers."""
+    """A lease needs a stamp or a resolved checkout, not write tools alone."""
     from run_agent import AIAgent
 
     direct_writer = object.__new__(AIAgent)
@@ -194,6 +194,10 @@ def test_writer_admission_boundary_preserves_direct_read_only_seams():
     assert delegate_tool._requires_writer_admission(
         SimpleNamespace(_delegate_admission_required=True)
     )
+    # Write tools without a resolved checkout are not a lease. Slack children
+    # have terminal and must still start.
+    assert not delegate_tool._requires_writer_admission(direct_writer)
+    setattr(direct_writer, "_delegate_repo_root", "/repo")
     assert delegate_tool._requires_writer_admission(direct_writer)
     assert not delegate_tool._requires_writer_admission(direct_reader)
     assert not delegate_tool._requires_writer_admission(
