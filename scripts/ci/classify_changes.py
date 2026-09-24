@@ -401,8 +401,8 @@ def classify(files: list[str], *, fork: bool = False, root: Path | None = None) 
         for lane in called.get(f, set()):
             if lane in ret:
                 ret[lane] = True
-        if f == _FORK_IMAGE_WORKFLOW:
-            # The one .github file that is an image input (the build runs it).
+        if f == _FORK_IMAGE_WORKFLOW or "python_prod" in called.get(f, set()):
+            # A called workflow gated on python product changes rebuilds the image.
             ret["docker"] = True
     if not files or github:
         ret["python"] = True
