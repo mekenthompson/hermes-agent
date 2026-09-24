@@ -55,6 +55,12 @@ jobs:
             if [ -f "contributors/emails/${email}" ]; then
               continue  # mapped via the contributors directory
             fi
+            # Mapping files are case-sensitive on Linux runners. A commit email
+            # that differs only by case from an existing file is the same person.
+            email_folded=$(printf '%s' "$email" | tr '[:upper:]' '[:lower:]')
+            if [ -f "contributors/emails/${email_folded}" ]; then
+              continue
+            fi
 
             if ! grep -qF "\"${email}\"" scripts/release.py 2>/dev/null; then
               AUTHOR=$(git log --author="$email" --format='%an' -1)
