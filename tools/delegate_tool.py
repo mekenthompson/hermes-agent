@@ -178,6 +178,7 @@ def _build_child_agent(
     routing_cfg: Optional[Dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
+    repo_root: Optional[str] = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -270,7 +271,18 @@ def _build_child_agent(
     # because they supply a subagent-shaped test double.  Do not stamp a mocked
     # constructor result as a writer: a production AIAgent is checked below for
     # the source-writing tools it can actually invoke.
-    setattr(child, "_delegate_admission_required", _is_concrete_source_writer(child))
+    parent_cwd = None
+    with _quiet(None):
+        from tools.terminal_tool import resolve_recorded_session_cwd
+        parent_cwd = resolve_recorded_session_cwd(getattr(parent_agent, "_current_task_id", None))
+    coding_root, coding_error = resolve_delegate_coding_root(
+        repo_root, parent_cwd or _resolve_workspace_hint(parent_agent), isolate=_get_worktree_isolation(),
+    )
+    if coding_error:
+        raise ValueError(coding_error)
+    setattr(child, "_delegate_repo_root", coding_root)
+    # Lease only when a checkout was resolved. Write tools alone are not a writer.
+    setattr(child, "_delegate_admission_required", bool(coding_root) and _is_concrete_source_writer(child))
     _apply_child_compression_cap(child, delegation_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
@@ -338,17 +350,40 @@ def _is_concrete_source_writer(child: Any) -> bool:
     return is_agent and bool(_SOURCE_WRITING_TOOLS & _source_writing_tool_names(child))
 
 
-def _requires_writer_admission(child: Any) -> bool:
-    """Whether this direct helper invocation can launch a source-writing child.
+def resolve_delegate_coding_root(
+    repo_root: Optional[str], parent_cwd: Optional[str], *, isolate: bool,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(git toplevel, error)`` for a delegate that may edit source.
 
-    Production construction stamps every delegate child explicitly.  The
-    fallback covers a direct call with a concrete AIAgent that exposes a
-    source-writing tool, while preserving non-launching test doubles and
-    read-only direct helper callers.
+    An explicit ``repo_root`` must be a checkout, even when the global
+    isolation flag is off. A parent cwd that is not a repo, with no
+    ``repo_root``, is not an error: that child starts with no writer lease.
+    The parent checkout is a coding root only when isolation is on.
+    """
+    from tools.subagent_worktree import resolve_repo_root
+
+    if isinstance(repo_root, str) and repo_root.strip():
+        resolved = resolve_repo_root(repo_root.strip())
+        if not resolved:
+            return None, "no repo root for a coding delegate"
+        return resolved, None
+    if not isolate or not parent_cwd:
+        return None, None
+    return resolve_repo_root(parent_cwd), None
+
+
+def _requires_writer_admission(child: Any) -> bool:
+    """Whether this launch must show a linked worktree before it starts.
+
+    Tool presence is not the signal. A Slack child with ``terminal`` and no
+    checkout must start. A production stamp, or a resolved coding root on a
+    concrete source writer, is the lease.
     """
     if getattr(child, "_delegate_admission_required", False) is True:
         return True
-    return _is_concrete_source_writer(child)
+    if getattr(child, "_delegate_repo_root", None):
+        return _is_concrete_source_writer(child)
+    return False
 
 
 def _run_single_child(
@@ -496,7 +531,8 @@ def _build_children(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
+                repo_root=t.get("repo_root"), **overrides,
             )
         except ValueError as exc:
             return [], str(exc)
@@ -802,6 +838,12 @@ DELEGATE_TASK_SCHEMA = {
                             "is enabled; otherwise the whole call returns as one message). Tasks sharing a group return "
                             "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
                             "order execution; if B needs A's output, dispatch B after A returns.",
+                        ),
+                        "repo_root": _p(
+                            "string",
+                            "Absolute path of the git checkout this child may edit. Omit for review, gh, or research. "
+                            "When set, the child gets one linked worktree under that repo (shared object store, not a "
+                            "clone). A path that is not a git checkout fails the spawn with a named error.",
                         ),
                     },
                     "required": ["goal"],
