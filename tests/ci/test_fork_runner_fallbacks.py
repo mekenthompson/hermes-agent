@@ -86,6 +86,17 @@ class ForkRunnerFallbackTests(unittest.TestCase):
         )
         self.assertIn(expected_workers, tests_lines)
         self.assertIn("    timeout-minutes: 60", tests_lines)
+        bare = []
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if stripped in {
+                    "runs-on: ubuntu-latest-32-core",
+                    "runs-on: ubuntu-latest-96-core",
+                    "runs-on: windows-latest-32-core",
+                }:
+                    bare.append(f"{path.relative_to(ROOT)}: {stripped}")
+        self.assertEqual(bare, [])
 
     def test_windows_large_runner_has_standard_fork_fallback(self) -> None:
         trust_guard = (
