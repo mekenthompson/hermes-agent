@@ -143,7 +143,7 @@ jobs:
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
     runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
-    timeout-minutes: 30
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -199,7 +199,22 @@ jobs:
         # and must not share interpreter state.
         # tests/e2e/core/upgrade runs in its own job (e2e-upgrade) below.
         run: |
-          scripts/run_tests.sh --include-integration tests/e2e
+          # Keep the slow virtual-clock soak out of the three concurrent
+          # process trees; upgrade has its own fully gated job below.
+          python3 - "$RUNNER_TEMP/e2e-files.txt" <<'PY'
+          from pathlib import Path
+          import sys
+          root = Path('tests/e2e')
+          soak = root / 'core/delivery/test_cron_virtual_clock_soak.py'
+          upgrade = root / 'core/upgrade'
+          files = sorted(root.rglob('test_*.py'))
+          assert soak in files
+          selected = [p for p in files if p != soak and upgrade not in p.parents]
+          assert selected
+          Path(sys.argv[1]).write_text('\n'.join(map(str, selected)) + '\n', encoding='utf-8')
+          PY
+          scripts/run_tests.sh --include-integration --files-from "$RUNNER_TEMP/e2e-files.txt"
+          HERMES_TEST_WORKERS=1 scripts/run_tests.sh --include-integration tests/e2e/core/delivery/test_cron_virtual_clock_soak.py
         env:
           # An e2e file is a process tree, not one CPU-bound pytest worker. With
           # 32 files at once the hosted run starved live children before their

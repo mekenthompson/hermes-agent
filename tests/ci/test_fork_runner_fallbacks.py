@@ -55,6 +55,15 @@ class ForkRunnerFallbackTests(unittest.TestCase):
         self.assertEqual(scripts["check:test:ui"], "npm run test:ui")
         self.assertEqual(scripts["test:ui"], "vitest run --project ui")
 
+    def test_e2e_cron_soak_runs_after_other_files_without_parallel_trees(self) -> None:
+        text = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+        self.assertIn('assert soak in files', text)
+        self.assertIn('--files-from "$RUNNER_TEMP/e2e-files.txt"', text)
+        self.assertIn(
+            'HERMES_TEST_WORKERS=1 scripts/run_tests.sh --include-integration '
+            'tests/e2e/core/delivery/test_cron_virtual_clock_soak.py', text,
+        )
+
     def test_fork_skips_upstream_only_packaging_workflows(self) -> None:
         for relative in (".github/workflows/nix.yml", ".github/workflows/docker.yml"):
             with self.subTest(workflow=relative):
