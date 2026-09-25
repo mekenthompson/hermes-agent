@@ -64,10 +64,14 @@ jobs:
           - name: Windows-only tests
             runner: windows-latest-32-core
             marker: windows
+            workers: 8
           - name: Windows-only tests (arm64)
             runner: windows-latest-32-arm-core
             marker: windows
             timeout: 60
+            # Fork fallback runs this row on x64 windows-latest, not native ARM64.
+            # Its slow shared runner still needs the arm row's bounded parallelism.
+            workers: 2
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -160,7 +164,7 @@ jobs:
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '2' || '8') || '' }}
+          HERMES_TEST_WORKERS: ${{ matrix.workers || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
           OPENROUTER_API_KEY: ''

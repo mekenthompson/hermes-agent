@@ -105,7 +105,7 @@ jobs:
         run: |
           args=(tests/e2e/core/live -m live -rsxX -p no:cacheprovider --tb=short --junitxml=live-junit.xml)
           if [ -n "$LIVE_FILTER" ]; then args+=(-k "$LIVE_FILTER"); fi
-          "$HERMES_PYTHON" -m pytest "${args[@]}"
+          .venv/bin/python -m pytest "${args[@]}"
 
       - name: Usage and cost summary
         if: always() && steps.gate.outputs.configured != '0'

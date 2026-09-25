@@ -305,17 +305,17 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           # The suite's own probe (_bwrap_usable, same flags as every sandboxed
           # run): without it the suite silently runs the updater unsandboxed.
-          "$HERMES_PYTHON" -c "from tests.e2e.core.upgrade._helpers import BWRAP_OK; assert BWRAP_OK, 'bwrap unusable'" && echo "bwrap ok"
+          .venv/bin/python -c "from tests.e2e.core.upgrade._helpers import BWRAP_OK; assert BWRAP_OK, 'bwrap unusable'" && echo "bwrap ok"
 
       - name: Require a WAL-capable SQLite
         # The state.db suites skip on a WAL-reset-vulnerable SQLite; fail
         # instead of reporting green over zero coverage.
         run: |
-          "$HERMES_PYTHON" -c "import sqlite3, hermes_state_wal as w; print('sqlite', sqlite3.sqlite_version); assert not w.is_sqlite_wal_reset_vulnerable()"
+          .venv/bin/python -c "import sqlite3, hermes_state_wal as w; print('sqlite', sqlite3.sqlite_version); assert not w.is_sqlite_wal_reset_vulnerable()"
 
       - name: Run upgrade e2e tests
         run: |
-          scripts/run_tests.sh --include-integration tests/e2e/core/upgrade
+          HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh --include-integration tests/e2e/core/upgrade
         env:
           # Each file drives real installs/updaters (process trees plus uv and
           # git I/O); cpu_count of them at once starves their deadlines.

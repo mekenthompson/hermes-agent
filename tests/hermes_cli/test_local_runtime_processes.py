@@ -151,6 +151,14 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
     jobs, children, handles = [], [], []
     real_init = processes._WindowsJob.__init__
     real_assign = processes._WindowsJob.assign
+    real_popen = subprocess.Popen
+    creationflags = []
+
+    def track_popen(*args, **kwargs):
+        creationflags.append(kwargs.get('creationflags', 0))
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(processes.subprocess, 'Popen', track_popen)
 
     def track_job(job):
         jobs.append(job)
@@ -174,7 +182,10 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
 
     def assign(job, proc):
         children.append(proc)
-        assert psutil.Process(proc.pid).status() == psutil.STATUS_STOPPED
+        # A process-wide psutil snapshot can say "running" even while the
+        # CREATE_SUSPENDED primary thread has not executed. Check the actual
+        # creation flag handed to Popen, then verify the marker stays absent.
+        assert creationflags[-1] & 0x4  # CREATE_SUSPENDED
         assert not marker.exists()
         # Query the actual kernel object, not implementation source/constants.
         limits = processes._ExtendedLimits()
@@ -211,6 +222,8 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
         with pytest.raises((OSError, KeyboardInterrupt)):
             processes.spawn_server(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE)
+        if failure != 'configure':
+            assert creationflags and creationflags[-1] & 0x4
         assert not marker.exists()
         assert jobs and jobs[0]._handle is None
         for proc in children:
