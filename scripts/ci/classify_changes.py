@@ -20,11 +20,12 @@ Lanes:
 * ``site``        — Docusaurus + generated skill docs.
 * ``scan``        — supply-chain scan (Python files, .pth, setup hooks).
 * ``deps``        — pyproject.toml dependency bounds check.
-* ``uv_lock``     — ``uv lock --check``. Re-resolves the whole graph against
+* ``uv_lock``     — ``PM lock check``. Re-resolves the whole graph against
   PyPI, so a diff that touches neither ``pyproject.toml`` nor ``uv.lock``
   must not run it.
 * ``npm_lock``    — semantic package-lock.json diff PR comment.
-* ``installer``   — PowerShell installer tests (Windows runner).
+* ``bootstrap``   — the bootstrap installer lane: install.sh sandbox install,
+  pin-fragment drift check, and shipped version-stamp verification.
 * ``desktop_updater`` — the Windows desktop-update hand-off script and the
   tests that drive the REAL ``windows.ps1`` (``-SelfTestUi`` / pipe drain /
   retry policy). These are integration tests of a PowerShell process on a
@@ -144,14 +145,20 @@ _SCAN_FILES = {"setup.cfg", "pyproject.toml"}
 _MCP_CATALOG_PATHS = ("optional-mcps/",)
 _MCP_CATALOG_FILES = {"hermes_cli/mcp_catalog.py"}
 
-# Windows installer + its PowerShell tests. These only run on a Windows runner,
-# so they get their own lane rather than riding along with ``python``.
+# Bootstrap installer: the POSIX shell installer, the dev-checkout wrapper
+# that carries the same pin fragment, and the Tauri app's non-Rust sources
+# (the .rs/Cargo files are the ``rust`` lane's job). Changes here get the
+# bootstrap-installer.yml lane — a real sandboxed install + stamp check.
+_BOOTSTRAP_PATHS = ("apps/bootstrap-installer/",)
+_BOOTSTRAP_FILES = {"scripts/install.sh", "setup-hermes.sh"}
+# Windows installer and its PowerShell tests: the fork's OS lane uses this
+# surface to decide whether native-host validation is needed.
 _INSTALLER_PATHS = ("scripts/tests/",)
 _INSTALLER_FILES = {"scripts/install.ps1", "scripts/install.cmd"}
-
 # Windows desktop-update hand-off (scripts/desktop-update/windows.ps1 + the
 # Electron side that launches it) and the pytest files that spawn it.
-_DESKTOP_UPDATER_PATHS = ("scripts/desktop-update/",)
+# tests/_fixtures/ holds the conftest's platform gating, so it re-arms the lane too.
+_DESKTOP_UPDATER_PATHS = ("scripts/desktop-update/", "tests/_fixtures/")
 _DESKTOP_UPDATER_TEST_PREFIX = "tests/scripts/desktop_update/"
 _DESKTOP_UPDATER_FILES = {
     "apps/desktop/electron/updater-process.ts",
@@ -188,7 +195,7 @@ _OS_TESTS_FILES = {
     "uv.lock",
     "scripts/ci/list_os_marked_tests.py",
 }
-_OS_MARKER_RE = re.compile(r"\b(?:windows_only|macos_only)\b")
+_OS_MARKER_RE = re.compile(r"\b(?:platforms\s*\(|windows_only\b|macos_only\b)")
 
 # Tree checks the fork gates: committed infographics (images) and profile
 # archives. Mirrors the extensions those two checks reject.
@@ -221,7 +228,7 @@ def _py_test_only(p: str) -> bool:
 
     Product jobs (Desktop E2E's ``hermes serve`` backend, the Docker image)
     run installed code — nothing under ``tests/`` is packaged or importable
-    there. scripts/run_tests.sh and run_tests_parallel.py are deliberately
+    there. scripts/run_tests.sh and scripts/run_tests_parallel.py are deliberately
     NOT test-only: they are runner infrastructure, and a bad edit there can
     mask real failures, so they stay conservative (python_prod=true).
     """
@@ -267,7 +274,7 @@ def _is_os_marked_test(p: str, root: Path) -> bool:
     if not (p.startswith("tests/") and p.endswith(".py")):
         return False
     try:
-        text = (root / p).read_text(encoding="utf-8", errors="replace")
+        text = (root / p).read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return False
     return bool(_OS_MARKER_RE.search(text))
@@ -300,15 +307,15 @@ def _ci_called_workflow_lanes(root: Path) -> dict[str, set[str]] | None:
 
     ``{'.github/workflows/tests.yml': {'python'}, ...}``. A called workflow
     whose job has no lane condition maps to an empty set. Returns ``None``
-    when ci.yaml cannot be parsed (no PyYAML, unreadable, malformed) so the
+    when ci.yaml cannot be parsed (no hermes_yaml, unreadable, malformed) so the
     caller falls back to the upstream fail-open rule.
     """
     try:
-        import yaml
+        import hermes_yaml as yaml
     except ImportError:
         return None
     try:
-        ci = yaml.safe_load((root / _CI_ORCHESTRATOR).read_text(encoding="utf-8"))
+        ci = yaml.safe_load((root / _CI_ORCHESTRATOR).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, yaml.YAMLError):
         return None
     jobs = ci.get("jobs") if isinstance(ci, dict) else None
@@ -367,7 +374,11 @@ def classify(files: list[str], *, fork: bool = False, root: Path | None = None) 
     python = any(not _py_irrelevant(f) for f in lane_files)
     python_prod = any(not _py_irrelevant(f) and not _py_test_only(f) for f in lane_files)
     frontend = any(
-        f.startswith(_FRONTEND) or f in _ROOT_NPM or f in _FRONTEND_FILES
+        f.startswith(_FRONTEND)
+        or f in _ROOT_NPM
+        or f in _FRONTEND_FILES
+        or f.startswith("tests-js/")
+        or (f.startswith("scripts/build/") and f.endswith((".mjs", ".js", ".ts")))
         for f in lane_files
     )
     deps = any(f == "pyproject.toml" for f in lane_files)
@@ -388,7 +399,9 @@ def classify(files: list[str], *, fork: bool = False, root: Path | None = None) 
         "deps": deps,
         "uv_lock": any(f in ("pyproject.toml", "uv.lock") for f in lane_files),
         "npm_lock": npm_lock,
-        "installer": any(_is_installer(f) for f in lane_files),
+        "bootstrap": any(
+            f.startswith(_BOOTSTRAP_PATHS) or f in _BOOTSTRAP_FILES for f in lane_files
+        ),
         "desktop_updater": any(_is_desktop_updater(f) for f in lane_files),
         "rust": any(_is_rust(f) for f in lane_files),
         "mcp_catalog": any(_is_mcp_catalog(f) for f in lane_files),
@@ -415,7 +428,7 @@ def classify(files: list[str], *, fork: bool = False, root: Path | None = None) 
         ret["deps"] = True
         ret["uv_lock"] = True
         ret["npm_lock"] = True
-        ret["installer"] = True
+        ret["bootstrap"] = True
         ret["desktop_updater"] = True
         ret["rust"] = True
         ret["nix"] = True
@@ -437,7 +450,7 @@ def _pull_request_number() -> str | None:
     if not event_path:
         return None
     try:
-        with open(event_path, encoding="utf-8") as fh:
+        with open(event_path, encoding="utf-8-sig") as fh:
             payload = json.load(fh)
     except (OSError, json.JSONDecodeError):
         return None

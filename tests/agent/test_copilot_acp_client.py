@@ -110,7 +110,9 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
             original_read_text = Path.read_text
 
             def strict_read_text(self, encoding=None, errors=None, **kwargs):
-                if self == target and encoding != "utf-8":
+                # The repo encoding policy makes reads BOM-tolerant, so both
+                # UTF-8 family codecs satisfy this regression guard.
+                if self == target and encoding not in ("utf-8", "utf-8-sig"):
                     raise UnicodeDecodeError(
                         "gbk", b"\x94", 0, 1, "illegal multibyte sequence"
                     )

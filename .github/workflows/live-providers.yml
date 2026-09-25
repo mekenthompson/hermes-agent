@@ -77,17 +77,17 @@ jobs:
             pyproject.toml
             uv.lock
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.14
         if: steps.gate.outputs.configured != '0'
         uses: ./.github/actions/retry
         with:
-          command: uv python install 3.11
+          command: uv python install 3.14
 
       - name: Install dependencies
         if: steps.gate.outputs.configured != '0'
         uses: ./.github/actions/retry
         with:
-          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic
+          command: uv sync --locked --python 3.14 --extra all --group dev --extra anthropic
 
       - name: Run live canaries
         if: steps.gate.outputs.configured != '0'
@@ -103,10 +103,9 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.LIVE_GEMINI_API_KEY }}
           XAI_API_KEY: ${{ secrets.LIVE_XAI_API_KEY }}
         run: |
-          source .venv/bin/activate
           args=(tests/e2e/core/live -m live -rsxX -p no:cacheprovider --tb=short --junitxml=live-junit.xml)
           if [ -n "$LIVE_FILTER" ]; then args+=(-k "$LIVE_FILTER"); fi
-          python -m pytest "${args[@]}"
+          .venv/bin/python -m pytest "${args[@]}"
 
       - name: Usage and cost summary
         if: always() && steps.gate.outputs.configured != '0'

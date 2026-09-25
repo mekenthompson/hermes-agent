@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
-import yaml
+from hermes_yaml import safe_dump
 
 from gateway.config import GatewayConfig
 from gateway.run import GatewayRunner
@@ -22,7 +22,7 @@ def _write_profile_service_plugin(hermes_home: Path) -> None:
     plugin_dir = hermes_home / "plugins" / "profile_service_probe"
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "plugin.yaml").write_text(
-        yaml.safe_dump(
+        safe_dump(
             {
                 "name": "profile_service_probe",
                 "version": "0.1.0",
@@ -39,7 +39,7 @@ def _write_profile_service_plugin(hermes_home: Path) -> None:
         "    ctx.register_profile_service('profile-probe', service)\n"
     )
     (hermes_home / "config.yaml").write_text(
-        yaml.safe_dump({"plugins": {"enabled": ["profile_service_probe"]}})
+        safe_dump({"plugins": {"enabled": ["profile_service_probe"]}})
     )
 
 

@@ -78,6 +78,55 @@ def _assistant_texts(run: CodexRun) -> list[str]:
     return [r["content"] for r in messages(run.home, run.session_id) if r["role"] == "assistant" and r["content"]]
 
 
+def test_crash_stderr_tail_waits_for_reader_after_process_exit(tmp_path, monkeypatch):
+    import threading
+
+    from agent.transports.codex_app_server import CodexAppServerClient
+    from agent.transports.codex_app_server_session import CodexAppServerSession
+
+    marker = "CRASH-READER-RACE"
+    fake_codex = tmp_path / "fake_codex.py"
+    fake_codex.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        f"sys.stderr.write({marker!r} + '\\n')\n"
+        "sys.stderr.flush()\n"
+        "os._exit(3)\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+
+    entered = threading.Event()
+    release = threading.Event()
+    append_stderr = CodexAppServerClient._append_stderr
+
+    def hold_stderr_capture(client, line):
+        entered.set()
+        assert release.wait(timeout=2), "test did not release the stderr reader"
+        append_stderr(client, line)
+
+    monkeypatch.setattr(CodexAppServerClient, "_append_stderr", hold_stderr_capture)
+    client = CodexAppServerClient(codex_bin=str(fake_codex))
+    try:
+        assert client._proc.wait(timeout=2) == 3
+        assert entered.wait(timeout=2), "stderr reader never received the flushed crash marker"
+
+        reader_join = client._stderr_reader.join
+
+        def release_then_join(timeout=None):
+            release.set()
+            return reader_join(timeout=timeout)
+
+        monkeypatch.setattr(client._stderr_reader, "join", release_then_join)
+        session = CodexAppServerSession.__new__(CodexAppServerSession)
+        session._client = client
+        error = session._format_error_with_stderr("codex app-server subprocess exited unexpectedly", tail_lines=20)
+        assert error.count(marker) == 1, error
+    finally:
+        release.set()
+        client.close()
+
+
 def test_crash_mid_item_surfaced_once_without_partial_content_or_orphan(runs):
     run = runs["crash"]
     result = run.results[0]

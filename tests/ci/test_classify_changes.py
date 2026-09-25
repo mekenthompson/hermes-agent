@@ -40,7 +40,7 @@ DEFAULT = {
     "deps": True,
     "uv_lock": True,
     "npm_lock": True,
-    "installer": True,
+    "bootstrap": True,
     "desktop_updater": True,
     "rust": True,
     "mcp_catalog": False,
@@ -50,7 +50,7 @@ DEFAULT = {
 }
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, installer=False, desktop_updater=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None, os_tests=None, binary_artifacts=False) -> dict[str, bool]:
+def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, bootstrap=False, desktop_updater=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None, os_tests=None, binary_artifacts=False) -> dict[str, bool]:
     # python_prod tracks python except for tests-only diffs; default it to
     # python so the majority of cases don't need to spell it out.
     #
@@ -62,7 +62,7 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
     # os_tests fires for the installer / desktop-updater surfaces (their
     # tests are Windows integration tests) and for platform-named paths;
     # pass it explicitly for the latter.
-    _os_tests = (installer or desktop_updater) if os_tests is None else os_tests
+    _os_tests = desktop_updater if os_tests is None else os_tests
     return {
         "python": python,
         "python_prod": _python_prod,
@@ -75,7 +75,7 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
         "deps": deps,
         "uv_lock": uv_lock,
         "npm_lock": npm_lock,
-        "installer": installer,
+        "bootstrap": bootstrap,
         "desktop_updater": desktop_updater,
         "rust": rust,
         "mcp_catalog": mcp_catalog,
@@ -86,6 +86,8 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
 
 
 CASES = {
+    "shared JS builder → frontend": (["scripts/build/web.mjs"], _lanes(python=True, frontend=True)),
+    "root JS tests → frontend": (["tests-js/product-builders.test.mjs"], _lanes(python=True, frontend=True)),
     "docs-only → nothing heavy": (["README.md", "docs/guide.md"], _lanes()),
     "python source → python": (["run_agent.py"], _lanes(python=True, scan=True)),
     # pyproject.toml declares the pytest markers the OS lanes select on, so it
@@ -159,14 +161,10 @@ CASES = {
     ),
     # Prose cannot change the closure or the binary.
     "docs-only → no nix": (["README.md"], _lanes()),
-    # install.ps1 is a shell script Python never imports, but it's also not
-    # provably prose, so python stays on (fail-open) alongside the Windows lane.
-    "install.ps1 → installer": (["scripts/install.ps1"], _lanes(python=True, installer=True)),
-    "installer test → installer": (
-        ["scripts/tests/test-install-ps1-longpath.ps1"],
-        _lanes(python=True, installer=True),
-    ),
-    "python source alone → no installer lane": (["run_agent.py"], _lanes(python=True, scan=True)),
+    # install.ps1 and its PowerShell suites are exercised by platforms("windows")
+    # pytest files, so they must turn on python (which gates tests-os).
+    "install.ps1 → python + os_tests": (["scripts/install.ps1"], _lanes(python=True, os_tests=True)),
+    "installer suite → python + os_tests": (["scripts/tests/test-install-ps1-longpath.ps1"], _lanes(python=True, os_tests=True)),
     # The Windows desktop-update hand-off is a PowerShell integration surface:
     # its tests spawn the real script and poll its loopback server. They run
     # when the script, the Electron side that launches it, or their own test
@@ -195,20 +193,20 @@ CASES = {
     # the ONLY lane a Rust change ran, and the crate's tests never executed.
     "rust source → rust": (
         ["apps/bootstrap-installer/src-tauri/src/powershell.rs"],
-        _lanes(frontend=True, rust=True),
+        _lanes(frontend=True, bootstrap=True, rust=True),
     ),
     "cargo lockfile → rust": (
         ["apps/bootstrap-installer/src-tauri/Cargo.lock"],
-        _lanes(frontend=True, rust=True),
+        _lanes(frontend=True, bootstrap=True, rust=True),
     ),
     # Non-.rs files in the crate still change what cargo builds.
     "tauri config → rust": (
         ["apps/bootstrap-installer/src-tauri/tauri.conf.json"],
-        _lanes(frontend=True, rust=True),
+        _lanes(frontend=True, bootstrap=True, rust=True),
     ),
     "ts source alone → no rust lane": (
         ["apps/bootstrap-installer/src/main.tsx"],
-        _lanes(frontend=True),
+        _lanes(frontend=True, bootstrap=True),
     ),
     # Unknown top-level file keeps Python on rather than risk a silent skip.
     "unknown toplevel → python": (["Makefile"], _lanes(python=True)),
@@ -227,6 +225,10 @@ CASES = {
         _lanes(python=True, python_prod=False, scan=True, desktop_updater=True),
     ),
     # OS lanes (fork consumes ``os_tests``; upstream gates them on python).
+    "conftest fixture module → python + desktop_updater": (
+        ["tests/_fixtures/platform_gating.py"],
+        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True),
+    ),
     "platform-named source → os_tests": (
         ["tools/windows_native.py"],
         _lanes(python=True, scan=True, os_tests=True),
@@ -252,7 +254,9 @@ CASES = {
         _lanes(python=True, scan=True),
     ),
     # Runner infrastructure is NOT tests-only — a bad runner edit can mask
-    # real failures, so it keeps the conservative full lane set.
+    # real failures, so it keeps the conservative full lane set. The .py
+    # runner additionally trips the supply-chain scan lane (executable
+    # .py/.pth payloads are what it scans for).
     "test runner script → python_prod stays on": (
         ["scripts/run_tests_parallel.py"],
         _lanes(python=True, scan=True),
@@ -291,7 +295,7 @@ CASES = {
     ),
     "bootstrap-installer eslint config → ci_review": (
         ["apps/bootstrap-installer/eslint.config.mjs"],
-        _lanes(frontend=True, ci_review=True),
+        _lanes(frontend=True, bootstrap=True, ci_review=True),
     ),
     "prettier config → ci_review": (
         [".prettierrc"],
@@ -300,6 +304,20 @@ CASES = {
     "workflow yml → ci_review (also fail-open all)": (
         [".github/workflows/typecheck.yml"],
         DEFAULT,
+    ),
+    # The bootstrap installer lane: shell installer, dev-checkout wrapper,
+    # and the Tauri app's non-Rust sources.
+    "install.sh → bootstrap + os_tests": (
+        ["scripts/install.sh"],
+        _lanes(python=True, bootstrap=True, python_prod=True, os_tests=True),
+    ),
+    "setup-hermes.sh → bootstrap lane": (
+        ["setup-hermes.sh"],
+        _lanes(python=True, bootstrap=True, python_prod=True),
+    ),
+    "tauri installer source → bootstrap + rust": (
+        ["apps/bootstrap-installer/src-tauri/src/lib.rs"],
+        _lanes(frontend=True, bootstrap=True, rust=True),
     ),
     "composite action → ci_review (also fail-open all)": (
         [".github/actions/retry/action.yml"],
@@ -323,11 +341,49 @@ def test_classify(files, expected):
     assert classify(files) == expected
 
 
+def test_upstream_frontend_paths_are_classified():
+    for path in ("tests-js/product-builders.test.mjs", "scripts/build/web.mjs"):
+        assert classify([path])["frontend"]
+
+
+def test_platforms_marker_classifies_changed_test_as_os_specific(tmp_path):
+    test_file = tmp_path / "tests" / "test_platform_marker.py"
+    test_file.parent.mkdir()
+    test_file.write_text(
+        '@pytest.mark.platforms("windows")\ndef test_windows_only(): pass\n',
+        encoding="utf-8",
+    )
+    assert classify(["tests/test_platform_marker.py"], root=tmp_path)["os_tests"]
+
+
+def test_fork_workflow_scope_uses_declared_call_lanes(tmp_path):
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "ci.yaml").write_text(
+        "jobs:\n"
+        "  tests:\n"
+        "    if: needs.detect.outputs.python == 'true'\n"
+        "    uses: ./.github/workflows/tests.yml\n"
+        "  frontend:\n"
+        "    if: needs.detect.outputs.frontend == 'true'\n"
+        "    uses: ./.github/workflows/js-tests.yml\n",
+        encoding="utf-8",
+    )
+    lanes = classify([".github/workflows/tests.yml"], fork=True, root=tmp_path)
+    assert lanes == _lanes(
+        python=True,
+        python_prod=False,
+        docker=False,
+        nix=False,
+        ci_review=True,
+    )
+
+
 _REPO = Path(__file__).resolve().parents[2]
 
 
 def _yaml(rel: str) -> dict:
-    yaml = pytest.importorskip("yaml")
+    yaml = pytest.importorskip("hermes_yaml")
     return yaml.safe_load((_REPO / rel).read_text(encoding="utf-8"))
 
 
