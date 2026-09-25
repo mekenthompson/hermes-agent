@@ -274,7 +274,7 @@ def _is_os_marked_test(p: str, root: Path) -> bool:
     if not (p.startswith("tests/") and p.endswith(".py")):
         return False
     try:
-        text = (root / p).read_text(encoding="utf-8", errors="replace")
+        text = (root / p).read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return False
     return bool(_OS_MARKER_RE.search(text))
@@ -315,7 +315,7 @@ def _ci_called_workflow_lanes(root: Path) -> dict[str, set[str]] | None:
     except ImportError:
         return None
     try:
-        ci = yaml.safe_load((root / _CI_ORCHESTRATOR).read_text(encoding="utf-8"))
+        ci = yaml.safe_load((root / _CI_ORCHESTRATOR).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, yaml.YAMLError):
         return None
     jobs = ci.get("jobs") if isinstance(ci, dict) else None

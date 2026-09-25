@@ -110,7 +110,7 @@ def _session_end_mode() -> str:
             config_paths.append(managed_dir / "config.yaml")
         for config_path in config_paths:
             try:
-                with open(config_path, encoding="utf-8") as f:
+                with open(config_path, encoding="utf-8-sig") as f:
                     user_config = fast_safe_load(f)
             except FileNotFoundError:
                 pass  # No user config is the historical cleanup-default state.

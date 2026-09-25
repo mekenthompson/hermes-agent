@@ -92,7 +92,7 @@ test.skipIf(process.platform === 'win32')(
     })
     const python: string = process.env.HERMES_PYTHON || 'python3'
     const fixtureScript: string = path.join(import.meta.dirname, 'fixtures', 'source-backend.py')
-    const token: string = 'desktop-pm-contract'
+    const token: string = 'desktop-pm-contract-token-for-tests'
     env.HERMES_DASHBOARD_SESSION_TOKEN = token
     vi.stubEnv('HOME', home)
 

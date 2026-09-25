@@ -96,7 +96,6 @@ jobs:
         # No --files: the runner discovers the suite itself. The discovered
         # set is identical to the list the removed matrix job used to pass in.
         run: |
-          source .venv/bin/activate
           scripts/run_tests.sh --slice ${{ matrix.slice }}/${{ matrix.slices }}
         env:
           # This is the maximum number of test FILES that run together.
@@ -306,19 +305,16 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           # The suite's own probe (_bwrap_usable, same flags as every sandboxed
           # run): without it the suite silently runs the updater unsandboxed.
-          source .venv/bin/activate
-          python -c "from tests.e2e.core.upgrade._helpers import BWRAP_OK; assert BWRAP_OK, 'bwrap unusable'" && echo "bwrap ok"
+          "$HERMES_PYTHON" -c "from tests.e2e.core.upgrade._helpers import BWRAP_OK; assert BWRAP_OK, 'bwrap unusable'" && echo "bwrap ok"
 
       - name: Require a WAL-capable SQLite
         # The state.db suites skip on a WAL-reset-vulnerable SQLite; fail
         # instead of reporting green over zero coverage.
         run: |
-          source .venv/bin/activate
-          python -c "import sqlite3, hermes_state_wal as w; print('sqlite', sqlite3.sqlite_version); assert not w.is_sqlite_wal_reset_vulnerable()"
+          "$HERMES_PYTHON" -c "import sqlite3, hermes_state_wal as w; print('sqlite', sqlite3.sqlite_version); assert not w.is_sqlite_wal_reset_vulnerable()"
 
       - name: Run upgrade e2e tests
         run: |
-          source .venv/bin/activate
           scripts/run_tests.sh --include-integration tests/e2e/core/upgrade
         env:
           # Each file drives real installs/updaters (process trees plus uv and
