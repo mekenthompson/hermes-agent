@@ -6,6 +6,8 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from hermes_cli.admission import AdmissionController, AdmissionLimits
 from hermes_cli.admission_contract import AdmissionCaller, AdmissionErrorCode
 from hermes_cli.admission_runtime import admit_writer, cancel_admission_request, ledger_path, release_admission
@@ -80,6 +82,36 @@ def test_temp_home_shares_one_ledger_for_kanban_and_delegate_capacity_priority_a
     conflict = _admit("same-branch", AdmissionCaller.KANBAN, second)
     assert conflict.state == "rejected"
     assert conflict.reason == AdmissionErrorCode.CONFLICTING_WRITER.value
+
+
+def test_idle_ledger_adopts_new_configured_capacity_but_live_work_blocks_migration(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _repo, first, second, third, _fourth = _worktrees(tmp_path)
+
+    old = _admit("old", AdmissionCaller.KANBAN, first)
+    assert old.state == "running"
+    assert release_admission(old.lease_id) is None
+    with sqlite3.connect(ledger_path()) as connection:
+        assert connection.execute("SELECT count(*) FROM admission_requests WHERE state IN ('queued', 'running')").fetchone()[0] == 0
+
+    changed = admit_writer(
+        request_id="changed", caller=AdmissionCaller.DELEGATE, workspace=str(second), priority=0,
+        writer_id="delegate:changed", kanban_cap=4, delegate_cap=4,
+    )
+    assert changed.state == "running"
+    with sqlite3.connect(ledger_path()) as connection:
+        assert connection.execute("SELECT limits_json FROM admission_configuration").fetchone()[0] == (
+            '{"queued":{"gateway":4},"running":{"gateway":4}}'
+        )
+    # A concurrent worker still owns a lease. Never silently resize its ledger.
+    with pytest.raises(ValueError, match="identical limits"):
+        admit_writer(
+            request_id="unsafe", caller=AdmissionCaller.KANBAN, workspace=str(third), priority=0,
+            writer_id="kanban:unsafe", kanban_cap=3, delegate_cap=3,
+        )
+    assert release_admission(changed.lease_id) is None
 
 
 def test_temp_home_rejects_unisolated_delegate_and_records_durable_reason(tmp_path, monkeypatch):
