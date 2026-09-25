@@ -3,9 +3,9 @@ deleted WAL generation (regression for #116244, sibling of #105567).
 
 ``append_message`` already probes the replaced/lost generation INSIDE ``_lock`` so it can only see
 the stable post-close state; ``optimize_fts``, ``rebuild_fts``, ``vacuum`` and the SQLite-error
-branch of ``_execute_write`` probed outside it and could observe the mid-teardown window (sidecars
-unlinked, identity not yet cleared), setting the sticky ``_db_wal_generation_lost`` flag on a
-healthy handle. ``normal`` is the control.
+branch of ``_execute_write`` probed outside it and could observe the mid-teardown window (connection
+closed, identity not yet cleared; SQLite may or may not unlink sidecars on close), setting the sticky
+``_db_wal_generation_lost`` flag on a healthy handle. ``normal`` is the control.
 """
 import sqlite3
 import threading
@@ -56,7 +56,11 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
     def paused_close(connection):
         close(connection)
         if connection is conn:
-            assert not path.with_name(path.name + "-wal").exists(), "real close did not end WAL"
+            # Where supported, NO_CKPT_ON_CLOSE intentionally keeps WAL sidecars; synchronize on the
+            # real connection close, before SessionDB clears the recorded generation below this helper.
+            with pytest.raises(sqlite3.ProgrammingError):
+                connection.execute("SELECT 1")
+            assert db._conn is None and db._db_sidecar_identity
             closed.set()
             assert progress.wait(10), "writer reached neither guard nor lock"
 

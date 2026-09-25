@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import unittest
 from pathlib import Path
+from hermes_yaml import safe_load
 
 ROOT = next(parent for parent in Path(__file__).resolve().parents if (parent / ".git").exists())
 SCRIPT = ROOT / "scripts" / "verify-exact-main-ci.py"
@@ -131,17 +132,15 @@ class ExactMainCiGateTests(unittest.TestCase):
             self.assertIn(flag, result.stdout)
 
     def test_publish_gate_waits_for_ci(self):
-        import yaml
         text = (ROOT / ".github/workflows/" / self.workflow_name).read_text()
-        publish = yaml.safe_load(text)["jobs"][self.job_name]["steps"]
+        publish = safe_load(text)["jobs"][self.job_name]["steps"]
         gates = [s for s in publish if "scripts/verify-exact-main-ci.py" in s.get("run", "")]
         self.assertEqual(len(gates), 1)
         self.assertIn("--wait", gates[0]["run"])
 
     def test_gate_authenticates_github_api(self):
-        import yaml
         text = (ROOT / ".github/workflows/" / self.workflow_name).read_text()
-        jobs = yaml.safe_load(text)["jobs"]
+        jobs = safe_load(text)["jobs"]
         gates = [s for j in jobs.values() for s in j.get("steps", [])
                  if "scripts/verify-exact-main-ci.py" in s.get("run", "")]
         self.assertTrue(gates)

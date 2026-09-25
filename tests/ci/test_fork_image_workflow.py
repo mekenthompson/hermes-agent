@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from hermes_yaml import safe_load
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/fork-agent-image.yml"
@@ -33,7 +34,6 @@ class ForkImageWorkflowTests(unittest.TestCase):
             self.assertTrue(path.is_file(), path)
 
     def test_workflow_publishes_main_pushes_and_manual_dispatches_only(self) -> None:
-        import yaml
 
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertRegex(text, r"(?m)^\s*pull_request:\s*$")
@@ -43,7 +43,7 @@ class ForkImageWorkflowTests(unittest.TestCase):
         self.assertIn("type: boolean", text)
         self.assertIn("default: false", text)
         self.assertIn("environment: agent-image-publish", text)
-        workflow = yaml.safe_load(text)
+        workflow = safe_load(text)
         self.assertEqual(sorted(workflow[True]), ["pull_request", "push", "workflow_dispatch"])
         self.assertEqual(workflow[True]["push"], {"branches": ["main"]})
         preflight = " ".join(workflow["jobs"]["preflight"]["if"].split())
@@ -69,10 +69,9 @@ class ForkImageWorkflowTests(unittest.TestCase):
         self.assertEqual(concurrency["cancel-in-progress"], "${{ github.event_name == 'pull_request' }}")
 
     def test_publish_waits_for_exact_main_ci_before_registry_write(self) -> None:
-        import yaml
 
         text = WORKFLOW.read_text(encoding="utf-8")
-        steps = yaml.safe_load(text)["jobs"]["publish"]["steps"]
+        steps = safe_load(text)["jobs"]["publish"]["steps"]
         names = [step.get("name", "") for step in steps]
         gate = next(i for i, step in enumerate(steps) if "scripts/verify-exact-main-ci.py" in step.get("run", ""))
         self.assertIn("--wait", steps[gate]["run"])

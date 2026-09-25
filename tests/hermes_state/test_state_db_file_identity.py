@@ -28,6 +28,18 @@ def _make_db(path: Path, session_id: str, content: str) -> SessionDB:
     return db
 
 
+def _checkpoint_and_clear_sidecars(path: Path) -> None:
+    """Make a closed database safe to replace by its main file alone."""
+    conn = sqlite3.connect(str(path))
+    try:
+        busy, _, _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        assert busy == 0
+    finally:
+        conn.close()
+    for suffix in ("-wal", "-shm", "-journal"):
+        Path(f"{path}{suffix}").unlink(missing_ok=True)
+
+
 def _require_identity(db: SessionDB) -> None:
     if db._db_file_identity is None:
         pytest.skip("filesystem does not expose st_dev/st_ino for identity checks")
@@ -115,8 +127,12 @@ def test_new_sessiondb_on_replaced_path_records_new_identity(tmp_path):
     old_id = db._db_file_identity
     _require_identity(db)
     db.close()
+    # os.replace below moves only the main file. Retire the closed target's
+    # WAL generation first, or SQLite can replay it over the replacement.
+    _checkpoint_and_clear_sidecars(live)
     alt = _make_db(other, "t", "b")
     alt.close()
+    _checkpoint_and_clear_sidecars(other)
     os.replace(other, live)
     reopened = SessionDB(db_path=live)
     try:

@@ -164,7 +164,7 @@ jobs:
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.workers || '' }}
+          HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && matrix.workers || (matrix.marker == 'windows' && '2' || '') }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
           OPENROUTER_API_KEY: ''
