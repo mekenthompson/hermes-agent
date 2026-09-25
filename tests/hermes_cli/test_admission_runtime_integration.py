@@ -113,6 +113,24 @@ def test_idle_ledger_adopts_new_configured_capacity_but_live_work_blocks_migrati
         )
     assert release_admission(changed.lease_id) is None
 
+    # An abandoned lease past its expiry is not live work. Reap it under the
+    # same writer lock before deciding whether the changed cap is safe.
+    abandoned = admit_writer(
+        request_id="abandoned", caller=AdmissionCaller.KANBAN, workspace=str(third), priority=0,
+        writer_id="kanban:abandoned", kanban_cap=4, delegate_cap=4,
+    )
+    assert abandoned.state == "running"
+    with sqlite3.connect(ledger_path()) as connection:
+        connection.execute("UPDATE admission_requests SET lease_expires_at = 1 WHERE request_id = 'abandoned'")
+    recovered = admit_writer(
+        request_id="recovered", caller=AdmissionCaller.DELEGATE, workspace=str(second), priority=0,
+        writer_id="delegate:recovered", kanban_cap=3, delegate_cap=3,
+    )
+    assert recovered.state == "running"
+    with sqlite3.connect(ledger_path()) as connection:
+        assert connection.execute("SELECT state FROM admission_requests WHERE request_id = 'abandoned'").fetchone()[0] == "expired"
+    release_admission(recovered.lease_id)
+
 
 def test_temp_home_rejects_unisolated_delegate_and_records_durable_reason(tmp_path, monkeypatch):
     home = tmp_path / "home"

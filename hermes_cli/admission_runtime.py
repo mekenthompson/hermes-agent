@@ -229,6 +229,14 @@ def _reconcile_idle_limits(connection: sqlite3.Connection, capacity: int) -> Non
     try:
         row = connection.execute("SELECT limits_json FROM admission_configuration WHERE singleton = 1").fetchone()
         if row is not None and row["limits_json"] != desired:
+            # Normal admission reaps expired leases, but cannot start while its
+            # constructor rejects a changed cap. Reap them under this same lock.
+            connection.execute(
+                "UPDATE admission_requests SET state = 'expired', lease_id = NULL, "
+                "lease_expires_at = NULL, reason = 'lease_expired' "
+                "WHERE state = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?",
+                (int(time.time()),),
+            )
             active = connection.execute(
                 "SELECT 1 FROM admission_requests WHERE state IN ('queued', 'running') LIMIT 1"
             ).fetchone()
