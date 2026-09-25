@@ -281,6 +281,12 @@ class CodexAppServerClient:
 
     def stderr_tail(self, n: int = 20) -> list[str]:
         """Return last n lines of codex's stderr (for error reports)."""
+        if self._proc.poll() is not None:
+            # Process exit and the stderr pump are independent: poll() can see a
+            # dead child before its final flushed lines have been appended.
+            # Drain briefly before taking the snapshot; bound the wait because
+            # descendants may inherit the stderr pipe and keep the reader open.
+            self._stderr_reader.join(timeout=1.0)
         with self._stderr_lock:
             return list(self._stderr_lines[-n:])
 
