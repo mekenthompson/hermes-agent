@@ -213,6 +213,42 @@ def _git_ref_exists(workspace: Path, ref: str) -> bool:
     return result.returncode == 0
 
 
+def _reconcile_idle_limits(connection: sqlite3.Connection, capacity: int) -> None:
+    """Apply a changed launch cap only while the shared ledger has no live reservations."""
+    tables = {
+        row["name"] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('admission_configuration', 'admission_requests')"
+        )
+    }
+    if tables != {"admission_configuration", "admission_requests"}:
+        return
+    desired = json.dumps({"queued": {"gateway": capacity}, "running": {"gateway": capacity}},
+                         sort_keys=True, separators=(",", ":"))
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        row = connection.execute("SELECT limits_json FROM admission_configuration WHERE singleton = 1").fetchone()
+        if row is not None and row["limits_json"] != desired:
+            # Normal admission reaps expired leases, but cannot start while its
+            # constructor rejects a changed cap. Reap them under this same lock.
+            connection.execute(
+                "UPDATE admission_requests SET state = 'expired', lease_id = NULL, "
+                "lease_expires_at = NULL, reason = 'lease_expired' "
+                "WHERE state = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?",
+                (int(time.time()),),
+            )
+            active = connection.execute(
+                "SELECT 1 FROM admission_requests WHERE state IN ('queued', 'running') LIMIT 1"
+            ).fetchone()
+            if active is not None:
+                raise ValueError("all controllers sharing an admission ledger must use identical limits")
+            connection.execute("UPDATE admission_configuration SET limits_json = ? WHERE singleton = 1", (desired,))
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+
+
 def admit_writer(
     *, request_id: str, caller: AdmissionCaller, workspace: str | None, priority: int,
     writer_id: str, dependencies: Iterable[str] = (), unresolved_dependencies: Iterable[str] = (),
@@ -239,6 +275,7 @@ def admit_writer(
         return _reject(request_id, caller, code, str(exc))
     connection = _connect()
     try:
+        _reconcile_idle_limits(connection, capacity)
         controller = AdmissionController(connection, AdmissionLimits(running={"gateway": capacity}, queued={"gateway": capacity}))
         admission = controller.admit(request)
         if admission.state == "rejected":

@@ -1442,6 +1442,25 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
 
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_luna_max_child_effort_beats_parent_model_reasoning(self, MockAgent, mock_cfg):
+        """An explicit child effort must win even when the parent model has another override."""
+        mock_cfg.return_value = {"model": "gpt-6-luna", "provider": "openai-codex",
+                                 "max_iterations": 50, "reasoning_effort": "max"}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "high"}
+
+        _build_child_agent(
+            task_index=0, goal="test", context=None, toolsets=None,
+            model="gpt-6-luna", max_iterations=50, parent_agent=parent,
+            task_count=1,
+        )
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(call_kwargs["model"], "gpt-6-luna")
+        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "max"})
+
 # =========================================================================
 # Dispatch helper, progress events, concurrency
 # =========================================================================
