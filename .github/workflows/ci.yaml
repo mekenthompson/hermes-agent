@@ -48,7 +48,9 @@ jobs:
   detect:
     name: Detect affected areas
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    # Full-history checkout of a large upstream alignment can exceed one minute
+    # on hosted runners before classification even starts.
+    timeout-minutes: 10
     outputs:
       python: ${{ steps.classify.outputs.python }}
       python_prod: ${{ steps.classify.outputs.python_prod }}
@@ -150,6 +152,14 @@ jobs:
     #   if: ${{ needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' }}
     if: false
     uses: ./.github/workflows/e2e-desktop.yml
+
+  e2e-desktop-core:
+    name: Desktop core E2E
+    needs: detect
+    # The deterministic core suite (apps/desktop/e2e/core): transcript
+    # integrity, boot/respawn/orphans, clarify+approval. Required; retries 0.
+    if: ${{ needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' }}
+    uses: ./.github/workflows/e2e-desktop-core.yml
 
   docs-site:
     name: Docs Site
@@ -266,6 +276,7 @@ jobs:
       - installer-tests
       - rust-tests
       - e2e-desktop
+      - e2e-desktop-core
       - docs-site
       - history-check
       - contributor-check

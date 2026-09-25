@@ -66,7 +66,11 @@ def is_mapped(email: str) -> bool:
         return True
     if ID_NOREPLY_RE.search(email):
         return True
-    if (REPO_ROOT / "contributors" / "emails" / email).is_file():
+    emails_dir = REPO_ROOT / "contributors" / "emails"
+    if (emails_dir / email).is_file():
+        return True
+    folded = email.casefold()
+    if emails_dir.is_dir() and any(path.name.casefold() == folded for path in emails_dir.iterdir()):
         return True
     release_py = REPO_ROOT / "scripts" / "release.py"
     try:

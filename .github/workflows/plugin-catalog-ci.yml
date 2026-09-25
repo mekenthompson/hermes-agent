@@ -75,7 +75,7 @@ jobs:
         if: steps.changed.outputs.files != ''
         uses: ./.github/actions/retry
         with:
-          command: pip install -e .
+          command: pip install -e . 'aiohttp==3.14.3'
 
       - name: Clone each entry at its pinned sha and validate
         if: steps.changed.outputs.files != ''
