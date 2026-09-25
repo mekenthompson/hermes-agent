@@ -279,7 +279,7 @@ def _fs_read_text_file(params: dict[str, Any], cwd: str) -> Any:
     if block_error := get_read_block_error(str(path)):
         raise PermissionError(block_error)
     try:
-        content = path.read_text(encoding="utf-8")
+        content = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         content = ""
     line, limit = params.get("line"), params.get("limit")

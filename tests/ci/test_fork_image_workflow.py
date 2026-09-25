@@ -129,19 +129,22 @@ class ForkImageWorkflowTests(unittest.TestCase):
         self.assertIn("platforms: linux/amd64", text)
         self.assertIn("load: true", text)
         self.assertIn("push: false", text)
-        self.assertIn("HERMES_GIT_SHA=${{ github.sha }}", text)
+        self.assertEqual(text.count("name: Write image install stamp"), 2)
+        self.assertEqual(text.count("--commit \"$GITHUB_SHA\""), 2)
+        self.assertNotIn("HERMES_GIT_SHA=${{ github.sha }}", text)
         self.assertIn("/etc/hermes/image-provenance.json", text)
         self.assertIn("anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26", text)
         self.assertIn("aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25", text)
         self.assertIn("severity: CRITICAL", text)
         self.assertIn("exit-code: 1", text)
 
-    def test_node_source_pin_contains_fixed_bundled_tar(self) -> None:
+    def test_node_runtime_is_sha_pinned_by_pm_not_a_legacy_base_image(self) -> None:
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-        vulnerable = "sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73"
-        fixed = "sha256:367679cf9792759492a486e4aa4b421764d71a9546a6dae8aab81a99eb797b3e"
-        self.assertNotIn(vulnerable, dockerfile)
-        self.assertIn(f"FROM node:26-bookworm-slim@{fixed} AS node_source", dockerfile)
+        lock = json.loads((ROOT / "pm/lock.json").read_text(encoding="utf-8"))
+        node = lock["packages"]["node"]
+        assert node["version"] == "26.7.0"
+        assert len(node["artifacts"]["linux-x64"]["sha256"]) == 64
+        self.assertNotIn("AS node_source", dockerfile)
 
     def test_publish_promotes_the_scanned_candidate_without_rebuilding(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
