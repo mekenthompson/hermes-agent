@@ -26,6 +26,7 @@ class TurnState:
     ctx: Any = None
     started_ts: float = 0.0  # 0.0 = not running
     lease: Any = None  # cross-process active-session slot lease
+    worker_done: Any = None  # physical worker Event; an asyncio wrapper is not completion proof
     busy_ack_ts: float = 0.0  # debounce; 0.0 = never acked
     # Held turn-lease tokens keyed by acquiring run generation: release/rebind resolve the
     # token for their own generation, so a displaced turn's unwind frees only its own lease and
@@ -34,7 +35,7 @@ class TurnState:
 
     def clear(self) -> None:
         """Reset the per-turn slot.  The caller pops ``lease`` first to release it."""
-        self.agent = self.lease = self.event = self.ctx = None
+        self.agent = self.lease = self.event = self.ctx = self.worker_done = None
         self.started_ts = self.busy_ack_ts = 0.0
 
 

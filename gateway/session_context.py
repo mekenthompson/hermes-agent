@@ -38,6 +38,7 @@ _SESSION_VARS = (
     _SESSION_UI_SESSION_ID, _SESSION_MESSAGE_ID, _SESSION_PROFILE,
     _BROWSER_CONTROL_PRINCIPAL, _BROWSER_CONTROL_TRANSPORT_FAMILY,
     _BROWSER_CONTROL_PROVIDER, _BROWSER_CONTROL_SUBJECT, _CRON_SESSION, _SESSION_PARENT_CHAT_ID,
+    _SESSION_RUN_GENERATION,
 ) = tuple(ContextVar(name, default=_UNSET) for name in (
     "HERMES_SESSION_PLATFORM", "HERMES_SESSION_SOURCE", "HERMES_SESSION_CHAT_ID",
     "HERMES_SESSION_CHAT_TYPE", "HERMES_SESSION_CHAT_NAME", "HERMES_SESSION_THREAD_ID",
@@ -46,7 +47,7 @@ _SESSION_VARS = (
     "HERMES_UI_SESSION_ID", "HERMES_SESSION_MESSAGE_ID", "HERMES_SESSION_PROFILE",
     "HERMES_BROWSER_CONTROL_PRINCIPAL", "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY",
     "HERMES_BROWSER_CONTROL_PROVIDER", "HERMES_BROWSER_CONTROL_SUBJECT",
-    "HERMES_CRON_SESSION", "HERMES_SESSION_PARENT_CHAT_ID",
+    "HERMES_CRON_SESSION", "HERMES_SESSION_PARENT_CHAT_ID", "HERMES_SESSION_RUN_GENERATION",
 ))
 
 # Whether this channel can route an ASYNC completion back AFTER the turn ends (see
@@ -92,6 +93,17 @@ def set_current_session_id(session_id: str) -> None:
     except Exception:
         pass
     os.environ["HERMES_SESSION_ID"] = session_id
+
+
+def set_session_run_generation(generation: int) -> None:
+    """Bind the gateway claim to tool invocations in this turn's task context."""
+    _SESSION_RUN_GENERATION.set(str(generation))
+
+
+def get_session_run_generation() -> int | None:
+    """Return only a gateway-bound generation, never an ambient environment value."""
+    value = _SESSION_RUN_GENERATION.get()
+    return int(value) if isinstance(value, str) and value.isdigit() and int(value) > 0 else None
 
 
 @contextmanager
@@ -140,6 +152,7 @@ def set_session_vars(
         user_name, scope_id, session_key, session_id, ui_session_id, message_id, profile,
         browser_control_principal, browser_control_transport_family, browser_control_provider,
         browser_control_subject, cron_session, parent_chat_id,
+        "",
     )
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))

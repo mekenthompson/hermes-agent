@@ -443,6 +443,7 @@ class GatewayAgentCacheMixin:
 
     def _interrupt_running_turn(
         self, session_key: str, *, interrupt_reason: str, invalidation_reason: str, tool_reason: str | None = None,
+        delivery_report: dict | None = None,
     ) -> int:
         """Sync core shared by /stop, /new and eviction: request a hard interrupt on the in-flight
         agent, invalidate its run generation, and reap the tool processes that turn spawned.
@@ -452,13 +453,18 @@ class GatewayAgentCacheMixin:
         from gateway.run import _AGENT_PENDING_SENTINEL, _reap_gateway_turn_processes, request_hard_interrupt
         state = self._peek_session_state(session_key)
         running_agent = state.turn.agent if state else None
+        if delivery_report is not None:
+            delivery_report["interrupt"] = "prelaunch" if running_agent is _AGENT_PENDING_SENTINEL else "unsupported"
+            delivery_report["reap"] = "none"
         _process_task_id, _process_baseline = "", None
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             # A raising interrupt implementation must not leave the slot unroutable: the generation
             # bump and release below are the cleanup that matters.
             with _log_suppressed(logging.WARNING, "Failed to interrupt running agent for %s; continuing",
                                  session_key, exc_info=True):
-                request_hard_interrupt(running_agent, interrupt_reason, tool_reason=tool_reason)
+                delivered = request_hard_interrupt(running_agent, interrupt_reason, tool_reason=tool_reason)
+                if delivery_report is not None and delivered:
+                    delivery_report["interrupt"] = "delivered"
             _process_task_id = getattr(running_agent, "_gateway_turn_process_task_id", "")
             _process_baseline = getattr(running_agent, "_gateway_turn_process_baseline", None)
         # Bump the generation BEFORE scheduling the reap thread and capture the post-bump value:
@@ -467,21 +473,29 @@ class GatewayAgentCacheMixin:
         # covers its cleanup, so nothing stays unreaped.
         _generation_at_interrupt = self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
         if _process_task_id and _process_baseline is not None:
-            threading.Thread(
-                target=copy_context().run,
-                args=(_reap_gateway_turn_processes, _process_task_id, _process_baseline),
-                kwargs={
-                    "source": "gateway_turn_interrupt",
-                    "is_still_current": lambda: self._is_session_run_current(session_key, _generation_at_interrupt),
-                },
-                name=f"gateway-turn-reaper-{_process_task_id[:12]}",
-                daemon=True,
-            ).start()
+            try:
+                threading.Thread(
+                    target=copy_context().run,
+                    args=(_reap_gateway_turn_processes, _process_task_id, _process_baseline),
+                    kwargs={
+                        "source": "gateway_turn_interrupt",
+                        "is_still_current": lambda: self._is_session_run_current(session_key, _generation_at_interrupt),
+                    },
+                    name=f"gateway-turn-reaper-{_process_task_id[:12]}",
+                    daemon=True,
+                ).start()
+                if delivery_report is not None:
+                    delivery_report["reap"] = "scheduled"
+            except Exception:
+                logger.warning("Failed to start turn process reaper for %s", session_key, exc_info=True)
+                if delivery_report is not None:
+                    delivery_report["reap"] = "failed"
         return _generation_at_interrupt
 
     async def _interrupt_and_clear_session(
         self, session_key: str, source: SessionSource, *, interrupt_reason: str,
         invalidation_reason: str, release_running_state: bool = True,
+        delivery_report: dict | None = None,
     ) -> None:
         """Interrupt the current run and clear queued session state consistently."""
         if not session_key:
@@ -490,6 +504,7 @@ class GatewayAgentCacheMixin:
         running_agent = state.turn.agent if state else None
         _generation_at_interrupt = self._interrupt_running_turn(
             session_key, interrupt_reason=interrupt_reason, invalidation_reason=invalidation_reason,
+            delivery_report=delivery_report,
         )
         from gateway.run import _AGENT_PENDING_SENTINEL
         # The turn's hard interrupt reaches only its in-turn children; background delegations were
@@ -518,12 +533,30 @@ class GatewayAgentCacheMixin:
                 logger.debug("agent_loop_stopped hook dispatch failed", exc_info=True)
         adapter = self._delivery_adapter_for(source)
         interrupt_session_activity = getattr(type(adapter), "interrupt_session_activity", None)
+        if delivery_report is not None:
+            delivery_report["activity_clear"] = "none"
+        activity_waited = False
         if adapter and callable(interrupt_session_activity):
-            metadata = self._thread_metadata_for_source(source)
-            if _accepts_keyword(interrupt_session_activity, "metadata"):
-                await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
+            async def _clear_activity():
+                metadata = self._thread_metadata_for_source(source)
+                if _accepts_keyword(interrupt_session_activity, "metadata"):
+                    await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
+                else:
+                    await adapter.interrupt_session_activity(session_key, source.chat_id)
+            if delivery_report is None:
+                activity_waited = True
+                await _clear_activity()
             else:
-                await adapter.interrupt_session_activity(session_key, source.chat_id)
+                try:
+                    activity_waited = True
+                    await _clear_activity()
+                except Exception:
+                    logger.warning("Failed to clear adapter activity for %s", session_key, exc_info=True)
+                    delivery_report["activity_clear"] = "failed"
+                else:
+                    delivery_report["activity_clear"] = "completed"
+        if activity_waited and not self._is_session_run_current(session_key, _generation_at_interrupt):
+            return  # a successor claimed the slot during interrupt_session_activity
         if adapter and hasattr(adapter, "get_pending_message"):
             # Discard a stale human follow-up (the slot held only user text when /stop started doing
             # this, 59575d6a917) — but an internal wake (async-delegation completion, notify+wake)
