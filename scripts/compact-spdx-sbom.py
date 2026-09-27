@@ -53,7 +53,7 @@ def main() -> int:
     if args.max_bytes <= 0:
         raise SystemExit("--max-bytes must be positive")
 
-    document = json.loads(args.input.read_text(encoding="utf-8"))
+    document = json.loads(args.input.read_text(encoding="utf-8-sig"))
     packages = document.get("packages")
     files = document.get("files")
     relationships = document.get("relationships")

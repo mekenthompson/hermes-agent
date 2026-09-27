@@ -23,7 +23,7 @@ def main() -> int:
     args = parse_args()
     if not DIGEST.fullmatch(args.image_id):
         raise ValueError(f"invalid local image ID: {args.image_id!r}")
-    manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    manifest = json.loads(args.manifest.read_text(encoding="utf-8-sig"))
     if not isinstance(manifest, dict):
         raise ValueError("remote manifest must be an object")
     config = manifest.get("config")

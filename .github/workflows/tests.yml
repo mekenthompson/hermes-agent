@@ -96,7 +96,6 @@ jobs:
         # No --files: the runner discovers the suite itself. The discovered
         # set is identical to the list the removed matrix job used to pass in.
         run: |
-          source .venv/bin/activate
           scripts/run_tests.sh --slice ${{ matrix.slice }}/${{ matrix.slices }}
         env:
           # This is the maximum number of test FILES that run together.
