@@ -527,6 +527,7 @@ class CopilotACPClient:
             threading.Thread(target=_pump, args=(proc.stdout, lambda line: enqueue(_decode(line))), daemon=True, name="acp-pump"),
             threading.Thread(target=_pump, args=(proc.stderr, lambda line: stderr_tail.append(line.rstrip("\n"))), daemon=True, name="acp-pump"),
         ]
+        stderr_pump = pumps[1]
         for thread in pumps:
             thread.start()
         request_ids = iter(range(1, 1 << 62))
