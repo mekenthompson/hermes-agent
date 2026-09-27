@@ -2061,6 +2061,8 @@ class GatewayTurnMixin:
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
+        from gateway.session_context import set_session_run_generation
+        set_session_run_generation(run_generation)
         # Self-injected turns (MessageEvent(internal=True)) persist with a DB-only display_kind so
         # UIs render timeline notices, not user bubbles; role/content untouched.
         persist_user_display_kind = display_kind_for_event(event)
@@ -3287,8 +3289,7 @@ class GatewayTurnMixin:
                     "Skipping stale agent promotion for %s — generation %s is no longer current",
                     session_key or "", run_generation,
                 )
-                if execution_id is not None:
-                    turn_ctx.execution_launch_allowed = False
+                turn_ctx.execution_launch_allowed = False
                 return
             allowed = self._promote_running_agent(
                 session_key=session_key, run_generation=run_generation, agent=agent_holder[0],
@@ -3296,8 +3297,7 @@ class GatewayTurnMixin:
             )
             # The executor thread waits at TurnRunner's launch fence.  An accepted Stop before
             # promotion must return without entering run_conversation, not strand the thread.
-            if execution_id is not None:
-                turn_ctx.execution_launch_allowed = allowed
+            turn_ctx.execution_launch_allowed = allowed
             if not allowed:
                 return
             self._session_state(session_key).turn.ctx = turn_ctx
@@ -3309,7 +3309,7 @@ class GatewayTurnMixin:
             # cancelled unconditionally in _run_agent_cleanup_turn_tasks, and any cancellation
             # between spawn and promotion used to park the worker thread forever.
             # execution_launch_allowed stays False unless promotion explicitly allowed launch.
-            if execution_id is not None and gate is not None:
+            if gate is not None:
                 gate.set()
 
     async def _run_agent_fire_pending_interrupt(
@@ -3465,6 +3465,10 @@ class GatewayTurnMixin:
                 else (lambda: True)
             ),
         )
+        if session_key and run_generation is not None and self._is_session_run_current(session_key, run_generation):
+            self._session_state(session_key).turn.worker_done = worker.worker_done
+        if session_key and run_generation is not None:
+            self._track_chat_stop_worker(session_key, run_generation, worker.worker_done)
 
         def _run_sync_with_timeout_lifecycle():
             try:
@@ -4293,7 +4297,7 @@ class GatewayTurnMixin:
         # Kept on the turn context only until promotion; an ID is never inferred
         # from a later live slot.
         turn_ctx.internal_plugin_execution_id = internal_plugin_execution_id
-        if internal_plugin_execution_id is not None:
+        if session_key and run_generation is not None:
             # A threading.Event crosses the executor boundary without treating cancellation
             # of its asyncio wrapper as physical worker completion.
             turn_ctx.execution_launch_gate = threading.Event()

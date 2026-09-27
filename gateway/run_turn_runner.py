@@ -1891,8 +1891,8 @@ class TurnRunner:
         unique_tags = (["[[audio_as_voice]]"] if has_voice_directive else []) + list(dict.fromkeys(media_tags))
         return final_response + "\n" + "\n".join(unique_tags)
 
-    def _await_execution_launch(self, execution_id: str) -> bool:
-        """Launch fence for an internal-plugin turn: True iff promotion allowed launch.
+    def _await_execution_launch(self, execution_id: str | None) -> bool:
+        """Launch fence for a gateway turn: True iff promotion allowed launch.
 
         A loop-side promotion decides this real thread boundary, so the wait is bounded: the
         setter lives in a cancellable task (the tracker is cancelled unconditionally during
@@ -1902,7 +1902,7 @@ class TurnRunner:
         ctx = self._ctx
         if not ctx.execution_launch_gate.wait(timeout=EXECUTION_LAUNCH_GATE_TIMEOUT):
             logger.warning(
-                "internal plugin launch fence timed out after %.0fs for session=%s execution=%s; "
+                "gateway launch fence timed out after %.0fs for session=%s execution=%s; "
                 "treating launch as denied",
                 EXECUTION_LAUNCH_GATE_TIMEOUT, ctx.session_key or "", execution_id,
             )
@@ -1976,7 +1976,7 @@ class TurnRunner:
             agent._pending_fallback_notice = pending_fallback_notice
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
         execution_id = ctx.internal_plugin_execution_id
-        if execution_id is not None and not self._await_execution_launch(execution_id):
+        if ctx.execution_launch_gate is not None and not self._await_execution_launch(execution_id):
             return {"final_response": "", "messages": [], "api_calls": 0,
                     "tools": [], "completed": True, "interrupted": True}
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
