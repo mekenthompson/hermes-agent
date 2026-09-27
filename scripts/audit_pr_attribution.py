@@ -13,7 +13,7 @@ Logic (kept in sync with contributor-check.yml):
   - skips teknium/bot emails and ``<id>+<login>@users.noreply.github.com``
     (CI auto-resolves those)
   - everything else must have ``contributors/emails/<email>`` or a legacy
-    AUTHOR_MAP entry in scripts/release.py
+    AUTHOR_MAP entry in scripts/releases/authors_legacy.py
 
 ``--fix`` resolution order for an unmapped email:
   1. bare ``<login>@users.noreply.github.com`` → ``<login>``, verified via
@@ -72,9 +72,9 @@ def is_mapped(email: str) -> bool:
     folded = email.casefold()
     if emails_dir.is_dir() and any(path.name.casefold() == folded for path in emails_dir.iterdir()):
         return True
-    release_py = REPO_ROOT / "scripts" / "release.py"
+    authors_py = REPO_ROOT / "scripts" / "releases" / "authors_legacy.py"
     try:
-        if f'"{email}"' in release_py.read_text(encoding="utf-8", errors="replace"):
+        if f'"{email}"' in authors_py.read_text(encoding="utf-8-sig", errors="replace"):
             return True
     except OSError:
         pass
