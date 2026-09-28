@@ -44,12 +44,11 @@ Lanes:
 * ``binary_artifacts`` — a changed image / archive file. The fork gates the
   committed-infographic and profile-archive tree checks on it; upstream runs
   those on every event regardless.
+* ``upgrade`` — fork-only applicability for real install/upgrade and packaged
+  Desktop update E2E. Only a small known backend-only set can disable it.
 
-Fork mode (``--fork`` / ``REPO=mekenthompson/hermes-agent``) refines only
-the ``.github/`` rule below: a workflow ci.yaml never calls cannot change
-what CI runs, and a workflow it does call only affects the lanes that gate
-it. Everything else in this file behaves identically upstream and in the
-fork.
+Fork mode (``--fork`` / ``REPO=mekenthompson/hermes-agent``) retains broad
+CI-plumbing coverage and scopes only known backend-only upgrade changes.
 
 Docker is not a lane — it builds on push-to-main and release only,
 never per-PR.
@@ -79,9 +78,10 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
+
+from scripts.ci.list_os_marked_tests import file_gates_on
 
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
 # Shipped page outside those packages, exercised by the desktop Electron suite.
@@ -179,7 +179,6 @@ _RUST_FILENAMES = {"Cargo.toml", "Cargo.lock"}
 # concurrency cap, so it scopes harder than upstream where this file marks it.
 FORK_REPOSITORY = "mekenthompson/hermes-agent"
 _FORK_IMAGE_WORKFLOW = ".github/workflows/fork-agent-image.yml"
-_CI_ORCHESTRATOR = ".github/workflows/ci.yaml"
 
 # OS-specific surfaces: a path fragment that names a platform, the files the
 # OS lanes' selection depends on, and anything the installer / desktop
@@ -197,6 +196,19 @@ _OS_TESTS_FILES = {
     "scripts/ci/list_os_marked_tests.py",
 }
 _OS_MARKER_RE = re.compile(r"\b(?:windows_only|macos_only)\b")
+_SHARED_NATIVE_RUNTIME_PATHS = (
+    "hermes_cli/update_", "hermes_cli/local_runtime/", "pm/",
+    "tools/environments/", "hermes_platform/", "scripts/build/launcher",
+)
+_SHARED_NATIVE_RUNTIME_FILES = {
+    "hermes_cli/update_cmd.py", "hermes_cli/update.py",
+    "hermes_cli/_launchers.py", "hermes_cli/relaunch.py", "hermes_cli/runtime_paths.py",
+    "scripts/build/mint_launchers.py",
+}
+_FORK_UPGRADE_UNRELATED_PREFIXES = (
+    "gateway/platforms/", "plugins/kanban/", "tests/agent/test_",
+    "tests/gateway/platforms/test_", "website/docs/",
+)
 
 # Tree checks the fork gates: committed infographics (images) and profile
 # archives. Mirrors the extensions those two checks reject.
@@ -268,17 +280,18 @@ def _is_os_marked_test(p: str, root: Path) -> bool:
     """Does the changed test file itself carry an OS marker?
 
     Reads only the changed file (never the whole tree), so a diff of N files
-    costs N small reads at most. A file that is gone from the checkout was
-    deleted by the diff; a deletion cannot break the OS lanes (their
-    zero-tests guard covers the last marked file), so it is not marked.
+    costs N small reads at most. A removed file's former marker is unknown,
+    so its native lanes stay selected.
     """
     if not (p.startswith("tests/") and p.endswith(".py")):
         return False
     try:
         text = (root / p).read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
-        return False
-    return bool(_OS_MARKER_RE.search(text))
+        return True
+    return bool(_OS_MARKER_RE.search(text)) or any(
+        file_gates_on(text, host) for host in ("macos", "windows")
+    )
 
 
 def _is_os_specific(p: str, root: Path) -> bool:
@@ -287,7 +300,8 @@ def _is_os_specific(p: str, root: Path) -> bool:
     Frontend and prose trees never can (they are not Python), whatever their
     name says — ``apps/bootstrap-installer`` is TypeScript.
     """
-    if _is_installer(p) or _is_desktop_updater(p) or p in _OS_TESTS_FILES:
+    if (_is_installer(p) or _is_desktop_updater(p) or p in _OS_TESTS_FILES
+            or p in _SHARED_NATIVE_RUNTIME_FILES or p.startswith(_SHARED_NATIVE_RUNTIME_PATHS)):
         return True
     if _py_irrelevant(p):
         return False
@@ -299,38 +313,9 @@ def _is_binary_artifact(p: str) -> bool:
     return p.lower().endswith(_BINARY_ARTIFACT_SUFFIXES)
 
 
-def _is_workflow(p: str) -> bool:
-    return p.startswith(".github/workflows/") and p.endswith((".yml", ".yaml"))
-
-
-def _ci_called_workflow_lanes(root: Path) -> dict[str, set[str]] | None:
-    """Map each workflow ci.yaml calls to the detect lanes gating that call.
-
-    ``{'.github/workflows/tests.yml': {'python'}, ...}``. A called workflow
-    whose job has no lane condition maps to an empty set. Returns ``None``
-    when ci.yaml cannot be parsed (no PyYAML, unreadable, malformed) so the
-    caller falls back to the upstream fail-open rule.
-    """
-    try:
-        import yaml
-    except ImportError:
-        return None
-    try:
-        ci = yaml.safe_load((root / _CI_ORCHESTRATOR).read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError, yaml.YAMLError):
-        return None
-    jobs = ci.get("jobs") if isinstance(ci, dict) else None
-    if not isinstance(jobs, dict):
-        return None
-    lanes: dict[str, set[str]] = {}
-    for job in jobs.values():
-        uses = job.get("uses") if isinstance(job, dict) else None
-        if not isinstance(uses, str) or not uses.startswith("./"):
-            continue
-        cond = job.get("if")
-        gates = set(re.findall(r"needs\.detect\.outputs\.(\w+) == 'true'", cond)) if isinstance(cond, str) else set()
-        lanes.setdefault(uses[2:], set()).update(gates)
-    return lanes
+def _unrelated_to_upgrade(p: str) -> bool:
+    """Narrow fork allowlist: these paths cannot change installer/update plumbing."""
+    return p.startswith(_FORK_UPGRADE_UNRELATED_PREFIXES)
 
 
 def _is_ci_review(p: str) -> bool:
@@ -349,28 +334,16 @@ def ci_review_files(files: list[str]) -> list[str]:
 def classify(files: list[str], *, fork: bool = False, root: Path | None = None) -> dict[str, bool]:
     """Map changed paths to ``{lane: should_run}``.
 
-    ``fork`` enables the fork-only ``.github/`` refinement (see the module
-    docstring); ``root`` is the checkout the changed paths are relative to
+    ``fork`` enables narrow upgrade applicability; ``root`` is the checkout
+    the changed paths are relative to
     (defaults to the repository this script lives in).
     """
     root = root or Path(__file__).resolve().parents[2]
     files = [f.strip() for f in files if f.strip()]
 
-    # Fork: a workflow ci.yaml never calls (fork-agent-image.yml, the
-    # scheduled / workflow_run automations) cannot change what CI runs, and a
-    # called workflow only affects the lanes gating its call. Only ci.yaml
-    # itself, composite actions, .github/scripts and anything unparseable
-    # keep the upstream run-everything rule. Scoped workflow files leave the
-    # per-path lane computation entirely: they are neither prose nor Python,
-    # so the ``python`` denylist would otherwise keep every lane on for them.
+    # CI plumbing can alter a called suite or its gate; select broadly.
     github = [f for f in files if f.startswith(".github/")]
-    scoped: list[str] = []
-    called: dict[str, set[str]] = {}
-    if fork and github:
-        parsed = _ci_called_workflow_lanes(root)
-        if parsed is not None and all(_is_workflow(f) and f != _CI_ORCHESTRATOR for f in github):
-            called, scoped, github = parsed, github, []
-    lane_files = [f for f in files if f not in scoped]
+    lane_files = files
 
     python = any(not _py_irrelevant(f) for f in lane_files)
     python_prod = any(not _py_irrelevant(f) and not _py_test_only(f) for f in lane_files)
@@ -409,15 +382,9 @@ def classify(files: list[str], *, fork: bool = False, root: Path | None = None) 
         "nix": python_prod or frontend or any(_is_nix(f) for f in lane_files),
         "os_tests": any(_is_os_specific(f, root) for f in lane_files),
         "binary_artifacts": any(_is_binary_artifact(f) for f in lane_files),
+        "upgrade": not fork or not files or any(not _unrelated_to_upgrade(f) for f in files),
     }
-    for f in scoped:
-        for lane in called.get(f, set()):
-            if lane in ret:
-                ret[lane] = True
-        if f == _FORK_IMAGE_WORKFLOW or "python_prod" in called.get(f, set()):
-            # A called workflow gated on python product changes rebuilds the image.
-            ret["docker"] = True
-    if not files or github:
+    if not files or github or (fork and any(f.startswith("scripts/ci/") for f in files)):
         ret["python"] = True
         ret["python_prod"] = True
         ret["docker"] = True
@@ -445,61 +412,6 @@ def classify(files: list[str], *, fork: bool = False, root: Path | None = None) 
     return ret
 
 
-def _pull_request_number() -> str | None:
-    """Read the PR number from the Actions event payload, if present."""
-    event_path = os.environ.get("GITHUB_EVENT_PATH")
-    if not event_path:
-        return None
-    try:
-        with open(event_path, encoding="utf-8-sig") as fh:
-            payload = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return None
-    number = (payload.get("pull_request") or {}).get("number")
-    return str(number) if number else None
-
-
-def pull_request_changed_files() -> list[str]:
-    """Recover the PR file list when the compare API returned nothing.
-
-    ``detect-changes`` calls ``repos/.../compare/base...head`` with raw SHAs.
-    A fork force-push can 404 for ~30s until GitHub attaches the new head SHA
-    to the base repo, so the action fails open with an empty file list. That
-    forces ``ci_review=true`` and blocks the PR on a ``ci-reviewed`` label
-    even when no CI-sensitive file changed.
-
-    The pull-request files endpoint already knows the PR's files (it is how
-    this action used to classify), so use it as a fallback on pull_request
-    events only. Push/dispatch keep the empty-diff fail-open.
-    """
-    if os.environ.get("EVENT_NAME") != "pull_request":
-        return []
-    repo = os.environ.get("REPO") or os.environ.get("GITHUB_REPOSITORY") or ""
-    pr = _pull_request_number()
-    if not repo or not pr:
-        return []
-    try:
-        completed = subprocess.run(
-            [
-                "gh",
-                "api",
-                "--paginate",
-                f"repos/{repo}/pulls/{pr}/files",
-                "--jq",
-                ".[].filename",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    if completed.returncode != 0:
-        return []
-    return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
-
-
 def is_fork(argv: list[str] | None = None, environ: "os._Environ[str] | dict[str, str] | None" = None) -> bool:
     """``--fork`` on the command line, or REPO / GITHUB_REPOSITORY naming the fork."""
     argv = sys.argv[1:] if argv is None else argv
@@ -510,15 +422,6 @@ def is_fork(argv: list[str] | None = None, environ: "os._Environ[str] | dict[str
 
 def main() -> int:
     files = sys.stdin.read().splitlines()
-    if not any(f.strip() for f in files):
-        recovered = pull_request_changed_files()
-        if recovered:
-            print(
-                f"compare API returned no files; recovered {len(recovered)} "
-                "path(s) from the pull request files endpoint",
-                file=sys.stderr,
-            )
-            files = recovered
     lanes = classify(files, fork=is_fork())
     out = "\n".join([
         *(f"{key}={str(value).lower()}" for key, value in lanes.items()),
