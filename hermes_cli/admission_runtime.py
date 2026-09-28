@@ -162,7 +162,7 @@ def _reject(request_id: str, caller: AdmissionCaller, reason: AdmissionErrorCode
 
 def _git(workspace: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(workspace), *args], text=True, capture_output=True, timeout=15, check=False,
+        ["git", "-C", str(workspace), *args], text=True, encoding="utf-8", capture_output=True, timeout=15, check=False,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()

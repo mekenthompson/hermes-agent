@@ -450,7 +450,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None, *, gh: GhRunner = run_gh) -> int:
     args = build_parser().parse_args(argv)
     try:
-        payload = json.loads(args.manifest.read_text(encoding="utf-8"))
+        payload = json.loads(args.manifest.read_text(encoding="utf-8-sig"))
         manifest = validate_manifest(payload, expected_revision=args.expected_revision)
         github = GitHub(args.fleet_repo, gh)
         result = ensure_pin_pr(github, manifest, source_run_url=args.source_run_url, dry_run=args.dry_run)

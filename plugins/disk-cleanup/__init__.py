@@ -7,8 +7,8 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
+import os
 import re
 import shlex
 import threading
@@ -27,7 +27,12 @@ _lock = threading.Lock()
 _SESSION_END_MODES = frozenset({"report_only", "cleanup", "disabled"})
 _MAX_REPORTED_CANDIDATES = 100
 
-_TERMINAL_PATH_REGEX = re.compile(r"(?:^|\s)(/[^\s'\"`]+|\~/[^\s'\"`]+)")
+
+# Tool-call result shapes we can parse
+_WRITE_FILE_PATH_KEY = "path"
+_TERMINAL_PATH_REGEX = re.compile(
+    r"(?:^|\s)(/[^\s'\"`]+|~/[^\s'\"`]+|[A-Za-z]:[\\/][^\s'\"`]+)"
+)
 
 
 def _extract_path_arg(args: Dict[str, Any], result: str) -> Set[str]:
@@ -41,8 +46,19 @@ def _extract_paths_from_terminal(args: Dict[str, Any], result: str) -> Set[str]:
     paths: Set[str] = set()
     cmd = args.get("command") or ""
     if isinstance(cmd, str) and cmd:
-        with contextlib.suppress(ValueError):  # tokenise — catches `touch /tmp/hermes-x/test_foo.py`
-            paths.update(tok for tok in shlex.split(cmd, posix=True) if tok.startswith(("/", "~")))
+        # Tokenise the command — catches `touch /tmp/hermes-x/test_foo.py`.
+        # ``posix`` follows the host so Windows backslash paths survive
+        # (``shlex.split(posix=True)`` would eat them as escapes).
+        # Non-posix mode keeps quote characters in tokens, so strip a fully
+        # wrapping pair (`"C:\file"` → `C:\file`) before matching.
+        try:
+            for tok in shlex.split(cmd, posix=os.name == "posix"):
+                if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ("'", '"'):
+                    tok = tok[1:-1]
+                if tok.startswith(("/", "~")) or re.match(r"^[A-Za-z]:[\\/]", tok):
+                    paths.add(tok)
+        except ValueError:
+            pass
     # Only scan the result text if it's a reasonable size (avoid 50KB dumps).
     if isinstance(result, str) and len(result) < 4096:
         paths.update(_TERMINAL_PATH_REGEX.findall(result))
@@ -94,7 +110,7 @@ def _session_end_mode() -> str:
             config_paths.append(managed_dir / "config.yaml")
         for config_path in config_paths:
             try:
-                with open(config_path, encoding="utf-8") as f:
+                with open(config_path, encoding="utf-8-sig") as f:
                     user_config = fast_safe_load(f)
             except FileNotFoundError:
                 pass  # No user config is the historical cleanup-default state.

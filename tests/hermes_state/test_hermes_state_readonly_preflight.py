@@ -26,7 +26,7 @@ import hermes_state
 from hermes_state import SessionDB, preflight_db_writability
 
 pytestmark = [
-    pytest.mark.skipif(sys.platform == "win32", reason="POSIX chmod semantics"),
+    pytest.mark.platforms("posix"),  # POSIX chmod semantics
     pytest.mark.skipif(
         hasattr(os, "geteuid") and os.geteuid() == 0,
         reason="root bypasses file permission checks",
@@ -152,6 +152,20 @@ class TestSkips:
         before = stat.S_IMODE(db.stat().st_mode)
         preflight_db_writability(db)
         assert stat.S_IMODE(db.stat().st_mode) == before
+
+    def test_vanished_file_is_not_reported_as_read_only(self, hermes_home, monkeypatch):
+        db = hermes_home / "state.db"
+        db.write_bytes(b"\0" * 64)
+        real_access = os.access
+
+        def access(path, mode, *args, **kwargs):
+            if Path(path) == db:
+                db.unlink()
+                return False
+            return real_access(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "access", access)
+        preflight_db_writability(db)
 
 
 class TestSessionDBIntegration:

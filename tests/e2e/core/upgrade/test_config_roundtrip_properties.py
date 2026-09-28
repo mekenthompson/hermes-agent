@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from tests.e2e.core._pending_fixes import known_failure
 from tests.e2e.core.upgrade._helpers import WORKTREE, isolated_env
@@ -236,7 +236,12 @@ def _value_for(default: Any, rng: random.Random, *, long: bool, env: dict[str, s
     if roll < 0.08:
         return None
     if roll < 0.18:
-        return copy.deepcopy(default) if not isinstance(default, (dict, list)) else None
+        # Same-value-as-default write. Only representable scalars may be
+        # deep-copied: a default-less target (e.g. c18_custom_root) passes the
+        # _MISSING sentinel, which must never be planted in the config tree.
+        if isinstance(default, (bool, int, float, str)) or default is None:
+            return copy.deepcopy(default)
+        return None
     if isinstance(default, bool):
         return rng.random() < 0.5
     if isinstance(default, int):

@@ -136,12 +136,18 @@ class ForkImageWorkflowTests(unittest.TestCase):
         self.assertIn("severity: CRITICAL", text)
         self.assertIn("exit-code: 1", text)
 
-    def test_node_source_pin_contains_fixed_bundled_tar(self) -> None:
+    def test_node_source_pin_uses_sha_verified_pm_artifacts(self) -> None:
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        lock_text = (ROOT / "pm/lock.json").read_text(encoding="utf-8")
+        lock = json.loads(lock_text)
+        node = lock["packages"]["node"]
         vulnerable = "sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73"
-        fixed = "sha256:367679cf9792759492a486e4aa4b421764d71a9546a6dae8aab81a99eb797b3e"
-        self.assertNotIn(vulnerable, dockerfile)
-        self.assertIn(f"FROM node:26-bookworm-slim@{fixed} AS node_source", dockerfile)
+        self.assertNotIn(vulnerable, dockerfile + lock_text)
+        self.assertEqual(node["version"], "26.7.0")
+        self.assertTrue(node["artifacts"])
+        for artifact in node["artifacts"].values():
+            self.assertRegex(artifact["sha256"], r"^[0-9a-f]{64}$")
+        self.assertIn("pm", dockerfile)
 
     def test_publish_promotes_the_scanned_candidate_without_rebuilding(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")

@@ -233,6 +233,8 @@ def gateway_lifecycle_block(
     guard_cwd = _resolve_command_cwd(
         workdir=workdir, default_cwd=guard_cwd_base, session_key=session_key,
         env_type=env_type, task_id=task_id,
+        mounted_host=getattr(env, "host_cwd", None),
+        env=env,
     )
     unsafe, refusal = scan_gateway_lifecycle(
         command,
