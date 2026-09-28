@@ -138,6 +138,26 @@ class ForkRunnerFallbackTests(unittest.TestCase):
         self.assertIn("runner.arch == 'ARM64' && '2'", workers)
         self.assertIn("'8') || '2'", workers)
 
+    def test_nested_matrix_target_runner_falls_back_on_untrusted_forks(self) -> None:
+        fallback = (
+            "startsWith(matrix.target.runner, 'windows-latest-32') && "
+            "(github.repository != 'NousResearch/hermes-agent' || "
+            "(github.event_name == 'pull_request' && "
+            "github.event.pull_request.head.repo.full_name != github.repository)) && "
+            "'windows-latest' || matrix.target.runner"
+        )
+        hits = []
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if not stripped.startswith("runs-on:"):
+                    continue
+                if "matrix.target.runner" not in stripped:
+                    continue
+                hits.append(f"{path.name}: {stripped}")
+                self.assertIn(fallback, stripped, f"unguarded nested runner: {path.name}: {stripped}")
+        self.assertIn("pm-bundle.yml: runs-on: ${{ " + fallback + " }}", hits)
+
     def test_docker_large_runners_reject_untrusted_fork_prs(self) -> None:
         trust_guard = (
             "github.repository == 'NousResearch/hermes-agent' && "

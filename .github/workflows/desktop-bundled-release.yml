@@ -429,7 +429,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && inputs.build_commit == '' && inputs.channel == ''
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: ${{ startsWith(matrix.target.runner, 'windows-latest-32') && (github.repository != 'NousResearch/hermes-agent' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'windows-latest' || matrix.target.runner }}
     environment: release-signing
     cache-mode: write
     timeout-minutes: 900
@@ -727,7 +727,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && inputs.build_commit == '' && inputs.channel == ''
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: ${{ startsWith(matrix.target.runner, 'windows-latest-32') && (github.repository != 'NousResearch/hermes-agent' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'windows-latest' || matrix.target.runner }}
     environment: release-signing
     cache-mode: write
     timeout-minutes: 900
@@ -748,7 +748,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && (inputs.build_commit != '' || inputs.channel != '')
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: ${{ startsWith(matrix.target.runner, 'windows-latest-32') && (github.repository != 'NousResearch/hermes-agent' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'windows-latest' || matrix.target.runner }}
     environment: release-signing
     cache-mode: read
     timeout-minutes: 900
@@ -764,7 +764,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && (inputs.build_commit != '' || inputs.channel != '')
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: ${{ startsWith(matrix.target.runner, 'windows-latest-32') && (github.repository != 'NousResearch/hermes-agent' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'windows-latest' || matrix.target.runner }}
     environment: release-signing
     cache-mode: read
     timeout-minutes: 900
@@ -837,7 +837,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && inputs.build_commit == '' && inputs.channel == ''
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: ${{ startsWith(matrix.target.runner, 'windows-latest-32') && (github.repository != 'NousResearch/hermes-agent' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'windows-latest' || matrix.target.runner }}
     environment: release-signing
     cache-mode: write
     timeout-minutes: 360
@@ -1122,7 +1122,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && inputs.build_commit == '' && inputs.channel == ''
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: ${{ startsWith(matrix.target.runner, 'windows-latest-32') && (github.repository != 'NousResearch/hermes-agent' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'windows-latest' || matrix.target.runner }}
     environment: release-signing
     cache-mode: write
     timeout-minutes: 360
@@ -1143,7 +1143,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && (inputs.build_commit != '' || inputs.channel != '')
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: ${{ startsWith(matrix.target.runner, 'windows-latest-32') && (github.repository != 'NousResearch/hermes-agent' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'windows-latest' || matrix.target.runner }}
     environment: release-signing
     cache-mode: read
     timeout-minutes: 360
@@ -1159,7 +1159,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && (inputs.build_commit != '' || inputs.channel != '')
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: ${{ startsWith(matrix.target.runner, 'windows-latest-32') && (github.repository != 'NousResearch/hermes-agent' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'windows-latest' || matrix.target.runner }}
     environment: release-signing
     cache-mode: read
     timeout-minutes: 360
