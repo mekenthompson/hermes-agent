@@ -157,7 +157,7 @@ jobs:
             runner: ubuntu-latest-32-arm-core
             platform: linux/arm64
 
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && matrix.runner || 'ubuntu-latest' }}
     timeout-minutes: 45
     steps:
       - name: Checkout code
@@ -340,7 +340,7 @@ jobs:
           - arch: arm64
             runner: ubuntu-latest-32-arm-core
             platform: linux/arm64
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && matrix.runner || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - name: Checkout trusted source
@@ -509,7 +509,7 @@ jobs:
   # login/push fails loudly (missing credentials) instead of faking green.
   release-publish:
     name: Publish tested Docker image (${{ matrix.variant }}/${{ matrix.arch }})
-    if: needs.mode.outputs.phase == 'publish'
+    if: needs.mode.outputs.phase == 'publish' && github.repository == 'NousResearch/hermes-agent'
     needs: [mode]
     environment: container-publish
     strategy:
@@ -517,7 +517,7 @@ jobs:
       matrix:
         arch: [amd64, arm64]
         variant: [slim, desktop]
-    runs-on: ubuntu-latest-32-core
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
     timeout-minutes: 45
     env:
       ARCH: ${{ matrix.arch }}

@@ -536,6 +536,7 @@ all = [
 # Build and test tooling never ships in runtime payloads.
 dev = [
   "debugpy==1.8.20",
+  "PyYAML==6.0.3",
   "pytest==9.1.1",
   "pytest-asyncio==1.3.0",
   "mcp==2.0.0",

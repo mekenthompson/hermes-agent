@@ -23,7 +23,7 @@ concurrency:
 jobs:
   windows-bundle-tools:
     name: Cold Windows SDK (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && matrix.runner || 'windows-latest' }}
     # Cold ARM64 npm extraction alone can exceed 15 minutes on the hosted runner.
     timeout-minutes: 45
     strategy:

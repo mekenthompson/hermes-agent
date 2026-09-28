@@ -264,7 +264,7 @@ import {
   resolveGatewayFileBackend,
   saveGatewayDownload
 } from './gateway-file-download'
-import { startGatewaysAfterUpdateAbort, stopGatewayBeforeUpdate } from './gateway-stop-before-update'
+import { stopGatewayBeforeUpdate } from './gateway-stop-before-update'
 import { mintGatewayWsTicketWithSessionToken as mintGatewayWsTicketWithSessionTokenTransport } from './gateway-ticket-transport'
 import { downloadViaOauthSessionToFile, downloadViaTokenToFile } from './gateway-file-download-transport'
 import { resolveGatewayVersion } from './gateway-version' 

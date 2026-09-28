@@ -60,7 +60,13 @@ class ForkRunnerFallbackTests(unittest.TestCase):
                 lines = (ROOT / relative).read_text(encoding="utf-8").splitlines()
                 start = lines.index("  detect:")
                 block = lines[start : start + 12]
-                self.assertIn("    if: github.repository == 'NousResearch/hermes-agent'", block)
+                self.assertTrue(
+                    any(
+                        line.strip().startswith("if: github.repository == 'NousResearch/hermes-agent'")
+                        for line in block
+                    ),
+                    block,
+                )
 
     def test_upstream_large_runners_have_standard_fork_fallbacks(self) -> None:
         trust_guard = (
@@ -97,6 +103,22 @@ class ForkRunnerFallbackTests(unittest.TestCase):
                 }:
                     bare.append(f"{path.relative_to(ROOT)}: {stripped}")
         self.assertEqual(bare, [])
+        large_labels = (
+            "ubuntu-latest-32-core",
+            "ubuntu-latest-32-arm-core",
+            "ubuntu-latest-96-core",
+            "windows-latest-32-core",
+            "windows-latest-32-arm-core",
+        )
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip().startswith("runs-on:"):
+                    continue
+                if not any(label in line for label in large_labels) and "matrix.runner" not in line:
+                    continue
+                if path.name == "tests-os.yml":
+                    continue  # its inverse predicate explicitly selects hosted Windows on forks
+                self.assertIn(trust_guard, line, f"untrusted runner selection: {path.name}: {line.strip()}")
 
     def test_windows_large_runner_has_standard_fork_fallback(self) -> None:
         trust_guard = (
@@ -105,12 +127,16 @@ class ForkRunnerFallbackTests(unittest.TestCase):
             "github.event.pull_request.head.repo.full_name == github.repository)"
         )
         lines = (ROOT / ".github/workflows/tests-os.yml").read_text(encoding="utf-8").splitlines()
-        expected = (
-            "    runs-on: ${{ matrix.name == 'Windows-only tests' && "
-            f"{trust_guard} && 'windows-latest-32-core' || matrix.runner }}}}"
-        )
-        self.assertIn(expected, lines)
-        self.assertIn("            runner: windows-latest", lines)
+        fallback = next(line for line in lines if line.startswith("    runs-on: ${{ startsWith(matrix.runner"))
+        self.assertIn("startsWith(matrix.runner, 'windows-')", fallback)
+        self.assertIn("github.repository != 'NousResearch/hermes-agent'", fallback)
+        self.assertIn("github.event_name == 'pull_request'", fallback)
+        self.assertIn("github.event.pull_request.head.repo.full_name != github.repository", fallback)
+        self.assertIn("'windows-latest' || matrix.runner", fallback)
+        workers = next(line for line in lines if "HERMES_TEST_WORKERS:" in line)
+        self.assertIn(trust_guard, workers)
+        self.assertIn("runner.arch == 'ARM64' && '2'", workers)
+        self.assertIn("'8') || '2'", workers)
 
     def test_docker_large_runners_reject_untrusted_fork_prs(self) -> None:
         trust_guard = (
@@ -119,8 +145,12 @@ class ForkRunnerFallbackTests(unittest.TestCase):
             "github.event.pull_request.head.repo.full_name == github.repository)"
         )
         lines = (ROOT / ".github/workflows/docker.yml").read_text(encoding="utf-8").splitlines()
-        expected = f"    if: {trust_guard} && needs.detect.outputs.build == 'true'"
-        self.assertIn(expected, lines)
+        build_runner = f"    runs-on: ${{{{ {trust_guard} && matrix.runner || 'ubuntu-latest' }}}}"
+        publish_runner = f"    runs-on: ${{{{ {trust_guard} && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}}}"
+        self.assertIn(build_runner, lines)
+        self.assertIn(publish_runner, lines)
+        publish_if = next(line for line in lines if line.strip().startswith("if: needs.mode.outputs.phase == 'publish'"))
+        self.assertIn("github.repository == 'NousResearch/hermes-agent'", publish_if)
 
 
 if __name__ == "__main__":

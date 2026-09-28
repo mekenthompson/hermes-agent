@@ -86,7 +86,7 @@ def test_closing_writer_stays_guarded_until_sqlite_closes(tmp_path, monkeypatch)
         os.close(os.open(tmp_path / name, os.O_RDONLY))
     shm = os.stat(f"{path}-shm").st_ino
     in_gap: dict = {}
-    real_close = db._close_connection_quietly
+    real_close = db._close_connection_cleanly
 
     def _sibling_closes_in_the_gap(conn):
         subprocess.run([sys.executable, "-c",
@@ -95,7 +95,7 @@ def test_closing_writer_stays_guarded_until_sqlite_closes(tmp_path, monkeypatch)
         in_gap["shm"] = os.stat(f"{path}-shm").st_ino if os.path.exists(f"{path}-shm") else None
         real_close(conn)
 
-    monkeypatch.setattr(db, "_close_connection_quietly", _sibling_closes_in_the_gap)
+    monkeypatch.setattr(db, "_close_connection_cleanly", _sibling_closes_in_the_gap)
     db.close()
     assert in_gap["shm"] == shm, "a sibling's close unlinked -shm under the closing writer"
     assert not os.path.exists(f"{path}-wal"), "the true last close must still end the generation"
