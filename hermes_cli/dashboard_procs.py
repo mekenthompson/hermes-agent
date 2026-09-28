@@ -165,6 +165,33 @@ def _pid_passwd_home(pid: int) -> str | None:
     return None
 
 
+def _ledger_row_for_pid(pid: int) -> dict | None:
+    """Spawn-ledger row for a live serve/dashboard *pid*, or None."""
+    with contextlib.suppress(Exception):
+        from hermes_cli.process_identity import ledger_entries
+        for entry in ledger_entries():
+            if entry.get("pid") == pid and entry.get("purpose") in ("serve", "dashboard"):
+                return entry
+    return None
+
+
+def _ledger_respawn_argv(pid: int) -> list[str] | None:
+    """Rebuild a dashboard/serve launch when /proc cmdline is unreadable.
+
+    The ledger argv is often the ``-c dashboard`` fragment, not a runnable command.
+    Host and port were recorded after bind, so they are the respawn.
+    """
+    entry = _ledger_row_for_pid(pid)
+    if not entry:
+        return None
+    port = entry.get("port")
+    if not isinstance(port, int) or port <= 0:
+        return None
+    host = str(entry.get("host") or "127.0.0.1")
+    return [sys.executable, "-m", "hermes_cli.main", str(entry.get("purpose") or "dashboard"),
+            "--no-open", "--host", host, "--port", str(port)]
+
+
 def _hermes_home_for_pid(pid: int) -> str | None:
     """The Hermes home *pid* runs on, tri-state: ``None`` ONLY when its environment is unreadable
     (another user, hardened ``/proc``) — callers spare those, never guess.
@@ -180,7 +207,10 @@ def _hermes_home_for_pid(pid: int) -> str | None:
     """
     env = _pid_environ(pid)
     if env is None:
-        return None
+        # Hardened /proc hides the environ, but the process registered its own home.
+        entry = _ledger_row_for_pid(pid)
+        home = str((entry or {}).get("hermes_home") or "").strip()
+        return home or None
     from hermes_cli.main_dashboard import _dashboard_cmdline_for_pid
     from hermes_cli.profiles import get_active_profile, normalize_profile_name, profile_root_for_env_home
     argv = _dashboard_cmdline_for_pid(pid) or []
@@ -649,7 +679,7 @@ def _kill_stale_dashboard_processes(
             pid_service[pid] = _dash._get_systemd_service_for_pid(pid)
             if pid_service[pid]:
                 continue
-            cmdline = _dash._dashboard_cmdline_for_pid(pid)
+            cmdline = _dash._dashboard_cmdline_for_pid(pid) or _ledger_respawn_argv(pid)
             if launchd_jobs and (job := _launchd_owner(pid, cmdline)):
                 pid_launchd[pid] = job
             elif cmdline:

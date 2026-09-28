@@ -263,5 +263,23 @@ class TestHermesHomeForPid:
 
     def test_unreadable_env_is_none_and_spared(self, monkeypatch):
         monkeypatch.setattr(dashboard_procs, "_pid_environ", lambda pid: None)
+        monkeypatch.setattr(
+            "hermes_cli.process_identity.ledger_entries", lambda **kwargs: [])
         assert dashboard_procs._hermes_home_for_pid(7) is None
         assert dashboard_procs._pids_owned_by_hermes_home([7], "/home/alice/.hermes") == []
+
+    def test_unreadable_env_uses_the_process_ledger_home(self, monkeypatch):
+        monkeypatch.setattr(dashboard_procs, "_pid_environ", lambda pid: None)
+        monkeypatch.setattr(
+            "hermes_cli.process_identity.ledger_entries",
+            lambda **kwargs: [{
+                "pid": 141, "purpose": "dashboard", "hermes_home": "/tmp/sb/.hermes",
+                "host": "127.0.0.1", "port": 52069,
+            }],
+        )
+        assert dashboard_procs._hermes_home_for_pid(141) == "/tmp/sb/.hermes"
+        assert dashboard_procs._pids_owned_by_hermes_home([141], "/tmp/sb/.hermes") == [141]
+        assert dashboard_procs._ledger_respawn_argv(141) == [
+            dashboard_procs.sys.executable, "-m", "hermes_cli.main", "dashboard",
+            "--no-open", "--host", "127.0.0.1", "--port", "52069",
+        ]
