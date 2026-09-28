@@ -218,6 +218,20 @@ Run the relevant JS workspace checks for JS changes. Native install/update
 E2E runs on disposable CI hosts, never against the developer's live app.
 See [Package management](website/docs/reference/package-management.md) for PM commands and runtime ownership.
 
+### Local readiness before CI
+
+Keep the checkout, lockfiles, and test interpreter tied to the revision being
+reviewed. Reproduce a bug with a focused failing test, fix it, then run that
+test and its neighboring contracts with `scripts/run_tests.sh` (for example,
+`scripts/run_tests.sh -j 2 tests/ci/`). Run the touched Python lint/type checks
+(`ruff check` and `ty check`) or the affected JS workspace checks before
+requesting CI. For a change that crosses a core and consumer boundary, run the
+consumer's existing contract suite against the exact intended core checkout;
+a missing pinned source or skipped scenario is not a passing contract. Have an
+independent reviewer check the local diff, including fixtures and generated files, then
+run the relevant broader suite once on the intended tree. Record native OS,
+Docker, or release-only checks that require hosted CI as unverified locally.
+
 ---
 
 ## Project Structure

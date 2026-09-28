@@ -141,9 +141,6 @@ def test_compare_via_gh_uses_the_three_dot_compare_endpoint():
 
 # ───────────────────────── fork-mode classification ─────────────────────────
 
-ALL_OFF = {lane: False for lane in classify(["README.md"])}
-
-
 def _fork(files):
     return classify(files, fork=True)
 
@@ -159,30 +156,30 @@ def test_fork_mode_matches_upstream_outside_dot_github():
     for files in (["README.md"], ["hermes_cli/config.py"], ["tests/agent/test_x.py"], ["ui-tui/src/a.ts"], ["pyproject.toml"], []):
         upstream = classify(files)
         fork = _fork(files)
-        assert {k: v for k, v in fork.items() if k != "docker"} == {k: v for k, v in upstream.items() if k != "docker"}, files
+        assert {k: v for k, v in fork.items() if k not in {"docker", "upgrade"}} == {k: v for k, v in upstream.items() if k not in {"docker", "upgrade"}}, files
 
 
 def test_fork_docs_only_runs_nothing():
-    assert _fork(["README.md", "docs/fork-agent-image.md"]) == ALL_OFF
+    lanes = _fork(["README.md", "docs/fork-agent-image.md"])
+    assert all(not value for name, value in lanes.items() if name != "upgrade")
+    assert lanes["upgrade"]  # no product lane consumes it for a docs-only diff
 
 
-def test_fork_standalone_workflow_change_runs_no_ci_lane():
+def test_fork_ci_plumbing_change_selects_broad_coverage():
     lanes = _fork([".github/workflows/fork-agent-image.yml"])
-    assert lanes == {**ALL_OFF, "docker": True, "ci_review": True}
+    assert lanes == _fork([])
     lanes = _fork([".github/workflows/install-e2e.yml", "docs/x.md"])
-    assert lanes == {**ALL_OFF, "ci_review": True}
+    assert lanes["python"] and lanes["os_tests"] and lanes["upgrade"]
 
 
-def test_fork_called_workflow_change_runs_only_the_lanes_gating_it():
+def test_fork_called_workflow_change_keeps_native_and_upgrade_lanes():
     ci = _yaml(".github/workflows/ci.yaml")
     for job in ci["jobs"].values():
         uses = job.get("uses", "")
         if not uses.startswith("./"):
             continue
-        expected = set(re.findall(r"needs\.detect\.outputs\.(\w+) == 'true'", job.get("if", "") or ""))
         lanes = _fork([uses[2:]])
-        on = {k for k, v in lanes.items() if v}
-        assert on == expected | {"ci_review"} | ({"docker"} if "python_prod" in expected else set()), uses
+        assert lanes["python"] and lanes["os_tests"] and lanes["upgrade"], uses
 
 
 def test_fork_orchestrator_actions_and_scripts_still_fail_open():
@@ -219,7 +216,7 @@ def test_main_uses_fork_mode_from_the_repo_env(monkeypatch, capsys):
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
     assert classify_mod.main() == 0
     out = capsys.readouterr().out
-    assert "python=false" in out and "docker=true" in out
+    assert "python=true" in out and "docker=true" in out and "upgrade=true" in out
 
 
 # ───────────────────────── workflow contracts ─────────────────────────
@@ -234,53 +231,36 @@ def test_detect_and_aggregate_can_never_be_skipped():
     jobs = _yaml(".github/workflows/ci.yaml")["jobs"]
     assert "if" not in jobs["detect"]
     assert jobs["all-checks-pass"]["if"] == "always()"
-    # Every lane job feeds the gate, so a skipped lane is counted (as a pass).
+    # Every lane job feeds the gate, which checks its selected status.
     gated = {name for name, job in jobs.items() if "needs.detect.outputs" in (job.get("if") or "")}
-    # infographic-check has never been in the gate's needs upstream (it runs
-    # but is not required); the fork does not change that. osv-scanner is
-    # now advisory-only upstream (fail-on-vuln: false) so it must not gate
-    # merges either.
-    assert gated - set(jobs["all-checks-pass"]["needs"]) <= {
-        "infographic-check",
-        "osv-scanner",
-    }
+    assert gated <= set(jobs["all-checks-pass"]["needs"])
 
 
-def test_all_checks_pass_treats_a_fully_skipped_run_as_green(tmp_path):
+def test_all_checks_pass_allows_explicit_non_applicable_skips():
     policy = _load("ci_policy")
     needs = {"detect": {"result": "success"}, "tests": {"result": "skipped"}, "osv-scanner": {"result": "skipped"}}
-    assert policy.evaluate_needs(needs).failed == []
+    assert policy.evaluate_needs(needs, {"detect": True, "tests": False, "osv-scanner": False}).failed == []
 
 
 def test_fork_only_gates_in_ci_yaml():
-    jobs = _yaml(".github/workflows/ci.yaml")["jobs"]
-    fork_guard = "github.repository != 'mekenthompson/hermes-agent'"
-    expected = {
-        "tests-os": "needs.detect.outputs.os_tests == 'true'",
-        "docs-site": None,
-        "contributor-check": "needs.detect.outputs.event_name == 'pull_request'",
-        "infographic-check": "needs.detect.outputs.binary_artifacts == 'true'",
-        "profile-artifact-check": "needs.detect.outputs.binary_artifacts == 'true'",
-        "osv-scanner": "needs.detect.outputs.uv_lock == 'true'",
-    }
-    for name, fork_condition in expected.items():
-        cond = jobs[name]["if"]
-        assert fork_guard in cond, name
-        if fork_condition:
-            assert fork_condition in cond, name
-    assert jobs["osv-scanner"]["needs"] == "detect"
-    # Dependency PRs keep the OSV scan.
-    assert "needs.detect.outputs.npm_lock == 'true'" in jobs["osv-scanner"]["if"]
-    assert "needs.detect.outputs.deps == 'true'" in jobs["osv-scanner"]["if"]
-    # Upstream: the lanes still key on the upstream outputs alone.
-    assert jobs["tests-os"]["if"].startswith("needs.detect.outputs.python == 'true' &&")
-    assert jobs["docs-site"]["if"].startswith("needs.detect.outputs.site == 'true' &&")
+    policy = _load("ci_policy")
+    lanes = {lane: "false" for lane in classify(["run_agent.py"])}
+    lanes.update(python="true", site="true", python_prod="true")
+    fork = policy.selected_jobs(lanes, FORK, "push")
+    upstream = policy.selected_jobs(lanes, UPSTREAM, "push")
+    assert fork["tests"] and upstream["tests"]
+    assert not fork["tests-os"] and upstream["tests-os"]
+    assert not fork["docs-site"] and upstream["docs-site"]
+    assert not fork["contributor-check"] and upstream["contributor-check"]
+    assert not fork["osv-scanner"] and upstream["osv-scanner"]
+    lanes["uv_lock"] = "true"
+    assert policy.selected_jobs(lanes, FORK, "pull_request")["osv-scanner"]
 
 
 def test_detect_declares_every_lane_the_fork_gates_read():
     ci = _yaml(".github/workflows/ci.yaml")
     action = _yaml(".github/actions/detect-changes/action.yml")
-    for lane in ("os_tests", "binary_artifacts"):
+    for lane in ("os_tests", "binary_artifacts", "upgrade"):
         assert lane in ci["jobs"]["detect"]["outputs"]
         assert lane in action["outputs"]
 
@@ -296,6 +276,8 @@ def test_detect_changes_scopes_fork_pushes_only():
     assert 'CHANGED="$(python3 scripts/ci/push_changed_files.py)"' in script
     # The PR branch is untouched.
     assert 'if [ "$EVENT_NAME" = "pull_request" ]; then' in script
+    assert 'CHANGED="$(python3 -m scripts.ci.pr_changed_files)"' in script
+    assert 'python3 -m scripts.ci.classify_changes' in script
 
 
 def test_fork_image_workflow_gates_build_and_publish_on_the_docker_lane():

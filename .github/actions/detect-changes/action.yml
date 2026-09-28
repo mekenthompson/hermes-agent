@@ -72,6 +72,9 @@ outputs:
   binary_artifacts:
     description: An image or archive file changed (fork gates the infographic / profile-archive tree checks on it).
     value: ${{ steps.classify.outputs.binary_artifacts }}
+  upgrade:
+    description: Run real install/upgrade and packaged Desktop update E2E on the fork unless paths are known backend-only.
+    value: ${{ steps.classify.outputs.upgrade }}
 
 runs:
   using: composite
@@ -101,37 +104,9 @@ runs:
         # dispatch) leave CHANGED empty, so the classifier fails open and every
         # lane runs. Post-merge / on-demand validation is never weakened.
         if [ "$EVENT_NAME" = "pull_request" ]; then
-          # Use the compare endpoint with the pinned base/head SHAs from the
-          # event payload instead of the "current PR files" endpoint. The SHAs
-          # are frozen at trigger time, so the file list is deterministic even
-          # if the PR receives a new push between trigger and detect.
-          #
-          # Retried: a rate-limit blip or eventual-consistency 404 on a
-          # freshly-pushed HEAD would otherwise silently fall open (all lanes
-          # run — safe, but wasteful and it masks the API failure).
-          #
-          # `.files[]?` (null-safe): with --paginate, a PR more than 100
-          # commits ahead of its merge-base paginates the compare, and pages
-          # after the first carry `files: null` — bare `.files[]` makes jq
-          # die with "cannot iterate over: null", which fails every retry
-          # and forces the fail-open path (seen on stacked PRs). The full
-          # file list (up to the API's 300-file cap) is on page one.
-          CHANGED=""
-          for i in 1 2 3; do
-            if CHANGED="$(gh api \
-              --paginate \
-              "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
-              --jq '.files[]?.filename')"; then
-              break
-            fi
-            if [ "$i" = 3 ]; then
-              echo "::warning::compare API failed after 3 attempts — failing open (all lanes run)"
-              CHANGED=""
-              break
-            fi
-            echo "::warning::compare API failed (attempt $i); retrying in 10s"
-            sleep 10
-          done
+          # Exact event SHAs, status-bearing local git diff when available;
+          # capped or incomplete compare data deliberately selects all lanes.
+          CHANGED="$(python3 -m scripts.ci.pr_changed_files)"
         elif [ "$EVENT_NAME" = "push" ] && [ "$REPO" = "mekenthompson/hermes-agent" ]; then
           # Fork only: scope a main push to the pushed range
           # (github.event.before...github.sha). The helper prints nothing —
@@ -142,4 +117,4 @@ runs:
 
         echo "Changed files:"
         printf '%s\n' "${CHANGED:-(none)}"
-        printf '%s\n' "${CHANGED:-}" | python3 scripts/ci/classify_changes.py
+        printf '%s\n' "${CHANGED:-}" | python3 -m scripts.ci.classify_changes

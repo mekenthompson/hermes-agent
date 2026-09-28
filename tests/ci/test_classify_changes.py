@@ -11,7 +11,6 @@ import importlib.util
 import io
 import json
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -25,7 +24,6 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 classify = _mod.classify
 ci_review_files = _mod.ci_review_files
-pull_request_changed_files = _mod.pull_request_changed_files
 main = _mod.main
 
 DEFAULT = {
@@ -48,6 +46,7 @@ DEFAULT = {
     "ci_review": True,
     "os_tests": True,
     "binary_artifacts": True,
+    "upgrade": True,
 }
 
 
@@ -84,6 +83,7 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
         "ci_review": ci_review,
         "os_tests": _os_tests,
         "binary_artifacts": binary_artifacts,
+        "upgrade": True,
     }
 
 
@@ -158,7 +158,7 @@ CASES = {
     "product python → nix": (["hermes_cli/config.py"], _lanes(python=True, scan=True)),
     # tests/ is not packaged, so the built binary cannot change.
     "tests-only → no nix": (
-        ["tests/agent/test_foo.py"],
+        ["tests/agent/test_skill_bundles.py"],
         _lanes(python=True, python_prod=False, scan=True),
     ),
     # Prose cannot change the closure or the binary.
@@ -217,7 +217,7 @@ CASES = {
     # tests-only diffs: pytest lanes stay ON, product jobs (Desktop E2E,
     # Docker) gate on python_prod and skip.
     "tests-only → python without python_prod": (
-        ["tests/agent/test_foo.py"],
+        ["tests/agent/test_skill_bundles.py"],
         _lanes(python=True, python_prod=False, scan=True),
     ),
     # conftest.py owns the _OS_MARKS skip logic, so it re-arms the
@@ -236,7 +236,7 @@ CASES = {
         _lanes(python=True, python_prod=False, scan=True, os_tests=True),
     ),
     "unmarked test file → no os_tests": (
-        ["tests/agent/test_foo.py"],
+        ["tests/agent/test_skill_bundles.py"],
         _lanes(python=True, python_prod=False, scan=True),
     ),
     "committed image → binary_artifacts": (
@@ -252,7 +252,7 @@ CASES = {
         _lanes(python=True, python_prod=False, scan=True, desktop_updater=True),
     ),
     "tests + prod source → both lanes": (
-        ["tests/agent/test_foo.py", "agent/x.py"],
+        ["tests/agent/test_skill_bundles.py", "agent/x.py"],
         _lanes(python=True, scan=True),
     ),
     # Runner infrastructure is NOT tests-only — a bad runner edit can mask
@@ -343,6 +343,53 @@ def test_classify(files, expected):
     assert classify(files) == expected
 
 
+@pytest.mark.parametrize("spec", ["windows", "macos", "posix", "any", "not linux"])
+def test_modern_platform_marker_keeps_native_lanes(tmp_path: Path, spec: str) -> None:
+    path = tmp_path / "tests" / "agent" / "test_runtime.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(f'import pytest\n@pytest.mark.platforms("{spec}")\ndef test_runtime(): pass\n')
+    assert classify(["tests/agent/test_runtime.py"], fork=True, root=tmp_path)["os_tests"]
+
+
+@pytest.mark.parametrize("path", [
+    "hermes_cli/update_cmd.py", "hermes_cli/update_runtime.py",
+    "pm/workspace.py", "tools/environments/local.py",
+    "hermes_cli/_launchers.py", "scripts/build/launcher_wrapper.py",
+])
+def test_shared_update_and_runtime_paths_keep_native_lanes(path: str) -> None:
+    assert classify([path], fork=True)["os_tests"]
+
+
+@pytest.mark.parametrize("path", [
+    "gateway/platforms/telegram.py", "plugins/kanban/commands.py",
+    "tests/agent/test_skill_bundles.py",
+])
+def test_known_backend_only_change_omits_fork_upgrade(path: str) -> None:
+    lanes = classify([path], fork=True)
+    assert lanes["python"]
+    assert not lanes["upgrade"]
+
+
+@pytest.mark.parametrize("path", [
+    "hermes_cli/update_cmd.py", "scripts/install.sh", "pm/workspace.py",
+    "tools/environments/local.py", "pyproject.toml", "uv.lock",
+    "tests/conftest.py", ".github/workflows/tests.yml", "Makefile",
+])
+def test_shared_or_unknown_change_keeps_fork_upgrade(path: str) -> None:
+    assert classify([path], fork=True)["upgrade"]
+
+
+def test_unrelated_backend_file_cannot_hide_an_installer_change() -> None:
+    lanes = classify(["gateway/platforms/telegram.py", "scripts/install.sh"], fork=True)
+    assert lanes["upgrade"] and lanes["bootstrap"] and lanes["python"]
+
+
+def test_fork_ci_selection_plumbing_rearms_native_and_installer_lanes() -> None:
+    lanes = classify(["scripts/ci/classify_changes.py"], fork=True)
+    assert lanes["python"] and lanes["os_tests"]
+    assert lanes["installer"] and lanes["bootstrap"] and lanes["upgrade"]
+
+
 _REPO = Path(__file__).resolve().parents[2]
 
 
@@ -404,77 +451,7 @@ def test_ci_review_files_returns_only_sensitive_paths_sorted_and_unique():
     ]
 
 
-def _write_event(tmp_path, number: int | None = 88442) -> Path:
-    payload = {"pull_request": {"number": number}} if number is not None else {}
-    path = tmp_path / "event.json"
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    return path
-
-
-def test_pull_request_changed_files_skips_non_pr_events(monkeypatch):
-    monkeypatch.setenv("EVENT_NAME", "push")
-    monkeypatch.setenv("REPO", "NousResearch/hermes-agent")
-    assert pull_request_changed_files() == []
-
-
-def test_pull_request_changed_files_skips_without_pr_number(tmp_path, monkeypatch):
-    monkeypatch.setenv("EVENT_NAME", "pull_request")
-    monkeypatch.setenv("REPO", "NousResearch/hermes-agent")
-    monkeypatch.setenv("GITHUB_EVENT_PATH", str(_write_event(tmp_path, number=None)))
-    assert pull_request_changed_files() == []
-
-
-def test_pull_request_changed_files_parses_gh_output(tmp_path, monkeypatch):
-    monkeypatch.setenv("EVENT_NAME", "pull_request")
-    monkeypatch.setenv("REPO", "NousResearch/hermes-agent")
-    monkeypatch.setenv("GITHUB_EVENT_PATH", str(_write_event(tmp_path)))
-
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args[0],
-            0,
-            stdout="scripts/install.sh\ntests/scripts/install/test_install_sh_node_deps_workspaces.py\n",
-            stderr="",
-        )
-
-    monkeypatch.setattr(_mod.subprocess, "run", fake_run)
-    assert pull_request_changed_files() == [
-        "scripts/install.sh",
-        "tests/scripts/install/test_install_sh_node_deps_workspaces.py",
-    ]
-
-
-def test_pull_request_changed_files_returns_empty_when_gh_fails(tmp_path, monkeypatch):
-    monkeypatch.setenv("EVENT_NAME", "pull_request")
-    monkeypatch.setenv("REPO", "NousResearch/hermes-agent")
-    monkeypatch.setenv("GITHUB_EVENT_PATH", str(_write_event(tmp_path)))
-
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(args[0], 1, stdout="", stderr="gh: Not Found")
-
-    monkeypatch.setattr(_mod.subprocess, "run", fake_run)
-    assert pull_request_changed_files() == []
-
-
-def test_main_recovers_pr_files_instead_of_fail_open_ci_review(monkeypatch, capsys):
-    """A fork compare 404 must not demand ci-reviewed for a CLI-only install."""
-    monkeypatch.setattr(
-        _mod,
-        "pull_request_changed_files",
-        lambda: ["scripts/install.sh", "tests/scripts/install/test_install_sh_node_deps_workspaces.py"],
-    )
-    monkeypatch.setattr(sys, "stdin", io.StringIO("\n"))
-    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
-
-    assert main() == 0
-    out = capsys.readouterr().out
-    assert "ci_review=false" in out
-    assert "python=true" in out
-    assert "python_prod=true" in out
-
-
-def test_main_still_fail_opens_when_recovery_is_empty(monkeypatch, capsys):
-    monkeypatch.setattr(_mod, "pull_request_changed_files", lambda: [])
+def test_main_fail_opens_when_detector_returns_no_paths(monkeypatch, capsys):
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
 
