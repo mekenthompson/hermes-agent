@@ -1913,7 +1913,7 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
     # Restart a managed dashboard via systemd or stop stale manual ones (raw-killing
     # a systemd-owned PID reads as clean stop and leaves the Cloudflare origin dead).
     # Already-restarted units aren't redone.
-    _refresh_dashboard_after_update(already_restarted_units=set(restart.restarted_services))
+    confirmed_dead = _refresh_dashboard_after_update(already_restarted_units=set(restart.restarted_services))
 
     # Success-path twin of the abort-recovery probe: the restart phase only touches
     # units, so a unit-less `hermes serve` keeps stale sys.modules. Runs AFTER
@@ -1927,7 +1927,8 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
     # survivor is escalated (exit 1) instead of merely printed.
     _stale_serve_rows: "list | None" = None
     with _best_effort('Failed to check for surviving serve runtimes: %s'):
-        _stale_serve_rows = _surviving_pre_update_serve_runtimes(_pre_update_plan)
+        _stale_serve_rows = _surviving_pre_update_serve_runtimes(
+            _pre_update_plan, confirmed_dead=confirmed_dead)
         if _stale_serve_rows:
             _warn_stale_serve_runtimes(_stale_serve_rows)
 

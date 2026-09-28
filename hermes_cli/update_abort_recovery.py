@@ -19,7 +19,7 @@ def _serve_unit_recovery_available() -> bool:
     return sys.platform == "linux" and bool(shutil.which("systemctl"))
 
 
-def _surviving_pre_update_serve_runtimes(plan) -> list[dict]:
+def _surviving_pre_update_serve_runtimes(plan, confirmed_dead: "set | None" = None) -> list[dict]:
     """Pre-update serve/dashboard runtimes that are STILL the same process — i.e. live on the
     pre-update code generation. Identity is the incarnation ``(pid, create_time)``, never the PID
     alone: ``ledger_entries()`` prunes dead entries, but a correctly restarted serve can come back
@@ -66,9 +66,10 @@ def _surviving_pre_update_serve_runtimes(plan) -> list[dict]:
             and abs(float(live_created) - float(planned_created)) >= 2.0)
 
     # The operator-facing row drops the incarnation (a matching key only).
+    dead = {int(pid) for pid in (confirmed_dead or set()) if isinstance(pid, int) and pid > 0}
     survivors = [
         {k: v for k, v in row.items() if k != "_create_time"}
-        for pid, row in planned.items() if _still_live(pid, row)]
+        for pid, row in planned.items() if pid not in dead and _still_live(pid, row)]
     return sorted(survivors, key=lambda row: row["pid"])
 
 

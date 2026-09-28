@@ -1121,6 +1121,22 @@ def test_same_pid_and_same_incarnation_is_still_a_survivor(monkeypatch):
     assert "_create_time" not in rows[0]
 
 
+def test_confirmed_dead_pid_is_not_a_survivor_when_the_ledger_still_lists_it(monkeypatch):
+    """A kill that already waited for the PID to exit must not fail the update when the ledger still names it."""
+    monkeypatch.setattr(
+        _identity_module(),
+        "ledger_entries",
+        lambda *a, **k: [{"pid": 139, "purpose": "dashboard", "create_time": 1000.0}],
+    )
+    assert (
+        update_cmd._surviving_pre_update_serve_runtimes(
+            _plan(_serve_runtime(139, create_time=1000.0, kind="dashboard")),
+            confirmed_dead={139},
+        )
+        == []
+    )
+
+
 def test_missing_incarnation_on_either_side_fails_closed(monkeypatch):
     """No incarnation to compare means the runtime cannot be cleared."""
     monkeypatch.setattr(
