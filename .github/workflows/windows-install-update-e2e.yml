@@ -7,8 +7,10 @@ name: Windows install + update E2E
 # Each file walks one journey (one install) and asserts several user-visible cells;
 # tracked bugs are message-gated xfails (tests/e2e/core/_pending_fixes.py).
 #
-# Called from tests-os.yml on every Python PR. Pushes to wine2e-install/** run it alone,
-# for sabotage proofs and iteration without the rest of CI.
+# Called from tests-os.yml on upstream Python changes. The fork skips that call:
+# windows-latest cannot finish six parallel installs, and the fleet does not
+# install with install.ps1. Pushes to wine2e-install/** still run it alone,
+# including on the fork, for a deliberate installer proof.
 
 on:
   workflow_call:

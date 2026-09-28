@@ -172,6 +172,15 @@ class ForkRunnerFallbackTests(unittest.TestCase):
         publish_if = next(line for line in lines if line.strip().startswith("if: needs.mode.outputs.phase == 'publish'"))
         self.assertIn("github.repository == 'NousResearch/hermes-agent'", publish_if)
 
+    def test_fork_does_not_require_windows_install_journey(self) -> None:
+        lines = (ROOT / ".github/workflows/tests-os.yml").read_text(encoding="utf-8").splitlines()
+        start = lines.index("  install-update-e2e:")
+        block = "\n".join(lines[start : start + 16])
+        self.assertIn("if: github.repository != 'mekenthompson/hermes-agent'", block)
+        self.assertIn("uses: ./.github/workflows/windows-install-update-e2e.yml", block)
+        standalone = (ROOT / ".github/workflows/windows-install-update-e2e.yml").read_text(encoding="utf-8")
+        self.assertIn("wine2e-install/**", standalone)
+
 
 if __name__ == "__main__":
     unittest.main()
