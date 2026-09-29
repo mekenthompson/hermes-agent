@@ -1369,24 +1369,16 @@ def _clarify_timeout_seconds() -> float | None:
     return 300
 
 
-def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
-    """Bridge the clarify tool callback onto a ``clarify`` server request. Single question: the response is
-    ``{"answer"}`` ("" = skip). Batch: one request with only the wire fields (tool-side entries carry
-    result-assembly keys too); answers lock one at a time through ``clarify.lock`` and the tool gets
-    ``{"answers", "timed_out"?}`` as JSON — a response with no ``answers`` is a cancel-all."""
+def _clarify_block(sid: str, questions: list[dict]) -> dict:
+    """Bridge the clarify tool callback onto one ``clarify`` server request carrying only the wire fields
+    (tool-side entries carry result-assembly keys too). Answers lock one at a time through ``clarify.lock``
+    (``null`` = skipped); the tool gets ``{"answers", "outcome"}`` — ``undelivered`` when no client took it."""
     from tui_gateway import server_requests
-    if questions:
-        wire = [{"qid": e["qid"], "question": e["question"], "choices": e["choices"], "multi_select": bool(e["multi_select"])}
-                for e in questions]
-        result = server_requests.send("clarify", sid, {"questions": wire}, timeout=_clarify_timeout_seconds(),
-                                      qids=[e["qid"] for e in questions])
-        if not result or "answers" not in result:
-            return ""
-        return json.dumps(result, ensure_ascii=False)
-    params = {"question": q, "choices": c, "multi_select": True} if multi_select else {"question": q, "choices": c}
-    result = server_requests.send("clarify", sid, params, timeout=_clarify_timeout_seconds())
-    answer = (result or {}).get("answer", "")
-    return answer if isinstance(answer, str) else ""
+    wire = [{"qid": e["qid"], "question": e["question"], "choices": e["choices"], "multi_select": bool(e["multi_select"])}
+            for e in questions]
+    result = server_requests.send("clarify", sid, {"questions": wire}, timeout=_clarify_timeout_seconds(),
+                                  qids=[e["qid"] for e in questions])
+    return result or {"answers": {}, "outcome": "undelivered"}
 
 
 # A tour action is a DOM op the renderer answers in ms; the generous deadline exists only because a
@@ -1427,6 +1419,70 @@ def _tour_request(sid: str, payload: dict) -> str:
     elif state != "answered":
         session["tour_bridge"] = "unanswered"
     return answer or _TOUR_BRIDGE_UNAVAILABLE
+
+
+_PREVIEW_ACTION_TIMEOUT_S = 45
+# Until a session's client has proven it answers preview.act at all, hold it to a
+# deadline a working renderer cannot miss (same ladder as the tour probe).
+_PREVIEW_ACTION_PROBE_TIMEOUT_S = 10
+# An unanswered probe condemns the bridge only until the cooldown expires: the
+# renderer may attach late (app launched after the turn started). One caller at
+# a time re-probes; concurrent siblings fail fast instead of stacking waits.
+_PREVIEW_ACTION_REPROBE_COOLDOWN_S = 30
+
+_PREVIEW_ACTION_BRIDGE_UNAVAILABLE = json.dumps({
+    "success": False,
+    "error": ("No Hermes Desktop window answered the preview action request. The drive_preview / "
+              "annotate_preview bridge is served by the desktop app's renderer, which updates "
+              "separately from this backend, so an app build older than the tool has nothing "
+              "listening. Update the Hermes Desktop app, open a page with open_preview, and try "
+              "again in this session after a short cooldown.")})
+
+# One in-flight cooldown-expiry reprobe per session: concurrent callers fail fast.
+_preview_action_reprobe: dict[str, object] = {}
+_preview_action_reprobe_lock = threading.Lock()
+
+
+def _preview_action_request(sid: str, payload: dict) -> str:
+    """Bridge the drive_preview / annotate_preview callback onto a ``preview.act`` server request
+    without paying for a client that cannot answer: against an older app (or a session no window
+    hosts, #94272 / #119333) nobody answers ``preview.act`` and each action would block the full
+    deadline, stacking per turn exactly like the tour timeouts (#89620). First action per session
+    gets the short probe deadline; unanswered → bridge marked unavailable for that session with a
+    cooldown-gated reprobe; once answered, the full deadline. The verdict lives on the session
+    record, so a new session re-probes. Interrupt ≠ timeout: a cancelled wait (Stop, session close)
+    returns without poisoning the state, because ``send()``'s None conflates the two and only the
+    cooldown-reprobe token distinguishes an in-flight probe — so state flips only through it.
+    """
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        if session is None:
+            # detached caller: throwaway record, plain bridge, unprobed ({} is falsy but a REAL record)
+            session = {}
+        state = session.get("preview_action_bridge")
+        now = time.monotonic()
+        if state == "unanswered" and now < session.get("preview_action_bridge_retry_at", 0):
+            return _PREVIEW_ACTION_BRIDGE_UNAVAILABLE
+        if state == "unanswered":
+            with _preview_action_reprobe_lock:
+                if _preview_action_reprobe.get(sid) is not None:
+                    return _PREVIEW_ACTION_BRIDGE_UNAVAILABLE
+                _preview_action_reprobe[sid] = object()
+                session["preview_action_bridge_retry_at"] = now + _PREVIEW_ACTION_REPROBE_COOLDOWN_S
+    try:
+        answer = _ask("preview.act", sid, dict(payload),
+                      timeout=_PREVIEW_ACTION_TIMEOUT_S if state == "answered" else _PREVIEW_ACTION_PROBE_TIMEOUT_S)
+    finally:
+        if state == "unanswered":
+            with _preview_action_reprobe_lock:
+                _preview_action_reprobe.pop(sid, None)
+    with _sessions_lock:
+        if answer:
+            session["preview_action_bridge"] = "answered"
+        elif session.get("preview_action_bridge") != "answered":
+            session["preview_action_bridge"] = "unanswered"
+            session["preview_action_bridge_retry_at"] = time.monotonic() + _PREVIEW_ACTION_REPROBE_COOLDOWN_S
+    return answer or _PREVIEW_ACTION_BRIDGE_UNAVAILABLE
 
 
 def _clear_pending(sid: str | None = None) -> None:
