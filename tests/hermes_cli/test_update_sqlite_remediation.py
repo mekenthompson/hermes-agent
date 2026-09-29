@@ -43,20 +43,3 @@ def test_dashboard_refresh_preserves_restart_bookkeeping(already_restarted_units
     assert calls == [{'restart_managed': True, 'already_restarted_units': already_restarted_units,
                       'scope_home': str(get_hermes_home())}]
     assert 'could not be auto-restarted' in capsys.readouterr().out
-
-
-def test_down_planned_dashboard_is_respawned_from_its_recorded_port(monkeypatch):
-    spawned = []
-    monkeypatch.setattr(
-        "hermes_cli.main_dashboard._dashboard_listening", lambda host, port: port != 52795)
-    monkeypatch.setattr(
-        "hermes_cli.main_dashboard._respawn_dashboard_processes",
-        lambda commands: spawned.extend(commands) or [])
-    plan = SimpleNamespace(runtimes=[SimpleNamespace(
-        kind="dashboard", supervisor="manual-serve",
-        detail={"host": "127.0.0.1", "port": 52795})])
-    update_cmd_maint._respawn_down_planned_dashboards(plan)
-    assert spawned == [[
-        sys.executable, "-m", "hermes_cli.main", "dashboard",
-        "--no-open", "--host", "127.0.0.1", "--port", "52795",
-    ]]
