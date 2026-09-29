@@ -308,37 +308,6 @@ def _refresh_dashboard_after_update(*, already_restarted_units: set[str] | None 
     return unrecovered
 
 
-def _respawn_down_planned_dashboards(plan) -> None:
-    """Relaunch a planned manual dashboard whose port is down after the update.
-
-    The process scan misses a dashboard whose environ is hidden, and the code
-    swap can kill it before the scan runs. The plan already recorded host and
-    port. A port that is already up is left alone.
-    """
-    from hermes_cli.main_dashboard import _dashboard_listening, _respawn_dashboard_processes
-    commands: list[list[str]] = []
-    for runtime in getattr(plan, "runtimes", None) or []:
-        kind = runtime.get("kind") if isinstance(runtime, dict) else getattr(runtime, "kind", None)
-        supervisor = runtime.get("supervisor") if isinstance(runtime, dict) else getattr(runtime, "supervisor", None)
-        if kind != "dashboard" or supervisor != "manual-serve":
-            continue
-        detail = runtime.get("detail") if isinstance(runtime, dict) else getattr(runtime, "detail", None)
-        detail = detail or {}
-        port = detail.get("port")
-        if not isinstance(port, int) or port <= 0:
-            continue
-        host = str(detail.get("host") or "127.0.0.1")
-        with suppress(Exception):
-            if _dashboard_listening(host, port):
-                continue
-        commands.append([
-            sys.executable, "-m", "hermes_cli.main", "dashboard",
-            "--no-open", "--host", host, "--port", str(port),
-        ])
-    if commands:
-        _respawn_dashboard_processes(commands)
-
-
 def _print_update_completion(message: str) -> None:
     """Print the outcome (with branch @ sha so drift is visible) plus, when launched by the
     dashboard with an action id, a receipt line the Desktop matches after restart.

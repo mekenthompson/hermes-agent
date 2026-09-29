@@ -1910,9 +1910,7 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
     from hermes_cli.update_cmd import (
         _m, _surviving_pre_update_serve_runtimes, _warn_stale_serve_runtimes,
     )
-    from hermes_cli.update_cmd_maint import (
-        _refresh_dashboard_after_update, _respawn_down_planned_dashboards,
-    )
+    from hermes_cli.update_cmd_maint import _refresh_dashboard_after_update
     with _best_effort('Legacy unit check during update failed: %s'):
         _print_legacy_units_warning()
 
@@ -1923,8 +1921,6 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
     _dashboards_down = _refresh_dashboard_after_update(already_restarted_units=set(restart.restarted_services))
     if _dashboards_down:
         restart.incomplete = True
-    with _best_effort('Failed to respawn a planned dashboard: %s'):
-        _respawn_down_planned_dashboards(_pre_update_plan)
 
     # Success-path twin of the abort-recovery probe: the restart phase only touches
     # units, so a unit-less `hermes serve` keeps stale sys.modules. Runs AFTER
