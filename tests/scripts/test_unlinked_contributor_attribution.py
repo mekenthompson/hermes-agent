@@ -48,6 +48,12 @@ def test_exact_declared_source_identity_is_accepted(source):
     assert module().verified_unlinked_author('raw@example.test', sha, repo=repo)
 
 
+def test_bom_prefixed_declaration_preserves_exact_source_identity(source):
+    repo, path, record, sha = source
+    path.write_text(json.dumps(record), encoding='utf-8-sig')
+    assert module().verified_unlinked_author('raw@example.test', sha, repo=repo)
+
+
 @pytest.mark.parametrize('change', ['sha', 'name', 'email', 'url', 'empty_reason', 'duplicate'])
 def test_mismatched_or_ambiguous_record_fails_closed(source, change):
     repo, path, record, sha = source

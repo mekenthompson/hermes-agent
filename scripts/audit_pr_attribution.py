@@ -115,7 +115,7 @@ def verified_unlinked_author(email: str, sha: str, *, repo: Path = REPO_ROOT) ->
     try:
         if path.is_symlink():
             return False
-        declaration = json.loads(path.read_text(encoding="utf-8"))
+        declaration = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(declaration, dict) or declaration.get("email") != email:
             return False
         records = declaration.get("commits")
