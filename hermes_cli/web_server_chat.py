@@ -14,9 +14,11 @@ import sys
 import tempfile
 import threading
 import urllib.request
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from pathlib import Path
 from typing import Optional
+
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from pathlib import Path
+from typing import Optional  # noqa: F811 — historical duplicate import kept
 from hermes_cli.pty_session import PtySessionRegistry
 
 # Same logger the code used before extraction (record parity).
@@ -217,6 +219,31 @@ def _gateway_ws_ticket_from_subprotocol(ws: "WebSocket") -> tuple[str, str]:
     return (ticket, "ok") if ticket else ("", "invalid")
 
 
+def _ws_request_view(ws: "WebSocket") -> "Request":
+    """A ``Request`` facade over a ``WebSocket`` for the auth helpers.
+
+    ``_verify_access_token`` only touches ``request.headers`` (X-Forwarded-For
+    via ``client_ip``) and ``request.client`` on this path (``audit=False``,
+    no cookie/redirect work), so a lightweight duck-typed stand-in avoids
+    constructing a real ASGI request inside the upgrade. ``scan_session_providers``
+    itself never sees the request — only the provider callbacks do.
+    """
+    from fastapi import Request
+
+    return Request({
+        "type": "http",
+        "headers": [(k.lower().encode("latin-1"), v.encode("latin-1"))
+                    for k, v in getattr(ws.headers, "items", lambda: {})()],
+        "client": (ws.client.host, 0) if ws.client else None,
+        "server": None,
+        "scheme": "ws",
+        "method": "GET",
+        "path": ws.url.path,
+        "query_string": b"",
+        "root_path": "",
+    })
+
+
 def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     """Validate WS-upgrade auth; return ``(reason, credential)``.
 
@@ -228,8 +255,10 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     Gated: ``?ticket=`` (browser-minted, single-use, 30s TTL), ``?internal=``
     (process-lifetime, multi-use, only for server-spawned WS clients), or the
     explicitly operator-configured (never generated) ``?token=`` used by stock
-    Desktop connections.  Exactly one credential shape is allowed on an upgrade
-    so a valid reusable token cannot bypass a malformed or invalid ticket.
+    Desktop connections, or a provider-verified user session ``?token=``.
+    Exactly one credential shape is allowed on an upgrade so a valid reusable
+    token cannot bypass a malformed or invalid ticket. Generated process tokens
+    are never passed to session providers.
     """
     from hermes_cli.web_server import (
         _SESSION_TOKEN, _SESSION_TOKEN_IS_EXPLICIT, _explicit_session_token_session, app)
@@ -302,11 +331,38 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                 return "ticket_invalid", "ticket"
 
         if token:
-            if _SESSION_TOKEN_IS_EXPLICIT and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+            # Generated process credentials never enter the provider-token leg.
+            # Operator-configured credentials keep their stable Desktop identity.
+            if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+                if not _SESSION_TOKEN_IS_EXPLICIT:
+                    _reject("generated process token")
+                    return "token_mismatch", "token"
                 session = _explicit_session_token_session()
                 _stamp_identity({"user_id": session.user_id, "provider": session.provider})
                 return None, "explicit-token"
-            return "token_mismatch", "token"
+
+            from hermes_cli.dashboard_auth.base import ProviderError
+            from hermes_cli.dashboard_auth.middleware import _verify_access_token
+
+            try:
+                session = _verify_access_token(
+                    _ws_request_view(ws), access_token=token, audit=False)
+            except ProviderError:
+                # A provider outage must not crash an upgrade or leak provider
+                # diagnostics (which may contain credentials) into the audit.
+                _reject("session token verify unavailable")
+                return "token_unavailable", "token"
+            if session is not None:
+                _stamp_identity({"user_id": session.user_id, "provider": session.provider})
+                audit_log(
+                    AuditEvent.TOKEN_AUTH_SUCCESS,
+                    provider=session.provider, user_id=session.user_id,
+                    ip=(ws.client.host if ws.client else ""), path=ws.url.path)
+                return None, "token"
+            audit_log(
+                AuditEvent.TOKEN_AUTH_FAILURE, reason="session_token_invalid",
+                ip=(ws.client.host if ws.client else ""), path=ws.url.path)
+            return "token_invalid", "token"
         return "no_credential", "none"
 
     token = ws.query_params.get("token", "")
