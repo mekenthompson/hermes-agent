@@ -309,3 +309,34 @@ def test_changed_entries_step(tmp_path, change, rc, listed, text):
     assert [f for f in lines if f and "__EOF__" not in f and f != "files<<__EOF__"] == listed
     if text:
         assert text in res.stdout
+
+
+def test_house_reconcile_may_change_catalog_and_tooling(tmp_path):
+    """Only this fork's house/reconcile-* head skips the data-only admission rule."""
+    repo = tmp_path / "pr"
+    _write(repo, {"plugin-catalog/old.yaml": "name: old\n", "plugin-catalog/README.md": "rules\n"})
+    _git(repo, "init", "-qb", "main")
+    base = _commit(repo, "base")
+    _git(repo, "checkout", "-qb", "pr")
+    _write(repo, {**NEW, "scripts/tool.py": "x = 2\n"})
+    _commit(repo, "pr")
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "merge", "-q", "--no-ff", "-m", "merge", "pr")
+    _git(repo, "checkout", "-q", "--detach")
+    _git(repo, "update-ref", "refs/remotes/origin/main", base)
+    out = tmp_path / "gh-output.txt"
+    out.touch()
+    script = _step("Find changed catalog")
+    cases = [
+        ({"CATALOG_HEAD_REPO": "mekenthompson/hermes-agent", "CATALOG_HEAD_REF": "house/reconcile-abc"}, 0),
+        ({"CATALOG_HEAD_REPO": "attacker/hermes-agent", "CATALOG_HEAD_REF": "house/reconcile-abc"}, 1),
+        ({"CATALOG_HEAD_REPO": "mekenthompson/hermes-agent", "CATALOG_HEAD_REF": "feature/reconcile"}, 1),
+        ({}, 1),
+    ]
+    for extra, rc in cases:
+        out.write_text("", encoding="utf-8")
+        res = _run(script, tmp_path, repo, {**os.environ, "GITHUB_OUTPUT": str(out), **extra})
+        assert res.returncode == rc, (extra, res.stdout, res.stderr)
+        if rc == 0:
+            assert "plugin-catalog/new.yaml" in out.read_text(encoding="utf-8")
+
