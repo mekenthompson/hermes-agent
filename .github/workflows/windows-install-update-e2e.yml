@@ -7,7 +7,7 @@ name: Windows install + update E2E
 # Each file walks one journey (one install) and asserts several user-visible cells;
 # tracked bugs are message-gated xfails (tests/e2e/core/_pending_fixes.py).
 #
-# Called from tests-os.yml on upstream Python changes. The fork skips that call:
+# Called from tests-os.yml when the e2e_upgrade lane is on, except on the fork:
 # windows-latest cannot finish six parallel installs, and the fleet does not
 # install with install.ps1. Pushes to wine2e-install/** still run it alone,
 # including on the fork, for a deliberate installer proof.
@@ -34,7 +34,7 @@ jobs:
     timeout-minutes: 70
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
           # serve.git is a bare clone of this checkout: the installer's treeless clone and
           # `hermes update` need real history and release tags (version identity), as on GitHub.
