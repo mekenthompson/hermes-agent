@@ -466,14 +466,6 @@ def test_fork_ci_selection_plumbing_rearms_native_and_installer_lanes() -> None:
     assert lanes["installer"] and lanes["bootstrap"] and lanes["upgrade"]
 
 
-_REPO = Path(__file__).resolve().parents[2]
-
-
-def _yaml(rel: str) -> dict:
-    yaml = pytest.importorskip("hermes_yaml")
-    return yaml.safe_load((_REPO / rel).read_text(encoding="utf-8"))
-
-
 def test_every_lane_reaches_the_composite_action():
     """The action is the one surface every consumer reads, so it must carry all
     of them — ci.yaml, nix.yml and docker.yml each re-export a different subset.

@@ -495,6 +495,9 @@ def classify(files: list[str], run_e2e: bool = False, *, fork: bool = False, roo
             ret["docker"] = any(f == _FORK_IMAGE_WORKFLOW or not f.startswith(".github/") for f in files)
 
         # explicitly skip mcp catalog here. it's not needed unless those files are modified.
+    if fork and any(f.startswith(("apps/shared/", "web/", "skills/")) for f in files):
+        # The fork image copies these trees. Upstream's docker lane does not.
+        ret["docker"] = True
     return ret
 
 

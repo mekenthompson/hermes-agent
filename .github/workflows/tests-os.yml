@@ -198,7 +198,7 @@ jobs:
     # Fork: not a required CI job. windows-latest cannot finish six parallel
     # installs; upstream still runs this inside tests-os on its 32-core runner.
     name: Windows install + update E2E
-    if: inputs.e2e_upgrade && github.repository != 'mekenthompson/hermes-agent'
+    if: github.repository != 'mekenthompson/hermes-agent'
     uses: ./.github/workflows/windows-install-update-e2e.yml
 
   e2e-windows:

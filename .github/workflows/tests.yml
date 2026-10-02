@@ -250,7 +250,7 @@ jobs:
     # directory gets its own shard without editing this file, and no shard
     # carries the whole tree's wall time against the 60-minute timeout.
     # Skipping this job skips every e2e-upgrade shard with it.
-    if: inputs.e2e_upgrade && inputs.upgrade
+    if: inputs.upgrade
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -288,7 +288,7 @@ jobs:
     # runs ~5-15 min. Sharded by suite directory (see e2e-upgrade-plan).
     name: e2e-upgrade (${{ matrix.shard }})
     needs: e2e-upgrade-plan
-    if: inputs.e2e_upgrade && inputs.upgrade
+    if: inputs.upgrade
     # Use dedicated 32-core runners only inside the upstream repo; the fork
     # falls back to GitHub-hosted ubuntu-latest.
     runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
