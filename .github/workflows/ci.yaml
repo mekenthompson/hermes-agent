@@ -107,6 +107,14 @@ jobs:
         with:
           # PR merge checkout includes both event SHA parents at depth two.
           fetch-depth: 2
+      # These guards are unconditional. Share detect's checkout in the fork
+      # rather than queueing two more machines for seconds of Python work.
+      - name: Reject case-colliding filenames
+        if: github.repository == 'mekenthompson/hermes-agent'
+        run: python3 scripts/check-case-collisions.py
+      - name: Reject production imports of tools.lazy_deps
+        if: github.repository == 'mekenthompson/hermes-agent'
+        run: python3 scripts/ci/check_lazy_deps_imports.py
       - name: Detect affected areas
         id: classify
         uses: ./.github/actions/detect-changes
@@ -310,11 +318,13 @@ jobs:
   case-collision-check:
     name: Check no case-colliding filenames
     needs: detect
+    if: github.repository != 'mekenthompson/hermes-agent' || inputs.release == true
     uses: ./.github/workflows/case-collision-check.yml
 
   lazy-deps-guard:
     name: No production imports of the tools.lazy_deps stub
     needs: detect
+    if: github.repository != 'mekenthompson/hermes-agent' || inputs.release == true
     uses: ./.github/workflows/lazy-deps-guard.yml
 
   lockfile-diff:

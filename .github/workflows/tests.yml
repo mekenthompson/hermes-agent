@@ -162,6 +162,10 @@ jobs:
     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
     if: inputs.e2e
     runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
+    # Separate machines preserve the three-process-tree limit inside each job.
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(github.repository == 'mekenthompson/hermes-agent' && '{"slice":[1,2,3,4],"slices":[4]}' || '{"slice":[1],"slices":[1]}') }}
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -221,7 +225,7 @@ jobs:
         # tests/e2e/core/upgrade runs in its own job (e2e-upgrade) below.
         run: |
           mapfile -t files < <(find tests/e2e -name 'test_*.py' -not -path 'tests/e2e/core/upgrade/*' | sort)
-          scripts/run_tests.sh --include-integration "${files[@]}"
+          scripts/run_tests.sh --include-integration --slice ${{ matrix.slice }}/${{ matrix.slices }} "${files[@]}"
         env:
           # An e2e file is a process tree, not one CPU-bound pytest worker. With
           # 32 files at once the hosted run starved live children before their
@@ -244,7 +248,7 @@ jobs:
           NOUS_API_KEY: ""
 
   e2e-upgrade-plan:
-    # One e2e-upgrade shard per suite directory: the files directly under
+    # Discover suite directories and file groups once: the files directly under
     # tests/e2e/core/upgrade ("core") plus every subdirectory that holds
     # test_*.py (pm, git, handoff, network, hosts, ...). A new suite
     # directory gets its own shard without editing this file, and no shard
@@ -259,25 +263,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
-          sparse-checkout: tests/e2e/core/upgrade
-      - name: List suite directories
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            tests/e2e/core/upgrade
+            scripts/ci/upgrade_test_plan.py
+      - name: Plan upgrade file groups
         id: plan
         run: |
           set -euo pipefail
-          shards=$(python3 - <<'PY'
-          import json, os, pathlib
-          root = pathlib.Path("tests/e2e/core/upgrade")
-          shards = ["core"] if any(root.glob("test_*.py")) else []
-          shards += sorted(d.name for d in root.iterdir()
-                           if d.is_dir() and not d.name.startswith(("_", ".")) and any(d.rglob("test_*.py")))
-          # The handoff shard's 1s dashboard restart passes on upstream's
-          # 32-core runner and fails on the fork's ubuntu-latest fallback.
-          if os.environ.get("GITHUB_REPOSITORY") == "mekenthompson/hermes-agent":
-              shards = [shard for shard in shards if shard != "handoff"]
-          print(json.dumps(shards))
-          PY
-          )
-          echo "shards=$shards" | tee -a "$GITHUB_OUTPUT"
+          python3 scripts/ci/upgrade_test_plan.py
 
   e2e-upgrade:
     # tests/e2e/core/upgrade: a real N-1 -> HEAD `hermes update` (clean,
@@ -285,7 +279,8 @@ jobs:
     # entrypoint smoke, the config round-trip property matrix, and the lane
     # suites below it (pm: PM environment lifecycle across updates, ...).
     # Its own job: it needs full history + tags, bubblewrap, and one file
-    # runs ~5-15 min. Sharded by suite directory (see e2e-upgrade-plan).
+    # runs ~5-15 min. Split the fork's core/git suites into file groups
+    # so their longest install fixture gets its own machine.
     name: e2e-upgrade (${{ matrix.shard }})
     needs: e2e-upgrade-plan
     if: inputs.upgrade
@@ -295,8 +290,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      matrix:
-        shard: ${{ fromJSON(needs.e2e-upgrade-plan.outputs.shards || '["core"]') }}
+      matrix: ${{ fromJSON(needs.e2e-upgrade-plan.outputs.shards) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -387,20 +381,26 @@ jobs:
         run: |
           set -euo pipefail
           source .venv/bin/activate
-          if [ "$SHARD" = core ]; then
-            mapfile -t files < <(find tests/e2e/core/upgrade -maxdepth 1 -name 'test_*.py' | sort)
-          else
-            mapfile -t files < <(find "tests/e2e/core/upgrade/$SHARD" -name 'test_*.py' | sort)
-          fi
-          # A shard that collects nothing is a wiring bug, not a pass.
-          [ "${#files[@]}" -gt 0 ] || { echo "no test files for shard $SHARD" >&2; exit 1; }
-          printf 'shard %s: %s\n' "$SHARD" "${files[*]}"
-          scripts/run_tests.sh --include-integration "${files[@]}"
+          # The planner discovers all files once. Pass filenames as data so a
+          # matrix value cannot become shell code or change another job's slice.
+          python3 - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path("tests/e2e/core/upgrade")
+          files = json.loads(os.environ["UPGRADE_FILES"])
+          assert files and len(files) == len(set(files)), "empty or duplicate upgrade files"
+          for relative in files:
+              path = root / relative
+              assert path.resolve().is_relative_to(root.resolve()) and path.is_file(), relative
+          pathlib.Path("upgrade-files.txt").write_text(
+              "".join(str(root / relative) + "\n" for relative in files))
+          PY
+          scripts/run_tests.sh --include-integration --files-from upgrade-files.txt
         env:
-          SHARD: ${{ matrix.shard }}
+          UPGRADE_FILES: ${{ toJSON(matrix.files) }}
           # Each file drives real installs/updaters (process trees plus uv and
           # git I/O); cpu_count of them at once starves their deadlines. A
-          # shard holds at most ~7 files, so this runs each shard in one wave.
+          # fork core/git groups hold at most three files; the longest
+          # fixture gets a whole machine. Keep other suites' existing limit.
           HERMES_TEST_WORKERS: "6"
           HERMES_TEST_FILE_TIMEOUT: "3000"
           OPENROUTER_API_KEY: ""
