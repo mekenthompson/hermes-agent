@@ -39,7 +39,6 @@ Lanes:
 * ``rust``        — ``cargo test`` for the Tauri bootstrap installer. ``.rs``
   lives under ``apps/``, so without this lane a Rust change matched ``frontend``
   and only the TypeScript matrix ran.
-* ``mcp_catalog`` — bundled MCP catalog / installer review.
 
 ``docker``, ``nix`` and the E2E lanes take most of the larger-runner minutes.
 An ordinary product change does not start them on a pull request. Every push
@@ -80,6 +79,7 @@ import sys
 from pathlib import Path
 
 from scripts.ci.list_os_marked_tests import file_gates_on
+from scripts.ci.fork_review_files import ci_review_files, review_lanes
 
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
 # Shipped page outside those packages, exercised by the desktop Electron suite.
@@ -122,26 +122,9 @@ _PY_RELEVANT_CONTRACT_FILES = {
     "plugin-catalog/README.md",
 }
 
-# CI-sensitive files: eslint config, workflow files, composite actions.
-# Changes here can influence what code the autofix job executes and pushes to
-# main, so they require explicit maintainer review (ci-reviewed label).
-#
-# package.json is deliberately NOT listed here: npm scripts only execute on the
-# unprivileged generate-patch runner (contents: read), never on the privileged
-# apply-patch job. The two-job split means a malicious package.json script
-# can't get push access — it runs on an ephemeral runner with zero write perms.
-_CI_REVIEW_FILES = {
-    ".prettierrc",
-}
-_CI_REVIEW_PATHS = (".github/workflows/", ".github/actions/")
-
 # Supply-chain scan: files that can execute code at install/import time.
 _SCAN_EXTS = (".py", ".pth")
 _SCAN_FILES = {"setup.cfg", "pyproject.toml"}
-
-# MCP catalog files that require explicit security review.
-_MCP_CATALOG_PATHS = ("optional-mcps/",)
-_MCP_CATALOG_FILES = {"hermes_cli/mcp_catalog.py"}
 
 # Bootstrap installer: the POSIX shell installer, the dev-checkout wrapper
 # that carries the same pin fragment, and the Tauri app's non-Rust sources
@@ -297,10 +280,6 @@ def _is_scan(p: str) -> bool:
     return p.endswith(_SCAN_EXTS) or p in _SCAN_FILES
 
 
-def _is_mcp_catalog(p: str) -> bool:
-    return p.startswith(_MCP_CATALOG_PATHS) or p in _MCP_CATALOG_FILES
-
-
 def _is_desktop_updater(p: str) -> bool:
     return (
         p.startswith(_DESKTOP_UPDATER_PATHS)
@@ -315,19 +294,6 @@ def _is_rust(p: str) -> bool:
         or p.startswith(_RUST_PATHS)
         or os.path.basename(p) in _RUST_FILENAMES
     )
-
-
-def _is_ci_review(p: str) -> bool:
-    if p in _CI_REVIEW_FILES or p.startswith(_CI_REVIEW_PATHS):
-        return True
-    # Any eslint config file at any path — eslint configs can define custom
-    # fix functions that execute arbitrary code, so they all require review.
-    return os.path.basename(p).startswith("eslint.config.")
-
-
-def ci_review_files(files: list[str]) -> list[str]:
-    """Return the CI-sensitive paths that need maintainer review."""
-    return sorted({f.strip() for f in files if f.strip() and _is_ci_review(f.strip())})
 
 
 def _slow_lanes(files: list[str]) -> dict[str, bool]:
@@ -463,8 +429,7 @@ def classify(files: list[str], run_e2e: bool = False, *, fork: bool = False, roo
         ),
         "desktop_updater": any(_is_desktop_updater(f) for f in files),
         "rust": any(_is_rust(f) for f in files),
-        "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
-        "ci_review": any(_is_ci_review(f) for f in files),
+        **review_lanes(files),
         **{lane: run_e2e or on for lane, on in _slow_lanes(files).items()},
         "installer": any(_is_installer(f) for f in files),
         "os_tests": any(_is_os_specific(f, root) for f in files),
@@ -542,9 +507,8 @@ def pull_request_changed_files() -> list[str]:
 
     ``detect-changes`` calls ``repos/.../compare/base...head`` with raw SHAs.
     A fork force-push can 404 for ~30s until GitHub attaches the new head SHA
-    to the base repo, so the action fails open with an empty file list. That
-    forces ``ci_review=true`` and blocks the PR on a ``ci-reviewed`` label
-    even when no CI-sensitive file changed.
+    to the base repo, so the action fails open with an empty file list and
+    runs every lane even when the change is narrow.
 
     The pull-request files endpoint already knows the PR's files (it is how
     this action used to classify), so use it as a fallback on pull_request
