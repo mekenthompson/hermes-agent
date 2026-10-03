@@ -90,7 +90,7 @@ jobs:
       desktop_updater: ${{ steps.gate-lanes.outputs.desktop_updater }}
       rust: ${{ steps.gate-lanes.outputs.rust }}
       docker_meta: ${{ steps.gate-lanes.outputs.docker_meta }}
-      mcp_catalog: ${{ steps.gate-lanes.outputs.mcp_catalog }}
+      mcp_catalog: ${{ steps.classify.outputs.mcp_catalog }}
       e2e: ${{ steps.gate-lanes.outputs.e2e }}
       e2e_upgrade: ${{ steps.gate-lanes.outputs.e2e_upgrade }}
       e2e_desktop_core: ${{ steps.gate-lanes.outputs.e2e_desktop_core }}
@@ -122,7 +122,6 @@ jobs:
           github-token: ${{ github.token }}
       - name: Force all lanes on release
         # Overwrite the classifier outputs with 'true' when inputs.release.
-        # ci_review stays raw: it only ever feeds the PR review-label gate.
         id: gate-lanes
         env:
           RELEASE: ${{ inputs.release }}

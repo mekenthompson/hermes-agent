@@ -1,0 +1,17 @@
+{
+  "email": "michael.guber@outlook.com",
+  "commits": [
+    {
+      "sha": "6ce2a1c259cea486ca9d805b25ca38c878e08bb3",
+      "name": "Michael Guber",
+      "source_url": "https://github.com/NousResearch/hermes-agent/commit/6ce2a1c259cea486ca9d805b25ca38c878e08bb3",
+      "reason": "Official Nous commit API reports no linked author account. Preserve the exact upstream git author; this declaration does not cover any other commit with this email."
+    },
+    {
+      "sha": "e93f5e23210d4b8bedc3bbfee8f85afe39803a24",
+      "name": "Michael Guber",
+      "source_url": "https://github.com/NousResearch/hermes-agent/commit/e93f5e23210d4b8bedc3bbfee8f85afe39803a24",
+      "reason": "Official Nous commit API reports no linked author account. Preserve the exact upstream git author; this declaration does not cover any other commit with this email."
+    }
+  ]
+}

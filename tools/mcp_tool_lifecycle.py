@@ -4,6 +4,8 @@ server shutdown and draining of the background MCP loop."""
 import logging
 import asyncio
 import os
+import signal
+import sys
 import time
 from typing import Dict, Optional
 from tools.mcp_tool_common import _core
@@ -22,6 +24,83 @@ _orphan_stdio_pid_servers: Dict[int, str] = {}
 # grandchildren keep that PGID after the direct child exits, so killpg still reaches them.
 # Separate from _stdio_pids so the PGID survives the child's removal. Empty on Windows.
 _stdio_pgids: Dict[int, int] = {}
+# Spawn-time start ticks (/proc/<pid>/stat field 22) of each stdio child's pgroup leader,
+# captured alongside the PGID.  PIDs/PGIDs are recycled by the kernel once the original
+# process exits and is reaped, so a long-lived tracker holding a bare PGID is unsafe: by
+# the time a sweep runs, that number may name an unrelated process group (observed in the
+# wild: a desktop browser whose session leader happened to reuse a dead MCP child's PID —
+# #43044).  We re-check the leader's start time before signalling so a recycled PGID is
+# never killed.  None entries are dropped: platforms without /proc (macOS) have no baseline
+# and keep the legacy best-effort behaviour.
+_stdio_starttimes: Dict[int, int] = {}  # pid -> leader start ticks
+# Per-spawn marker inherited by stdio descendants. On Linux, an exited leader's
+# numeric PGID alone cannot prove ownership after the original group disappears.
+_stdio_spawn_markers: Dict[int, str] = {}
+_SPAWN_MARKER_ENV = "HERMES_INTERNAL_MCP_SPAWN_ID"
+
+
+def _member_has_marker(pid: int, pgid: int, marker: str) -> bool:
+    """Check both group membership and this spawn's inherited environment marker."""
+    expected = f"{_SPAWN_MARKER_ENV}={marker}".encode()
+    try:
+        if os.getpgid(pid) != pgid:
+            return False
+        with open(f"/proc/{pid}/environ", "rb") as stream:
+            return expected in stream.read().split(b"\0")
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
+def _marked_group_pids(pgid: int, marker: str) -> list[int]:
+    """Find surviving members of this spawn without trusting a recyclable PGID alone."""
+    found = []
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return found
+    with entries:
+        for entry in entries:
+            if not entry.name.isdecimal():
+                continue
+            pid = int(entry.name)
+            if _member_has_marker(pid, pgid, marker):
+                found.append(pid)
+    return found
+
+
+def _signal_marked_group(pgid: int, marker: str, sig: int) -> bool:
+    """Signal verified descendants through pidfds so PID reuse cannot redirect a signal."""
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_signal = getattr(signal, "pidfd_send_signal", None)
+    if pidfd_open is None or pidfd_signal is None:
+        return False
+    sent = False
+    for pid in _marked_group_pids(pgid, marker):
+        try:
+            fd = pidfd_open(pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+        try:
+            # Recheck after opening the stable process handle: the PID might have
+            # changed owners between the group scan and pidfd_open.
+            if _member_has_marker(pid, pgid, marker):
+                pidfd_signal(fd, sig)
+                sent = True
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        finally:
+            os.close(fd)
+    return sent
+
+
+def _leader_start_time(pid: int) -> Optional[int]:
+    """``/proc``-backed start time of the pgroup leader (PGID == leader PID on setsid spawn);
+    ``None`` on platforms without /proc (macOS/Windows) or for an already-reaped PID."""
+    from gateway.status import get_process_start_time
+    try:
+        return get_process_start_time(pid)
+    except Exception:  # noqa: BLE001 — the guard must never break signalling
+        return None
 
 
 def _snapshot_child_pids() -> set:
@@ -219,9 +298,8 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
         _close_mcp_stderr_logs(scope=scope)
 
 
-def _take_reapable_pids(include_active: bool, server_name: Optional[str]) -> tuple[Dict[int, str], Dict[int, int]]:
-    """Pop the PIDs to reap (and their spawn-time pgids) out of the ledgers under the lock, so
-    a future spawn can't collide with stale state. Returns ``(pid -> owner, pid -> pgid)``."""
+def _take_reapable_pids(include_active: bool, server_name: Optional[str]) -> tuple[Dict[int, str], Dict[int, int], Dict[int, int], Dict[int, str]]:
+    """Pop PIDs and their group, start-time, and marker ledgers under one lock."""
     def _owned(entries: Dict[int, str]) -> Dict[int, str]:
         return {pid: owner for pid, owner in entries.items() if server_name is None or owner == server_name}
 
@@ -236,12 +314,36 @@ def _take_reapable_pids(include_active: bool, server_name: Optional[str]) -> tup
             for pid in active:
                 _stdio_pids.pop(pid, None)
         pgids = {pid: _stdio_pgids.pop(pid) for pid in pids if pid in _stdio_pgids}
-    return pids, pgids
+        starts = {pid: _stdio_starttimes.pop(pid) for pid in pids if pid in _stdio_starttimes}
+        markers = {pid: _stdio_spawn_markers.pop(pid) for pid in pids if pid in _stdio_spawn_markers}
+    return pids, pgids, starts, markers
 
 
-def _signal_mcp_process(pid: int, sig: int, server_name: str, pgid: Optional[int], my_pgid: Optional[int]) -> None:
-    """SIGTERM/SIGKILL via the spawn-time pgroup on POSIX (reaches reparented grandchildren),
-    falling back to a per-pid signal."""
+def _signal_mcp_process(pid: int, sig: int, server_name: str, pgid: Optional[int], my_pgid: Optional[int],
+                        expected_start: Optional[int] = None, spawn_marker: Optional[str] = None) -> None:
+    """Signal a live leader's group when its start time matches the spawn record.
+
+    On Linux, an absent leader leaves a recyclable PGID, so signal only group
+    members carrying this spawn's marker through pidfds. A mismatched live leader
+    is never signalled. Other platforms retain the existing best-effort path."""
+    current_start = _leader_start_time(pid) if expected_start is not None or spawn_marker else None
+    if expected_start is not None and current_start is not None and current_start != expected_start:
+        logger.debug(
+            "Skip signalling MCP pid %d (%s): start-time mismatch — PID was recycled; "
+            "refusing to kill an unrelated process group.", pid, server_name)
+        return
+    if sys.platform.startswith("linux") and current_start is None and expected_start is not None and not spawn_marker:
+        from gateway.status import _pid_exists
+        if not _pid_exists(pid):
+            logger.debug("Skip MCP pid %d (%s): exited leader has no group ownership marker", pid, server_name)
+            return
+    if sys.platform.startswith("linux") and spawn_marker and (current_start is None or expected_start is None):
+        # The leader is gone. Its PGID might now belong to a different group,
+        # including one whose new leader has also exited. Verify each descendant
+        # and use its pidfd instead of killpg on the recyclable group number.
+        if pgid is not None and pgid != my_pgid:
+            _signal_marked_group(pgid, spawn_marker, sig)
+        return
     killpg = getattr(os, "killpg", None)
     if pgid is not None and killpg is not None:
         if my_pgid is not None and pgid == my_pgid:
@@ -305,7 +407,7 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
     final shutdown after the MCP loop has stopped. ``server_name`` limits the sweep to one
     server (stdio reconnects cleaning up their old transport)."""
     import signal as _signal
-    pids, pgids = _take_reapable_pids(include_active, server_name)
+    pids, pgids, starts, markers = _take_reapable_pids(include_active, server_name)
     if not pids:  # skip the 2s sleep every MCP-free shutdown would otherwise pay
         return
 
@@ -315,14 +417,30 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
         my_pgid = None  # Windows or restricted environment
 
     for pid, owner in pids.items():
-        _signal_mcp_process(pid, _signal.SIGTERM, owner, pgids.get(pid), my_pgid)
+        _signal_mcp_process(pid, _signal.SIGTERM, owner, pgids.get(pid), my_pgid,
+                            starts.get(pid), markers.get(pid))
         logger.debug("Sent SIGTERM to orphaned MCP process %d (%s)", pid, owner)
     time.sleep(2)
     sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
     from gateway.status import _pid_exists  # ``os.kill(pid, 0)`` is NOT a no-op on Windows
     for pid, owner in pids.items():
-        if _pid_exists(pid):  # survived SIGTERM
-            _signal_mcp_process(pid, sigkill, owner, pgids.get(pid), my_pgid)
+        # A reaped leader is absent from /proc even while its children survive.
+        # On Linux, require this spawn's marker; a bare group-liveness probe may
+        # find an unrelated group that recycled the old PGID.
+        pgid = pgids.get(pid)
+        group_alive = False
+        if pgid is not None and pgid != my_pgid and (pid in starts or markers.get(pid)) and hasattr(os, "killpg"):
+            try:
+                if sys.platform.startswith("linux") and markers.get(pid):
+                    group_alive = bool(_marked_group_pids(pgid, markers[pid]))
+                elif not sys.platform.startswith("linux"):
+                    os.killpg(pgid, 0)  # windows-footgun: ok — POSIX-only, guarded
+                    group_alive = True
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        if _pid_exists(pid) or group_alive:  # leader or descendants survived SIGTERM
+            _signal_mcp_process(pid, sigkill, owner, pgids.get(pid), my_pgid,
+                                starts.get(pid), markers.get(pid))
             logger.warning("Force-killed MCP process %d (%s) after SIGTERM timeout", pid, owner)
     # These groups are reaped. Release them last, so a crash partway through the SIGTERM/SIGKILL
     # dance still leaves the supervisor holding them.

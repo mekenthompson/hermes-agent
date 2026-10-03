@@ -8,8 +8,7 @@ name: Lint (ruff + ty)
 #      Separate job so the advisory diff still runs even when enforcement
 #      fails.
 #
-# CI-sensitive file review was previously here as a ``ci-review`` job but
-# has moved to ``review-labels.yml`` so it can be rerun independently.
+# On this fork, review-labels.yml enforces `ci-reviewed` for CI-sensitive files.
 
 on:
   workflow_call:
