@@ -97,15 +97,15 @@ def build_results(
                 "kind": "action_required",
                 "title": "CI-sensitive file review",
                 "summary": (
-                    "This PR changes CI-sensitive files (.pth, eslint config, "
-                    "workflow YAMLs, or composite actions). These influence "
-                    "what the js-autofix job executes and pushes to main."
+                    "This PR changes files that can execute during Python startup "
+                    "or control CI execution and automated changes to main."
                 ),
                 "how_to_fix": (
                     "Add the `ci-reviewed` label after verifying:\n"
                     "- no new eslint rules with custom `fix` functions that write outside linted paths,\n"
                     "- no workflow changes that widen permissions or remove guards,\n"
-                    "- no composite action changes that alter what gets executed."
+                    "- no composite action changes that alter what gets executed,\n"
+                    "- every changed .pth file and its imported modules or commands are safe to run at Python startup."
                 ),
             }
         if detail:
