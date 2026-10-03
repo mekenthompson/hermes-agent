@@ -10,6 +10,45 @@ from typing import Mapping
 
 FORK = "mekenthompson/hermes-agent"
 
+_FORK_IMAGE_WORKFLOW = ".github/workflows/fork-agent-image.yml"
+_FORK_UPGRADE_UNRELATED_PREFIXES = (
+    "gateway/platforms/", "plugins/kanban/", "tests/agent/test_",
+    "tests/gateway/platforms/test_", "website/docs/",
+)
+
+
+def is_fork(argv: list[str] | None = None, environ: Mapping[str, str] | None = None) -> bool:
+    """Explicit fork mode, or the maintained fork's Actions repository identity."""
+    argv = sys.argv[1:] if argv is None else argv
+    env = os.environ if environ is None else environ
+    return "--fork" in argv or (env.get("REPO") or env.get("GITHUB_REPOSITORY") or "") == FORK
+
+
+def apply_fork_classification(files: list[str], lanes: Mapping[str, bool]) -> dict[str, bool]:
+    """Apply the maintained fork's image and upgrade policy to shared lanes.
+
+    Shared path classification stays in classify_changes. These decisions are
+    deployment policy for the fork's smaller runners and image contents.
+    """
+    result = dict(lanes)
+    result["upgrade"] = not files or any(
+        not path.startswith(_FORK_UPGRADE_UNRELATED_PREFIXES) for path in files
+    )
+    ci_change = any(path.startswith("scripts/ci/") for path in files)
+    if ci_change:
+        # A classifier/policy edit runs every lane except unrelated MCP catalog review.
+        for lane in result:
+            if lane not in {"mcp_catalog", "upgrade"}:
+                result[lane] = True
+    if files and (ci_change or any(path.startswith(".github/") for path in files)):
+        # .github is ignored by the image; its publication workflow is the exception.
+        result["docker"] = any(
+            path == _FORK_IMAGE_WORKFLOW or not path.startswith(".github/") for path in files
+        )
+    if any(path.startswith(("apps/shared/", "web/", "skills/")) for path in files):
+        result["docker"] = True
+    return result
+
 
 @dataclass(frozen=True)
 class NeedsSummary:
