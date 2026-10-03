@@ -9,12 +9,11 @@ name: Supply Chain Audit
 # yourself adding WARNING-tier patterns here again, make a separate
 # advisory-only workflow instead.
 #
-# Path-gating is handled centrally by the ``ci.yml`` orchestrator's
+# Path-gating is handled centrally by the ``ci.yaml`` orchestrator's
 # ``detect`` job. The orchestrator passes ``scan`` / ``deps`` booleans as
 # inputs; this workflow's jobs gate on those inputs instead of re-computing
-# the diff. Files that run at install/startup (.pth, setup.py, ...) and the
-# MCP catalog are not scanned here: .github/CODEOWNERS requires a maintainer
-# review for them.
+# the diff. Startup hooks and .pth files are checked here and by the
+# fork's ci-reviewed label gate.
 #
 # Outputs:
 #   review_status  — JSON array of status objects consumed by the review
@@ -84,6 +83,20 @@ jobs:
 
           FINDINGS=""
 
+          # --- .pth files execute on Python startup ---
+          PTH_FILES=$(git diff --diff-filter=d --name-only "$BASE"..."$HEAD" | grep '\.pth$' || true)
+          if [ -n "$PTH_FILES" ]; then
+            FINDINGS="${FINDINGS}
+          ### 🚨 CRITICAL: .pth file added or modified
+          Python \`.pth\` files in \`site-packages/\` execute automatically when the interpreter starts.
+
+          **Files:**
+          \`\`\`
+          ${PTH_FILES}
+          \`\`\`
+          "
+          fi
+
           # --- base64 decode + exec/eval on the same line (the litellm attack pattern) ---
           B64_EXEC_HITS=$(echo "$DIFF" | grep -n '^+' | grep -iE 'base64\.(b64decode|decodebytes|urlsafe_b64decode)' | grep -iE 'exec\(|eval\(' | head -10 || true)
           if [ -n "$B64_EXEC_HITS" ]; then
@@ -143,10 +156,15 @@ jobs:
           python3 - <<'PYEOF'
           import json, os
 
-          # The review-label gate consumes critical_findings and owns the
-          # action-required result. This scan remains a fact finder so a
-          # reviewed finding can pass on rerun.
-          status = []
+          # The label gate owns the blocking verdict; show exact scanner
+          # evidence in the review comment for the maintainer.
+          found = os.environ.get("FOUND") == "true"
+          detail = open("/tmp/findings.md", encoding="utf-8").read() if found else ""
+          status = [{"source": "supply chain", "results": [{
+              "kind": "info", "title": "Critical scan findings",
+              "summary": "Review these exact findings before applying `ci-reviewed`.",
+              "detail": detail,
+          }]}] if found else []
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"review_status={json.dumps(status)}\n")

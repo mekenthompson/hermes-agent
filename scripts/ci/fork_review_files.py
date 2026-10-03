@@ -11,7 +11,7 @@ _MCP_CATALOG_FILES = {"hermes_cli/mcp_catalog.py"}
 
 
 def is_ci_review(path: str) -> bool:
-    if path in _CI_REVIEW_FILES or path.startswith(_CI_REVIEW_PATHS):
+    if path.endswith(".pth") or path in _CI_REVIEW_FILES or path.startswith(_CI_REVIEW_PATHS):
         return True
     return PurePosixPath(path).name.startswith("eslint.config.")
 

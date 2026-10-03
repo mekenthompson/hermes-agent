@@ -261,7 +261,7 @@ CASES = {
         _lanes(python=True, scan=True, e2e=True, e2e_upgrade=True),
     ),
     # Supply-chain lanes
-    ".pth file → scan": (["evil.pth"], _lanes(python=True, scan=True)),
+    ".pth file → scan and review": (["evil.pth"], _lanes(python=True, scan=True, ci_review=True)),
     "setup.py → scan": (["setup.py"], _lanes(python=True, scan=True, docker=True, nix=True, e2e_upgrade=True)),
     # Files CODEOWNERS owns carry no lane of their own: they only route as code.
     "mcp catalog manifest → python only": (
