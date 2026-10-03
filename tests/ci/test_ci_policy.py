@@ -130,6 +130,28 @@ def test_review_label_gate_uses_critical_finding_result() -> None:
     ]
 
 
+def test_folded_guards_gate_detect_and_keep_release_checks() -> None:
+    yaml = pytest.importorskip("hermes_yaml")
+    jobs = yaml.safe_load((_PATH.parents[2] / ".github/workflows/ci.yaml").read_text())["jobs"]
+    commands = {step.get("run"): step for step in jobs["detect"]["steps"]}
+    for command in (
+        "python3 scripts/check-case-collisions.py",
+        "python3 scripts/ci/check_lazy_deps_imports.py",
+    ):
+        step = commands[command]
+        assert step["if"] == "github.repository == 'mekenthompson/hermes-agent'"
+        assert not step.get("continue-on-error", False)
+    fork = _mod.selected_jobs({}, "mekenthompson/hermes-agent", "pull_request")
+    upstream = _mod.selected_jobs({}, "NousResearch/hermes-agent", "pull_request")
+    for job in ("case-collision-check", "lazy-deps-guard"):
+        assert fork[job] is False
+        assert upstream[job] is True
+        assert jobs[job]["if"] == "github.repository != 'mekenthompson/hermes-agent' || inputs.release == true"
+    assert fork["detect"] is True
+    # A guard failure stops classification; its required parent cannot be skipped.
+    assert _mod.evaluate_needs({"detect": {"result": "failure"}}, {"detect": True}).failed == ["detect"]
+
+
 def test_policy_file_runs_as_the_aggregate_job_entrypoint(tmp_path: Path) -> None:
     """The checkout-provided script writes the output consumed by the workflow job."""
     output_path = tmp_path / "github-output"
