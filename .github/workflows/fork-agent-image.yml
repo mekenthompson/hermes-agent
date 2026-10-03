@@ -14,7 +14,7 @@ on:
 
 permissions:
   contents: read
-  actions: read # inspect CI for the exact selected commit; publication fails closed without it
+  actions: read # inspect the image CI aggregate for the exact selected commit
 
 concurrency:
   # One group per pull request, otherwise per exact commit, so a main push
@@ -156,7 +156,7 @@ jobs:
 
   publish:
     # Every main push that changes an image input publishes automatically
-    # once the exact-SHA CI run is green; publish=true dispatches remain
+    # once the exact-SHA image CI aggregate is green; publish=true dispatches remain
     # available for re-runs (and always build: dispatch fails open).
     needs: detect
     if: >-
@@ -252,8 +252,9 @@ jobs:
       # The build, runtime checks, SBOM, and scan above need no registry
       # credentials (base images are public), so they overlap with CI. Nothing
       # below this gate may log in to or write GHCR until the exact-SHA main
-      # CI run has completed successfully; waiting fails closed on timeout.
-      - name: Verify exact main CI gate before registry access
+      # image CI aggregate has passed; other products' tests continue in CI.
+      # Missing, failed or stale aggregate proof blocks publication.
+      - name: Verify exact main image CI gate before registry access
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -263,11 +264,12 @@ jobs:
             --workflow "ci.yaml" \
             --sha "$GITHUB_SHA" \
             --workflow-path ".github/workflows/ci.yaml" \
+            --required-job "Image required checks pass" \
             --wait \
             --timeout-minutes 30 \
             --interval-seconds 20
 
-      - name: Log in to GHCR after scan and exact-CI gate
+      - name: Log in to GHCR after scan and image CI gate
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io

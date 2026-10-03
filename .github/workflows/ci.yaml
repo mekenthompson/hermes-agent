@@ -144,6 +144,7 @@ jobs:
           LANES: ${{ toJSON(steps.gate-lanes.outputs) }}
           REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
+          RELEASE: ${{ inputs.release }}
         run: python3 scripts/ci/ci_policy.py --select
 
   # ─────────────────────────────────────────────────────────────────────
@@ -165,8 +166,22 @@ jobs:
     uses: ./.github/workflows/tests.yml
     with:
       upgrade: ${{ needs.detect.outputs.upgrade == 'true' }}
+      upgrade_partition: ${{ github.repository == 'mekenthompson/hermes-agent' && inputs.release != true && 'runtime' || 'all' }}
       e2e: ${{ needs.detect.outputs.e2e == 'true' }}
       e2e_upgrade: ${{ needs.detect.outputs.e2e_upgrade == 'true' }}
+
+  # These still block source merges. The Linux image does not use a native
+  # installer; upstream and stable releases retain the original combined call.
+  native-install-tests:
+    name: Native install tests
+    needs: detect
+    if: ${{ fromJSON(needs.detect.outputs.selected_jobs).native-install-tests }}
+    uses: ./.github/workflows/tests.yml
+    with:
+      unit: false
+      e2e: false
+      upgrade: true
+      upgrade_partition: native
 
   # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
   # the OS-marked tests it collects are skipped there by design (see the
@@ -385,6 +400,7 @@ jobs:
     needs:
       - detect
       - tests
+      - native-install-tests
       - tests-os
       - lint
       - js-tests
@@ -441,6 +457,43 @@ jobs:
           else
             echo "$NEEDS" | python3 scripts/ci/ci_policy.py
           fi
+
+  # Publication only: all runtime lanes still gate the Linux image. Other
+  # platforms/installers/Desktop keep running and remain in all-checks-pass.
+  # This introduces no second test run and does not change upstream releases.
+  image-checks-pass:
+    name: Image required checks pass
+    needs:
+      - detect
+      - tests
+      - lint
+      - js-tests
+      - history-check
+      - contributor-check
+      - uv-lockfile
+      - infographic-check
+      - case-collision-check
+      - lazy-deps-guard
+      - lockfile-diff
+      - docker-lint
+      - profile-artifact-check
+      - icons-freshness-check
+      - supply-chain
+      - osv-scanner
+      - review-labels
+    if: always() && github.repository == 'mekenthompson/hermes-agent' && inputs.release != true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - name: Evaluate image job results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          SELECTED_JOBS: ${{ needs.detect.outputs.selected_jobs }}
+          CRITICAL_FINDINGS: ${{ needs.supply-chain.outputs.critical_findings }}
+        run: printf '%s' "$NEEDS" | python3 scripts/ci/ci_policy.py --image
 
   # ─────────────────────────────────────────────────────────────────────
   # CI timing report: collect per-job/step durations from the GitHub API,

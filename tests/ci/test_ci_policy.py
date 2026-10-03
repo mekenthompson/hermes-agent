@@ -101,9 +101,32 @@ def test_selection_covers_each_orchestrator_prerequisite() -> None:
         (_PATH.parents[2] / ".github/workflows/ci.yaml").read_text()
     )
     jobs = workflow["jobs"]
-    expected = set(jobs) - {"all-checks-pass", "ci-timings"}
+    expected = set(jobs) - {"all-checks-pass", "image-checks-pass", "ci-timings"}
     selected = _mod.selected_jobs({}, "mekenthompson/hermes-agent", "pull_request")
     assert set(selected) == expected == set(jobs["all-checks-pass"]["needs"])
+
+
+def test_image_gate_keeps_runtime_failures_and_excludes_only_other_surfaces() -> None:
+    import yaml
+
+    jobs = yaml.safe_load((_PATH.parents[2] / ".github/workflows/ci.yaml").read_text())["jobs"]
+    selected = {name: True for name in jobs["all-checks-pass"]["needs"]}
+    image = _mod.image_selected_jobs(selected)
+    assert set(image) == set(jobs["image-checks-pass"]["needs"])
+    assert set(selected) - set(image) == {
+        "native-install-tests",
+        "tests-os", "installer-tests", "rust-tests", "bootstrap-installer",
+        "e2e-desktop", "e2e-desktop-core", "e2e-desktop-update", "docs-site",
+    }
+    needs = {name: {"result": "success"} for name in image}
+    assert not _mod.evaluate_needs(needs, image).failed
+    for name in image:
+        for result in ("failure", "cancelled", "skipped", "missing"):
+            broken = {**needs, name: {"result": result}}
+            assert _mod.evaluate_needs(broken, image).failed == [name]
+    # New lanes are required unless explicitly classified as another surface.
+    expanded = _mod.image_selected_jobs({**selected, "new-runtime-check": True})
+    assert _mod.evaluate_needs(needs, expanded).failed == ["new-runtime-check"]
 
 
 def test_upgrade_applicability_reaches_real_upgrade_suite() -> None:
@@ -119,6 +142,27 @@ def test_upgrade_applicability_reaches_real_upgrade_suite() -> None:
     assert tests[True]["workflow_call"]["inputs"]["upgrade"]["default"] is True
     assert tests["jobs"]["e2e-upgrade-plan"]["if"] == "inputs.upgrade"
     assert tests["jobs"]["e2e-upgrade"]["if"] == "inputs.upgrade"
+    # No duplicate units/E2E in the native call; both partitions are required
+    # for ordinary fork source merges, while releases retain the combined run.
+    native = ci["jobs"]["native-install-tests"]
+    assert native["with"] == {"unit": False, "e2e": False, "upgrade": True, "upgrade_partition": "native"}
+    assert native["if"] == "${{ fromJSON(needs.detect.outputs.selected_jobs).native-install-tests }}"
+    assert ci["jobs"]["tests"]["with"]["upgrade_partition"] == "${{ github.repository == 'mekenthompson/hermes-agent' && inputs.release != true && 'runtime' || 'all' }}"
+    assert tests[True]["workflow_call"]["inputs"]["unit"]["default"] is True
+    assert tests[True]["workflow_call"]["inputs"]["upgrade_partition"]["default"] == "all"
+    assert tests["jobs"]["test"]["if"] == "inputs.unit"
+    assert "inputs.upgrade_partition" in tests["concurrency"]["group"]
+    lanes = {"python": "true", "upgrade": "true"}
+    for repo, release, expected in (("mekenthompson/hermes-agent", False, True),
+                                    ("mekenthompson/hermes-agent", True, False),
+                                    ("NousResearch/hermes-agent", False, False)):
+        selected = _mod.selected_jobs(lanes, repo, "push", release=release)
+        assert selected["native-install-tests"] is expected
+        needs = {name: {"result": "success" if required else "skipped"} for name, required in selected.items()}
+        assert not _mod.evaluate_needs(needs, selected).failed
+        if expected:
+            needs["native-install-tests"]["result"] = "failure"
+            assert _mod.evaluate_needs(needs, selected).failed == ["native-install-tests"]
 
 
 def test_review_label_gate_uses_critical_finding_result() -> None:

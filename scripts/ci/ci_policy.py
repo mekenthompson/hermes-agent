@@ -10,6 +10,14 @@ from typing import Mapping
 
 FORK = "mekenthompson/hermes-agent"
 
+# These products are not shipped in the fork's Linux runtime image. All other
+# selected lanes, including Python/runtime E2E and bundled web/TUI JS, still gate it.
+_NON_IMAGE_JOBS = frozenset({
+    "native-install-tests",
+    "tests-os", "installer-tests", "rust-tests", "bootstrap-installer",
+    "e2e-desktop", "e2e-desktop-core", "e2e-desktop-update", "docs-site",
+})
+
 _FORK_IMAGE_WORKFLOW = ".github/workflows/fork-agent-image.yml"
 _FORK_UPGRADE_UNRELATED_PREFIXES = (
     "gateway/platforms/", "plugins/kanban/", "tests/agent/test_",
@@ -68,7 +76,7 @@ def should_cancel_in_progress(event_name: str, repository: str, ref: str) -> boo
 
 
 def selected_jobs(
-    lanes: Mapping[str, str], repository: str, event_name: str
+    lanes: Mapping[str, str], repository: str, event_name: str, *, release: bool = False,
 ) -> dict[str, bool]:
     """One applicability decision consumed by both CI jobs and their gate."""
 
@@ -81,6 +89,7 @@ def selected_jobs(
     return {
         "detect": True,
         "tests": on("python"),
+        "native-install-tests": fork and not release and on("python") and on("upgrade"),
         "tests-os": on("python") and (not fork or on("os_tests")),
         "lint": on("python"),
         "js-tests": on("frontend"),
@@ -105,6 +114,10 @@ def selected_jobs(
         "review-labels": pr and (on("ci_review") or on("mcp_catalog")),
         "osv-scanner": not fork or on("uv_lock") or on("npm_lock") or on("deps"),
     }
+
+
+def image_selected_jobs(selected: Mapping[str, bool]) -> dict[str, bool]:
+    return {name: required for name, required in selected.items() if name not in _NON_IMAGE_JOBS}
 
 
 def evaluate_needs(
@@ -138,7 +151,8 @@ def main() -> int:
     if "--select" in sys.argv[1:]:
         lanes = json.loads(os.environ.get("LANES", "{}"))
         selected = selected_jobs(
-            lanes, os.environ.get("REPO", ""), os.environ.get("EVENT_NAME", "")
+            lanes, os.environ.get("REPO", ""), os.environ.get("EVENT_NAME", ""),
+            release=os.environ.get("RELEASE") == "true",
         )
         out = "selected_jobs=" + json.dumps(selected, separators=(",", ":"))
         print(out)
@@ -151,6 +165,8 @@ def main() -> int:
         selected = json.loads(os.environ.get("SELECTED_JOBS", "{}"))
     except json.JSONDecodeError:
         selected = {}
+    if "--image" in sys.argv[1:]:
+        selected = image_selected_jobs(selected)
     summary = evaluate_needs(
         needs, selected, critical_findings=os.environ.get("CRITICAL_FINDINGS") == "true"
     )

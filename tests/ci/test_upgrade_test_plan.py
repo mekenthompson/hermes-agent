@@ -51,6 +51,30 @@ def test_empty_inventory_fails_closed(tmp_path):
         plan(tmp_path, "mekenthompson/hermes-agent")
 
 
+def test_publication_partitions_keep_runtime_coverage_without_duplicate_tests(tmp_path):
+    inventory = ROOT / "tests/e2e/core/upgrade"
+    files = [path.relative_to(inventory) for path in inventory.rglob("test_*.py")]
+    files += [Path("test_new_runtime.py"), Path("new-suite/test_new_runtime.py")]
+    for relative in files:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    def selected(partition):
+        return [file for job in plan(tmp_path, "mekenthompson/hermes-agent", partition)["include"] for file in job["files"]]
+    combined, runtime, native = (selected(partition) for partition in ("all", "runtime", "native"))
+    assert sorted(runtime + native) == sorted(combined)
+    assert len(runtime + native) == len(set(runtime + native))
+    assert set(runtime) == {
+        "test_config_roundtrip_properties.py", "test_fresh_process_entrypoints.py",
+        "test_profile_update_cron.py", "test_update_userstate_import.py",
+        "test_new_runtime.py", "new-suite/test_new_runtime.py",
+    }
+    for repository in ("mekenthompson/hermes-agent", "NousResearch/hermes-agent"):
+        assert plan(tmp_path, repository) == plan(tmp_path, repository, "all")
+    with pytest.raises(ValueError, match="unknown upgrade partition"):
+        plan(tmp_path, "mekenthompson/hermes-agent", "typo")
+
+
 def test_cli_output_drives_matrix_without_a_second_discovery(tmp_path):
     output = tmp_path / "output"
     child = subprocess.run(
