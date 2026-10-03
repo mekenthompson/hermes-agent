@@ -80,6 +80,7 @@ import sys
 from pathlib import Path
 
 from scripts.ci.list_os_marked_tests import file_gates_on
+from scripts.ci.ci_policy import apply_fork_classification, is_fork
 
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
 # Shipped page outside those packages, exercised by the desktop Electron suite.
@@ -345,11 +346,6 @@ def _slow_lanes(files: list[str]) -> dict[str, bool]:
 
 
 
-# The maintained fork. Its CI runs on 4-core hosted runners under a 20-job
-# concurrency cap, so it scopes harder than upstream where this file marks it.
-FORK_REPOSITORY = "mekenthompson/hermes-agent"
-_FORK_IMAGE_WORKFLOW = ".github/workflows/fork-agent-image.yml"
-
 # Fork-only Windows installer lane retained alongside upstream bootstrap checks.
 _INSTALLER_PATHS = ("scripts/tests/",)
 _INSTALLER_FILES = {"scripts/install.ps1", "scripts/install.cmd"}
@@ -377,10 +373,6 @@ _SHARED_NATIVE_RUNTIME_FILES = {
     "hermes_cli/_launchers.py", "hermes_cli/relaunch.py", "hermes_cli/runtime_paths.py",
     "scripts/build/mint_launchers.py",
 }
-_FORK_UPGRADE_UNRELATED_PREFIXES = (
-    "gateway/platforms/", "plugins/kanban/", "tests/agent/test_",
-    "tests/gateway/platforms/test_", "website/docs/",
-)
 _BINARY_ARTIFACT_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".tar.gz", ".tgz")
 
 
@@ -412,19 +404,6 @@ def _is_os_specific(p: str, root: Path) -> bool:
 
 def _is_binary_artifact(p: str) -> bool:
     return p.lower().endswith(_BINARY_ARTIFACT_SUFFIXES)
-
-
-def _unrelated_to_upgrade(p: str) -> bool:
-    """Narrow fork allowlist: these paths cannot change installer/update plumbing."""
-    return p.startswith(_FORK_UPGRADE_UNRELATED_PREFIXES)
-
-
-def is_fork(argv: list[str] | None = None, environ: "os._Environ[str] | dict[str, str] | None" = None) -> bool:
-    """``--fork`` on the command line, or REPO / GITHUB_REPOSITORY naming the fork."""
-    argv = sys.argv[1:] if argv is None else argv
-    env = os.environ if environ is None else environ
-    repo = env.get("REPO") or env.get("GITHUB_REPOSITORY") or ""
-    return "--fork" in argv or repo == FORK_REPOSITORY
 
 
 def classify(files: list[str], run_e2e: bool = False, *, fork: bool = False, root: Path | None = None) -> dict[str, bool]:
@@ -469,9 +448,9 @@ def classify(files: list[str], run_e2e: bool = False, *, fork: bool = False, roo
         "installer": any(_is_installer(f) for f in files),
         "os_tests": any(_is_os_specific(f, root) for f in files),
         "binary_artifacts": any(_is_binary_artifact(f) for f in files),
-        "upgrade": (not fork) or (not files) or any(not _unrelated_to_upgrade(f) for f in files),
+        "upgrade": True,
     }
-    if not files or any(f.startswith(".github/") for f in files) or (fork and any(f.startswith("scripts/ci/") for f in files)):
+    if not files or any(f.startswith(".github/") for f in files):
         ret["python"] = True
         ret["python_prod"] = True
         ret["docker_meta"] = True
@@ -489,16 +468,8 @@ def classify(files: list[str], run_e2e: bool = False, *, fork: bool = False, roo
         ret["installer"] = True
         ret["os_tests"] = True
         ret["binary_artifacts"] = True
-        if fork and files:
-            # .github/ is in .dockerignore: a CI-only diff cannot change the
-            # image, so the fork does not rebuild and republish it for one.
-            ret["docker"] = any(f == _FORK_IMAGE_WORKFLOW or not f.startswith(".github/") for f in files)
-
         # explicitly skip mcp catalog here. it's not needed unless those files are modified.
-    if fork and any(f.startswith(("apps/shared/", "web/", "skills/")) for f in files):
-        # The fork image copies these trees. Upstream's docker lane does not.
-        ret["docker"] = True
-    return ret
+    return apply_fork_classification(files, ret) if fork else ret
 
 
 def _event_payload() -> dict:
