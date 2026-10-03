@@ -23,6 +23,7 @@ def test_partition_is_disjoint_and_covers_new_files_and_suites(tmp_path, reposit
         "git/test_shallow_install.py", "git/test_other.py", "git/test_new.py",
         "new-suite/nested/test_new.py", "handoff/test_existing.py",
     ]
+    inventory += [f"pm/test_scenario_{index:02}.py" for index in range(10)]
     for relative in inventory:
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -38,8 +39,11 @@ def test_partition_is_disjoint_and_covers_new_files_and_suites(tmp_path, reposit
     if repository == "mekenthompson/hermes-agent":
         for long in ("test_upgrade_path.py", "git/test_shallow_install.py"):
             assert next(job["files"] for job in matrix if long in job["files"]) == [long]
+        pm = [job for job in matrix if job["shard"].startswith("pm-")]
+        assert len(pm) == 4
+        assert all(1 <= len(job["files"]) <= 3 for job in pm)
     else:
-        assert {job["shard"] for job in matrix} == {"core", "git", "new-suite", "handoff"}
+        assert {job["shard"] for job in matrix} == {"core", "git", "pm", "new-suite", "handoff"}
 
 
 def test_empty_inventory_fails_closed(tmp_path):

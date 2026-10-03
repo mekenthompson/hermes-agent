@@ -28,6 +28,12 @@ def upgrade_matrix(root: Path, repository: str) -> dict:
             # Each long file itself starts several real installs. Give it its
             # own four-core machine; split the other files across two machines.
             buckets = [bucket for bucket in (long, rest[::2], rest[1::2]) if bucket]
+        elif repository == FORK and suite == "pm":
+            # Every PM file stages real installs and generation updates. Six
+            # simultaneous trees became the tail after core/git were split.
+            # Cap files per machine, including newly added lifecycle scenarios.
+            groups = (len(files) + 2) // 3
+            buckets = [files[index::groups] for index in range(groups)]
         for index, bucket in enumerate(buckets, 1):
             include.append({
                 "shard": suite if len(buckets) == 1 else f"{suite}-{index}/{len(buckets)}",

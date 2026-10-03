@@ -279,7 +279,7 @@ jobs:
     # entrypoint smoke, the config round-trip property matrix, and the lane
     # suites below it (pm: PM environment lifecycle across updates, ...).
     # Its own job: it needs full history + tags, bubblewrap, and one file
-    # runs ~5-15 min. Split the fork's core/git suites into file groups
+    # runs ~5-15 min. Split the fork's core/git/PM suites into file groups
     # so their longest install fixture gets its own machine.
     name: e2e-upgrade (${{ matrix.shard }})
     needs: e2e-upgrade-plan
@@ -399,8 +399,8 @@ jobs:
           UPGRADE_FILES: ${{ toJSON(matrix.files) }}
           # Each file drives real installs/updaters (process trees plus uv and
           # git I/O); cpu_count of them at once starves their deadlines. A
-          # fork core/git groups hold at most three files; the longest
-          # fixture gets a whole machine. Keep other suites' existing limit.
+          # fork core/git/PM groups hold at most three files; the longest
+          # core/git fixture gets a whole machine. Other suites keep this limit.
           HERMES_TEST_WORKERS: "6"
           HERMES_TEST_FILE_TIMEOUT: "3000"
           OPENROUTER_API_KEY: ""
