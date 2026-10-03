@@ -8,9 +8,15 @@ from pathlib import Path
 
 FORK = "mekenthompson/hermes-agent"
 LONG_FILES = {"core": "test_upgrade_path.py", "git": "test_shallow_install.py"}
+# Native installation/self-update surfaces. New root files and new suites stay
+# in the runtime partition until explicitly reviewed here.
+NATIVE_FILES = {"test_install_fresh.py", "test_upgrade_path.py", "test_update_userstate_realistic.py"}
+NATIVE_SUITES = {"git", "hosts", "network", "pm", "handoff"}
 
 
-def upgrade_matrix(root: Path, repository: str) -> dict:
+def upgrade_matrix(root: Path, repository: str, partition: str = "all") -> dict:
+    if partition not in {"all", "runtime", "native"}:
+        raise ValueError(f"unknown upgrade partition: {partition}")
     suites = {"core": sorted(root.glob("test_*.py"))}
     suites.update(
         (directory.name, sorted(directory.rglob("test_*.py")))
@@ -19,6 +25,10 @@ def upgrade_matrix(root: Path, repository: str) -> dict:
     )
     include = []
     for suite, files in suites.items():
+        if partition != "all":
+            files = [file for file in files if (
+                suite in NATIVE_SUITES or (suite == "core" and file.name in NATIVE_FILES)
+            ) == (partition == "native")]
         if not files or (repository == FORK and suite == "handoff"):
             continue  # Existing fork exclusion: requires upstream's larger runner.
         buckets = [files]
@@ -45,7 +55,10 @@ def upgrade_matrix(root: Path, repository: str) -> dict:
 
 
 def main() -> None:
-    matrix = upgrade_matrix(Path("tests/e2e/core/upgrade"), os.environ["GITHUB_REPOSITORY"])
+    matrix = upgrade_matrix(
+        Path("tests/e2e/core/upgrade"), os.environ["GITHUB_REPOSITORY"],
+        os.environ.get("UPGRADE_PARTITION", "all"),
+    )
     output = "shards=" + json.dumps(matrix, separators=(",", ":"))
     print(output)
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:

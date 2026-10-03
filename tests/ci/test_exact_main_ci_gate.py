@@ -48,6 +48,61 @@ class ExactMainCiGateTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.module.fetch_runs("owner/repo", "ci.yaml", SHA, lambda *_, **__: (_ for _ in ()).throw(RuntimeError("api failure")))
 
+    def test_named_gate_accepts_only_current_success_without_waiting_for_other_jobs(self):
+        gate = "Image required checks pass"
+        pending = {**run(status="in_progress", conclusion=None), "id": 12, "run_attempt": 2}
+        success = {"name": gate, "run_id": 12, "run_attempt": 2, "head_sha": SHA,
+                   "status": "completed", "conclusion": "success"}
+        cases = [
+            (pending, [success], True),
+            ({**pending, "status": "completed", "conclusion": "failure"}, [success], True),
+            ({**pending, "status": "completed", "conclusion": "cancelled"}, [success], False),
+            (pending, [], False),
+            (pending, [success, success], False),
+        ]
+        cases += [(pending, [{**success, key: value}], False) for key, value in (
+            ("name", "Some other check"), ("run_id", 11), ("run_attempt", 1),
+            ("head_sha", "b" * 40), ("status", "in_progress"),
+            ("conclusion", "failure"), ("conclusion", "skipped"), ("conclusion", "cancelled"),
+        )]
+        for current, jobs, expected in cases:
+            with self.subTest(current=current, jobs=jobs):
+                self.assertEqual(self.module.wait_for_exact_main_ci(
+                    lambda: [current], SHA, ".github/workflows/ci.yml",
+                    timeout_seconds=0, interval_seconds=20,
+                    job_name=gate, fetch_jobs=lambda selected: jobs,
+                    log=lambda message: None,
+                ), expected)
+        # A rerun started while reading the successful job invalidates that proof.
+        polls = iter([[pending], [{**pending, "run_attempt": 3}]])
+        self.assertFalse(self.module.wait_for_exact_main_ci(
+            lambda: next(polls), SHA, ".github/workflows/ci.yml",
+            timeout_seconds=0, interval_seconds=20, job_name=gate,
+            fetch_jobs=lambda selected: [success], log=lambda message: None,
+        ))
+
+    def test_job_fetch_uses_attempt_pagination_and_rejects_api_errors(self):
+        import json
+        from types import SimpleNamespace
+
+        requested = []
+        selected = {"id": 12, "run_attempt": 2}
+        pages = [{"jobs": [{"name": "other"}]}, {"jobs": [{"name": "gate"}]}]
+        def call(command, **kwargs):
+            requested.append(command)
+            return SimpleNamespace(returncode=0, stdout=json.dumps(pages))
+        self.assertEqual(self.module.fetch_run_jobs("owner/repo", selected, call),
+                         [{"name": "other"}, {"name": "gate"}])
+        self.assertIn("--paginate", requested[0])
+        self.assertIn("--slurp", requested[0])
+        self.assertIn("repos/owner/repo/actions/runs/12/attempts/2/jobs?per_page=100", requested[0])
+        for response in (
+            SimpleNamespace(returncode=1, stderr="API refused"),
+            SimpleNamespace(returncode=0, stdout='[{"jobs":null}]'),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.module.fetch_run_jobs("owner/repo", selected, lambda *a, **k: response)
+
     def test_fetch_runs_filters_server_side_by_head_sha_without_filtering_status(self):
         requested = []
         pending = {"status": "in_progress", "conclusion": None}

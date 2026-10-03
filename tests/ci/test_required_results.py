@@ -20,14 +20,14 @@ import pytest
 
 
 @pytest.mark.parametrize("release", [False, True])
-@pytest.mark.parametrize("job", ["tests", "osv-scanner", "history-check", "e2e-desktop"])
+@pytest.mark.parametrize("job", ["tests", "osv-scanner", "history-check", "e2e-desktop", "native-install-tests"])
 @pytest.mark.parametrize("result,ordinary,excluded", [
     ("success", True, True), ("skipped", False, True), ("failure", False, False),
     ("cancelled", False, False), ("with-status", False, False),
     ("action_required", False, False), ("unknown", False, False), (None, False, False),
 ])
 def test_status_policy(job, result, ordinary, excluded, release):
-    expected = excluded if job in ("history-check", "e2e-desktop") else ordinary
+    expected = excluded if job in ("history-check", "e2e-desktop", "native-install-tests") else ordinary
     if result == "skipped" and not release:
         expected = True
     verdict = evaluate_gate({job: {} if result is None else {"result": result}}, release=release)
@@ -38,6 +38,7 @@ def test_status_policy(job, result, ordinary, excluded, release):
 def test_release_exclusion_policy():
     assert required_results.EXCLUDED_JOBS == {
         "history-check", "lockfile-diff", "supply-chain", "review-labels", "e2e-desktop",
+        "native-install-tests",
     }
 
 

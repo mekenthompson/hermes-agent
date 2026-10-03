@@ -3,6 +3,14 @@ name: Tests
 on:
   workflow_call:
     inputs:
+      unit:
+        description: Run unit tests (false only for the separate native installer call).
+        type: boolean
+        default: true
+      upgrade_partition:
+        description: Upgrade test partition (all, runtime, or native).
+        type: string
+        default: all
       # Slow lanes plus the fork upgrade gate. A caller that passes nothing
       # gets every job (defaults true).
       e2e:
@@ -26,12 +34,13 @@ permissions:
 
 # Cancel in-progress runs for the same ref
 concurrency:
-  group: tests-${{ github.ref_type == 'tag' && github.run_id || github.ref }}
+  group: tests-${{ inputs.upgrade_partition }}-${{ github.ref_type == 'tag' && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
   test:
     name: Run tests
+    if: inputs.unit
     # One 96-core runner for the whole suite. There is no slicing. Slicing
     # existed to spread the suite over 4-core runners. It cost a matrix job, a
     # duration cache, a per-slice artifact and a merge job to do it.
@@ -269,6 +278,8 @@ jobs:
             scripts/ci/upgrade_test_plan.py
       - name: Plan upgrade file groups
         id: plan
+        env:
+          UPGRADE_PARTITION: ${{ inputs.upgrade_partition }}
         run: |
           set -euo pipefail
           python3 scripts/ci/upgrade_test_plan.py

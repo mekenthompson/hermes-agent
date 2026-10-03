@@ -24,7 +24,8 @@ from typing import Any
 # Desktop E2E. These are the only skips a strict run tolerates.
 PR_ONLY_JOBS = ("history-check", "lockfile-diff", "supply-chain", "review-labels")
 DEFERRED_JOBS = ("e2e-desktop",)
-EXCLUDED_JOBS = frozenset((*PR_ONLY_JOBS, *DEFERRED_JOBS))
+# Releases run native installation inside `tests`, not the separate fork call.
+EXCLUDED_JOBS = frozenset((*PR_ONLY_JOBS, *DEFERRED_JOBS, "native-install-tests"))
 
 NEEDS_JSON_OUTPUT = "needs-json"
 
