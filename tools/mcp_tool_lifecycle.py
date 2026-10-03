@@ -333,8 +333,10 @@ def _signal_mcp_process(pid: int, sig: int, server_name: str, pgid: Optional[int
             "refusing to kill an unrelated process group.", pid, server_name)
         return
     if sys.platform.startswith("linux") and current_start is None and expected_start is not None and not spawn_marker:
-        logger.debug("Skip MCP pid %d (%s): exited leader has no group ownership marker", pid, server_name)
-        return
+        from gateway.status import _pid_exists
+        if not _pid_exists(pid):
+            logger.debug("Skip MCP pid %d (%s): exited leader has no group ownership marker", pid, server_name)
+            return
     if sys.platform.startswith("linux") and spawn_marker and (current_start is None or expected_start is None):
         # The leader is gone. Its PGID might now belong to a different group,
         # including one whose new leader has also exited. Verify each descendant
@@ -431,7 +433,7 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
             try:
                 if sys.platform.startswith("linux") and markers.get(pid):
                     group_alive = bool(_marked_group_pids(pgid, markers[pid]))
-                else:
+                elif not sys.platform.startswith("linux"):
                     os.killpg(pgid, 0)  # windows-footgun: ok — POSIX-only, guarded
                     group_alive = True
             except (ProcessLookupError, PermissionError, OSError):
