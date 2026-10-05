@@ -770,18 +770,22 @@ def cmd_validate(path: str, as_json: bool = False, install_deps: bool = False) -
     installs the declared Python deps first so the capability probe imports what an install would."""
     from hermes_cli.plugin_validate import validate_plugin_dir
     from hermes_cli.plugins_cmd import _console
-    probe_python = None
+    probe = None
     if install_deps:
         import pm
+        from pm import paths
+        from pm.environments import activation_environment, project_python
         from pm.plugin_inputs import Candidates
         try:
             pm.sync_venv(plugins=Candidates([Path(path)]))
-            from pm.environments import project_python
-            from pm.paths import repo_root
-            probe_python = project_python(repo_root())
+            # The sync commits a NEW environment that this running process never switches to,
+            # so the probe must import the plugin from that environment's interpreter.
+            root = paths.repo_root()
+            if project_python(root).is_file():  # a developer venv has no committed environment
+                probe = (project_python(root), activation_environment(root))
         except Exception as exc:  # validation still runs; the probe reports what is missing
             print(f"dependency preparation failed: {exc}", file=sys.stderr)
-    report = validate_plugin_dir(Path(path), probe_python=probe_python)
+    report = validate_plugin_dir(Path(path), probe)
     if as_json:
         print(json.dumps(report.to_dict(), indent=2))
         sys.exit(report.exit_code)
@@ -792,6 +796,12 @@ def cmd_validate(path: str, as_json: bool = False, install_deps: bool = False) -
                       + (f" [dim]— {detail}[/dim]" if detail else ""))
     for warning in report.warnings:
         console.print(f"[yellow]⚠ {warning}[/yellow]")
+    if report.isolation:
+        from hermes_cli.plugin_isolation_audit import IsolationReport
+        iso = IsolationReport(report.isolation["verdict"], report.isolation["reasons"], report.isolation["notes"])
+        console.print(f"{'[green]◆[/green]' if iso.host_ready else '[dim]◇[/dim]'} Isolation [dim]— {iso.summary()}[/dim]")
+        for note in iso.notes:
+            console.print(f"  [dim]· {note}[/dim]")
     console.print()
     console.print("[green bold]Validation passed.[/green bold]" if report.ok else "[red bold]Validation failed.[/red bold]")
     sys.exit(report.exit_code)
