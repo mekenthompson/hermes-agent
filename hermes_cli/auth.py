@@ -448,13 +448,7 @@ def is_rate_limited_auth_error(error: Exception) -> bool:
             and error.code == CODEX_RATE_LIMITED_CODE)
 
 
-def primary_failure_wording(error: Exception) -> tuple[str, str]:
-    """``(log_phrase, user_phrase)`` for a primary-provider failure that triggers the fallback
-    chain. A 429/quota AuthError leaves the credentials valid; labelling it "auth failed" sends
-    operators hunting for an expired token (#117482), so it reads as quota at every surface."""
-    if is_rate_limited_auth_error(error):
-        return "rate-limited (429)", "Primary provider quota exhausted"
-    return "auth failed", "Primary auth failed"
+from hermes_cli.auth_error_copy import primary_failure_wording
 
 
 # Entitlement failures: Nous gets a Portal-aware message; other providers a fixed generic one (or
@@ -2185,7 +2179,13 @@ def _external_process_spec(
                or str(getattr(profile, "process_command", "") or ""))
     raw_args = os.getenv(args_env_var, "").strip() if args_env_var else ""
     args = shlex.split(raw_args) if raw_args else list(getattr(profile, "process_args", ()) or [])
-    return command, args, base_url, shutil.which(command) if command else None, command_env_vars
+    resolved = shutil.which(command) if command else None
+    if command and not resolved:
+        # A GUI/service launch (LaunchAgent, Desktop backend) has a bare PATH: probe Claude Code's
+        # install prefixes as the Anthropic adapter does. Any other command stays PATH-only.
+        from agent.anthropic_adapter import find_claude_code_cli
+        resolved = find_claude_code_cli(command)
+    return command, args, base_url, resolved, command_env_vars
 
 
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:

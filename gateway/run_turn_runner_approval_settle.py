@@ -15,9 +15,18 @@ import logging
 from typing import Any, Callable, Optional
 
 from agent.i18n import t
+from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.base_exec_approval import approval_timeout_seconds, format_approval_timed_out_notice
 
 logger = logging.getLogger(__name__)
+
+
+def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
+    """True when the adapter class renders native approval buttons, or defines its own sender."""
+    probe = getattr(adapter_cls, "supports_exec_approval_buttons", None)
+    if callable(probe) and issubclass(adapter_cls, BasePlatformAdapter):
+        return bool(probe())
+    return getattr(adapter_cls, "send_exec_approval", None) is not None
 
 
 def register_timeout_notice(

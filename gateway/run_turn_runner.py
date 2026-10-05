@@ -26,6 +26,7 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.base_exec_approval import ea_default_reason_text
+from gateway.run_turn_runner_approval_settle import _renders_exec_approval_buttons
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -51,16 +52,6 @@ _CARD_DESTINATION_REFUSALS = {
 # Upper bound on the internal-plugin launch fence.  The loop-side promotion poller ticks
 # every 50ms; anything approaching this budget means the tracker task died or was cancelled.
 EXECUTION_LAUNCH_GATE_TIMEOUT = 30.0
-
-
-def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
-    """True when the adapter class renders native approval buttons. BasePlatformAdapter subclasses
-    say so through ``supports_exec_approval_buttons``; anything else (test doubles, relay-style
-    duck types) counts when it defines ``send_exec_approval`` itself."""
-    probe = getattr(adapter_cls, "supports_exec_approval_buttons", None)
-    if callable(probe) and issubclass(adapter_cls, BasePlatformAdapter):
-        return bool(probe())
-    return getattr(adapter_cls, "send_exec_approval", None) is not None
 
 
 # Rendered on a native clarify card whose wait ended without a click (mirrors the notice the
@@ -1546,7 +1537,8 @@ class TurnRunner:
         # in Slack threads and reserved by Matrix clients.
         msg = _format_exec_approval_fallback(cmd, desc, getattr(adapter, "typed_command_prefix", "/"), **flags)
         try:
-            # Mark as approval prompt so WeCom routes through the control lane.
+            # Mark as approval prompt: WeCom routes it through the control lane and Telegram pushes it
+            # in "important" mode (#132516). Never ``notify`` — A2A reads that as the turn-final reply.
             metadata = {**(ctx._status_thread_metadata or {}), "is_approval_prompt": True}
             fut = self._schedule(
                 adapter.send(ctx._status_chat_id, msg, metadata=_interim_metadata(metadata)), "Approval text-send scheduling error",

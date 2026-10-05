@@ -453,10 +453,7 @@ class TestStdioPgroupReaping:
             assert fake_pid not in _orphan_stdio_pids
 
     @pytest.mark.live_system_guard_bypass
-    @pytest.mark.skipif(
-        not hasattr(os, "killpg") or not hasattr(os, "setsid"),
-        reason="POSIX-only: requires os.killpg and os.setsid",
-    )
+    @pytest.mark.platforms("posix")
     def test_grandchild_reaped_via_pgroup(self, tmp_path):
         """End-to-end: an exited leader's TERM-ignoring grandchild is reaped by pidfd.
 
@@ -498,23 +495,28 @@ class TestStdioPgroupReaping:
             "    time.sleep(0.5)\n"
         )
 
-        # Parent: spawn grandchild, exit immediately (without killing it).
+        # Parent: spawn grandchild, exit when stdin closes (without killing it).
         parent_script = tmp_path / "parent.py"
         parent_script.write_text(
             "import subprocess, sys\n"
             f"subprocess.Popen([sys.executable, {str(grandchild_script)!r}])\n"
+            "sys.stdin.read()\n"
             # Parent exits — grandchild reparents to init.
         )
 
         # Spawn parent in its own session (mirrors stdio_client behaviour).
-        from tools.mcp_tool_lifecycle import _SPAWN_MARKER_ENV
+        from tools.mcp_tool_lifecycle import _SPAWN_MARKER_ENV, _leader_start_time
         marker = "e2e-" + tmp_path.name
         parent = subprocess.Popen(
             [sys.executable, str(parent_script)],
+            stdin=subprocess.PIPE,
             start_new_session=True,
             env={**os.environ, _SPAWN_MARKER_ENV: marker},
         )
         parent_pgid = os.getpgid(parent.pid)
+        parent_start = _leader_start_time(parent.pid)
+        assert parent_start is not None
+        parent.stdin.close()
         # Wait for parent to exit and grandchild to spin up.
         parent.wait(timeout=15)
         deadline = _time.time() + 15  # fresh CPython spinup dilates under CI load
@@ -527,30 +529,42 @@ class TestStdioPgroupReaping:
         assert psutil.pid_exists(grandchild_pid)
         assert os.getpgid(grandchild_pid) == parent_pgid
 
-        # Drive the reaper: register the parent pid + pgid as an orphan.
+        # Drive the reaper: register the parent pid + pgid + start baseline as an orphan.
         from tools.mcp_tool_lifecycle import (
             _kill_orphaned_mcp_children, _orphan_stdio_pid_servers, _orphan_stdio_pids,
-            _stdio_pgids, _stdio_pids, _stdio_spawn_markers)
+            _stdio_pgids, _stdio_pids, _stdio_spawn_markers, _stdio_starttimes)
         from tools.mcp_tool import _lock
         with _lock:
             _stdio_pids.clear()
             _orphan_stdio_pids.clear()
             _orphan_stdio_pid_servers.clear()
             _stdio_pgids.clear()
+            _stdio_starttimes.clear()
             _stdio_spawn_markers.clear()
             _orphan_stdio_pids.add(parent.pid)
             _orphan_stdio_pid_servers[parent.pid] = "orphan"
             _stdio_pgids[parent.pid] = parent_pgid
+            _stdio_starttimes[parent.pid] = parent_start
             _stdio_spawn_markers[parent.pid] = marker
         try:
             _kill_orphaned_mcp_children()
+            # SIGTERM is ignored, so only the SIGKILL pass can have reaped it.
+            deadline = _time.time() + 10
+            def _alive() -> bool:
+                try:
+                    return psutil.Process(grandchild_pid).status() != psutil.STATUS_ZOMBIE
+                except psutil.NoSuchProcess:
+                    return False
+            while _time.time() < deadline and _alive():
+                _time.sleep(0.05)
+            survived = _alive()
         finally:
-            # Belt-and-suspenders: ensure grandchild is dead even if test fails.
             try:
                 os.kill(grandchild_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
 
+        assert not survived, "grandchild survived marked pidfd reaping"
         # Grandchild should be gone — SIGKILL via its verified pidfd reached it.
         deadline = _time.time() + 10
         while _time.time() < deadline and psutil.pid_exists(grandchild_pid):

@@ -23,6 +23,7 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
+from gateway.run_display import _bg_prompt_preview
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import (
@@ -87,12 +88,6 @@ _CONTEXT_OVERFLOW_ERROR_PHRASES = (
 def _unexpected_silence_reply() -> str:
     """Reply when the model returned only a silence marker for a message that needed an answer."""
     return t("gateway.errors.unexpected_silence")
-
-
-def _bg_prompt_preview(prompt: str, limit: int = 60) -> str:
-    """Short single-line quote of a /bg prompt for its failure notice (the task id means nothing to the user)."""
-    text = " ".join(str(prompt or "").split())
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
 def is_context_overflow_failure_result(agent_result: dict, history_len: int) -> bool:
@@ -1106,7 +1101,7 @@ class GatewayTurnMixin:
             )
             _hyg_rotated = False
             _compressed = history
-        # Only rewrite the transcript when rotation produced a NEW session id. In-place compaction does NOT
+        # Only persist a child transcript when rotation produced a NEW session id. In-place compaction does NOT
         # need a rewrite: archive_and_compact() has already soft-archived the previous active rows and
         # inserted the compacted messages as the new active set inside _compress_context(). Calling
         # rewrite_transcript() after in-place compaction would invoke replace_messages(active_only=False)
@@ -1121,7 +1116,9 @@ class GatewayTurnMixin:
         # conversation silently vanishes. Persist the child transcript first; only then rebind the live
         # entry.
         if _hyg_rotated:
-            if not await self.async_session_store.rewrite_transcript(_hyg_new_sid, _compressed):
+            # Published child is already durable; a rewrite would drop rows cloned at publish.
+            if not await self.async_session_store.persist_rotated_compression_child(
+                    session_entry.session_id, _hyg_new_sid, _compressed):
                 logger.error(
                     "Session hygiene: failed to persist compressed transcript for rotated session "
                     "%s → %s; keeping the live entry on the original session so the "
@@ -1140,7 +1137,7 @@ class GatewayTurnMixin:
                 )
 
         if _hyg_rotated or _hyg_in_place:
-            # Rewritten (rotation) or persisted by archive_and_compact() (in-place): reset token count.
+            # Persisted (rotation) or persisted by archive_and_compact() (in-place): reset token count.
             session_entry.last_prompt_tokens = 0
             attempt.history = _compressed
             _new_count = len(_compressed)

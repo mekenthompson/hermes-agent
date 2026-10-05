@@ -832,7 +832,9 @@ class PluginContext:
         it freely); an ACTIVE installer goes in ``ensure_deps_fn`` (called from ``create_adapter()`` when
         ``check_fn`` is False). Extra kwargs (``setup_fn``, ``emoji``, ``allowed_users_env``,
         ``platform_hint``, ``ensure_deps_fn``) forward to ``PlatformEntry``; unknown keys raise TypeError."""
-        from gateway.platform_registry import platform_registry, PlatformEntry
+        from gateway.platform_registry import core_ships_platform, platform_registry, PlatformEntry
+        if entry_kwargs.get("trusted_inbound") and self.manifest.source != "bundled" and core_ships_platform(name):
+            raise self._refuse(f"core platform '{name}' with trusted_inbound (it would waive allowlists and pairing)")
         entry_kwargs.setdefault("plugin_name", self.manifest.name)
         entry = PlatformEntry(
             name=name, label=label, adapter_factory=adapter_factory, check_fn=check_fn,
@@ -2117,12 +2119,7 @@ def get_pre_tool_call_directive(
     return (details.action, details.message)
 
 
-def get_pre_tool_call_block_message(
-    tool_name: str, args: Optional[Dict[str, Any]], **hook_kwargs: Any
-) -> Optional[str]:
-    """Deprecated shim: only the ``block`` message (or ``None``); ``approve`` is invisible here."""
-    directive, message = get_pre_tool_call_directive(tool_name, args, **hook_kwargs)
-    return message if directive == "block" else None
+from hermes_cli.plugins_dispatch import get_pre_tool_call_block_message
 
 
 def resolve_pre_tool_block(

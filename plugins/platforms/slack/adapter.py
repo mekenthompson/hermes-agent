@@ -9,7 +9,6 @@ import logging
 import os
 import re
 import time
-import unicodedata
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, ClassVar, Dict, Optional, Any, Tuple, List
 
@@ -159,81 +158,16 @@ def _slack_file_marker(file_obj: Dict[str, Any]) -> str:
     return f"[file: {name} ({mimetype})]" if mimetype else f"[file: {name}]"
 
 
-# GFM tables: Slack mrkdwn shows pipe tables as literal pipes, so they are wrapped in ```
-# fences (monospace) and cells padded to per-column display width (CJK-wide aware).
-
-_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*){1,}\|?\s*$")
-
-
-def _is_table_row(line: str) -> bool:
-    """Return True if *line* could plausibly be a table data row."""
-    stripped = line.strip()
-    return bool(stripped) and "|" in stripped
-
-
-def _disp_width(s: str) -> int:
-    """Monospace display width: East-Asian Wide / Full-width chars count as 2."""
-    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
-
-
-def _pad(cell: str, width: int) -> str:
-    """Right-pad *cell* with spaces until its display width equals *width*."""
-    return cell + " " * max(width - _disp_width(cell), 0)
-
-
-def _split_table_row(line: str) -> List[str]:
-    """Split a ``| a | b | c |`` row into trimmed cells (outer pipes optional)."""
-    s = line.strip()
-    s = s[1:] if s.startswith("|") else s
-    s = s[:-1] if s.endswith("|") else s
-    return [c.strip() for c in s.split("|")]
-
-
-def _align_table(rows: List[str]) -> List[str]:
-    """Re-emit a markdown table padded to per-column display width. rows[1] is the GFM separator
-    (regenerated); short rows are padded to a uniform column count first."""
-    if len(rows) < 2:
-        return rows
-    parsed = [_split_table_row(r) for r in rows]
-    n_cols = max(len(r) for r in parsed)
-    parsed = [r + [""] * (n_cols - len(r)) for r in parsed]
-    parsed[1] = ["---"] * n_cols  # placeholder; regenerated below
-    widths = [max(_disp_width(r[c]) for r in parsed) for c in range(n_cols)]
-    out: List[str] = []
-    for idx, row in enumerate(parsed):
-        cells = ["-" * widths[c] if idx == 1 else _pad(row[c], widths[c]) for c in range(n_cols)]
-        out.append("| " + " | ".join(cells) + " |")
-    return out
-
-
-def _wrap_markdown_tables(text: str) -> str:
-    """Wrap GFM pipe tables in ``` fences and align columns; tables already in fences are left alone."""
-    if not text or "|" not in text or "-" not in text:
-        return text
-    lines = text.split("\n")
-    out: List[str] = []
-    in_fence = False
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
-        elif (
-            not in_fence and "|" in line and i + 1 < len(lines)
-            and _TABLE_SEPARATOR_RE.match(lines[i + 1])):
-            block = [line, lines[i + 1]]
-            j = i + 2
-            while j < len(lines) and _is_table_row(lines[j]):
-                block.append(lines[j])
-                j += 1
-            out.append("```")
-            out.extend(_align_table(block))
-            out.append("```")
-            i = j
-            continue
-        out.append(line)
-        i += 1
-    return "\n".join(out)
+try:  # sibling module; support package and flat plugin-dir imports
+    from .markdown_tables import (
+        _align_table, _disp_width, _is_table_row, _pad, _split_table_row,
+        _wrap_markdown_tables,
+    )
+except ImportError:  # pragma: no cover - plugin loaded outside package context
+    from markdown_tables import (
+        _align_table, _disp_width, _is_table_row, _pad, _split_table_row,
+        _wrap_markdown_tables,
+    )  # type: ignore
 
 
 # Slash invoker's user_id: set in _handle_slash_command, read in send() to pick the right stashed
@@ -1673,11 +1607,7 @@ class SlackAdapter(BasePlatformAdapter):
         else:  # pragma: no cover - registry always non-empty
             _slash_pattern = re.compile(r"^/hermes$")
 
-        @self._app.command(_slash_pattern)
-        async def handle_hermes_command(ack, command):
-            slash = (command.get("command") or "").lstrip("/")
-            await ack(response_type="ephemeral", text=t("platform.slack.slash.running", command=slash))
-            await self._handle_slash_command(command)
+        self._app.command(_slash_pattern)(self._handle_hermes_command)
 
         # Approval buttons, slash-confirm buttons (tools/slash_confirm.py), feedback.
         for _action_id in self._APPROVAL_CHOICES:
@@ -6121,6 +6051,25 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] Thread-root image recovery failed: %s", exc)
         return media_urls, media_types
 
+    def _slash_channel_gated(self, channel_id: str) -> bool:
+        """The message path's channel gates (_prefilter_inbound, _channel_gate_allows) for a slash
+        command: ignored channels are never touched, and outside allowed_channels only a 1:1 DM is
+        answered. By id alone, so no lookup can drop a control command."""
+        if self._is_ignored_channel(channel_id):
+            return True
+        allowed_channels = self._slack_allowed_channels()
+        return bool(allowed_channels) and not str(channel_id).startswith("D") and channel_id not in allowed_channels
+
+    async def _handle_hermes_command(self, ack, command: dict) -> None:
+        """Bolt listener for every native slash: ack within 3s, then run. A gated channel gets a
+        bare ack, never a "Running /x" promise the gate in _handle_slash_command will break."""
+        if self._slash_channel_gated(command.get("channel_id", "")):
+            await ack()
+        else:
+            slash = (command.get("command") or "").lstrip("/")
+            await ack(response_type="ephemeral", text=t("platform.slack.slash.running", command=slash))
+        await self._handle_slash_command(command)
+
     async def _handle_slash_command(self, command: dict) -> None:
         """Slash commands: native ``/<command> [args]`` for every COMMAND_REGISTRY entry, or
         ``/hermes <subcommand> [args]``; other text after ``/hermes`` is a regular message."""
@@ -6131,6 +6080,9 @@ class SlackAdapter(BasePlatformAdapter):
             self._remember_channel_team(channel_id, team_id)
         text = self._slash_command_text(command)
         thread_id = self._slash_thread_id(command)
+        if self._slash_channel_gated(channel_id):
+            logger.debug("[Slack] Ignoring slash command in ignored/non-allowed channel: %s", channel_id)
+            return
         is_dm = str(channel_id).startswith("D")
         if is_dm and self._slack_disable_dms():
             logger.info(

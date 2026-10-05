@@ -17,17 +17,7 @@ DEFAULT_VERCEL_IMAGE = "vercel/sandbox/universal:latest"
 LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choice
 
 
-def _aux(timeout, *, reasoning_effort=True, **extra):
-    """Standard auxiliary-task model block (see DEFAULT_CONFIG["auxiliary"]).
-
-    reasoning_effort=False omits that key (MoA blocks configure depth per slot);
-    ``extra`` keys are appended after the standard ones.
-    """
-    d = {"provider": "auto", "model": "", "base_url": "", "api_key": "", "timeout": timeout, "extra_body": {}}
-    if reasoning_effort:
-        d["reasoning_effort"] = ""
-    d.update(extra)
-    return d
+from hermes_cli.config_defaults_aux import _aux
 
 
 DEFAULT_CONFIG = {
@@ -1734,6 +1724,16 @@ DEFAULT_CONFIG = {
         # Opt-in unattended apply for the cadence check. Git-row plugins ONLY; every apply runs the
         # same security scan / consent pipeline as the manual update command.
         "auto_apply": False,
+        # Where third-party Python plugins run. in_process: imported into Hermes (default).
+        # host: one plugin-host process per profile runs them and they reach Hermes only through
+        # ctx (a crashing or hanging plugin takes down its host, which restarts; Hermes keeps
+        # running). Bundled plugins stay in-process; `hermes plugins validate` says whether a
+        # plugin can run in the host.
+        "isolation": "in_process",
+        "host": {
+            # argv prefix the plugin host runs under, e.g. a sandbox runner. [] = plain subprocess.
+            "launcher": [],
+        },
     },
     # Shell-script hooks: event name (pre_tool_call, post_tool_call, pre_llm_call, subagent_stop,
     # ...) -> list of {matcher, command, timeout}. First run of a new command prompts for consent;

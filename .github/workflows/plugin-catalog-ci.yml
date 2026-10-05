@@ -49,9 +49,12 @@ jobs:
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
-          # The pull_request checkout is GitHub's merge commit; depth 2 brings its
-          # first parent (the base tip), which is all the diff below needs.
-          fetch-depth: 2
+          # Full commit graph + tags, blobs on demand: the diff below needs the
+          # merge commit's first parent, and Hermes resolves its own version
+          # from the release tags merged into HEAD. A shallow checkout reports
+          # "unknown", which plugins checking the host version reject (omh).
+          fetch-depth: 0
+          filter: blob:none
           # `hermes plugins validate` below runs pinned-repo code; keep the
           # job's token out of .git/config where that code could read it.
           persist-credentials: false
@@ -62,6 +65,7 @@ jobs:
           # Set by Actions, not by the run script, so a PR cannot inject these.
           CATALOG_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           CATALOG_HEAD_REF: ${{ github.head_ref }}
+          CATALOG_PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           # HEAD is the PR merge commit: diffing it against its first parent is
@@ -88,14 +92,15 @@ jobs:
             # email maps are data the gate never executes; README/policy/CI PRs
             # with no entry change skip this check.
             #
-            # House: a reconciliation branch on this fork lands upstream catalog
-            # entries together with the tooling those entries were reviewed
-            # against. The exemption is the fork repo plus the house/reconcile-*
-            # ref. An outside fork using the same branch name does not qualify,
-            # and the pinned-source clone below still runs.
+            # House: the one authorized alignment PR carries upstream catalog entries
+            # together with reviewed tooling. Keep the exemption bound to this exact
+            # fork branch/repository and PR number; pinned-source validation below still runs.
             house_sync=0
             if [ "${CATALOG_HEAD_REPO:-}" = "mekenthompson/hermes-agent" ] \
-               && [[ "${CATALOG_HEAD_REF:-}" == house/reconcile-* ]]; then
+               && [ "${CATALOG_HEAD_REF:-}" = "hf457/align-nous-404ab00" ] \
+               && [ "${CATALOG_PR_NUMBER:-}" = "130" ] \
+               && git merge-base --is-ancestor 404ab00debc4f8e5ae642f2bf1be5286c10c8822 HEAD^2 \
+               && git merge-base --is-ancestor 0a43af83366890856994bdc393fd2d630aca9db1 HEAD^2; then
               house_sync=1
             fi
             if [ "$house_sync" -eq 0 ]; then

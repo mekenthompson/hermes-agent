@@ -280,7 +280,7 @@ import {
 import { downloadViaOauthSessionToFile, downloadViaTokenToFile } from './gateway-file-download-transport'
 import { stopGatewayBeforeUpdate } from './gateway-stop-before-update'
 import { mintGatewayWsTicketWithSessionToken as mintGatewayWsTicketWithSessionTokenTransport } from './gateway-ticket-transport'
-import { resolveGatewayVersion } from './gateway-version' 
+import { resolveGatewayVersion } from './gateway-version'
 import { probeGatewayWebSocket, spawnedBackendProbeOptions } from './gateway-ws-probe'
 import { windowsGitCandidates } from './git-binary-candidates'
 import { registerGitIpc } from './git-ipc'
@@ -364,7 +364,7 @@ import { localSkinProfileKey, readLocalSkinPayload } from './local-skin'
 import { ACTIVE_LOG_POLL_MS, planLogRotation, reclaimActiveLogIfOversized } from './log-rotation'
 import { registerMachineProfile } from './machine-profile'
 import { createMainProcessLagWatchdog } from './main-process-lag-watchdog'
-import { ensureMainWindow } from './main-window-lifecycle'
+import { activateWindow, ensureMainWindow, shouldQuitOnLastChatClosed } from './main-window-lifecycle'
 import {
   assertManagedUpdatePreflightClear,
   executeManagedRemoteUpdate,
@@ -447,9 +447,25 @@ import {
 import { createPoolStopper } from './pool-stop'
 import { poolTouchKeys } from './pool-touch-scope'
 import { createPortalSession } from './portal-session'
-import { createKeepAwake } from './power-save'
+import {
+  createKeepAwake,
+  type KeepAwakeMode,
+  keepAwakeWanted,
+  parseKeepAwakeMode,
+  readKeepAwakeMode
+} from './power-save'
 import { readPreUpdateBackupEnabled } from './pre-update-backup-config'
 import { capturePreviewContents } from './preview-capture'
+import {
+  looksBinary,
+  MEDIA_MIME_TYPES,
+  PREVIEW_HTML_EXTENSIONS,
+  PREVIEW_LANGUAGE_BY_EXT,
+  PREVIEW_PDF_EXTENSIONS,
+  PREVIEW_WATCH_DEBOUNCE_MS,
+  previewFileMetadata,
+  TEXT_PREVIEW_MAX_BYTES
+} from './preview-file-metadata'
 import { onPreviewWatchOwnerDestroyed, sendPreviewFileChangedToOwner } from './preview-file-watch'
 import { hasClosePreviewFlag, previewGuestInputAction } from './preview-guest-escape'
 import { commandFocusedGuest, notePreviewGuestHidden } from './preview-guest-offscreen'
@@ -1683,118 +1699,6 @@ function applyTitleBarOverlay(win) {
   }
 }
 
-const MEDIA_MIME_TYPES = {
-  '.avi': 'video/x-msvideo',
-  '.bmp': 'image/bmp',
-  '.flac': 'audio/flac',
-  '.gif': 'image/gif',
-  '.jpeg': 'image/jpeg',
-  '.jpg': 'image/jpeg',
-  '.m4a': 'audio/mp4',
-  '.mkv': 'video/x-matroska',
-  '.mov': 'video/quicktime',
-  '.mp3': 'audio/mpeg',
-  '.mp4': 'video/mp4',
-  '.ogg': 'audio/ogg',
-  '.opus': 'audio/ogg; codecs=opus',
-  '.pdf': 'application/pdf',
-  '.png': 'image/png',
-  '.svg': 'image/svg+xml',
-  '.wav': 'audio/wav',
-  '.webm': 'video/webm',
-  '.webp': 'image/webp'
-}
-
-const PREVIEW_HTML_EXTENSIONS = new Set(['.html', '.htm'])
-const PREVIEW_PDF_EXTENSIONS = new Set(['.pdf'])
-const PREVIEW_WATCH_DEBOUNCE_MS = 120
-const TEXT_PREVIEW_MAX_BYTES = 512 * 1024
-
-const PREVIEW_LANGUAGE_BY_EXT = {
-  '.c': 'c',
-  '.conf': 'ini',
-  '.cpp': 'cpp',
-  '.css': 'css',
-  '.csv': 'csv',
-  '.go': 'go',
-  '.graphql': 'graphql',
-  '.h': 'c',
-  '.hpp': 'cpp',
-  '.html': 'html',
-  '.java': 'java',
-  '.js': 'javascript',
-  '.json': 'json',
-  '.jsx': 'jsx',
-  '.kt': 'kotlin',
-  '.lua': 'lua',
-  '.md': 'markdown',
-  '.mjs': 'javascript',
-  '.py': 'python',
-  '.rb': 'ruby',
-  '.rs': 'rust',
-  '.sh': 'shell',
-  '.sql': 'sql',
-  '.svg': 'xml',
-  '.toml': 'toml',
-  '.ts': 'typescript',
-  '.tsx': 'tsx',
-  '.txt': 'text',
-  '.xml': 'xml',
-  '.yaml': 'yaml',
-  '.yml': 'yaml',
-  '.zsh': 'shell'
-}
-
-function looksBinary(buffer) {
-  if (!buffer.length) {
-    return false
-  }
-
-  let suspicious = 0
-
-  for (const byte of buffer) {
-    if (byte === 0) {
-      return true
-    }
-
-    // Allow common whitespace controls: tab, LF, CR.
-    if (byte < 32 && byte !== 9 && byte !== 10 && byte !== 13) {
-      suspicious += 1
-    }
-  }
-
-  return suspicious / buffer.length > 0.12
-}
-
-function previewFileMetadata(filePath, mimeType) {
-  let byteSize = 0
-  let binary = false
-
-  try {
-    const stat = fs.statSync(filePath)
-    byteSize = stat.size
-
-    if (!mimeType.startsWith('image/')) {
-      const fd = fs.openSync(filePath, 'r')
-
-      try {
-        const sample = Buffer.alloc(Math.min(byteSize, 4096))
-        const bytesRead = fs.readSync(fd, sample, 0, sample.length, 0)
-        binary = looksBinary(sample.subarray(0, bytesRead))
-      } finally {
-        fs.closeSync(fd)
-      }
-    }
-  } catch {
-    // Metadata is best-effort; the read handlers surface hard errors later.
-  }
-
-  return {
-    binary,
-    byteSize,
-    large: byteSize > TEXT_PREVIEW_MAX_BYTES
-  }
-}
 
 app.setName(APP_NAME)
 
@@ -13848,7 +13752,10 @@ const sessionWindows = createSessionWindowRegistry()
 const minimizeToTray = createMinimizeToTray({
   preferencesPath: path.join(app.getPath('userData'), 'minimize-to-tray.json'),
   getIconPath: getAppIconPath,
-  restoreMainWindow: () => ensureMainWindow(mainWindow, { isReady: app.isReady(), createWindow, focusWindow }),
+  // A tray click is an explicit relaunch gesture (#130810): restore with
+  // activation (show + focus), not the ambient showInactive path.
+  restoreMainWindow: () =>
+    ensureMainWindow(mainWindow, { isReady: app.isReady(), createWindow, focusWindow: activateWindow }),
   isQuittingForHandoff: () => isQuittingForHandoff,
   log: rememberLog
 })
@@ -14033,7 +13940,12 @@ function spawnBrowserWindow(tabId) {
   })
 
   minimizeToTray.registerWindow(win)
-  win.on('closed', () => notifyBrowserPopoutClosed(tabId))
+  win.on('closed', () => {
+    notifyBrowserPopoutClosed(tabId)
+    // Deferred: browserWindows' own self-delete 'closed' listener is attached
+    // after this factory returns, so the size is only accurate next tick.
+    setImmediate(quitIfNoSurfaceLeft)
+  })
 
   loadWindowUrl(
     win,
@@ -14196,6 +14108,8 @@ let petOverlayWindow = null
 // persisted popped-out flag survives for the next boot's restorePetOverlay
 // (#55920).
 let appQuitting = false
+// Real quit proceeding; see shouldQuitOnLastChatClosed (#130810).
+let quitInProgress = false
 // Set while a close is in flight: Electron's close() is async and can be
 // aborted on macOS, so the window may still be alive after closePetOverlay().
 // openPetOverlay must never reuse (or leave) a closing window — otherwise two
@@ -15388,8 +15302,15 @@ function createWindow() {
   bindGeometryPersistence(mainWindow, schedulePersistWindowState)
   mainWindow.on('maximize', schedulePersistWindowState)
   mainWindow.on('unmaximize', schedulePersistWindowState)
-  mainWindow.on('close', () => {
+  mainWindow.on('close', (event: Electron.Event) => {
     schedulePersistWindowState.flush()
+
+    // A prevented close (tray absorb, active-work "Keep Running") leaves the
+    // window alive, so the app is not quitting: keep the latch clear so a
+    // later close still quits cleanly (#130810).
+    if (event.defaultPrevented) {
+      return
+    }
 
     // On Windows/Linux, closing the primary window IS quitting (the
     // window-all-closed handler calls app.quit()). Latch the quit flag here,
@@ -16627,8 +16548,11 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
                         metadata.display_name = profile.display_name.trim()
                       }
 
-                      if (typeof profile?.title === 'string' && profile.title.trim()) {
-                        metadata.title = profile.title.trim()
+                      // `/api/profiles` names the Bot Mode title `bot_title`. Carried even
+                      // when empty: "this backend has no title" is what lets the renderer
+                      // drop a stale local one instead of painting it on this bot.
+                      if (typeof profile?.bot_title === 'string') {
+                        metadata.title = profile.bot_title.trim()
                       }
 
                       if (profile?.ui_meta && typeof profile.ui_meta === 'object') {
@@ -18225,18 +18149,37 @@ const streamThrottle = createStreamThrottle(undefined, undefined, {
   keepFullscreenPainting: process.platform === 'linux' && linuxOzoneBackend(process.env, process.argv) === 'wayland'
 })
 
+function isAnyTurnInFlight() {
+  return mergeActiveWork(activeWorkByWebContents.values()).count > 0
+}
+
 function updateStreamThrottleFromActiveWork() {
-  streamThrottle.update(mergeActiveWork(activeWorkByWebContents.values()).count > 0)
+  const working = isAnyTurnInFlight()
+
+  streamThrottle.update(working)
+  // The 'while-working' keep-awake mode rides the same merged signal: no
+  // listener or timer of its own (see the keep-awake block below).
+  applyKeepAwake(working)
 }
 
 ipcMain.on('hermes:active-work', (event, payload) => {
   const id = event.sender.id
 
   if (!activeWorkByWebContents.has(id)) {
-    event.sender.once('destroyed', () => {
+    const forget = () => {
+      // Whichever fires first detaches the other, so crash/reload cycles on
+      // one webContents don't stack listeners.
+      event.sender.off('destroyed', forget)
+      event.sender.off('render-process-gone', forget)
       activeWorkByWebContents.delete(id)
       updateStreamThrottleFromActiveWork()
-    })
+    }
+
+    event.sender.once('destroyed', forget)
+    // A dead renderer keeps its webContents, and some exits never reload, so
+    // its last count would pin throttling and the 'while-working' blocker
+    // until quit. A reloaded renderer re-reports its live turns on mount.
+    event.sender.once('render-process-gone', forget)
   }
 
   const work = normalizeActiveWork(payload)
@@ -18387,27 +18330,45 @@ ipcMain.on('hermes:translucency', (_event, payload) => {
 })
 
 // Keep-awake: hold the machine awake for long/overnight runs. Main owns the one
-// blocker and its persisted state so a cold launch restores it (applied on
-// ready — powerSaveBlocker needs the app ready). The renderer toggles it from
-// Settings → Advanced over IPC. See store/keep-awake.
+// blocker and the persisted mode so a cold launch restores it (applied on
+// ready — powerSaveBlocker needs the app ready). The renderer picks the mode
+// from Settings → Advanced over IPC. In 'while-working' the blocker follows the
+// merged active-work picture that already drives stream throttling, so it is
+// held exactly while a turn is in flight and released at idle. See
+// store/keep-awake + power-save.ts.
 const KEEP_AWAKE_CONFIG_PATH = path.join(app.getPath('userData'), 'keep-awake.json')
 const keepAwake = createKeepAwake(powerSaveBlocker)
+let keepAwakeMode: KeepAwakeMode = 'off'
 
-function readPersistedKeepAwake() {
+function readPersistedKeepAwakeMode(): KeepAwakeMode {
   try {
-    return JSON.parse(fs.readFileSync(KEEP_AWAKE_CONFIG_PATH, 'utf8')).on === true
+    return readKeepAwakeMode(JSON.parse(fs.readFileSync(KEEP_AWAKE_CONFIG_PATH, 'utf8')))
   } catch {
-    return false
+    return 'off'
   }
 }
 
-ipcMain.on('hermes:keep-awake', (_event, on) => {
-  const enabled = Boolean(on)
-  keepAwake.set(enabled)
+// Reconcile the blocker with the mode and the live turn picture. Called from
+// every mode change and every active-work report — both happen after app
+// ready, when `keepAwake` and `keepAwakeMode` above are initialised.
+function applyKeepAwake(working = isAnyTurnInFlight()) {
+  keepAwake.set(keepAwakeWanted(keepAwakeMode, working))
+}
+
+ipcMain.on('hermes:keep-awake', (_event, value) => {
+  // Accepts the mode string, or the boolean the pre-mode toggle sent.
+  const mode = parseKeepAwakeMode(value)
+
+  if (mode === null) {
+    return
+  }
+
+  keepAwakeMode = mode
+  applyKeepAwake()
 
   try {
     fs.mkdirSync(path.dirname(KEEP_AWAKE_CONFIG_PATH), { recursive: true })
-    fs.writeFileSync(KEEP_AWAKE_CONFIG_PATH, JSON.stringify({ on: enabled }, null, 2), 'utf8')
+    fs.writeFileSync(KEEP_AWAKE_CONFIG_PATH, JSON.stringify({ mode }, null, 2), 'utf8')
   } catch (error) {
     rememberLog(`[keep-awake] write failed: ${error.message}`)
   }
@@ -19271,6 +19232,12 @@ function handleDeepLink(url) {
         mainWindow.restore()
       }
 
+      // #130810: a tray-hidden primary reports invisible but not minimized;
+      // without an explicit show the focus below lands on a hidden window.
+      if (!mainWindow.isVisible()) {
+        mainWindow.show()
+      }
+
       mainWindow.focus()
 
       if (mainWindow.isFullScreen()) {
@@ -19290,15 +19257,8 @@ function handleDeepLink(url) {
   }
 
   try {
-    if (mainWindow.isMinimized()) {
-      mainWindow.restore()
-    }
-
-    // #83998: a deep link must deliver without re-pumping the Windows
-    // foreground when the window already has focus.
-    if (shouldFocusToTakeKeyboard(mainWindow)) {
-      mainWindow.focus()
-    }
+    // #130810 un-hide a tray-hidden window; #83998 no foreground re-pump.
+    activateWindow(mainWindow)
 
     mainWindow.webContents.send('hermes:deep-link', payload)
     rememberLog(`[deeplink] delivered ${kind}/${name}`)
@@ -19397,10 +19357,15 @@ if (!isPrimaryInstance) {
       handleDeepLink(url)
     }
 
+    // #130810: a second Start-menu / shortcut / Hermes.exe launch must never
+    // silently exit. Log it so a future silent exit stays diagnosable, then
+    // restore a live primary with activation (restore + show + focus), or
+    // re-create it when it was destroyed.
+    rememberLog(`[second-instance] relaunch (deepLink=${url ? 'yes' : 'no'})`)
     ensureMainWindow(mainWindow, {
       isReady: app.isReady(),
       createWindow,
-      focusWindow,
+      focusWindow: activateWindow,
       // deep-link delivery focuses a live window after its renderer is ready.
       focusExisting: !url
     })
@@ -19483,7 +19448,8 @@ app.whenReady().then(() => {
   ensureWslWindowsFonts()
   configureSpellChecker()
   registerPowerResumeListeners()
-  keepAwake.set(readPersistedKeepAwake())
+  keepAwakeMode = readPersistedKeepAwakeMode()
+  applyKeepAwake()
   void minimizeToTray.start()
   mainProcessLagWatchdog.start()
   f12Blocked = readPersistedDisableF12()
@@ -19552,10 +19518,12 @@ app.whenReady().then(() => {
     // Recreate the primary window if it's gone. Guard on mainWindow directly
     // (not just total window count) so a dock click still restores the main
     // window when only secondary session windows remain open.
+    // #130810: a dock/taskbar activate is explicit, so restore with
+    // activation (restore + show + focus), not the ambient showInactive path.
     if (!mainWindow || mainWindow.isDestroyed()) {
       createWindow()
     } else {
-      focusWindow(mainWindow)
+      activateWindow(mainWindow)
     }
   })
 })
@@ -19704,20 +19672,45 @@ function registerChatWindow(window: BrowserWindow) {
 
     heldQuitForActiveWork(event)
   })
-  window.once('closed', () => chatWindows.delete(window))
+  window.once('closed', () => {
+    chatWindows.delete(window)
+    quitIfNoSurfaceLeft()
+  })
+}
+
+// Last-surface fallback (#130810), run when a chat window OR a popped-out
+// Browser window closes: popped-out Browser windows are user-visible surfaces
+// too, so they keep the app alive — and closing the last one must quit.
+function quitIfNoSurfaceLeft() {
+  if (
+    shouldQuitOnLastChatClosed({
+      platform: process.platform,
+      isQuittingForHandoff,
+      remainingChatWindows: chatWindows.size + browserWindows.size,
+      quitInProgress
+    })
+  ) {
+    app.quit()
+  }
 }
 
 app.on('before-quit', event => {
-  // Latch first, before ANY teardown below closes the pet overlay: its
-  // 'closed' handler must not echo pop-in during quit, or the persisted
-  // popped-out state is wiped and the overlay never restores (#55920).
-  appQuitting = true
-
   // Runs ahead of every teardown below, so "Keep Running" leaves the app
-  // exactly as it was.
+  // exactly as it was: a held quit is not a quit in progress, and the
+  // overlay-suppression latch must not leak into the next close (#130810).
   if (heldQuitForActiveWork(event)) {
+    appQuitting = false
+    quitInProgress = false
+
     return
   }
+
+  // Quit is really proceeding: latch both before ANY teardown below closes
+  // the pet overlay — its 'closed' handler must not echo pop-in during quit,
+  // or the persisted popped-out state is wiped and the overlay never restores
+  // (#55920).
+  appQuitting = true
+  quitInProgress = true
 
   minimizeToTray.beginQuit()
   mainProcessLagWatchdog.stop()
