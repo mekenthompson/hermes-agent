@@ -4290,6 +4290,12 @@ class GatewayRunner(
         _adapter = (getattr(self, "adapters", None) or {}).get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
         source_profile = str(getattr(context.source, "profile", "") or "").strip()
+        if not source_profile and getattr(
+            getattr(self, "config", None), "multiplex_profiles", False
+        ):
+            from gateway.session_identity import identity_of
+            identity = identity_of(context.source)
+            source_profile = identity.runtime_profile if identity is not None else ""
         if not source_profile and not getattr(
             getattr(self, "config", None), "multiplex_profiles", False
         ):
