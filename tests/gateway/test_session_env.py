@@ -32,6 +32,34 @@ def _reset_contextvars():
         var.set(_UNSET)
 
 
+def test_multiplex_default_profile_is_bound_from_resolved_identity(monkeypatch):
+    """A multiplexed primary source keeps profile=None on the wire but tools need its identity."""
+    from pathlib import Path
+
+    from gateway.session_identity import resolve_identity
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._primary_profile_name = "default"
+    runner._active_profile_name = lambda: "default"
+    runner._transport_owner = lambda _source: (None, None)
+    runner._profile_name_for_source = lambda _source: None
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat-1")
+    identity = resolve_identity(
+        source, runner=runner, primary_home=Path("/safe/default-home")
+    )
+    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+
+    assert identity.runtime_profile == "default"
+    assert source.profile is None  # serialized primary identity remains unchanged
+    tokens = runner._set_session_env(context)
+    try:
+        assert get_session_env("HERMES_SESSION_PROFILE") == "default"
+    finally:
+        runner._clear_session_env(tokens)
+
+
 def test_set_session_env_sets_contextvars(monkeypatch):
     """_set_session_env should populate contextvars, not os.environ."""
     runner = object.__new__(GatewayRunner)
