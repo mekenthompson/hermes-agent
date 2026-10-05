@@ -505,15 +505,17 @@ class TestStdioPgroupReaping:
         )
 
         # Spawn parent in its own session (mirrors stdio_client behaviour).
-        from tools.mcp_tool_lifecycle import _SPAWN_MARKER_ENV
+        from tools.mcp_tool_lifecycle import _SPAWN_MARKER_ENV, _leader_start_time
         marker = "e2e-" + tmp_path.name
         parent = subprocess.Popen(
             [sys.executable, str(parent_script)],
+            stdin=subprocess.PIPE,
             start_new_session=True,
             env={**os.environ, _SPAWN_MARKER_ENV: marker},
         )
         parent_pgid = os.getpgid(parent.pid)
         parent_start = _leader_start_time(parent.pid)
+        assert parent_start is not None
         parent.stdin.close()
         # Wait for parent to exit and grandchild to spin up.
         parent.wait(timeout=15)
@@ -530,17 +532,19 @@ class TestStdioPgroupReaping:
         # Drive the reaper: register the parent pid + pgid + start baseline as an orphan.
         from tools.mcp_tool_lifecycle import (
             _kill_orphaned_mcp_children, _orphan_stdio_pid_servers, _orphan_stdio_pids,
-            _stdio_pgids, _stdio_pids, _stdio_spawn_markers)
+            _stdio_pgids, _stdio_pids, _stdio_spawn_markers, _stdio_starttimes)
         from tools.mcp_tool import _lock
         with _lock:
             _stdio_pids.clear()
             _orphan_stdio_pids.clear()
             _orphan_stdio_pid_servers.clear()
             _stdio_pgids.clear()
+            _stdio_starttimes.clear()
             _stdio_spawn_markers.clear()
             _orphan_stdio_pids.add(parent.pid)
             _orphan_stdio_pid_servers[parent.pid] = "orphan"
             _stdio_pgids[parent.pid] = parent_pgid
+            _stdio_starttimes[parent.pid] = parent_start
             _stdio_spawn_markers[parent.pid] = marker
         try:
             _kill_orphaned_mcp_children()

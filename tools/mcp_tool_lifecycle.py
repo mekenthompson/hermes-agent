@@ -330,11 +330,16 @@ def _signal_mcp_process(pid: int, sig: int, server_name: str, pgid: Optional[int
     members carrying this spawn's marker through pidfds. A mismatched live leader
     is never signalled. Other platforms retain the existing best-effort path."""
     current_start = _leader_start_time(pid) if expected_start is not None or spawn_marker else None
-    if expected_start is not None and current_start is not None and current_start != expected_start:
-        logger.debug(
-            "Skip signalling MCP pid %d (%s): start-time mismatch — PID was recycled; "
-            "refusing to kill an unrelated process group.", pid, server_name)
-        return
+    if expected_start is not None and current_start is not None:
+        try:
+            from gateway.status import start_time_fingerprints_match
+            if not start_time_fingerprints_match(expected_start, current_start):
+                logger.debug(
+                    "Skip signalling MCP pid %d (%s): start-time mismatch — PID was recycled; "
+                    "refusing to kill an unrelated process group.", pid, server_name)
+                return
+        except (TypeError, ValueError):
+            pass  # junk fingerprints: preserve existing best-effort signalling behavior.
     if sys.platform.startswith("linux") and current_start is None and expected_start is not None and not spawn_marker:
         from gateway.status import _pid_exists
         if not _pid_exists(pid):

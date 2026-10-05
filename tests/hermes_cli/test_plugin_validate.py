@@ -86,13 +86,15 @@ def test_validate_cli_probes_synced_environment_python(tmp_path, monkeypatch):
 
     plugin_dir = _make_plugin(tmp_path, manifest=dict(BASE_MANIFEST))
     selected_python = tmp_path / "selected" / "bin" / "python"
+    selected_python.parent.mkdir(parents=True)
+    selected_python.touch()
     monkeypatch.setattr(pm, "sync_venv", lambda **kwargs: None)
     monkeypatch.setattr(pm_environments, "project_python", lambda _root: selected_python)
     monkeypatch.setattr(pm_paths, "repo_root", lambda: tmp_path)
     probed = {}
 
-    def record_probe(_plugin_dir, _manifest, python_executable=None):
-        probed["python"] = python_executable
+    def record_probe(_plugin_dir, _manifest, probe=None):
+        probed["probe"] = probe
         return {}, ""
 
     monkeypatch.setattr(plugin_validate, "_run_capability_probe", record_probe)
@@ -102,7 +104,9 @@ def test_validate_cli_probes_synced_environment_python(tmp_path, monkeypatch):
         assert exc.code == 0
     else:
         raise AssertionError("cmd_validate should exit with the validation report")
-    assert probed.get("python") == selected_python
+    probe = probed.get("probe")
+    assert isinstance(probe, tuple)
+    assert probe[0] == selected_python
 
 
 def test_requires_hermes_spec_is_validated(tmp_path):
