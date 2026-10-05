@@ -2,14 +2,15 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+
 import { afterEach, describe, expect, it } from 'vitest'
 
 import {
+  looksBinary,
   MEDIA_MIME_TYPES,
   PREVIEW_LANGUAGE_BY_EXT,
-  TEXT_PREVIEW_MAX_BYTES,
-  looksBinary,
-  previewFileMetadata
+  previewFileMetadata,
+  TEXT_PREVIEW_MAX_BYTES
 } from './preview-file-metadata'
 
 const temporaryFiles: string[] = []
@@ -22,8 +23,10 @@ afterEach(() => {
 
 function tempFile(contents: Buffer): string {
   const file = path.join(os.tmpdir(), `hermes-preview-metadata-${crypto.randomUUID()}`)
+
   fs.writeFileSync(file, contents)
   temporaryFiles.push(file)
+
   return file
 }
 

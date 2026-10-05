@@ -311,32 +311,43 @@ def test_changed_entries_step(tmp_path, change, rc, listed, text):
         assert text in res.stdout
 
 
-def test_exact_alignment_branch_may_change_catalog_and_tooling(tmp_path):
-    """Only the authorized fork alignment head skips the data-only admission rule."""
+def test_pr130_catalog_guard_predicate_matrix(tmp_path):
+    """Run the real shell gate with synthetic pinned history, including a base-only commit."""
     repo = tmp_path / "pr"
-    _write(repo, {"plugin-catalog/old.yaml": "name: old\n", "plugin-catalog/README.md": "rules\n"})
+    _write(repo, {"plugin-catalog/old.yaml": "name: old\n"})
     _git(repo, "init", "-qb", "main")
     base = _commit(repo, "base")
     _git(repo, "checkout", "-qb", "pr")
+    _write(repo, {"upstream.txt": "frozen upstream\n"})
+    upstream = _commit(repo, "upstream")
     _write(repo, {**NEW, "scripts/tool.py": "x = 2\n"})
-    _commit(repo, "pr")
+    _commit(repo, "catalog plus tooling")
     _git(repo, "checkout", "-q", "main")
-    _git(repo, "merge", "-q", "--no-ff", "-m", "merge", "pr")
-    _git(repo, "checkout", "-q", "--detach")
-    _git(repo, "update-ref", "refs/remotes/origin/main", base)
-    out = tmp_path / "gh-output.txt"
-    out.touch()
+    _write(repo, {"base-only.txt": "not on PR head\n"})
+    base_only = _commit(repo, "base only")
+    _git(repo, "merge", "-q", "--no-ff", "-m", "synthetic PR merge", "pr")
     script = _step("Find changed catalog")
-    cases = [
-        ({"CATALOG_HEAD_REPO": "mekenthompson/hermes-agent", "CATALOG_HEAD_REF": "hf457/align-nous-404ab00"}, 0),
-        ({"CATALOG_HEAD_REPO": "attacker/hermes-agent", "CATALOG_HEAD_REF": "hf457/align-nous-404ab00"}, 1),
-        ({"CATALOG_HEAD_REPO": "mekenthompson/hermes-agent", "CATALOG_HEAD_REF": "house/reconcile-abc"}, 1),
-        ({}, 1),
-    ]
-    for extra, rc in cases:
+    first = "404ab00debc4f8e5ae642f2bf1be5286c10c8822"
+    second = "0a43af83366890856994bdc393fd2d630aca9db1"
+    assert first in script and second in script
+    # Only the fixture's pin identities change; actual Git ancestry is exercised.
+    script = script.replace(first, upstream).replace(second, base)
+    correct = {"CATALOG_HEAD_REPO": "mekenthompson/hermes-agent",
+               "CATALOG_HEAD_REF": "hf457/align-nous-404ab00", "CATALOG_PR_NUMBER": "130"}
+    cases = [("authorized", correct, script, 0)]
+    for key, bad in (("CATALOG_HEAD_REPO", "attacker/hermes-agent"),
+                     ("CATALOG_HEAD_REF", "hf457/other"), ("CATALOG_PR_NUMBER", "131")):
+        cases.append((key, {**correct, key: bad}, script, 1))
+        cases.append(("missing " + key, {k: v for k, v in correct.items() if k != key}, script, 1))
+    cases.append(("upstream not on head", correct, script.replace(upstream, base_only), 1))
+    cases.append(("fork not on head", correct, script.replace(base, base_only), 1))
+    out = tmp_path / "gh-output.txt"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CATALOG_")}
+    for name, extra, candidate, rc in cases:
         out.write_text("", encoding="utf-8")
-        res = _run(script, tmp_path, repo, {**os.environ, "GITHUB_OUTPUT": str(out), **extra})
-        assert res.returncode == rc, (extra, res.stdout, res.stderr)
-        if rc == 0:
+        res = _run(candidate, tmp_path, repo, {**env, "GITHUB_OUTPUT": str(out), **extra})
+        assert res.returncode == rc, (name, res.stdout, res.stderr)
+        if rc:
+            assert "may only touch" in res.stdout
+        else:
             assert "plugin-catalog/new.yaml" in out.read_text(encoding="utf-8")
-

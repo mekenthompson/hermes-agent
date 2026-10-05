@@ -65,6 +65,7 @@ jobs:
           # Set by Actions, not by the run script, so a PR cannot inject these.
           CATALOG_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           CATALOG_HEAD_REF: ${{ github.head_ref }}
+          CATALOG_PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           # HEAD is the PR merge commit: diffing it against its first parent is
@@ -93,10 +94,13 @@ jobs:
             #
             # House: the one authorized alignment PR carries upstream catalog entries
             # together with reviewed tooling. Keep the exemption bound to this exact
-            # fork branch/repository; pinned-source validation below still runs.
+            # fork branch/repository and PR number; pinned-source validation below still runs.
             house_sync=0
             if [ "${CATALOG_HEAD_REPO:-}" = "mekenthompson/hermes-agent" ] \
-               && [ "${CATALOG_HEAD_REF:-}" = "hf457/align-nous-404ab00" ]; then
+               && [ "${CATALOG_HEAD_REF:-}" = "hf457/align-nous-404ab00" ] \
+               && [ "${CATALOG_PR_NUMBER:-}" = "130" ] \
+               && git merge-base --is-ancestor 404ab00debc4f8e5ae642f2bf1be5286c10c8822 HEAD^2 \
+               && git merge-base --is-ancestor 0a43af83366890856994bdc393fd2d630aca9db1 HEAD^2; then
               house_sync=1
             fi
             if [ "$house_sync" -eq 0 ]; then

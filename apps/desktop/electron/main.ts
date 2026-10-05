@@ -34,16 +34,6 @@ import {
 } from 'electron'
 import type { Session } from 'electron'
 
-import {
-  MEDIA_MIME_TYPES,
-  PREVIEW_HTML_EXTENSIONS,
-  PREVIEW_LANGUAGE_BY_EXT,
-  PREVIEW_PDF_EXTENSIONS,
-  PREVIEW_WATCH_DEBOUNCE_MS,
-  TEXT_PREVIEW_MAX_BYTES,
-  looksBinary,
-  previewFileMetadata
-} from './preview-file-metadata'
 import { type ActiveRuntimeState, classifyActiveRuntime } from './active-runtime-state'
 import { HERMES_API_EXPECTED_404 } from './api-expected-404'
 import {
@@ -290,7 +280,7 @@ import {
 import { downloadViaOauthSessionToFile, downloadViaTokenToFile } from './gateway-file-download-transport'
 import { stopGatewayBeforeUpdate } from './gateway-stop-before-update'
 import { mintGatewayWsTicketWithSessionToken as mintGatewayWsTicketWithSessionTokenTransport } from './gateway-ticket-transport'
-import { resolveGatewayVersion } from './gateway-version' 
+import { resolveGatewayVersion } from './gateway-version'
 import { probeGatewayWebSocket, spawnedBackendProbeOptions } from './gateway-ws-probe'
 import { windowsGitCandidates } from './git-binary-candidates'
 import { registerGitIpc } from './git-ipc'
@@ -466,6 +456,16 @@ import {
 } from './power-save'
 import { readPreUpdateBackupEnabled } from './pre-update-backup-config'
 import { capturePreviewContents } from './preview-capture'
+import {
+  looksBinary,
+  MEDIA_MIME_TYPES,
+  PREVIEW_HTML_EXTENSIONS,
+  PREVIEW_LANGUAGE_BY_EXT,
+  PREVIEW_PDF_EXTENSIONS,
+  PREVIEW_WATCH_DEBOUNCE_MS,
+  previewFileMetadata,
+  TEXT_PREVIEW_MAX_BYTES
+} from './preview-file-metadata'
 import { onPreviewWatchOwnerDestroyed, sendPreviewFileChangedToOwner } from './preview-file-watch'
 import { hasClosePreviewFlag, previewGuestInputAction } from './preview-guest-escape'
 import { commandFocusedGuest, notePreviewGuestHidden } from './preview-guest-offscreen'
