@@ -2190,6 +2190,7 @@ from gateway.cwd_placeholder import CWD_PLACEHOLDERS, resolve_placeholder_termin
 
 from gateway.config import (
     ChannelOverride, Platform, GatewayConfig, PlatformConfig, _getenv, load_gateway_config)
+from gateway.run_display import _format_duration
 from gateway.session import (
     AsyncSessionStore, SessionStore, SessionSource, SessionContext, build_session_key,
     profile_from_session_key_namespace)
@@ -2579,15 +2580,6 @@ def _build_document_context_note(
         f"To read it, extract the document's text yourself — for example with the "
         f"terminal tool or the ocr-and-documents skill — before answering, instead "
         f"of asking the user to paste the contents.]")
-
-
-def _format_duration(seconds: float) -> str:
-    total = max(0, int(round(seconds)))
-    hours, rem = divmod(total, 3600)
-    minutes, secs = divmod(rem, 60)
-    if hours:
-        return f"{hours}:{minutes:02d}:{secs:02d}"
-    return f"{minutes}:{secs:02d}"
 
 
 async def _probe_audio_duration(path: str) -> Optional[str]:

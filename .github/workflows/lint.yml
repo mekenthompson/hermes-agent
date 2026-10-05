@@ -166,7 +166,7 @@ jobs:
         with:
           # The authorized fork alignment compares against two pinned historical parents.
           # Every ordinary PR keeps the shallow merge-commit + first-parent checkout.
-          fetch-depth: ${{ github.repository == 'mekenthompson/hermes-agent' && github.head_ref == 'hf457/align-nous-404ab00' && 0 || 2 }}
+          fetch-depth: ${{ github.repository == 'mekenthompson/hermes-agent' && github.event.pull_request.head.repo.full_name == 'mekenthompson/hermes-agent' && github.head_ref == 'hf457/align-nous-404ab00' && '0' || '2' }}
 
       - uses: ./.github/actions/setup-pm
         with:
@@ -179,6 +179,8 @@ jobs:
           command: python -m scripts.ci.python_packages "$(python -m scripts.code_health --print-pins)"
 
       - name: Ratchet the PR against the base branch tip
+        env:
+          CI_PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: python scripts/check --only health --base HEAD^1
 
   windows-footguns:

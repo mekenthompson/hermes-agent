@@ -98,12 +98,7 @@ def _release_db(db) -> None:
         release_or_close(db)
 
 
-def _branch_title(db, parent_key: str) -> str:
-    """Next title in the parent's lineage (mirrors the TUI /branch naming)."""
-    current = db.get_session_title(parent_key) or "branch"
-    if hasattr(db, "get_next_title_in_lineage"):
-        return db.get_next_title_in_lineage(current)
-    return f"{current} (branch)"
+from .session_titles import _branch_title
 
 
 def _cwd_info(session: dict, cwd: str, branch=None) -> dict:

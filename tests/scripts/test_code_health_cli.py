@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -106,6 +108,59 @@ def _engine_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def test_cli_two_parent_intersection_credits_inherited_occurrences_once(tmp_path, capsys):
+    repo, root = _ratchet_repo(tmp_path)
+    common = _commit(repo, {"pkg/common.py": _SWALLOW})
+    _git(repo, "checkout", "-q", "-b", "other", common)
+    other = _commit(repo, {"pkg/other.py": _SWALLOW})
+    _git(repo, "checkout", "-q", "main")
+    fork = _commit(repo, {"pkg/fork.py": _SWALLOW})
+    _git(repo, "merge", "--no-ff", "-q", "other", "-m", "synthetic two-parent merge")
+    merged = _git(repo, "rev-parse", "HEAD")
+
+    # Each parent independently owns its inherited occurrence; intersection accepts the merge.
+    assert cli.run(repo, root, merged, inherited_bases=(fork, other)) == 0
+    capsys.readouterr()
+
+    # A common-ancestor occurrence is present in both parents, but earns one credit, not two.
+    copied = _commit(repo, {"pkg/copy.py": _SWALLOW})
+    assert cli.run(repo, common, copied, inherited_bases=(fork, other)) == 1
+    assert "pkg/copy.py" in capsys.readouterr().out
+
+    # Copying an occurrence already present in only one of two parents is likewise new.
+    _git(repo, "checkout", "-q", "-b", "single-parent", root)
+    left = _commit(repo, {"pkg/left.py": _SWALLOW})
+    _git(repo, "checkout", "-q", "-b", "right", root)
+    right = _commit(repo, {"pkg/right.py": "def right():\n    return 1\n"})
+    _git(repo, "checkout", "-q", "single-parent")
+    _git(repo, "merge", "--no-ff", "-q", "right", "-m", "synthetic merge")
+    candidate = _commit(repo, {"pkg/copied-left.py": _SWALLOW})
+    assert cli.run(repo, root, candidate, inherited_bases=(left, right)) == 1
+    assert "pkg/copied-left.py" in capsys.readouterr().out
+
+
+def test_alignment_baselines_require_same_repository_head(tmp_path, monkeypatch):
+    repo = _engine_repo(tmp_path)
+    parent = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "remote", "add", "origin", "https://github.com/mekenthompson/hermes-agent.git")
+    _git(repo, "checkout", "-b", "hf457/align-nous-404ab00")
+    resolve = runpy.run_path(str(repo / "scripts/check"))["_alignment_parents"]
+    monkeypatch.setitem(resolve.__globals__, "_ALIGNMENT_PARENTS", (parent,))
+    monkeypatch.delenv("GITHUB_HEAD_REF", raising=False)
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+    assert resolve(None) == (parent,)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mekenthompson/hermes-agent")
+    monkeypatch.setenv("GITHUB_HEAD_REF", "hf457/align-nous-404ab00")
+    monkeypatch.delenv("CI_PR_HEAD_REPOSITORY", raising=False)
+    assert resolve(None) == ()
+    monkeypatch.setenv("CI_PR_HEAD_REPOSITORY", "other/hermes-agent")
+    assert resolve(None) == ()
+    monkeypatch.setenv("CI_PR_HEAD_REPOSITORY", "mekenthompson/hermes-agent")
+    assert resolve(None) == (parent,)
+    monkeypatch.setenv("GITHUB_HEAD_REF", "ordinary-feature")
+    assert resolve(None) == ()
+
+
 def _check(repo: Path, *args: str) -> subprocess.CompletedProcess:
     return _sh(repo, sys.executable, str(repo / "scripts/check"), *args)
 
@@ -147,7 +202,10 @@ def test_staged_health_ignores_unstaged_policy_and_engine(tmp_path, unstaged):
     assert edited != original
     (repo / rel).write_text(edited, encoding="utf-8")
     again = _check(repo, "--staged", "--only", "health", "--base", "HEAD")
-    assert again.stdout == first.stdout, again.stdout + again.stderr
+    # Runtime is the only expected stdout difference; retain all health diagnostics.
+    assert re.sub(r"\((?:\d+\.\d+|\d+)s\)", "(<elapsed>s)", again.stdout) == re.sub(
+        r"\((?:\d+\.\d+|\d+)s\)", "(<elapsed>s)", first.stdout
+    ), again.stdout + again.stderr
     # the judged artifact and the user's unstaged work are both untouched
     assert _git(repo, "write-tree") == tree
     assert (repo / rel).read_text(encoding="utf-8") == edited

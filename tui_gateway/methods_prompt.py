@@ -678,6 +678,28 @@ def _lock_in_submit_turn(
 _CLIENT_SURFACES = frozenset({"hud", "voice-live"})
 
 
+def _has_truncation(params: dict) -> bool:
+    """Whether the submit explicitly requests a history cut."""
+    return any(params.get(key) is not None for key in _TRUNCATION_PARAMS)
+
+
+def _requested_rebind_ids(raw_ids):
+    """Keep integer survivor row identities, excluding bools and non-list inputs."""
+    return (
+        {row_id for row_id in raw_ids if isinstance(row_id, int) and not isinstance(row_id, bool)}
+        if isinstance(raw_ids, list) else None)
+
+
+def _reopen_before_isolated_submit(session, sid):
+    try:
+        with _session_db(session) as db:
+            if db is not None:
+                _reopen_if_finalized(db, str(session.get("session_key") or ""))
+    except Exception:
+        logger.debug("finalized-session reopen before isolated dispatch failed for %s",
+                     sid, exc_info=True)
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
@@ -731,7 +753,7 @@ def _(rid, params: dict) -> dict:
     voice_context = params.get("voice_context")
     session["voice_live_context"] = (
         voice_context[:6000] if session["client_surface"] == "voice-live" and isinstance(voice_context, str) else "")
-    has_truncation = any(params.get(k) is not None for k in _TRUNCATION_PARAMS)
+    has_truncation = _has_truncation(params)
     if has_truncation and isinstance(text, str):
         # A rewind replays what the transcript shows: re-expand a skill invocation or
         # `/work fix it` sends nine literal chars.
@@ -772,10 +794,7 @@ def _(rid, params: dict) -> dict:
             display_kind=display_kind)
         if busy_response is not None:
             return busy_response
-    raw_rebind_ids = params.get("rebind_survivor_row_ids")
-    requested_rebind_ids = (
-        {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
-        if isinstance(raw_rebind_ids, list) else None)
+    requested_rebind_ids = _requested_rebind_ids(params.get("rebind_survivor_row_ids"))
     err, survivor_fields = _lock_in_submit_turn(
         rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
     if err is not None:
@@ -790,13 +809,7 @@ def _(rid, params: dict) -> dict:
         # applied inline), and the child's transcript writes must land in a live row
         # (#85303 review: the early return made _reopen_if_finalized unreachable on
         # this path). Best-effort like the helper: a failed read never blocks the send.
-        try:
-            with _session_db(session) as db:
-                if db is not None:
-                    _reopen_if_finalized(db, str(session.get("session_key") or ""))
-        except Exception:
-            logger.debug("finalized-session reopen before isolated dispatch failed for %s",
-                         sid, exc_info=True)
+        _reopen_before_isolated_submit(session, sid)
         isolated_response = _submit_prompt_to_compute_host(
             rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata)
         if not isolated_response.get("error"):

@@ -121,6 +121,8 @@ def _alignment_parents(head: str | None) -> tuple[str, ...]:
     origin = gitio.git(REPO, "remote", "get-url", "origin", check=False).strip().lower()
     if branch != _ALIGNMENT_BRANCH or repository not in ("", "mekenthompson/hermes-agent"):
         return ()
+    if repository and os.environ.get("CI_PR_HEAD_REPOSITORY") != repository:
+        return ()
     if origin not in ("https://github.com/mekenthompson/hermes-agent.git",
                       "https://github.com/mekenthompson/hermes-agent",
                       "git@github.com:mekenthompson/hermes-agent.git",

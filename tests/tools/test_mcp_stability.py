@@ -564,6 +564,7 @@ class TestStdioPgroupReaping:
             except ProcessLookupError:
                 pass
 
+        assert not survived, "grandchild survived marked pidfd reaping"
         # Grandchild should be gone — SIGKILL via its verified pidfd reached it.
         deadline = _time.time() + 10
         while _time.time() < deadline and psutil.pid_exists(grandchild_pid):

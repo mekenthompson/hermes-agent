@@ -2119,12 +2119,7 @@ def get_pre_tool_call_directive(
     return (details.action, details.message)
 
 
-def get_pre_tool_call_block_message(
-    tool_name: str, args: Optional[Dict[str, Any]], **hook_kwargs: Any
-) -> Optional[str]:
-    """Deprecated shim: only the ``block`` message (or ``None``); ``approve`` is invisible here."""
-    directive, message = get_pre_tool_call_directive(tool_name, args, **hook_kwargs)
-    return message if directive == "block" else None
+from hermes_cli.plugins_dispatch import get_pre_tool_call_block_message
 
 
 def resolve_pre_tool_block(
