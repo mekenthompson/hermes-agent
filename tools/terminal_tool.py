@@ -1011,7 +1011,9 @@ def _resolve_command_cwd(
             default_cwd,
         )
         return _container_visible_default(default_cwd, env_type, env)
-    return recorded or coerce_ssh_remote_cwd(
+    if recorded:
+        return coerce_ssh_remote_cwd(recorded, env_type)
+    return coerce_ssh_remote_cwd(
         _container_visible_default(default_cwd, env_type, env), env_type
     )
 

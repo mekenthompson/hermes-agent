@@ -311,8 +311,8 @@ def test_changed_entries_step(tmp_path, change, rc, listed, text):
         assert text in res.stdout
 
 
-def test_house_reconcile_may_change_catalog_and_tooling(tmp_path):
-    """Only this fork's house/reconcile-* head skips the data-only admission rule."""
+def test_exact_alignment_branch_may_change_catalog_and_tooling(tmp_path):
+    """Only the authorized fork alignment head skips the data-only admission rule."""
     repo = tmp_path / "pr"
     _write(repo, {"plugin-catalog/old.yaml": "name: old\n", "plugin-catalog/README.md": "rules\n"})
     _git(repo, "init", "-qb", "main")
@@ -328,9 +328,9 @@ def test_house_reconcile_may_change_catalog_and_tooling(tmp_path):
     out.touch()
     script = _step("Find changed catalog")
     cases = [
-        ({"CATALOG_HEAD_REPO": "mekenthompson/hermes-agent", "CATALOG_HEAD_REF": "house/reconcile-abc"}, 0),
-        ({"CATALOG_HEAD_REPO": "attacker/hermes-agent", "CATALOG_HEAD_REF": "house/reconcile-abc"}, 1),
-        ({"CATALOG_HEAD_REPO": "mekenthompson/hermes-agent", "CATALOG_HEAD_REF": "feature/reconcile"}, 1),
+        ({"CATALOG_HEAD_REPO": "mekenthompson/hermes-agent", "CATALOG_HEAD_REF": "hf457/align-nous-404ab00"}, 0),
+        ({"CATALOG_HEAD_REPO": "attacker/hermes-agent", "CATALOG_HEAD_REF": "hf457/align-nous-404ab00"}, 1),
+        ({"CATALOG_HEAD_REPO": "mekenthompson/hermes-agent", "CATALOG_HEAD_REF": "house/reconcile-abc"}, 1),
         ({}, 1),
     ]
     for extra, rc in cases:

@@ -91,14 +91,12 @@ jobs:
             # email maps are data the gate never executes; README/policy/CI PRs
             # with no entry change skip this check.
             #
-            # House: a reconciliation branch on this fork lands upstream catalog
-            # entries together with the tooling those entries were reviewed
-            # against. The exemption is the fork repo plus the house/reconcile-*
-            # ref. An outside fork using the same branch name does not qualify,
-            # and the pinned-source clone below still runs.
+            # House: the one authorized alignment PR carries upstream catalog entries
+            # together with reviewed tooling. Keep the exemption bound to this exact
+            # fork branch/repository; pinned-source validation below still runs.
             house_sync=0
             if [ "${CATALOG_HEAD_REPO:-}" = "mekenthompson/hermes-agent" ] \
-               && [[ "${CATALOG_HEAD_REF:-}" == house/reconcile-* ]]; then
+               && [ "${CATALOG_HEAD_REF:-}" = "hf457/align-nous-404ab00" ]; then
               house_sync=1
             fi
             if [ "$house_sync" -eq 0 ]; then
