@@ -33,6 +33,10 @@ on every push: python scripts/check --install-hook pre-push)."""
 
 _SWITCH_FILE = "scripts/code_health/config.py"
 _MODES = ("blocking", "advisory", "off")
+_TRUSTED_ALIGNMENT_PARENTS = frozenset((
+    "0a43af83366890856994bdc393fd2d630aca9db1",
+    "404ab00debc4f8e5ae642f2bf1be5286c10c8822",
+))
 
 
 def parse_switch(text: str) -> str:
@@ -64,6 +68,8 @@ def enforcement(repo: Path, rev: str) -> str:
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="code_health", description=__doc__)
     p.add_argument("--base", help="base revision (default: merge-base of HEAD with origin/main)")
+    p.add_argument("--inherited-base", action="append", default=[],
+                   help="additional explicitly trusted comparison parent (repeatable)")
     p.add_argument("--head", help="head commit or tree (default: the working tree, untracked included)")
     p.add_argument("--report", action="store_true", help="burn-down summary of the whole head tree")
     p.add_argument("--json", action="store_true", help="machine-readable findings")
@@ -87,7 +93,7 @@ def _skipped(why: str, as_json: bool) -> None:
 
 
 def run(repo: Path, base: str, head: str | None, as_json: bool = False,
-        switch_rev: str | None = None) -> int:
+        switch_rev: str | None = None, inherited_bases: tuple[str, ...] = ()) -> int:
     """Judge ``head`` against ``base``; the ENFORCEMENT switch is read from ``switch_rev``
     (default: the base), never from the head under test."""
     started = time.monotonic()
@@ -109,6 +115,23 @@ def run(repo: Path, base: str, head: str | None, as_json: bool = False,
     base_m = measurer.measure(base, base_paths)
     head_m = measurer.measure(head, head_paths)
     findings = compare(base_m, head_m, changes)
+    if inherited_bases:
+        # Each trusted parent independently evaluates the exact head. An occurrence is
+        # inherited if either parent already owns it; compare() preserves one-to-one credit
+        # within each parent, so two copies cannot consume one occurrence.
+        identities: set[tuple[str, str, str, int]] | None = None
+        for parent in inherited_bases:
+            parent_changes = gitio.changed_files(repo, parent, head)
+            parent_head_paths = sorted({c.new for c in parent_changes if c.new and in_scope(c.new)})
+            parent_base_paths = sorted({c.old for c in parent_changes if c.old and in_scope(c.old)})
+            parent_measurer = Measurer(repo, ruff, known_env=gitio.known_env_names(repo, parent))
+            parent_m = parent_measurer.measure(parent, parent_base_paths)
+            parent_head_m = parent_measurer.measure(head, parent_head_paths)
+            parent_findings = {(f.path, f.rule, f.scope, f.line)
+                               for f in compare(parent_m, parent_head_m, parent_changes)}
+            identities = parent_findings if identities is None else identities & parent_findings
+        if identities is not None:
+            findings = [f for f in findings if (f.path, f.rule, f.scope, f.line) in identities]
     apply_allows(findings, head_m)
     blocking, advisory = verdict(findings)
     failed = bool(blocking) and mode == "blocking"
@@ -139,13 +162,33 @@ def main(argv: list[str] | None = None) -> int:
         if args.report:
             return _report(repo, head)
         if args.base:  # CI: the base is the target branch tip, which also holds the switch
-            return run(repo, gitio.resolve_rev(repo, args.base), head, as_json=args.json)
+            base = gitio.resolve_rev(repo, args.base)
+            trusted = tuple(gitio.resolve_rev(repo, p) for p in args.inherited_base)
+            for parent in trusted:
+                if parent not in _TRUSTED_ALIGNMENT_PARENTS:
+                    raise RuntimeError(f"unapproved inherited parent {parent}")
+                proc = subprocess.run(["git", "merge-base", "--is-ancestor", parent,
+                                       args.head or "HEAD"], cwd=repo, capture_output=True,
+                                      stdin=subprocess.DEVNULL, timeout=60, check=False)
+                if proc.returncode != 0:
+                    raise RuntimeError(f"trusted parent {parent} is not an ancestor of the head")
+            return run(repo, base, head, as_json=args.json, inherited_bases=trusted)
         # Locally the base is the merge-base, which lags main; the switch comes from the main tip
         # so a flip on main reaches a branch without a rebase. The head never supplies it.
         tip = gitio.commit_or_none(repo, args.head) if args.head else None
         base = gitio.default_base(repo, tip or "HEAD")
         switch_rev = gitio.commit_or_none(repo, "origin/main") or base
-        return run(repo, base, head, as_json=args.json, switch_rev=switch_rev)
+        trusted = tuple(gitio.resolve_rev(repo, p) for p in args.inherited_base)
+        for parent in trusted:
+            if parent not in _TRUSTED_ALIGNMENT_PARENTS:
+                raise RuntimeError(f"unapproved inherited parent {parent}")
+            proc = subprocess.run(["git", "merge-base", "--is-ancestor", parent,
+                                   args.head or "HEAD"], cwd=repo, capture_output=True,
+                                  stdin=subprocess.DEVNULL, timeout=60, check=False)
+            if proc.returncode != 0:
+                raise RuntimeError(f"trusted parent {parent} is not an ancestor of the head")
+        return run(repo, base, head, as_json=args.json, switch_rev=switch_rev,
+                   inherited_bases=trusted)
     except RuntimeError as exc:
         print(f"code health: {exc}", file=sys.stderr)
         return 2

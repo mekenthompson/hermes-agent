@@ -164,7 +164,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
-          fetch-depth: 2 # the merge commit and its first parent (the base branch tip)
+          # The authorized fork alignment compares against two pinned historical parents.
+          # Every ordinary PR keeps the shallow merge-commit + first-parent checkout.
+          fetch-depth: ${{ github.repository == 'mekenthompson/hermes-agent' && github.head_ref == 'hf457/align-nous-404ab00' && 0 || 2 }}
 
       - uses: ./.github/actions/setup-pm
         with:

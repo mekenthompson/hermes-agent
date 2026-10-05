@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from scripts.code_health.cli import run
+from scripts.code_health.cli import main as health_main, run
+from scripts.code_health import cli as health_cli
 
 REPO = Path(__file__).resolve().parents[2]
 _LEGACY = "def legacy(x):\n" + "".join(f"    if x == {i}:\n        return {i}\n" for i in range(21))
@@ -41,6 +42,7 @@ def _repo(tmp_path: Path) -> tuple[Path, str]:
     _git(repo, "init", "-q", "-b", "main")
     _git(repo, "config", "user.email", "t@example.com")
     _git(repo, "config", "user.name", "t")
+    _git(repo, "config", "core.hooksPath", "/dev/null")
     return repo, _commit(repo, {"pkg/a.py": _LEGACY + "\n\n" + _SWALLOW})
 
 
@@ -92,6 +94,59 @@ def test_moved_code_keeps_its_cap(tmp_path, capsys):
     renamed: dict[str, str | None] = {"pkg/a.py": None, "pkg/b.py": _LEGACY + "\n\n" + _SWALLOW}
     code, out = _verdict(repo, base, renamed, capsys)
     assert code == 0, out
+
+
+def test_two_parent_credit_is_occurrence_scoped_on_synthetic_merge_and_followup(tmp_path, capsys):
+    repo, root = _repo(tmp_path)
+    fork = _commit(repo, {"pkg/fork.py": _SWALLOW})
+    _git(repo, "checkout", "-q", "-b", "upstream", root)
+    upstream = _commit(repo, {"pkg/upstream.py": _SWALLOW})
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "merge", "--no-ff", "-q", "upstream", "-m", "synthetic PR merge")
+    merged = _git(repo, "rev-parse", "HEAD")
+    assert run(repo, root, merged) == 1  # ordinary single-base behavior is unchanged
+    capsys.readouterr()
+    assert run(repo, root, merged, inherited_bases=(fork, upstream)) == 0
+    capsys.readouterr()
+
+    source = (repo / "pkg/upstream.py").read_text(encoding="utf-8")
+    _commit(repo, {"pkg/upstream.py": source + "\n\n" + _SWALLOW.replace("other", "copy")})
+    head = _git(repo, "rev-parse", "HEAD")
+    assert run(repo, root, head, inherited_bases=(fork, upstream)) == 1
+    assert "pkg/upstream.py" in capsys.readouterr().out
+
+
+def test_growth_above_both_parent_caps_still_blocks(tmp_path, capsys):
+    repo, root = _repo(tmp_path)
+    lower = _LEGACY
+    higher = lower + "    if x == 99:\n        return 99\n"
+    fork = _commit(repo, {"pkg/fork_metric.py": lower + "\n\n" + _SWALLOW})
+    _git(repo, "checkout", "-q", "-b", "upstream", root)
+    upstream = _commit(repo, {"pkg/up_metric.py": higher + "\n\n" + _SWALLOW})
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "merge", "--no-ff", "-q", "upstream", "-m", "synthetic PR merge")
+    merged = _git(repo, "rev-parse", "HEAD")
+    largest = higher + "    if x == 100:\n        return 100\n"
+    head = _commit(repo, {"pkg/up_metric.py": largest + "    if x == 101:\n        return 101\n\n\n" + _SWALLOW})
+    assert run(repo, root, head, inherited_bases=(fork, upstream)) == 1
+    assert "CC" in capsys.readouterr().out
+    assert merged in _git(repo, "log", "--format=%H", "-3")
+
+
+def test_missing_and_nonancestor_parent_fail_closed(tmp_path, capsys, monkeypatch):
+    repo, base = _repo(tmp_path)
+    monkeypatch.setattr(health_cli.gitio, "repo_root", lambda _start: repo)
+    head = _commit(repo, {"pkg/new.py": _LEGACY + "\n\n" + _SWALLOW})
+    assert health_main(["--base", base, "--head", head,
+                        "--inherited-base", "deadbeef"]) == 2
+    assert "failed" in capsys.readouterr().err
+
+    _git(repo, "checkout", "-q", "-b", "other", base)
+    unrelated = _commit(repo, {"pkg/unrelated.py": _SWALLOW})
+    monkeypatch.setattr(health_cli, "_TRUSTED_ALIGNMENT_PARENTS", frozenset((unrelated,)))
+    assert health_main(["--base", base, "--head", head,
+                        "--inherited-base", unrelated]) == 2
+    assert "not an ancestor" in capsys.readouterr().err
 
 
 _RUN = "import subprocess\n\n\ndef f(cmd):\n    return subprocess.run(cmd{})\n"
