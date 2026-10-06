@@ -77,6 +77,9 @@ class GatewayPluginServicesMixin:
         from hermes_cli.plugins import get_plugin_manager
         from hermes_constants import get_hermes_home
 
+        # Startup must not lose references to still-running services on a repeated call.
+        if any(not task.done() for task in getattr(self, "_profile_service_tasks", ())):
+            return
         stop_event = getattr(self, "_profile_service_stop", None)
         if stop_event is None or stop_event.is_set():
             stop_event = asyncio.Event()
@@ -94,7 +97,14 @@ class GatewayPluginServicesMixin:
                 if name != active_profile
             )
 
+        seen_homes: set[Path] = set()
         for profile_name, profile_home in profiles:
+            # A logical launch name and `default` may refer to the same home.
+            # Home ownership, not the spelling of a routing alias, owns services.
+            resolved_home = profile_home.resolve()
+            if resolved_home in seen_homes:
+                continue
+            seen_homes.add(resolved_home)
             with _profile_runtime_scope(profile_home):
                 runtime = SimpleNamespace(
                     profile_home=str(get_hermes_home()),
