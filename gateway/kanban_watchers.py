@@ -89,7 +89,14 @@ class GatewayKanbanWatchersMixin:
 
         sub_fail_counts: dict[tuple, int] = getattr(self, "_kanban_sub_fail_counts", {})
         self._kanban_sub_fail_counts = sub_fail_counts
-        notifier_profile = getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name()
+        notifier_profile = getattr(self, "_kanban_notifier_profile", None)
+        if not notifier_profile:
+            # The watcher owns subscriptions stamped by the runtime profile. In
+            # standalone containers get_active_profile_name() can describe the
+            # mounted default home even when the launcher pinned HERMES_PROFILE.
+            from hermes_cli.profiles import current_profile_name
+
+            notifier_profile = current_profile_name("default")
         self._kanban_notifier_profile = notifier_profile
 
         # Initial delay so the gateway can finish wiring adapters.
