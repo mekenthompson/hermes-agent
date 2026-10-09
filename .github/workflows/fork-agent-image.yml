@@ -1,9 +1,10 @@
 name: Fork Agent Image
 
+# Intentional release only. Pull requests and pushes do not build or publish.
+# Dispatch this workflow on main: publish=false runs the credential-free
+# preflight; publish=true publishes that exact commit after the image CI gate.
+
 on:
-  pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       publish:
@@ -17,11 +18,10 @@ permissions:
   actions: read # inspect the image CI aggregate for the exact selected commit
 
 concurrency:
-  # One group per pull request, otherwise per exact commit, so a main push
-  # and a later manual re-run of the same SHA queue instead of colliding and
-  # a newer main push never cancels an in-progress publication.
-  group: fork-agent-image-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # One publication per commit. A later dispatch of the same SHA queues.
+  # Never cancel an in-progress publish.
+  group: fork-agent-image-${{ github.sha }}
+  cancel-in-progress: false
 
 env:
   IMAGE_REPOSITORY: ghcr.io/mekenthompson/hermes-agent
@@ -55,15 +55,13 @@ jobs:
           github-token: ${{ github.token }}
 
   preflight:
-    # Pull requests and publish=false dispatches only; main pushes go
-    # straight to the publish job, which builds and scans its own candidate.
+    # publish=false dispatches only. Publication builds and scans its own candidate.
     needs: detect
     if: >-
       needs.detect.outputs.docker == 'true' &&
       github.repository == 'mekenthompson/hermes-agent' &&
-      github.event_name != 'push' &&
-      (github.event_name == 'pull_request' ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish != 'true'))
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.publish != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -155,16 +153,14 @@ jobs:
           retention-days: 30
 
   publish:
-    # Every main push that changes an image input publishes automatically
-    # once the exact-SHA image CI aggregate is green; publish=true dispatches remain
-    # available for re-runs (and always build: dispatch fails open).
+    # Explicit main dispatch only. A push to main does not publish.
     needs: detect
     if: >-
       needs.detect.outputs.docker == 'true' &&
       github.repository == 'mekenthompson/hermes-agent' &&
       github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true'))
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     environment: agent-image-publish

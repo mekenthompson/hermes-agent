@@ -32,20 +32,19 @@ class ForkImageWorkflowTests(unittest.TestCase):
         for path in (WORKFLOW, DOC, MANIFEST):
             self.assertTrue(path.is_file(), path)
 
-    def test_workflow_publishes_main_pushes_and_manual_dispatches_only(self) -> None:
+    def test_workflow_publishes_only_on_explicit_main_dispatch(self) -> None:
         import yaml
 
         text = WORKFLOW.read_text(encoding="utf-8")
-        self.assertRegex(text, r"(?m)^\s*pull_request:\s*$")
+        self.assertNotRegex(text, r"(?m)^  pull_request:\s*$")
+        self.assertNotRegex(text, r"(?m)^  push:\s*$")
         self.assertNotIn("    paths:", text)
-        self.assertRegex(text, r"(?m)^\s*workflow_dispatch:\s*$")
-        self.assertRegex(text, r"(?m)^  push:\n    branches: \[main\]\s*$")
+        self.assertRegex(text, r"(?m)^  workflow_dispatch:\s*$")
         self.assertIn("type: boolean", text)
         self.assertIn("default: false", text)
         self.assertIn("environment: agent-image-publish", text)
         workflow = yaml.safe_load(text)
-        self.assertEqual(sorted(workflow[True]), ["pull_request", "push", "workflow_dispatch"])
-        self.assertEqual(workflow[True]["push"], {"branches": ["main"]})
+        self.assertEqual(list(workflow[True]), ["workflow_dispatch"])
         preflight = " ".join(workflow["jobs"]["preflight"]["if"].split())
         publish = " ".join(workflow["jobs"]["publish"]["if"].split())
         self.assertEqual(
@@ -53,20 +52,19 @@ class ForkImageWorkflowTests(unittest.TestCase):
             "needs.detect.outputs.docker == 'true' && "
             "github.repository == 'mekenthompson/hermes-agent' && "
             "github.ref == 'refs/heads/main' && "
-            "(github.event_name == 'push' || "
-            "(github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true'))",
+            "github.event_name == 'workflow_dispatch' && "
+            "github.event.inputs.publish == 'true'",
         )
         self.assertEqual(
             preflight,
             "needs.detect.outputs.docker == 'true' && "
             "github.repository == 'mekenthompson/hermes-agent' && "
-            "github.event_name != 'push' && "
-            "(github.event_name == 'pull_request' || "
-            "(github.event_name == 'workflow_dispatch' && github.event.inputs.publish != 'true'))",
+            "github.event_name == 'workflow_dispatch' && "
+            "github.event.inputs.publish != 'true'",
         )
         concurrency = workflow["concurrency"]
-        self.assertEqual(concurrency["group"], "fork-agent-image-${{ github.event.pull_request.number || github.sha }}")
-        self.assertEqual(concurrency["cancel-in-progress"], "${{ github.event_name == 'pull_request' }}")
+        self.assertEqual(concurrency["group"], "fork-agent-image-${{ github.sha }}")
+        self.assertIs(concurrency["cancel-in-progress"], False)
 
     def test_publish_waits_for_exact_main_ci_before_registry_write(self) -> None:
         import yaml
@@ -266,17 +264,17 @@ candidate-123-1: digest: sha256:222222222222222222222222222222222222222222222222
     def test_documentation_states_release_boundary_and_handoff(self) -> None:
         text = DOC.read_text(encoding="utf-8").lower()
         for phrase in (
-            "automatic",
-            "every push to `main`",
-            "image input",
-            "fails open",
+            "intentional",
             "workflow_dispatch",
-            "exact pushed commit",
+            "publish: true",
+            "fails open",
+            "exact selected commit",
             "no manual reviewer prerequisite",
             "image digest",
             "fleet",
             "rollback",
             "does not deploy",
+            "does not schedule them",
         ):
             self.assertIn(phrase, text)
 
