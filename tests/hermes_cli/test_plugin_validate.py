@@ -90,6 +90,9 @@ def test_validate_cli_probes_synced_environment_python(tmp_path, monkeypatch):
     selected_python.touch()
     monkeypatch.setattr(pm, "sync_venv", lambda **kwargs: None)
     monkeypatch.setattr(pm_environments, "project_python", lambda _root: selected_python)
+    monkeypatch.setattr(pm_environments, "selected_venv", lambda _root: selected_python.parent.parent)
+    monkeypatch.setattr(pm_environments, "venv_command", lambda _root, _venv: [str(selected_python)])
+    monkeypatch.setattr(pm_environments, "activation_environment", lambda _root: {"VIRTUAL_ENV": "selected"})
     monkeypatch.setattr(pm_paths, "repo_root", lambda: tmp_path)
     probed = {}
 
@@ -106,7 +109,8 @@ def test_validate_cli_probes_synced_environment_python(tmp_path, monkeypatch):
         raise AssertionError("cmd_validate should exit with the validation report")
     probe = probed.get("probe")
     assert isinstance(probe, tuple)
-    assert probe[0] == selected_python
+    assert probe[0] == [str(selected_python)]
+    assert probe[1]["VIRTUAL_ENV"] == "selected"
 
 
 def test_requires_hermes_spec_is_validated(tmp_path):

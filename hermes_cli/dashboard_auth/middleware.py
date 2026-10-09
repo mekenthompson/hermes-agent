@@ -17,10 +17,6 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from starlette.concurrency import run_in_threadpool
 
-# Module import (not ``from … import``) so a partially initialised web_server
-# during its own startup import chain is fine: the explicit-token helpers are
-# resolved as attributes at request time, and tests may monkeypatch them.
-import hermes_cli.web_server as _web_server
 from hermes_cli.dashboard_auth import list_session_providers
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import ProviderError
@@ -173,6 +169,9 @@ async def gated_auth_middleware(
     # Explicit dashboard tokens are configured administrator credentials for
     # native remote clients. Check them before provider bearer verification so
     # an unavailable provider cannot reject a valid configured connection.
+    # Import inside the request: a module-level import cycles through
+    # web_server -> body_limit -> this module before _path_is_public exists.
+    import hermes_cli.web_server as _web_server
     if _web_server._has_valid_explicit_session_token(request):
         request.state.session = _web_server._explicit_session_token_session()
         return await call_next(request)

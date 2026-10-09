@@ -82,6 +82,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+# CI and the routing tests execute this file, not `python -m`. The fork
+# imports live under scripts/, which is not on sys.path[0] in that mode.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from scripts.ci.list_os_marked_tests import file_gates_on
 from scripts.ci.fork_review_files import ci_review_files, review_lanes
 from scripts.ci.ci_policy import apply_fork_classification, is_fork
