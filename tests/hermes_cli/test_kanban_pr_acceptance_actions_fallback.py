@@ -194,15 +194,43 @@ def test_actions_fallback_rejects_missing_workflow_provenance(tmp_path, monkeypa
 def test_actions_fallback_rejects_untrusted_event(tmp_path, monkeypatch):
     routes = _replace(_base_routes(), "/actions/runs?", body=[_page("workflow_runs", [_run(event="workflow_dispatch")])])
     receipt, calls = _refuse(tmp_path, monkeypatch, routes)
-    assert "provenance" in receipt["detail"]
+    assert receipt["ok"] is not True
+    assert "untrusted" in receipt["detail"]
     assert not any("/jobs" in call or "/contents/" in call for call in calls)
 
 
 def test_actions_fallback_rejects_pull_request_target(tmp_path, monkeypatch):
     routes = _replace(_base_routes(), "/actions/runs?", body=[_page("workflow_runs", [_run(event="pull_request_target")])])
     receipt, calls = _refuse(tmp_path, monkeypatch, routes)
-    assert "provenance" in receipt["detail"]
+    assert receipt["ok"] is not True
+    assert "untrusted" in receipt["detail"]
     assert not any("/jobs" in call for call in calls)
+
+
+def test_older_failed_dispatch_does_not_override_later_pull_request(tmp_path, monkeypatch):
+    dispatch = _run(event="workflow_dispatch", run_id=11, attempt=1)
+    pull = _run(event="pull_request", run_id=22, attempt=1)
+    routes = _replace(_base_routes(), "/actions/runs?", body=[_page("workflow_runs", [dispatch, pull])])
+    routes = [{"match": "/runs/11/jobs", "body": [_page("jobs", [_job(attempt=1, conclusion="failure", job_id=1)])]},
+              {"match": "/runs/22/jobs", "body": [_page("jobs", [_job(attempt=1, conclusion="success", job_id=2)])]}] + routes
+    log = _install_gh(tmp_path, monkeypatch, routes)
+    receipt = collect_acceptance(PR, PR)
+    assert receipt["ok"] is True
+    assert receipt["checks"][0]["id"] == 2
+    calls = _calls(log)
+    assert any("/runs/22/jobs" in call for call in calls)
+    assert not any("/runs/11/jobs" in call for call in calls)
+
+
+def test_older_successful_pull_request_does_not_hide_later_failure(tmp_path, monkeypatch):
+    older = _run(event="pull_request", run_id=11, attempt=1)
+    later = _run(event="pull_request", run_id=22, attempt=1)
+    routes = _replace(_base_routes(), "/actions/runs?", body=[_page("workflow_runs", [older, later])])
+    routes = [{"match": "/runs/11/jobs", "body": [_page("jobs", [_job(attempt=1, conclusion="success", job_id=1)])]},
+              {"match": "/runs/22/jobs", "body": [_page("jobs", [_job(attempt=1, conclusion="failure", job_id=2)])]}] + routes
+    receipt, _calls_made = _refuse(tmp_path, monkeypatch, routes)
+    assert receipt["classification"] == "failure"
+    assert receipt["checks"][0]["id"] == 2
 
 
 def test_actions_fallback_rejects_fork_head_repository(tmp_path, monkeypatch):
