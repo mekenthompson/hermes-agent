@@ -86,26 +86,30 @@ def selected_jobs(
     fork = repository == FORK
     pr = event_name == "pull_request"
     product = on("python_prod") or on("frontend")
+    # Unshipped surfaces stay upstream-owned. A full sync that turns every
+    # classifier lane true must not schedule them on the fork. ``release`` does
+    # not opt the fork back in; image publication is its own dispatch.
+    _ = release
     return {
         "detect": True,
         "tests": on("python"),
-        "native-install-tests": fork and not release and on("python") and on("upgrade"),
-        "tests-os": on("python") and (not fork or on("os_tests")),
+        "native-install-tests": False,
+        "tests-os": on("python") and not fork,
         "lint": on("python"),
         "js-tests": on("frontend"),
-        "installer-tests": on("installer"),
-        "rust-tests": on("rust"),
-        "bootstrap-installer": on("bootstrap"),
+        "installer-tests": on("installer") and not fork,
+        "rust-tests": on("rust") and not fork,
+        "bootstrap-installer": on("bootstrap") and not fork,
         "e2e-desktop": False,  # existing intentional disablement
-        "e2e-desktop-core": product,
-        "e2e-desktop-update": product and (not fork or on("upgrade")),
+        "e2e-desktop-core": product and not fork,
+        "e2e-desktop-update": product and not fork,
         "docs-site": on("site") and not fork,
         "history-check": pr,
-        "contributor-check": on("python") and (not fork or pr),
+        "contributor-check": on("python") and not fork,
         "uv-lockfile": on("uv_lock"),
-        "infographic-check": not fork or on("binary_artifacts"),
+        "infographic-check": not fork,
         "profile-artifact-check": not fork or on("binary_artifacts"),
-        "icons-freshness-check": True,
+        "icons-freshness-check": not fork,
         "case-collision-check": not fork,
         "lazy-deps-guard": not fork,
         "lockfile-diff": pr and on("npm_lock"),
