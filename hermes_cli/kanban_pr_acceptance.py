@@ -245,8 +245,9 @@ def collect_acceptance(contract: str, published_pr: str | None,
 
 
 def _checks_permission_failure(exc: _GateAuthError) -> bool:
-    return (exc.status == "403" and "/check-runs" in exc.endpoint
-            and exc.permission in {"checks", "integration"})
+    # A generic "Resource not accessible by integration" 403 does not name
+    # checks. Only the accepted-permissions header may open the fallback.
+    return exc.status == "403" and "/check-runs" in exc.endpoint and exc.permission == "checks"
 
 
 def _statuses_permission_failure(exc: _GateAuthError) -> bool:
