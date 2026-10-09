@@ -15,15 +15,15 @@ logger = logging.getLogger("tools.mcp_tool")
 
 # Live stdio MCP children (pid -> server_name), added after connection and removed on normal
 # shutdown, so they can be force-killed if SDK teardown fails.
-_stdio_pids: Dict[int, str] = {}
+_stdio_pids: dict[int, str] = {}
 # PIDs that survived their session context exit (detected in _run_stdio's finally, reaped by
 # _kill_orphaned_mcp_children). Separate from _stdio_pids so sweeps never race active sessions.
 _orphan_stdio_pids: set = set()
-_orphan_stdio_pid_servers: Dict[int, str] = {}
+_orphan_stdio_pid_servers: dict[int, str] = {}
 # pid -> pgid captured at spawn. The SDK spawns with start_new_session=True (PGID == PID);
 # grandchildren keep that PGID after the direct child exits, so killpg still reaches them.
 # Separate from _stdio_pids so the PGID survives the child's removal. Empty on Windows.
-_stdio_pgids: Dict[int, int] = {}
+_stdio_pgids: dict[int, int] = {}
 # Spawn-time start-time fingerprints of each stdio child's pgroup leader, captured
 # alongside the PGID (the psutil fallback means every platform has a baseline, macOS
 # included).  PIDs/PGIDs are recycled by the kernel once the original process exits and
@@ -102,7 +102,7 @@ def _leader_start_time(pid: int) -> Optional[int]:
     from gateway.status import get_process_start_time
     try:
         return get_process_start_time(pid)
-    except Exception:  # noqa: BLE001 — the guard must never break signalling
+    except Exception:
         return None
 
 
@@ -397,14 +397,14 @@ def _kill_windows_process_tree(pid: int, sig: int) -> None:
     for child in descendants:
         try:
             child.terminate()
-        except Exception:  # noqa: BLE001 - raced away or refused; sweep continues
+        except Exception:
             pass
     if sig == getattr(_signal, "SIGKILL", _signal.SIGTERM):  # force pass: don't wait for graceful exit
         _, alive = psutil.wait_procs(descendants, timeout=0)
         for child in alive:
             try:
                 child.kill()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
 
