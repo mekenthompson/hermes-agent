@@ -22,7 +22,7 @@ def test_project_children_materialize_distinct_worktrees_without_board_default(t
                                '-c', 'commit.gpgsign=false', *args],
                               check=True, capture_output=True, text=True).stdout.strip()
     git('init', '-b', 'main')
-    (repo / 'README.md').write_text('base\n')
+    (repo / 'README.md').write_text('base\n', encoding='utf-8')
     git('add', 'README.md')
     git('commit', '-m', 'base')
     with pdb.connect_closing() as pc:
