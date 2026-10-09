@@ -17,10 +17,6 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from starlette.concurrency import run_in_threadpool
 
-# Module import (not ``from … import``) so a partially initialised web_server
-# during its own startup import chain is fine: the explicit-token helpers are
-# resolved as attributes at request time, and tests may monkeypatch them.
-import hermes_cli.web_server as _web_server
 from hermes_cli.dashboard_auth import list_session_providers
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import ProviderError
@@ -44,7 +40,7 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/auth/login", "/auth/callback", "/auth/native/authorize", "/auth/native/token",
     "/auth/native/refresh", "/auth/password-login", "/auth/logout", "/login",
     "/api/auth/providers", "/api/mcp/oauth/callback/",
-    "/assets/", "/favicon.ico", "/ds-assets/", "/fonts/", "/fonts-terminal/")
+    "/assets/", "/dashboard-plugins/", "/favicon.ico", "/ds-assets/", "/fonts/", "/fonts-terminal/")
 
 
 def _path_is_public(path: str) -> bool:
@@ -58,10 +54,17 @@ def _path_is_public(path: str) -> bool:
 def _safe_next_target(request: Request) -> str:
     """URL-encoded ``next`` value for the login redirect, or ``""``. Only same-origin paths outside
     the auth flow and ``/api`` are kept (query preserved); dropped deep links fall back to the
-    SPA's ``sessionStorage["hermes.lastLocation"]``."""
+    SPA's ``sessionStorage["hermes.lastLocation"]``.
+
+    Behind a reverse proxy at a sub-path (``X-Forwarded-Prefix``, e.g. ``/hermes``), the prefix
+    is prepended AFTER validation so the post-login redirect lands within the mount
+    (``/hermes/sessions`` rather than bare ``/sessions``)."""
     path = request.url.path
     if not path or not is_safe_next_path(path):
         return ""
+    prefix = prefix_from_request(request)
+    if prefix:
+        path = prefix + path
     query = request.url.query
     return quote(f"{path}?{query}" if query else path, safe="")
 
@@ -166,6 +169,9 @@ async def gated_auth_middleware(
     # Explicit dashboard tokens are configured administrator credentials for
     # native remote clients. Check them before provider bearer verification so
     # an unavailable provider cannot reject a valid configured connection.
+    # Import inside the request: a module-level import cycles through
+    # web_server -> body_limit -> this module before _path_is_public exists.
+    import hermes_cli.web_server as _web_server
     if _web_server._has_valid_explicit_session_token(request):
         request.state.session = _web_server._explicit_session_token_session()
         return await call_next(request)

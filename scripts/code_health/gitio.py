@@ -85,14 +85,38 @@ def _parse_name_status(out: str) -> list[Change]:
     return changes
 
 
-def changed_files(repo: Path, base: str, head: str | None) -> list[Change]:
+def changed_names(repo: Path, base: str, head: str | None) -> set[str]:
+    """Names that differ, without rename detection.
+
+    ``-M`` on a multi-thousand-file sync dominates the code-health runtime.
+    Callers that only need an intersection use this, then ask
+    :func:`changed_files` for rename status on the small result.
+    """
+    args = ["diff", "--name-only", "--no-renames", "-z", "--no-color", base]
+    if head is not None:
+        args.append(head)
+    names = {path for path in git(repo, *args).split("\0") if path}
+    if head is None:
+        untracked = git(repo, "ls-files", "--others", "--exclude-standard", "-z")
+        names.update(path for path in untracked.split("\0") if path)
+    return names
+
+
+def changed_files(repo: Path, base: str, head: str | None,
+                  paths: list[str] | None = None) -> list[Change]:
+    if paths is not None and not paths:
+        return []
     args = ["diff", "--name-status", "-M", "-z", "--no-color", base]
     if head is not None:
         args.append(head)
+    if paths:
+        args.extend(["--", *paths])
     changes = _parse_name_status(git(repo, *args))
     if head is None:
         untracked = git(repo, "ls-files", "--others", "--exclude-standard", "-z")
-        changes.extend(Change("A", None, p) for p in untracked.split("\0") if p)
+        allow = set(paths) if paths is not None else None
+        changes.extend(Change("A", None, path) for path in untracked.split("\0")
+                       if path and (allow is None or path in allow))
     return changes
 
 
