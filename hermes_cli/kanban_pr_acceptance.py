@@ -20,6 +20,9 @@ _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 # GitHub's own Actions app. Unpinned and third-party requirements are not this.
 _ACTIONS_APP_ID = 15368
+# Events branch protection actually evaluates. workflow_dispatch, pull_request_target,
+# schedule, and other triggers are not required-check provenance.
+_TRUSTED_ACTIONS_EVENTS = frozenset({"merge_group", "pull_request", "push"})
 
 
 def _permission_denial(stderr: str) -> str | None:
@@ -266,6 +269,31 @@ def _trusted_workflow_path(path) -> bool:
             and ".." not in path.split("/") and (path.endswith(".yml") or path.endswith(".yaml")))
 
 
+def _trusted_actions_run(run: dict, repo: str) -> None:
+    """Fail closed unless this run is a protected-repo workflow on a required-check event."""
+    if not _trusted_workflow_path(run.get("path")) or run.get("event") not in _TRUSTED_ACTIONS_EVENTS:
+        raise ValueError("Actions run on the PR head lacks trusted workflow provenance")
+    head_repo = run.get("head_repository")
+    full_name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+    if full_name != repo:
+        raise ValueError("Actions run head repository is not the protected repository; untrusted provenance")
+    if not isinstance(run.get("run_attempt"), int) or run["run_attempt"] < 1:
+        raise ValueError("Actions run attempt is missing")
+
+
+def _require_base_workflow(repo: str, branch: str, path: str, profile_home) -> None:
+    """A workflow that exists only on the PR head is not an approved base-branch workflow."""
+    try:
+        body = _api(f"repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(branch, safe='')}",
+                    profile_home=profile_home)
+    except _GateAuthError as exc:
+        if exc.status == "404":
+            raise ValueError("Actions workflow is not on the protected base branch; unknown provenance") from None
+        raise
+    if not isinstance(body, dict) or body.get("type") != "file" or body.get("path") != path:
+        raise ValueError("Actions workflow is not a file on the protected base branch; unknown provenance")
+
+
 def _finish_receipt(receipt, outcomes, *, repo, number, sha, branch, profile_home):
     # Re-read after all pages: old-head successes are never transferable.
     current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
@@ -295,14 +323,16 @@ def _apply_actions_fallback(receipt, repo, sha, number, branch, required, profil
         runs = _slurp_rows(_api(
             f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100",
             paginate=True, profile_home=profile_home), "workflow_runs")
-        jobs = []
+        trusted = []
         for run in runs:
             if run.get("head_sha") != sha:
                 continue
-            if not _trusted_workflow_path(run.get("path")) or not isinstance(run.get("event"), str) or not run["event"]:
-                raise ValueError("Actions run on the PR head lacks trusted workflow provenance")
-            if not isinstance(run.get("run_attempt"), int) or run["run_attempt"] < 1:
-                raise ValueError("Actions run attempt is missing")
+            _trusted_actions_run(run, repo)
+            trusted.append(run)
+        for path in sorted({run["path"] for run in trusted}):
+            _require_base_workflow(repo, branch, path, profile_home)
+        jobs = []
+        for run in trusted:
             run_jobs = _slurp_rows(_api(
                 f"repos/{repo}/actions/runs/{int(run['id'])}/jobs?filter=latest&per_page=100",
                 paginate=True, profile_home=profile_home), "jobs")

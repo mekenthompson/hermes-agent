@@ -22,9 +22,11 @@ def _pr(sha=SHA):
             {"context": "build", "app": {"databaseId": ACTIONS_APP}}]}}}}}}
 
 
-def _run(sha=SHA, attempt=1, path=".github/workflows/ci.yml", event="pull_request", run_id=7):
+def _run(sha=SHA, attempt=1, path=".github/workflows/ci.yml", event="pull_request", run_id=7,
+         head_repo="acme/repo"):
     return {"id": run_id, "head_sha": sha, "run_attempt": attempt, "path": path,
             "event": event, "status": "completed", "conclusion": "success",
+            "head_repository": {"full_name": head_repo},
             "html_url": "https://github.com/acme/repo/actions/runs/7"}
 
 
@@ -75,6 +77,7 @@ def _base_routes(**overrides):
             "(https://api.github.com/repos/acme/repo/commits/" + SHA + "/check-runs)\n"
             "X-Accepted-GitHub-Permissions: checks=read\n"},
         {"match": "/actions/runs?", "body": [_page("workflow_runs", [_run(attempt=2)])]},
+        {"match": "/contents/", "body": {"type": "file", "path": ".github/workflows/ci.yml"}},
         {"match": "/jobs", "body": [_page("jobs", [_job(attempt=2)])]},
         {"match": "/pulls/7", "body": {"head": {"sha": SHA}, "base": {"ref": "main"}, "state": "open"}},
     ]
@@ -182,9 +185,38 @@ def test_actions_fallback_refuses_any_app_sentinel(tmp_path, monkeypatch):
 
 def test_actions_fallback_rejects_missing_workflow_provenance(tmp_path, monkeypatch):
     routes = _replace(_base_routes(), "/actions/runs?", body=[_page("workflow_runs", [_run(path="")])])
-    receipt, _calls_made = _refuse(tmp_path, monkeypatch, routes)
+    receipt, calls = _refuse(tmp_path, monkeypatch, routes)
     assert receipt["classification"] == "infra"
     assert "provenance" in receipt["detail"]
+    assert not any("/jobs" in call for call in calls)
+
+
+def test_actions_fallback_rejects_untrusted_event(tmp_path, monkeypatch):
+    routes = _replace(_base_routes(), "/actions/runs?", body=[_page("workflow_runs", [_run(event="workflow_dispatch")])])
+    receipt, calls = _refuse(tmp_path, monkeypatch, routes)
+    assert "provenance" in receipt["detail"]
+    assert not any("/jobs" in call or "/contents/" in call for call in calls)
+
+
+def test_actions_fallback_rejects_pull_request_target(tmp_path, monkeypatch):
+    routes = _replace(_base_routes(), "/actions/runs?", body=[_page("workflow_runs", [_run(event="pull_request_target")])])
+    receipt, calls = _refuse(tmp_path, monkeypatch, routes)
+    assert "provenance" in receipt["detail"]
+    assert not any("/jobs" in call for call in calls)
+
+
+def test_actions_fallback_rejects_fork_head_repository(tmp_path, monkeypatch):
+    routes = _replace(_base_routes(), "/actions/runs?", body=[_page("workflow_runs", [_run(head_repo="evil/fork")])])
+    receipt, calls = _refuse(tmp_path, monkeypatch, routes)
+    assert "untrusted provenance" in receipt["detail"]
+    assert not any("/jobs" in call for call in calls)
+
+
+def test_actions_fallback_rejects_workflow_absent_from_base(tmp_path, monkeypatch):
+    routes = _replace(_base_routes(), "/contents/", stderr="gh: HTTP 404: Not Found\n")
+    receipt, calls = _refuse(tmp_path, monkeypatch, routes)
+    assert "protected base branch" in receipt["detail"]
+    assert not any("/jobs" in call for call in calls)
 
 
 def test_actions_fallback_rejects_head_change_during_collection(tmp_path, monkeypatch):
