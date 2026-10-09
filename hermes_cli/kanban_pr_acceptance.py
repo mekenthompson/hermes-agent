@@ -270,8 +270,13 @@ def _trusted_workflow_path(path) -> bool:
 
 
 def _trusted_actions_run(run: dict, repo: str) -> None:
-    """Fail closed unless this run is a protected-repo workflow on a required-check event."""
-    if not _trusted_workflow_path(run.get("path")) or run.get("event") not in _TRUSTED_ACTIONS_EVENTS:
+    """Fail closed unless this required-check event is a protected-repo workflow.
+
+    Untrusted events are not passed here. A workflow_dispatch or
+    pull_request_target run is ignored by the caller so it cannot override
+    a later pull_request, push, or merge_group run.
+    """
+    if not _trusted_workflow_path(run.get("path")):
         raise ValueError("Actions run on the PR head lacks trusted workflow provenance")
     head_repo = run.get("head_repository")
     full_name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
@@ -308,9 +313,10 @@ def _finish_receipt(receipt, outcomes, *, repo, number, sha, branch, profile_hom
 def _apply_actions_fallback(receipt, repo, sha, number, branch, required, profile_home):
     """Prove Actions-pinned requirements from workflow jobs when Checks reads are denied.
 
-    Fail closed unless every requirement is the GitHub Actions app, every run on
-    this SHA has a repository workflow path, and each required job's latest
-    attempt succeeded on that exact SHA.
+    Fail closed unless every requirement is the GitHub Actions app and each
+    required job's latest trusted run succeeded on that exact SHA. An older
+    workflow_dispatch or other untrusted event is not evidence and cannot
+    override that run. Within the selected run, every same-named job must pass.
     """
     foreign = [context for context, app_id in sorted(required, key=str) if app_id != _ACTIONS_APP_ID]
     if foreign:
@@ -324,11 +330,21 @@ def _apply_actions_fallback(receipt, repo, sha, number, branch, required, profil
             f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100",
             paginate=True, profile_home=profile_home), "workflow_runs")
         trusted = []
+        skipped_untrusted = False
         for run in runs:
             if run.get("head_sha") != sha:
                 continue
+            if run.get("event") not in _TRUSTED_ACTIONS_EVENTS:
+                skipped_untrusted = True
+                continue
             _trusted_actions_run(run, repo)
             trusted.append(run)
+        if not trusted and skipped_untrusted:
+            receipt.update(classification="infra", evidence_source="actions", ok=False,
+                           detail=("No trusted Actions run on the PR head. workflow_dispatch, "
+                                   "pull_request_target, and other untrusted events are not "
+                                   "required-check evidence."))
+            return receipt
         for path in sorted({run["path"] for run in trusted}):
             _require_base_workflow(repo, branch, path, profile_home)
         jobs = []
@@ -352,6 +368,9 @@ def _apply_actions_fallback(receipt, repo, sha, number, branch, required, profil
         by_name.setdefault(job.get("name"), []).append((run, job))
     for context, _app_id in sorted(required, key=str):
         selected = by_name.get(context) or []
+        if selected:
+            latest = max(int(run["id"]) for run, _job in selected)
+            selected = [(run, job) for run, job in selected if int(run["id"]) == latest]
         if not selected:
             outcomes.append("missing")
             receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha,
