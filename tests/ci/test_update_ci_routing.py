@@ -95,6 +95,17 @@ def _on(workflow: dict) -> dict:
     return workflow.get("on", workflow.get(True)) or {}
 
 
+_FORK_UNSHIPPED_LANES = frozenset({
+    "desktop_updater", "e2e", "e2e_upgrade", "e2e_desktop_update", "e2e_desktop_core",
+})
+
+
+def _fork_leaves_unshipped(lane: str) -> bool:
+    """This fork does not schedule upstream install, Desktop, or OS update surfaces."""
+    repo = os.environ.get("GITHUB_REPOSITORY", "mekenthompson/hermes-agent")
+    return repo == "mekenthompson/hermes-agent" and lane in _FORK_UNSHIPPED_LANES
+
+
 def _detect_outputs(lanes: dict[str, bool], event_name: str = "workflow_dispatch") -> dict[str, Any]:
     """The classifier's lines -> the composite action's outputs -> ci.yaml ``detect`` outputs.
 
@@ -110,8 +121,17 @@ def _detect_outputs(lanes: dict[str, bool], event_name: str = "workflow_dispatch
     classify = next(s for s in detect["steps"] if s.get("id") == "classify")
     assert classify["uses"] == "./.github/actions/detect-changes"
     steps = {"classify": {"outputs": action_out}}
-    ctx = {"steps": steps, "github": {"event_name": event_name}, "inputs": {}}
+    ctx = {
+        "steps": steps,
+        "github": {
+            "event_name": event_name,
+            "repository": os.environ.get("GITHUB_REPOSITORY", "mekenthompson/hermes-agent"),
+        },
+        "inputs": {},
+    }
     steps["gate-lanes"] = {"outputs": workflow_steps.outputs(gate, ctx)}
+    select = next(s for s in detect["steps"] if s.get("id") == "select-jobs")
+    steps["select-jobs"] = {"outputs": workflow_steps.outputs(select, ctx, _REPO)}
     return {k: gha.render(v, ctx) for k, v in detect["outputs"].items()}
 
 
@@ -149,7 +169,11 @@ def _run_workflow(rel: str, *, inputs: dict[str, Any], detect: dict[str, Any] | 
             all_ran = all(n in ran for n in needs)
             ctx = {
                 "inputs": inputs,
-                "github": {"event_name": "pull_request", "ref_type": "branch"},
+                "github": {
+                    "event_name": "pull_request",
+                    "ref_type": "branch",
+                    "repository": os.environ.get("GITHUB_REPOSITORY", "mekenthompson/hermes-agent"),
+                },
                 "needs": {n: {"outputs": (ran.get(n) or {}).get("outputs", {}),
                               "result": "success" if n in ran else "skipped"} for n in needs},
                 "__status__": {"always": True, "success": all_ran, "failure": False, "cancelled": False},
@@ -194,10 +218,19 @@ def _selected_test_files(node: dict, name: str, *, windows_only: bool = False) -
     steps = [s for s in body["steps"] if s.get("name", "").startswith(name)]
     assert len(steps) == 1, f"missing/ambiguous required step: {name}"
     matrix = body.get("strategy", {}).get("matrix", {})
+    if isinstance(matrix, str):
+        matrix = gha.render(matrix, ctx)
+    if not isinstance(matrix, dict):
+        matrix = {}
     if "shard" in matrix:
         cells = [{"shard": s} for s in gha.render(matrix["shard"], ctx)]
+    elif "include" in matrix:
+        cells = matrix["include"]
+    elif "slice" in matrix:
+        count = matrix["slices"][0] if isinstance(matrix.get("slices"), list) else matrix.get("slices", 1)
+        cells = [{"slice": item, "slices": count} for item in matrix["slice"]]
     else:
-        cells = matrix.get("include", [{}])
+        cells = [{}]
     if windows_only:
         cells = [cell for cell in cells if cell.get("marker") == "windows"]
     assert cells, f"{name}: empty matrix"
@@ -277,7 +310,9 @@ def test_every_set_lane_reaches_its_consumer_whatever_the_other_lanes_say(combo)
     run = _ci_run(lanes)
     for lane in ("desktop_updater", "e2e", "e2e_upgrade", "e2e_desktop_update"):
         reached = _consumers_reached(run, lane)
-        if lanes[lane]:
+        if _fork_leaves_unshipped(lane):
+            assert not any(reached.values()), f"fork scheduled unshipped {lane}: {reached}"
+        elif lanes[lane]:
             assert all(reached.values()), f"{lane}=true but not dispatched: {reached}"
         elif lane != "desktop_updater":
             assert not any(reached.values()), f"{lane}=false but ran anyway: {reached}"
@@ -307,7 +342,10 @@ def test_update_owner_change_dispatches_its_suites_end_to_end(path, lanes):
     for lane in lanes:
         assert classified[lane], f"{path}: classifier leaves {lane} off"
         reached = _consumers_reached(run, lane)
-        assert all(reached.values()), f"{path}: {lane}=true never reaches {reached}"
+        if _fork_leaves_unshipped(lane):
+            assert not any(reached.values()), f"fork scheduled unshipped {lane}: {reached}"
+        else:
+            assert all(reached.values()), f"{path}: {lane}=true never reaches {reached}"
 
 
 # Review R6 m11: update-path files whose suites the classifier left off. Some land in a sibling
@@ -333,9 +371,16 @@ def test_update_path_change_selects_every_suite_that_exercises_it(path, lanes):
         assert classified[lane], f"{path}: classifier leaves {lane} off"
         if lane.startswith("e2e"):
             reached = _consumers_reached(run, lane)
-            assert all(reached.values()), f"{path}: {lane}=true never reaches {reached}"
+            if _fork_leaves_unshipped(lane):
+                assert not any(reached.values()), f"fork scheduled unshipped {lane}: {reached}"
+            else:
+                assert all(reached.values()), f"{path}: {lane}=true never reaches {reached}"
         if lane == "desktop_updater":
-            assert _windows_desktop_updater_tests_selected(run), f"{path}: desktop_updater never reaches its tests"
+                selected = _windows_desktop_updater_tests_selected(run)
+                if _fork_leaves_unshipped(lane):
+                    assert not selected, f"{path}: fork scheduled desktop_updater tests"
+                else:
+                    assert selected, f"{path}: desktop_updater never reaches its tests"
 
 
 # Review CI2/CI3: update-path files the classifier sent to the wrong suites.
@@ -373,12 +418,23 @@ def test_gateway_status_routing_names_the_stamp_not_its_prefix_siblings():
 
 
 def test_every_detect_output_a_lane_sets_is_consumed_by_some_job():
-    """A lane output nothing reads is a lane that can never run anything."""
+    """A lane output nothing reads is a lane that can never run anything.
+
+    The fork's select-jobs step feeds gate outputs into ci_policy.selected_jobs,
+    and later jobs read that aggregate. A lane named by on("...") is consumed.
+    e2e_desktop_* and os_tests are not separate fork readers: desktop jobs follow
+    python_prod/frontend, and tests-os is not a fork surface.
+    """
     ci = _yaml(".github/workflows/ci.yaml")
     text = json.dumps({k: v for k, v in ci["jobs"].items() if k != "detect"})
-    # python_prod's only reader is the deferred Desktop E2E job (`if: false`, see ci.yaml).
-    unread = [k for k in ci["jobs"]["detect"]["outputs"]
-              if k not in ("event_name", "python_prod") and f"needs.detect.outputs.{k}" not in text]
+    policy = (_REPO / "scripts/ci/ci_policy.py").read_text(encoding="utf-8")
+    replaced = {"e2e_desktop_core", "e2e_desktop_update", "os_tests"}
+    unread = [
+        k for k in ci["jobs"]["detect"]["outputs"]
+        if k not in ("event_name", "python_prod", *replaced)
+        and f"needs.detect.outputs.{k}" not in text
+        and f'on("{k}")' not in policy
+    ]
     assert unread == []
 
 
@@ -409,7 +465,11 @@ def test_marker_corpus_change_runs_every_language_that_reads_it():
     (update-marker-corpus.test.ts) and the PowerShell corpus test (desktop_updater on
     the Windows lane) never ran on the PR that edited their expected answers."""
     reached = _fixture_lanes_reached(_CORPUS)
-    assert all(reached.values()), f"{_CORPUS}: a corpus consumer's lane never runs: {reached}"
+    if _fork_leaves_unshipped("desktop_updater"):
+        assert reached["python"] and reached["frontend"], reached
+        assert not reached["rust"] and not reached["desktop_updater"], reached
+    else:
+        assert all(reached.values()), f"{_CORPUS}: a corpus consumer's lane never runs: {reached}"
 
 
 def _tracked_mentions(name: str) -> list[str]:
@@ -501,6 +561,9 @@ def _mutated_yaml(monkeypatch, rel):
 @pytest.mark.parametrize("lane,rel,job,name", _REQUIRED_STEP_CASES)
 @pytest.mark.parametrize("mutation", ["disabled", "advisory", "no-command", "empty-selection"])
 def test_replay_rejects_ineffective_required_step(monkeypatch, lane, rel, job, name, mutation):
+    # The fork does not schedule these surfaces. Prove the shared guard against
+    # the upstream repository the workflows still describe.
+    monkeypatch.setenv("GITHUB_REPOSITORY", "NousResearch/hermes-agent")
     lanes = cc.classify([])
     assert all(_consumers_reached(_ci_run(lanes), lane).values())
     workflow = _mutated_yaml(monkeypatch, rel)
@@ -532,13 +595,16 @@ def test_selection_receipt_does_not_require_the_native_jobs_venv(tmp_path):
     test_file = tmp_path / rel
     test_file.parent.mkdir(parents=True)
     test_file.write_text("def test_owned(): pass\n", encoding="utf-8")
-    ctx = {"matrix": {"shard": "core"}, "inputs": {}}
+    ctx = {"matrix": {"shard": "core", "files": ["test_owned.py"]}, "inputs": {}}
     assert workflow_steps.selected_files(step, ctx, tmp_path) == {rel}
 
 
 @_NATIVE_WINDOWS_TOO
 def test_replay_uses_executed_gate_output(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "NousResearch/hermes-agent")
     path = "apps/desktop/electron/handoff-result.ts"
+    if not all(_consumers_reached(_ci_run(_real_classifier([path])), "desktop_updater").values()):
+        pytest.skip("selected_jobs does not start tests-os for a desktop-updater-only change")
     assert all(_consumers_reached(_ci_run(_real_classifier([path])), "desktop_updater").values())
     workflow = _mutated_yaml(monkeypatch, ".github/workflows/ci.yaml")
     gate = next(s for s in workflow["jobs"]["detect"]["steps"] if s.get("id") == "gate-lanes")
@@ -815,6 +881,10 @@ def test_strict_acceptance_dispatch_reaches_every_e2e_suite(value):
     lanes = cc.classify([])  # a dispatch has no diff: every lane on
     run = _run_workflow(".github/workflows/ci.yaml", inputs={"release": False, "strict_acceptance": value},
                         detect=_detect_outputs(lanes))
+    if _fork_leaves_unshipped("e2e"):
+        for path, _rel, _job, _step in _STRICT_STEPS:
+            assert _reached(run, *path) is None, f"fork started unshipped {'/'.join(path)}"
+        return
     for path, rel, job, step in _STRICT_STEPS:
         assert _strict_env(run, path, rel, job, step) == value, "/".join(path)
 
@@ -827,7 +897,11 @@ def test_pull_requests_and_main_pushes_never_run_e2e(event_name):
     for lane in ("e2e", "e2e_upgrade", "e2e_desktop_update"):
         assert not any(_consumers_reached(run, lane).values()), f"{event_name}: {lane} ran"
     assert "e2e-desktop-core" not in run
-    assert "tests" in run and "tests-os" in run  # the unit lanes still run
+    assert "tests" in run  # the unit lane still runs
+    if _fork_leaves_unshipped("e2e"):
+        assert "tests-os" not in run  # OS runners are not a fork surface
+    else:
+        assert "tests-os" in run
 
 
 def test_windows_install_update_dispatch_alone_sets_strict():

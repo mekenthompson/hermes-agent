@@ -22,7 +22,8 @@ from typing import Any, Mapping
 _TOKEN = re.compile(r"""\s*(?:
     (?P<str>'(?:[^']|'')*')
   | (?P<num>-?\d+(?:\.\d+)?)
-  | (?P<op>==|!=|&&|\|\||<=|>=|[!()<>,])
+  | (?P<op>==|!=|&&|\|\||<=|>=|\[|\]|[!()<>,])
+  | (?P<prop>\.[A-Za-z_*][A-Za-z0-9_-]*)
   | (?P<path>[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_*][A-Za-z0-9_-]*)*)
 )""", re.VERBOSE)
 _TEMPLATE = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
@@ -51,7 +52,9 @@ def truthy(value: Any) -> bool:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return value != 0 and not math.isnan(value)
     if isinstance(value, str):
-        return value != ""
+        # Actions if-conditions treat the string "false" as false. A workflow
+        # input rendered from a boolean expression arrives as that string.
+        return value != "" and value.lower() != "false"
     return True
 
 
@@ -162,8 +165,24 @@ class _Parser:
         if text == "null":
             return None
         if self.peek() == ("op", "("):
-            return self.call(text)
-        return self.lookup(text)
+            return self.postfix(self.call(text))
+        return self.postfix(self.lookup(text))
+
+    def postfix(self, value: Any) -> Any:
+        """Index and property access after a call: ``fromJSON(...)['tests']`` and ``.tests``."""
+        while True:
+            tok = self.peek()
+            if tok == ("op", "["):
+                self.take("[")
+                key = self.or_()
+                self.take("]")
+                value = value.get(key) if isinstance(value, Mapping) else None
+            elif tok is not None and tok[0] == "prop":
+                self.take()
+                key = tok[1][1:]
+                value = value.get(key) if isinstance(value, Mapping) else None
+            else:
+                return value
 
     def call(self, name: str) -> Any:
         self.take("(")
@@ -187,6 +206,10 @@ class _Parser:
             if isinstance(hay, list):
                 return any(_equal(h, needle) for h in hay)
             return to_string(needle).lower() in to_string(hay).lower()
+        if name == "startsWith":
+            return to_string(args[0]).startswith(to_string(args[1]))
+        if name == "endsWith":
+            return to_string(args[0]).endswith(to_string(args[1]))
         raise Unsupported(f"function {name}() in {self.text!r}")
 
     def lookup(self, path: str) -> Any:

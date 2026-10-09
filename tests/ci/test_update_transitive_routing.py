@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from tests.ci.test_update_ci_routing import _REPO, _ci_run, _consumers_reached, _real_classifier
+from tests.ci.test_update_ci_routing import (
+    _REPO, _ci_run, _consumers_reached, _fork_leaves_unshipped, _real_classifier,
+)
 
 
 # bounded_probe_run -> spawn_server, kill_process_tree -> deadline; the
@@ -32,7 +34,11 @@ def test_second_hop_update_change_dispatches_real_update_consumers(path):
         assert lanes[lane], f"{path}: classifier leaves {lane} off"
     run = _ci_run(lanes)
     for lane in ("e2e_upgrade", "e2e_desktop_update"):
-        assert all(_consumers_reached(run, lane).values()), f"{path}: {lane} never reaches its consumers"
+        reached = _consumers_reached(run, lane)
+        if _fork_leaves_unshipped(lane):
+            assert not any(reached.values()), f"{path}: fork scheduled unshipped {lane}"
+        else:
+            assert all(reached.values()), f"{path}: {lane} never reaches its consumers"
 
 
 # Off the update lanes (review K132346-ci-cost: 4 of 7 replayed main commits that newly started

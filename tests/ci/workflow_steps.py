@@ -74,6 +74,11 @@ def _run(step: dict, ctx: dict, cwd: Path | None = None, *, receipt: bool = Fals
             "REPLAY_PYTHON": sys.executable, "REPLAY_CALLS": str(calls),
             **{k: gha.to_string(gha.render(v, ctx)) for k, v in step.get("env", {}).items()},
         }
+        repository = (ctx.get("github") or {}).get("repository")
+        if repository and "GITHUB_REPOSITORY" not in env:
+            # Actions injects this; the upgrade planner reads it and the step
+            # env block does not repeat it.
+            env["GITHUB_REPOSITORY"] = str(repository)
         script = root / "step.sh"
         script.write_text((_RECEIPTS if receipt else "") + gha.render(step["run"], ctx), encoding="utf-8")
         result = subprocess.run(
@@ -123,6 +128,12 @@ def selected_files(step: dict, ctx: dict, repo: Path) -> set[str]:
                 assert args[i] in ("platforms and integration", "platforms and not integration"), args
             elif arg.startswith("--ignore-glob="):
                 ignores.append(arg.split("=", 1)[1])
+            elif arg == "--files-from":
+                i += 1
+                listing = (cwd / args[i]).read_text(encoding="utf-8").splitlines()
+                paths.extend(line for line in listing if line)
+            elif arg == "--slice":
+                i += 1
             elif arg in ("--", "--include-integration", "-v", "--tb=short", "-rA"):
                 pass
             else:

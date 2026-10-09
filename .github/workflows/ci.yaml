@@ -143,6 +143,8 @@ jobs:
           e2e_allowed = release or os.environ['EVENT_NAME'] == 'workflow_dispatch'
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
               for lane, value in values.items():
+                  if not isinstance(value, str):
+                      value = 'true' if value is True else 'false'
                   if lane.startswith('e2e') and not e2e_allowed:
                       value = 'false'
                   elif release and value in ('true', 'false'):
