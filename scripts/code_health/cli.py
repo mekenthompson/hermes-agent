@@ -102,7 +102,19 @@ def run(repo: Path, base: str, head: str | None, as_json: bool = False,
     if mode == "off":
         _skipped(f"code health: off (ENFORCEMENT in {_SWITCH_FILE} on {switch_rev[:12]})", as_json)
         return 0
-    changes = gitio.changed_files(repo, base, head)
+    # A finding survives only when every trusted parent also reports it. Files
+    # identical to any trusted parent cannot meet that test, so a full upstream
+    # sync must not measure those thousands of inherited files.
+    scoped = None
+    if inherited_bases:
+        scope = gitio.changed_names(repo, base, head)
+        for parent in inherited_bases:
+            scope &= gitio.changed_names(repo, parent, head)
+        if not scope:
+            _skipped("code health: no merge-only files outside the trusted parents", as_json)
+            return 0
+        scoped = sorted(scope)
+    changes = gitio.changed_files(repo, base, head, scoped)
     head_paths = sorted({c.new for c in changes if c.new and in_scope(c.new)})
     base_paths = sorted({c.old for c in changes if c.old and in_scope(c.old)})
     if not head_paths:
@@ -116,12 +128,13 @@ def run(repo: Path, base: str, head: str | None, as_json: bool = False,
     head_m = measurer.measure(head, head_paths)
     findings = compare(base_m, head_m, changes)
     if inherited_bases:
-        # Each trusted parent independently evaluates the exact head. An occurrence is
-        # inherited if either parent already owns it; compare() preserves one-to-one credit
-        # within each parent, so two copies cannot consume one occurrence.
+        # Each trusted parent independently evaluates the exact head. The finding
+        # remains only when every parent also reports that same occurrence;
+        # compare() preserves one-to-one credit within each parent, so two
+        # copies cannot consume one occurrence.
         identities: set[tuple[str, str, str, int]] | None = None
         for parent in inherited_bases:
-            parent_changes = gitio.changed_files(repo, parent, head)
+            parent_changes = gitio.changed_files(repo, parent, head, scoped)
             parent_head_paths = sorted({c.new for c in parent_changes if c.new and in_scope(c.new)})
             parent_base_paths = sorted({c.old for c in parent_changes if c.old and in_scope(c.old)})
             parent_measurer = Measurer(repo, ruff, known_env=gitio.known_env_names(repo, parent))

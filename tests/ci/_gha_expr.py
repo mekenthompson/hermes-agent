@@ -52,9 +52,8 @@ def truthy(value: Any) -> bool:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return value != 0 and not math.isnan(value)
     if isinstance(value, str):
-        # Actions if-conditions treat the string "false" as false. A workflow
-        # input rendered from a boolean expression arrives as that string.
-        return value != "" and value.lower() != "false"
+        # GitHub Actions treats a non-empty string, including "false", as true.
+        return value != ""
     return True
 
 
