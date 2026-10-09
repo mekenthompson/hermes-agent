@@ -17,7 +17,7 @@ LIST = Path(__file__).with_name("fork_disabled_workflows.txt")
 
 def disabled_names() -> list[str]:
     names = []
-    for line in LIST.read_text(encoding="utf-8").splitlines():
+    for line in LIST.read_text(encoding="utf-8-sig").splitlines():
         line = line.split("#", 1)[0].strip()
         if line:
             names.append(line)
@@ -35,6 +35,7 @@ def main() -> int:
             check=False,
             capture_output=True,
             text=True,
+            timeout=60,
         )
         if result.returncode == 0:
             continue
