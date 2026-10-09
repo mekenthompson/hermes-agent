@@ -254,6 +254,15 @@ def test_actions_fallback_rejects_head_change_during_collection(tmp_path, monkey
     assert receipt["ok"] is False
 
 
+def test_generic_integration_denial_does_not_use_actions(tmp_path, monkeypatch):
+    routes = _replace(_base_routes(), "/check-runs",
+                      stderr="gh: HTTP 403: Resource not accessible by integration\n")
+    receipt, calls = _refuse(tmp_path, monkeypatch, routes)
+    assert receipt["classification"] == "auth"
+    assert receipt["ok"] is not True
+    assert not any("/actions/runs" in call for call in calls)
+
+
 def test_checks_rate_limit_does_not_use_actions(tmp_path, monkeypatch):
     routes = _replace(_base_routes(), "/check-runs", stderr="gh: HTTP 403: API rate limit exceeded\n")
     receipt, calls = _refuse(tmp_path, monkeypatch, routes)
