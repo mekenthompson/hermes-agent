@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 def inherit_creator_origin(
@@ -115,7 +116,7 @@ def decompose_triage_task(
     now = int(time.time())
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, project_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
@@ -177,11 +178,12 @@ def _insert_decomposed_child(
     inherits only when kinds match (a 'dir' child must not point at the
     root's worktree) and NEVER for worktrees — siblings dispatch concurrently
     and one shared checkout would put them all on the first sibling's branch
-    with no lock; leaving it unset makes dispatch materialize a fresh
-    ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
+    with no lock. Project-linked children retain the project repository with
+    fresh per-child paths; unlinked children use the board anchor.
     """
     from hermes_cli.kanban_db import (
         _new_task_id, _canonical_assignee, _append_event,
+        _resolve_project_link, _project_branch_name,
     )
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
@@ -195,16 +197,26 @@ def _insert_decomposed_child(
     else:
         child_ws_path = None
     new_id = _new_task_id()
+    project_id = None
+    branch_name = None
+    if child_ws_kind == "worktree" and not child_ws_path and root_row["project_id"]:
+        project_id, project, repo, _kind = _resolve_project_link(
+            conn, root_row["project_id"], root_id, child_ws_kind, None,
+        )
+        if not repo:
+            raise ValueError("decomposed project worktree requires a primary repository")
+        child_ws_path = str(Path(repo) / ".worktrees" / new_id)
+        branch_name = _project_branch_name(project, new_id, child["title"])
     body = child.get("body")
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        " workspace_path, tenant, created_at, created_by, project_id, branch_name) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
             _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
-            root_row["tenant"], now, (author or "decomposer"),
+            root_row["tenant"], now, (author or "decomposer"), project_id, branch_name,
         ),
     )
     _append_event(
