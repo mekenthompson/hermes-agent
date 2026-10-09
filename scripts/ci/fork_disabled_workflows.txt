@@ -1,0 +1,31 @@
+# Upstream product workflows. Disable these on mekenthompson/hermes-agent.
+# They are not called by the fork's selected CI jobs. A renamed upstream file
+# arrives enabled; re-run scripts/ci/disable_fork_upstream_workflows.py.
+archive-inputs.yml
+bootstrap-installer-build.yml
+canary-release.yml
+ci-review-comment.yml
+deploy-site.yml
+desktop-bundle-smoke.yml
+desktop-bundled-release.yml
+docker.yml
+install-e2e-macos-run.yml
+install-e2e-red.yml
+install-e2e-run.yml
+install-e2e-windows-run.yml
+install-e2e.yml
+js-autofix.yml
+live-providers.yml
+nix.yml
+plugin-catalog-ci.yml
+pm-bundle.yml
+publish-e2e-evidence.yml
+sandbox-image.yml
+skills-index-freshness.yml
+skills-index.yml
+stable-release-publication.yml
+stable-release.yml
+termux-verify.yml
+windows-bundle-sdk.yml
+windows-install-update-e2e.yml
+windows-venv-e2e.yml

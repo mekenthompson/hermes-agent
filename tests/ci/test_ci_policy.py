@@ -91,7 +91,7 @@ def test_selection_uses_boolean_values_and_fork_scope() -> None:
         _mod.selected_jobs(lanes, "mekenthompson/hermes-agent", "pull_request")[
             "tests-os"
         ]
-        is True
+        is False
     )
 
 
@@ -137,7 +137,11 @@ def test_upgrade_applicability_reaches_real_upgrade_suite() -> None:
     )
     assert (
         ci["jobs"]["tests"]["with"]["upgrade"]
-        == "${{ needs.detect.outputs.upgrade == 'true' }}"
+        == "${{ github.repository != 'mekenthompson/hermes-agent' && needs.detect.outputs.upgrade == 'true' }}"
+    )
+    assert (
+        ci["jobs"]["tests"]["with"]["e2e"]
+        == "${{ github.repository != 'mekenthompson/hermes-agent' && needs.detect.outputs.e2e == 'true' }}"
     )
     assert tests[True]["workflow_call"]["inputs"]["upgrade"]["default"] is True
     assert tests["jobs"]["e2e-upgrade-plan"]["if"] == "inputs.upgrade"
@@ -153,7 +157,7 @@ def test_upgrade_applicability_reaches_real_upgrade_suite() -> None:
     assert tests["jobs"]["test"]["if"] == "inputs.unit"
     assert "inputs.upgrade_partition" in tests["concurrency"]["group"]
     lanes = {"python": "true", "upgrade": "true"}
-    for repo, release, expected in (("mekenthompson/hermes-agent", False, True),
+    for repo, release, expected in (("mekenthompson/hermes-agent", False, False),
                                     ("mekenthompson/hermes-agent", True, False),
                                     ("NousResearch/hermes-agent", False, False)):
         selected = _mod.selected_jobs(lanes, repo, "push", release=release)
@@ -190,7 +194,7 @@ def test_folded_guards_gate_detect_and_keep_release_checks() -> None:
     for job in ("case-collision-check", "lazy-deps-guard"):
         assert fork[job] is False
         assert upstream[job] is True
-        assert jobs[job]["if"] == "github.repository != 'mekenthompson/hermes-agent' || inputs.release == true"
+        assert jobs[job]["if"] == "github.repository != 'mekenthompson/hermes-agent'"
     assert fork["detect"] is True
     # A guard failure stops classification; its required parent cannot be skipped.
     assert _mod.evaluate_needs({"detect": {"result": "failure"}}, {"detect": True}).failed == ["detect"]
@@ -216,6 +220,45 @@ def test_policy_file_runs_as_the_aggregate_job_entrypoint(tmp_path: Path) -> Non
     assert output_path.read_text(encoding="utf-8") == 'needs-json={"tests":"success"}\n'
 
 
+def test_fork_sync_does_not_select_unshipped_surfaces() -> None:
+    lanes = {key: "true" for key in (
+        "python", "python_prod", "frontend", "os_tests", "installer", "bootstrap",
+        "rust", "site", "upgrade", "e2e", "e2e_upgrade", "binary_artifacts",
+        "uv_lock", "npm_lock", "scan", "deps", "docker_meta", "ci_review",
+    )}
+    selected = _mod.selected_jobs(lanes, "mekenthompson/hermes-agent", "push", release=True)
+    for job in (
+        "native-install-tests", "tests-os", "installer-tests", "rust-tests",
+        "bootstrap-installer", "e2e-desktop", "e2e-desktop-core", "e2e-desktop-update",
+        "docs-site", "contributor-check", "infographic-check", "icons-freshness-check",
+    ):
+        assert selected[job] is False
+    assert selected["tests"] is True
+    assert selected["lint"] is True
+    assert selected["js-tests"] is True
+
+
+def test_disabled_upstream_workflows_are_not_fork_selected_calls() -> None:
+    yaml = pytest.importorskip("hermes_yaml")
+    root = _PATH.parents[2]
+    disabled = {
+        line.split("#", 1)[0].strip()
+        for line in (root / "scripts/ci/fork_disabled_workflows.txt").read_text().splitlines()
+        if line.split("#", 1)[0].strip()
+    }
+    jobs = yaml.safe_load((root / ".github/workflows/ci.yaml").read_text())["jobs"]
+    lanes = {key: "true" for key in ("python", "frontend", "uv_lock", "npm_lock", "scan", "deps", "docker_meta", "ci_review", "binary_artifacts")}
+    selected = _mod.selected_jobs(lanes, "mekenthompson/hermes-agent", "pull_request")
+    called = set()
+    for name, job in jobs.items():
+        if not selected.get(name):
+            continue
+        uses = job.get("uses") or ""
+        if uses.startswith("./.github/workflows/"):
+            called.add(uses.rsplit("/", 1)[-1])
+    assert not (disabled & called)
+
+
 def test_workflow_selection_output_is_boolean_json(tmp_path: Path) -> None:
     output_path = tmp_path / "selected"
     result = subprocess.run(
@@ -235,5 +278,7 @@ def test_workflow_selection_output_is_boolean_json(tmp_path: Path) -> None:
     assert result.stdout.strip() == line
     selected = json.loads(line.removeprefix("selected_jobs="))
     assert selected["tests"] is False
-    assert selected["e2e-desktop-core"] is True
+    assert selected["e2e-desktop-core"] is False
     assert selected["e2e-desktop-update"] is False
+    assert selected["native-install-tests"] is False
+    assert selected["tests-os"] is False

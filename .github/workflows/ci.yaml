@@ -151,13 +151,10 @@ jobs:
   # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
   # Skipped workflows (if condition is false) don't spin up runners.
   #
-  # The E2E suites (e2e, e2e-upgrade, both Desktop suites, and the two
-  # Windows journeys in tests-os) take most of the larger-runner minutes.
-  # On a pull request each runs only when the diff touches that suite or the
-  # code it guards, or the PR carries the `run-e2e` label
-  # (scripts/ci/classify_changes.py::_E2E_LANES). Every push to main runs
-  # all of them, so a regression the path lists miss turns main red after
-  # the merge.
+  # Fork validation is unit tests, lint, bundled JS, and dependency checks.
+  # E2E, upgrade, Desktop, other OS runners, and native installers are
+  # upstream product surfaces. A sync that touches those paths must not
+  # schedule them here.
   # ─────────────────────────────────────────────────────────────────────
   tests:
     name: Python tests
@@ -165,13 +162,13 @@ jobs:
     if: ${{ fromJSON(needs.detect.outputs.selected_jobs).tests }}
     uses: ./.github/workflows/tests.yml
     with:
-      upgrade: ${{ needs.detect.outputs.upgrade == 'true' }}
+      upgrade: ${{ github.repository != 'mekenthompson/hermes-agent' && needs.detect.outputs.upgrade == 'true' }}
       upgrade_partition: ${{ github.repository == 'mekenthompson/hermes-agent' && inputs.release != true && 'runtime' || 'all' }}
-      e2e: ${{ needs.detect.outputs.e2e == 'true' }}
-      e2e_upgrade: ${{ needs.detect.outputs.e2e_upgrade == 'true' }}
+      e2e: ${{ github.repository != 'mekenthompson/hermes-agent' && needs.detect.outputs.e2e == 'true' }}
+      e2e_upgrade: ${{ github.repository != 'mekenthompson/hermes-agent' && needs.detect.outputs.e2e_upgrade == 'true' }}
 
-  # These still block source merges. The Linux image does not use a native
-  # installer; upstream and stable releases retain the original combined call.
+  # Not selected on this fork. Upstream keeps the combined install call in its
+  # own repository. The job remains so a synced workflow graph still names it.
   native-install-tests:
     name: Native install tests
     needs: detect
@@ -328,18 +325,19 @@ jobs:
   icons-freshness-check:
     name: Icon assets freshness
     needs: detect
+    if: ${{ fromJSON(needs.detect.outputs.selected_jobs)['icons-freshness-check'] }}
     uses: ./.github/workflows/icons-freshness-check.yml
 
   case-collision-check:
     name: Check no case-colliding filenames
     needs: detect
-    if: github.repository != 'mekenthompson/hermes-agent' || inputs.release == true
+    if: github.repository != 'mekenthompson/hermes-agent'
     uses: ./.github/workflows/case-collision-check.yml
 
   lazy-deps-guard:
     name: No production imports of the tools.lazy_deps stub
     needs: detect
-    if: github.repository != 'mekenthompson/hermes-agent' || inputs.release == true
+    if: github.repository != 'mekenthompson/hermes-agent'
     uses: ./.github/workflows/lazy-deps-guard.yml
 
   lockfile-diff:
@@ -449,19 +447,18 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           RELEASE: ${{ inputs.release }}
+          REPO: ${{ github.repository }}
           SELECTED_JOBS: ${{ needs.detect.outputs.selected_jobs }}
           CRITICAL_FINDINGS: ${{ needs.supply-chain.outputs.critical_findings }}
         run: |
-          args=()
-          if [ "$RELEASE" = true ]; then
+          if [ "$RELEASE" = true ] && [ "$REPO" != "mekenthompson/hermes-agent" ]; then
             printf '%s' "$NEEDS" | python3 scripts/ci/required_results.py --release
           else
             echo "$NEEDS" | python3 scripts/ci/ci_policy.py
           fi
 
-  # Publication only: all runtime lanes still gate the Linux image. Other
-  # platforms/installers/Desktop keep running and remain in all-checks-pass.
-  # This introduces no second test run and does not change upstream releases.
+  # Publication only: runtime lanes this fork actually ships gate the Linux
+  # image. Unshipped surfaces are not selected, so they do not delay publication.
   image-checks-pass:
     name: Image required checks pass
     needs:
