@@ -140,17 +140,13 @@ To create as a draft, add `"draft": true` to the JSON body.
 
 ### Check CI Status
 
-**With gh:**
-
-```bash
-# One-shot check
-gh pr checks
-
-# Watch until all checks finish (polls every 10s)
-gh pr checks --watch
-```
-
-**With git + curl:**
+For PR acceptance, `gh pr checks` (and `/commits/<sha>/check-runs`) is not the
+source of truth when required checks are pinned to GitHub Actions. Query the
+exact PR head's Actions runs and jobs, verify workflow provenance on the base
+branch, latest attempt, pagination completeness, and reread the PR head/base
+before accepting. Do not broaden credentials or treat unsupported/mixed app
+requirements as satisfied. Use `gh run list`/`gh run view` for interactive
+diagnosis, not as acceptance proof.
 
 ```bash
 # Get the latest commit SHA on the current branch

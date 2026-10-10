@@ -23,25 +23,29 @@ def github(tmp_path, monkeypatch):
                 value = {"data": {"repository": {"pullRequest": {
                     "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
                     "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                        {"context": "required", "app": {"databaseId": 15368}}]}}}}}}
             elif "/rules/branches/" in self.path:
                 value = [[]]
-            elif "/check-runs" in self.path:
-                run = {"id": 42, "name": "required", "head_sha": sha,
-                       "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
-                       "html_url": "https://github.com/acme/repo/actions/runs/42"}
+            elif "/contents/" in self.path:
+                value = {"type": "file", "path": ".github/workflows/ci.yml"}
+            elif "/actions/runs?" in self.path:
+                run = {"id": 42, "name": "CI", "head_sha": sha, "run_attempt": 2,
+                       "event": "pull_request", "path": ".github/workflows/ci.yml",
+                       "head_repository": {"full_name": "acme/repo"},
+                       "status": "completed", "conclusion": state["conclusion"]}
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
                 runs = [] if state.get("missing") else [run]
-                value = [{"total_count": 100 + len(runs), "check_runs": [
-                    {**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
-                    for i in range(100)]}, {"total_count": 100 + len(runs), "check_runs": runs}]
+                value = [{"total_count": len(runs), "workflow_runs": runs}]
                 if state.get("race"):
                     state["race"]()
                 if state.get("head_change"):
                     state["head"] = "b" * 40
-            elif "/statuses" in self.path:
-                value = [[]]
+            elif "/jobs" in self.path:
+                value = [{"total_count": 1, "jobs": [{"id": 42, "name": "required",
+                    "head_sha": sha, "run_attempt": 2,
+                    "status": "in_progress" if state["conclusion"] == "pending" else "completed",
+                    "conclusion": state["conclusion"], "html_url": "https://github.com/acme/repo/actions/runs/42"}]}]
             elif "/pulls/" in self.path:
                 value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
             else:
@@ -91,7 +95,7 @@ def test_pr_completion_requires_current_required_evidence(github):
             if not ok:
                 assert task.status in {"running", "ready", "blocked", "review"}
                 assert "retry" in receipts[-1]["recovery"]
-                assert receipts[-1]["checks"][0]["id"] == 42
+                assert receipts[-1]["checks"][0]["name"] == "required"
         for fault in ("missing", "stale", "head_change"):
             github.update(conclusion="success", head="a" * 40)
             github[fault] = True

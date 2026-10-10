@@ -1,4 +1,4 @@
-"""Actions evidence may satisfy a Checks-permission denial, and nothing weaker."""
+"""Actions-pinned requirements use exact-head jobs without Checks API access."""
 import json
 import os
 import sys
@@ -95,7 +95,7 @@ def test_actions_fallback_accepts_latest_attempt_on_exact_head(tmp_path, monkeyp
     assert receipt["checks"][0]["name"] == "build"
     assert receipt["checks"][0]["conclusion"] == "success"
     calls = _calls(log)
-    assert any("/check-runs" in call for call in calls)
+    assert not any("/check-runs" in call for call in calls)
     assert any("/actions/runs?" in call and f"head_sha={SHA}" in call for call in calls)
     assert any("/jobs" in call and "filter=latest" in call for call in calls)
     assert not any("/statuses" in call for call in calls)
@@ -156,10 +156,10 @@ def test_actions_fallback_refuses_non_actions_requirement(tmp_path, monkeypatch)
         {"context": "codecov", "app": {"databaseId": 222}})
     routes = _replace(_base_routes(), "graphql", body=pr)
     receipt, calls = _refuse(tmp_path, monkeypatch, routes)
-    assert receipt["classification"] == "auth"
+    assert receipt["classification"] == "infra"
     assert "codecov" in receipt["detail"]
-    assert "15368" in receipt["detail"]
-    assert not any("/actions/runs" in call for call in calls)
+    assert "Actions-only" in receipt["detail"]
+    assert not any("/check-runs" in call or "/actions/runs" in call for call in calls)
 
 
 def test_actions_fallback_refuses_unpinned_requirement(tmp_path, monkeypatch):
@@ -169,7 +169,7 @@ def test_actions_fallback_refuses_unpinned_requirement(tmp_path, monkeypatch):
     routes = _replace(_base_routes(), "graphql", body=pr)
     receipt, calls = _refuse(tmp_path, monkeypatch, routes)
     assert receipt["ok"] is not True
-    assert "build" in receipt["detail"]
+    assert "unpinned" in receipt["detail"]
     assert not any("/actions/runs" in call for call in calls)
 
 
@@ -254,30 +254,33 @@ def test_actions_fallback_rejects_head_change_during_collection(tmp_path, monkey
     assert receipt["ok"] is False
 
 
-def test_generic_integration_denial_does_not_use_actions(tmp_path, monkeypatch):
+def test_headerless_pat_checks_denial_does_not_prevent_actions_evidence(tmp_path, monkeypatch):
     routes = _replace(_base_routes(), "/check-runs",
-                      stderr="gh: HTTP 403: Resource not accessible by integration\n")
-    receipt, calls = _refuse(tmp_path, monkeypatch, routes)
-    assert receipt["classification"] == "auth"
-    assert receipt["ok"] is not True
-    assert not any("/actions/runs" in call for call in calls)
+                      stderr="gh: HTTP 403: Resource not accessible by personal access token\n")
+    log = _install_gh(tmp_path, monkeypatch, routes)
+    receipt = collect_acceptance(PR, PR)
+    assert receipt["ok"] is True
+    assert receipt["evidence_source"] == "actions"
+    assert not any("/check-runs" in call for call in _calls(log))
 
 
-def test_checks_rate_limit_does_not_use_actions(tmp_path, monkeypatch):
+def test_checks_rate_limit_is_not_called(tmp_path, monkeypatch):
     routes = _replace(_base_routes(), "/check-runs", stderr="gh: HTTP 403: API rate limit exceeded\n")
-    receipt, calls = _refuse(tmp_path, monkeypatch, routes)
-    assert receipt["classification"] == "auth"
-    assert not any("/actions/runs" in call for call in calls)
+    log = _install_gh(tmp_path, monkeypatch, routes)
+    receipt = collect_acceptance(PR, PR)
+    assert receipt["ok"] is True and receipt["evidence_source"] == "actions"
+    assert not any("/check-runs" in call or "/statuses" in call for call in _calls(log))
 
 
-def test_checks_401_does_not_use_actions(tmp_path, monkeypatch):
+def test_checks_401_is_not_called(tmp_path, monkeypatch):
     routes = _replace(_base_routes(), "/check-runs", stderr="gh: HTTP 401: Bad credentials\n")
-    receipt, calls = _refuse(tmp_path, monkeypatch, routes)
-    assert receipt["classification"] == "auth"
-    assert not any("/actions/runs" in call for call in calls)
+    log = _install_gh(tmp_path, monkeypatch, routes)
+    receipt = collect_acceptance(PR, PR)
+    assert receipt["ok"] is True and receipt["evidence_source"] == "actions"
+    assert not any("/check-runs" in call or "/statuses" in call for call in _calls(log))
 
 
-def test_successful_check_run_does_not_consult_actions(tmp_path, monkeypatch):
+def test_successful_check_run_payload_is_ignored(tmp_path, monkeypatch):
     routes = _replace(_base_routes(), "/check-runs", stderr=None, body=[_page("check_runs", [{
         "id": 42, "name": "build", "head_sha": SHA, "app": {"id": ACTIONS_APP},
         "status": "completed", "conclusion": "success",
@@ -285,12 +288,12 @@ def test_successful_check_run_does_not_consult_actions(tmp_path, monkeypatch):
     routes.append({"match": "/statuses", "body": [[]]})
     log = _install_gh(tmp_path, monkeypatch, routes)
     receipt = collect_acceptance(PR, PR)
-    assert receipt["ok"] is True
-    assert receipt["evidence_source"] == "checks"
-    assert not any("/actions/runs" in call for call in _calls(log))
+    assert receipt["ok"] is True and receipt["evidence_source"] == "actions"
+    assert any("/actions/runs" in call for call in _calls(log))
+    assert not any("/check-runs" in call or "/statuses" in call for call in _calls(log))
 
 
-def test_failed_check_run_is_not_overridden_by_actions(tmp_path, monkeypatch):
+def test_failed_check_run_payload_is_ignored(tmp_path, monkeypatch):
     routes = _replace(_base_routes(), "/check-runs", stderr=None, body=[_page("check_runs", [{
         "id": 42, "name": "build", "head_sha": SHA, "app": {"id": ACTIONS_APP},
         "status": "completed", "conclusion": "failure",
@@ -298,17 +301,16 @@ def test_failed_check_run_is_not_overridden_by_actions(tmp_path, monkeypatch):
     routes.append({"match": "/statuses", "body": [[]]})
     log = _install_gh(tmp_path, monkeypatch, routes)
     receipt = collect_acceptance(PR, PR)
-    assert receipt["ok"] is not True
-    assert receipt["classification"] == "failure"
-    assert receipt["evidence_source"] == "checks"
-    assert not any("/actions/runs" in call for call in _calls(log))
+    assert receipt["ok"] is True and receipt["evidence_source"] == "actions"
+    assert any("/actions/runs" in call for call in _calls(log))
+    assert not any("/check-runs" in call or "/statuses" in call for call in _calls(log))
 
 
 def test_actions_api_denial_stays_closed(tmp_path, monkeypatch):
     routes = _replace(_base_routes(), "/actions/runs?", stderr="gh: HTTP 403: Resource not accessible by integration\n")
     receipt, _calls_made = _refuse(tmp_path, monkeypatch, routes)
     assert receipt["classification"] == "auth"
-    assert "Neither source" in receipt["detail"]
+    assert "Actions evidence" in receipt["detail"]
 
 
 def test_actions_pagination_mismatch_is_not_success(tmp_path, monkeypatch):
@@ -334,7 +336,7 @@ def test_name_collision_requires_every_matching_job(tmp_path, monkeypatch):
     assert receipt["classification"] == "failure"
 
 
-def test_statuses_permission_denial_still_accepts_app_pinned_checks(tmp_path, monkeypatch):
+def test_checks_permission_denial_is_not_called(tmp_path, monkeypatch):
     routes = _replace(_base_routes(), "/check-runs", stderr=None, body=[_page("check_runs", [{
         "id": 42, "name": "build", "head_sha": SHA, "app": {"id": ACTIONS_APP},
         "status": "completed", "conclusion": "success"}])])
@@ -342,9 +344,9 @@ def test_statuses_permission_denial_still_accepts_app_pinned_checks(tmp_path, mo
                    "gh: HTTP 403: Resource not accessible by integration\n"})
     log = _install_gh(tmp_path, monkeypatch, routes)
     receipt = collect_acceptance(PR, PR)
-    assert receipt["ok"] is True
-    assert receipt["evidence_source"] == "checks"
-    assert not any("/actions/runs" in call for call in _calls(log))
+    assert receipt["ok"] is True and receipt["evidence_source"] == "actions"
+    assert any("/actions/runs" in call for call in _calls(log))
+    assert not any("/check-runs" in call or "/statuses" in call for call in _calls(log))
 
 
 def test_ruleset_actions_requirement_uses_fallback(tmp_path, monkeypatch):
@@ -381,14 +383,13 @@ def test_ruleset_denial_does_not_skip_ahead_to_actions(tmp_path, monkeypatch):
     assert not any("/actions/runs" in call for call in calls)
 
 
-def test_statuses_permission_denial_does_not_skip_unpinned_context(tmp_path, monkeypatch):
+def test_unpinned_requirement_is_rejected_without_checks_or_actions(tmp_path, monkeypatch):
     pr = _pr()
     pr["data"]["repository"]["pullRequest"]["baseRef"]["branchProtectionRule"]["requiredStatusChecks"] = [
         {"context": "build", "app": None}]
     routes = _replace(_base_routes(), "graphql", body=pr)
-    routes = _replace(routes, "/check-runs", stderr=None, body=[_page("check_runs", [])])
-    routes.append({"match": "/statuses", "stderr": "gh: HTTP 403: Resource not accessible by integration\n"})
-    receipt, calls = _refuse(tmp_path, monkeypatch, routes)
-    assert "build" in receipt["detail"]
-    assert "legacy status" in receipt["detail"]
-    assert not any("/actions/runs" in call for call in calls)
+    log = _install_gh(tmp_path, monkeypatch, routes)
+    receipt = collect_acceptance(PR, PR)
+    assert "unpinned" in receipt["detail"]
+    assert not any("/check-runs" in call or "/statuses" in call or "/actions/runs" in call
+                   for call in _calls(log))
