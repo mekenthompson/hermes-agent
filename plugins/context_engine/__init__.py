@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 from plugins import plugin_loader as _loader
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from agent.context_engine import ContextEngine
 
 _CONTEXT_ENGINE_PLUGINS_DIR = Path(__file__).parent
 # Synthetic parent package for user-installed engines (keeps them out of the bundled namespace).

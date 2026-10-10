@@ -1746,10 +1746,8 @@ def cmd_chat(args):
     # First-run guard: the free-tier bootstrap runs first (synchronously here; it is the only thing
     # that may create the identity), then the inventory decides whether setup is needed.
     from hermes_cli.free_tier_bootstrap import run_bootstrap
-
     run_bootstrap(announce=False)
-    # The TUI owns its first-run state: it renders "Setup Required" with in-place /setup.
-    # The classic prompt only fronts the classic CLI.
+    # TUI owns first-run setup; the classic prompt only fronts the classic CLI.
     provider_configured = _has_any_provider_configured()
     if not use_tui and not provider_configured:
         _first_run_setup_guard(args)
@@ -1777,8 +1775,7 @@ def cmd_chat(args):
     _pin_kanban_board_env()
     from hermes_cli.observability.shared_metrics_consent import offer_consent_before_chat
 
-    # Not before setup: a blank install meets "Setup Required" first. The offer stays
-    # undecided, so it is asked on the first launch with a provider.
+    # Ask consent only after a provider exists; a blank install meets Setup Required first.
     if provider_configured:
         offer_consent_before_chat(args)
     _confirm_startup_expensive_model_override(args)

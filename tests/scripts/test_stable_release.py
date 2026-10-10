@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.scripts.test_release_r2 import r2_server
+pytest_plugins = ["tests.scripts.test_release_r2"]
 from scripts.releases.draft_warning import (
     WARNING_CLOSE, WARNING_OPEN, strip_draft_warning,
 )

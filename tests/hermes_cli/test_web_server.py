@@ -33,7 +33,6 @@ import hermes_cli.web_server_messaging as _web_server_messaging
 import hermes_cli.web_server_sessions as _web_server_sessions
 from datetime import UTC
 
-
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------

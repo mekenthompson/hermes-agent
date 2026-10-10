@@ -4017,7 +4017,6 @@ from hermes_cli.gateway_launchd import (
 )
 from datetime import UTC
 
-
 # Cached launchd domain — probe once per process invocation.
 _resolved_launchd_domain: str | None = None
 
