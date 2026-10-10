@@ -182,52 +182,8 @@ def collect_acceptance(contract: str, published_pr: str | None,
         if not required:
             receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
             return receipt
-        try:
-            pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
-                         paginate=True, profile_home=profile_home)
-        except _GateAuthError as exc:
-            if not _checks_permission_failure(exc):
-                raise
-            _apply_actions_fallback(receipt, repo, sha, number, branch, required, profile_home)
-            return receipt
-        runs = _slurp_rows(pages, "check_runs")
-        try:
-            status_pages = _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
-                                paginate=True, profile_home=profile_home)
-        except _GateAuthError as exc:
-            if not _statuses_permission_failure(exc):
-                raise
-            unpinned = [context for context, app_id in sorted(required, key=str) if app_id in (None, -1)]
-            if unpinned:
-                receipt.update(classification="auth", evidence_source="checks",
-                               detail=("GitHub refused commit-status reads and required checks "
-                                       f"{', '.join(unpinned)} are not pinned to an app, so legacy "
-                                       "status evidence cannot be skipped."))
-                return receipt
-            status_pages = []
-        statuses = [{**s, "sha": sha} for page in status_pages for s in page]
-        outcomes = []
-        receipt["evidence_source"] = "checks"
-        for context, app_id in sorted(required, key=str):
-            matching = [r for r in runs if r["name"] == context and
-                        (app_id in (None, -1) or r["app"]["id"] == app_id)]
-            # A legacy status can satisfy an unpinned context, but never a check pinned to an app.
-            legacy = [s for s in statuses if s["context"] == context] if app_id in (None, -1) else []
-            selected = matching + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
-            if not selected:
-                outcomes.append("missing")
-                receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
-            for check in selected:
-                is_run = "conclusion" in check
-                outcome = check.get("conclusion") if is_run else check["state"]
-                classification = _classify(check, sha, outcome, is_run)
-                outcomes.append(classification)
-                receipt["checks"].append({"name": context, "id": check["id"],
-                    "url": check.get("html_url") or check.get("target_url"),
-                    "head_sha": check.get("head_sha", check.get("sha")),
-                    "classification": classification, "conclusion": outcome})
-        return _finish_receipt(receipt, outcomes, repo=repo, number=number, sha=sha,
-                               branch=branch, profile_home=profile_home)
+        _apply_actions_evidence(receipt, repo, sha, number, branch, required, profile_home)
+        return receipt
     except _GateAuthError as exc:
         login = f"assignee profile {assignee!r}'s gh login" if assignee else "the ambient gh login"
         receipt.update(classification="auth",
@@ -242,17 +198,6 @@ def collect_acceptance(contract: str, published_pr: str | None,
         # Never persist gh stderr (credentials/host details); the failed phase is actionable.
         receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
         return receipt
-
-
-def _checks_permission_failure(exc: _GateAuthError) -> bool:
-    # A generic "Resource not accessible by integration" 403 does not name
-    # checks. Only the accepted-permissions header may open the fallback.
-    return exc.status == "403" and "/check-runs" in exc.endpoint and exc.permission == "checks"
-
-
-def _statuses_permission_failure(exc: _GateAuthError) -> bool:
-    return (exc.status == "403" and "/statuses" in exc.endpoint
-            and (exc.permission == "integration" or (exc.permission or "").find("status") >= 0))
 
 
 def _slurp_rows(pages, key: str) -> list:
@@ -311,8 +256,8 @@ def _finish_receipt(receipt, outcomes, *, repo, number, sha, branch, profile_hom
     return receipt
 
 
-def _apply_actions_fallback(receipt, repo, sha, number, branch, required, profile_home):
-    """Prove Actions-pinned requirements from workflow jobs when Checks reads are denied.
+def _apply_actions_evidence(receipt, repo, sha, number, branch, required, profile_home):
+    """Prove only all-Actions-pinned requirements from exact-head workflow jobs.
 
     Fail closed unless every requirement is the GitHub Actions app and each
     required job's latest trusted run succeeded on that exact SHA. An older
@@ -321,10 +266,9 @@ def _apply_actions_fallback(receipt, repo, sha, number, branch, required, profil
     """
     foreign = [context for context, app_id in sorted(required, key=str) if app_id != _ACTIONS_APP_ID]
     if foreign:
-        receipt.update(classification="auth", evidence_source="checks", ok=False,
-                       detail=("GitHub refused Checks API reads (HTTP 403, checks permission). "
-                               "Actions fallback refused because these required checks are not "
-                               f"pinned to GitHub Actions app {_ACTIONS_APP_ID}: {', '.join(foreign)}."))
+        receipt.update(classification="infra", evidence_source="actions", ok=False,
+                       detail=("Actions-only acceptance cannot prove mixed or unpinned required "
+                               f"checks: {', '.join(foreign)}."))
         return receipt
     try:
         runs = _slurp_rows(_api(
@@ -359,8 +303,7 @@ def _apply_actions_fallback(receipt, repo, sha, number, branch, required, profil
                 jobs.append((run, job))
     except _GateAuthError as exc:
         receipt.update(classification="auth", evidence_source="actions", ok=False,
-                       detail=("GitHub refused Checks API reads (HTTP 403, checks permission) and "
-                               f"Actions evidence ({exc}). Neither source can prove the required jobs."))
+                       detail=(f"GitHub refused Actions evidence ({exc}); Actions cannot prove the required jobs."))
         return receipt
     outcomes = []
     receipt["evidence_source"] = "actions"
