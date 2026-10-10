@@ -1418,7 +1418,7 @@ class SlackAdapter(BasePlatformAdapter):
         formatted = self.format_message(content)
         return self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH) or [formatted]
 
-    async def _send_slash_ephemeral(self, ctx: dict[str, Any], content: str) -> "SendResult":
+    async def _send_slash_ephemeral(self, ctx: dict[str, Any], content: str) -> SendResult:
         """Replace the ephemeral ack via ``response_url`` (``replace_original`` valid 30 min). First
         chunk replaces the ack, the rest post as new ephemerals; Slack caps a response_url at 5
         POSTs so overflow gets a truncation notice. ``success=False`` lets ``send()`` fall back.
@@ -1459,7 +1459,7 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     async def _post_ephemeral_fallback(
-        self, chat_id: str, ctx: dict[str, Any], content: str) -> "SendResult":
+        self, chat_id: str, ctx: dict[str, Any], content: str) -> SendResult:
         """Deliver a slash reply via ``chat.postEphemeral`` when ``response_url`` fails.
         Keeps the reply private (a public channel post must never happen for an ephemeral reply).
         Cannot ``replace_original``, so the ack stays; no 5-POST cap applies here.
@@ -2061,7 +2061,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     @staticmethod
     async def _start_native_task_card_stream(
-        client, stream: "_NativeTaskCardStream", metadata: Optional[dict[str, Any]]
+        client, stream: _NativeTaskCardStream, metadata: Optional[dict[str, Any]]
     ) -> None:
         """chat.startStream a plan-mode card in ``stream``'s thread; sets ``stream.stream_ts``."""
         start_payload: dict[str, Any] = {
@@ -6460,7 +6460,7 @@ class SlackAdapter(BasePlatformAdapter):
     _slack_ignored_channels = _extra_or_env_channel_set_getter(
         "ignored_channels", "SLACK_IGNORED_CHANNELS", coerce_scalar=True)
 
-    def _slack_mention_patterns(self) -> list["re.Pattern"]:
+    def _slack_mention_patterns(self) -> list[re.Pattern]:
         """Compile (cached) wake-word regexes from ``slack.mention_patterns`` (list/str) or
         ``SLACK_MENTION_PATTERNS`` (JSON list or newline/comma-separated)."""
         cached = getattr(self, "_compiled_mention_patterns", None)
@@ -6477,7 +6477,7 @@ class SlackAdapter(BasePlatformAdapter):
                     patterns = [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
         if isinstance(patterns, str):
             patterns = [patterns]
-        compiled: list["re.Pattern"] = []
+        compiled: list[re.Pattern] = []
         if isinstance(patterns, list):
             for pat in patterns:
                 if not isinstance(pat, str) or not pat.strip():

@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 from plugins import plugin_loader as _loader
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from cron.scheduler_provider import CronScheduler
 
 _CRON_PLUGINS_DIR = Path(__file__).parent
 # Synthetic parent package for user-installed providers (keeps them out of the bundled namespace).
@@ -61,7 +64,7 @@ def discover_cron_schedulers() -> list[tuple[str, str, bool]]:
             for name, child in _iter_provider_dirs()]
 
 
-def load_cron_scheduler(name: str) -> Optional["CronScheduler"]:
+def load_cron_scheduler(name: str) -> Optional[CronScheduler]:
     """Load a CronScheduler instance by name; None if not found or it fails to load."""
     provider_dir = find_provider_dir(name)
     if not provider_dir:
@@ -72,7 +75,7 @@ def load_cron_scheduler(name: str) -> Optional["CronScheduler"]:
         kind="Cron provider", noun="provider", logger=logger)
 
 
-def _load_provider_from_dir(provider_dir: Path) -> Optional["CronScheduler"]:
+def _load_provider_from_dir(provider_dir: Path) -> Optional[CronScheduler]:
     """Import a provider module and extract its CronScheduler (register(ctx) or subclass)."""
     from cron.scheduler_provider import CronScheduler
     name = provider_dir.name

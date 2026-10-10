@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 from plugins import plugin_loader as _loader
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from agent.context_engine import ContextEngine
 
 _CONTEXT_ENGINE_PLUGINS_DIR = Path(__file__).parent
 # Synthetic parent package for user-installed engines (keeps them out of the bundled namespace).
@@ -57,7 +60,7 @@ def find_engine_dir(name: str) -> Optional[Path]:
     return user if user and user.is_dir() and _is_context_engine_dir(user) else None
 
 
-def load_context_engine(name: str) -> Optional["ContextEngine"]:
+def load_context_engine(name: str) -> Optional[ContextEngine]:
     """Load a ContextEngine instance by name; None if not found or it fails to load."""
     engine_dir = find_engine_dir(name)
     if engine_dir is None:
@@ -68,7 +71,7 @@ def load_context_engine(name: str) -> Optional["ContextEngine"]:
     )
 
 
-def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
+def _load_engine_from_dir(engine_dir: Path) -> Optional[ContextEngine]:
     """Import an engine module and extract its ContextEngine (register(ctx) or subclass)."""
     from agent.context_engine import ContextEngine
     name = engine_dir.name
