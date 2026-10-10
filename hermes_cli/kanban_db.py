@@ -2262,36 +2262,11 @@ def claim_review_task(
 def _retry_status_for_run(
     conn: sqlite3.Connection, task_id: str, run_id: Optional[int] = None,
 ) -> str:
-    """``review`` when the run's ``claimed`` event says ``source_status=review``,
-    else ``ready`` — one place, so crash/timeout/reclaim can't silently turn a
-    reviewer run into an implementation run."""
-    task = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    if task is not None and task["max_retries"] is not None and int(task["max_retries"]) == 0:
-        prior = conn.execute(
-            "SELECT 1 FROM task_runs WHERE task_id = ? AND started_at IS NOT NULL LIMIT 1", (task_id,),
-        ).fetchone()
-        if prior is not None:
-            reason = ("Automatic replay is disabled (max_retries=0) after a recorded execution attempt. "
-                      "Operator reconciliation must verify the retained run, worker identity and external effects "
-                      "before authorizing any new execution; this block does not prove the worker stopped.")
-            previous = _json_dict(_row_get(_latest_event(conn, task_id, "blocked"), "payload"))
-            if previous.get("reason_code") != "no_auto_replay":
-                conn.execute("UPDATE tasks SET block_kind='capability', last_failure_error=? WHERE id=?", (reason, task_id))
-                _insert_comment(conn, task_id, "dispatcher", reason, int(time.time()))
-                _append_event(conn, task_id, "blocked", {
-                    "kind": "capability", "reason": reason, "reason_code": "no_auto_replay", "sticky": True,
-                }, run_id=run_id or _current_run_id(conn, task_id))
-            return "blocked"
-    if run_id is None:
-        run_id = _current_run_id(conn, task_id)
-    if run_id is None:
-        return "ready"
-    event = _latest_event(conn, task_id, "claimed", run_id)
-    payload = _json_dict(_row_get(event, "payload"))
-    return "review" if payload.get("source_status") == "review" else "ready"
+    from hermes_cli.kanban_db_retry import retry_status_for_run
+
+    return retry_status_for_run(conn, task_id, run_id)
 
 
-# Run outcome -> lifecycle status a goal loop should report for a handed-off run.
 _RUN_OUTCOME_TERMINAL_STATUS = {
     "completed": "done",
     "review_requested": "review",

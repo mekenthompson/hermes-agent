@@ -177,9 +177,8 @@ def test_runtime_profile_env_selects_standalone_notifier_owner(tmp_path, monkeyp
     db_path = tmp_path / "runtime-profile-notifier.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     monkeypatch.setenv("HERMES_PROFILE", "finn")
-    # The gateway test harness binds a default profile-home override; isolate
-    # the canonical standalone identity lookup while preserving its real call site.
-    monkeypatch.setattr(profiles, "current_profile_name", lambda default=None: "finn")
+    # Exercise the real resolver: the bound harness home is ignored in favor
+    # of the standalone launcher profile pin.
     kb.init_db()
     conn = kbc.connect()
     try:

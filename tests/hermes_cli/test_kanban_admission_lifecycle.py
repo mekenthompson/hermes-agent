@@ -118,24 +118,27 @@ def test_zero_retry_failure_paths_require_operator_reconciliation(lifecycle, mon
     conn.execute("UPDATE task_runs SET started_at=?, worker_pid=987654, worker_started_at='retained-fingerprint' WHERE id=?", (now - 120, run_id))
     monkeypatch.setattr(kbd, "_worker_alive", lambda *_: False)
     monkeypatch.setattr(kb, "_worker_alive", lambda *_: False)
-    if path in {"quota", "provider", "crash", "unknown"}:
-        codes = {"quota": kb.KANBAN_RATE_LIMIT_EXIT_CODE, "provider": kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE, "crash": 1, "unknown": None}
-        kinds = {"quota": "rate_limited", "provider": "terminal_provider", "crash": "nonzero_exit", "unknown": "unknown"}
-        monkeypatch.setattr(kbd, "_classify_worker_exit", lambda *_: (kinds[path], codes[path]))
-        monkeypatch.setattr(kbd, "_worker_log_exit_code", lambda *_, **__: None)
-        sweep = kbd._reclaim_dead_workers(conn)
-        assert (sweep.rate_limited if path == "quota" else sweep.crashed) == [task_id]
-    elif path == "timeout":
-        conn.execute("UPDATE tasks SET max_runtime_seconds=1 WHERE id=?", (task_id,))
-        assert task_id in kbd.enforce_max_runtime(conn, signal_fn=lambda *_: None)
-    elif path == "expired":
-        conn.execute("UPDATE tasks SET claim_expires=?, worker_pid=NULL WHERE id=?", (now - 1, task_id))
-        assert kb.release_stale_claims(conn, signal_fn=lambda *_: None) == 1
-    elif path == "orphan":
-        conn.execute("UPDATE tasks SET claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?", (task_id,))
-        assert kbd.reconcile_orphaned_running(conn) == [task_id]
+    exit_sweeps = {
+        "quota": ("rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        "provider": ("terminal_provider", kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE),
+        "crash": ("nonzero_exit", 1),
+        "unknown": ("unknown", None),
+    }
+    reclaimers = {
+        "quota": lambda: _exit_reclaim(conn, kbd, exit_sweeps["quota"]),
+        "provider": lambda: _exit_reclaim(conn, kbd, exit_sweeps["provider"]),
+        "crash": lambda: _exit_reclaim(conn, kbd, exit_sweeps["crash"]),
+        "unknown": lambda: _exit_reclaim(conn, kbd, exit_sweeps["unknown"]),
+        "timeout": lambda: _timeout_reclaim(conn, task_id, kbd),
+        "expired": lambda: _expired_reclaim(conn, task_id, now, kb),
+        "orphan": lambda: _orphan_reclaim(conn, task_id, kbd),
+        "stale": lambda: kbd.detect_stale_running(conn, stale_timeout_seconds=1, signal_fn=lambda *_: None),
+    }
+    reclaimed = reclaimers[path]()
+    if path in exit_sweeps:
+        assert (reclaimed.rate_limited if path == "quota" else reclaimed.crashed) == [task_id]
     else:
-        assert kbd.detect_stale_running(conn, stale_timeout_seconds=1, signal_fn=lambda *_: None) == [task_id]
+        assert task_id in reclaimed
     task = kb.get_task(conn, task_id)
     assert task.status == "blocked"
     assert task.block_kind == "capability"
@@ -148,6 +151,31 @@ def test_zero_retry_failure_paths_require_operator_reconciliation(lifecycle, mon
     assert len(runs) == 1
     retained = conn.execute("SELECT worker_pid, worker_started_at FROM task_runs WHERE id=?", (run_id,)).fetchone()
     assert tuple(retained) == (987654, 'retained-fingerprint')
+
+
+def _exit_reclaim(conn, dispatch, classification):
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(dispatch, "_classify_worker_exit", lambda *_: classification)
+    monkeypatch.setattr(dispatch, "_worker_log_exit_code", lambda *_, **__: None)
+    try:
+        return dispatch._reclaim_dead_workers(conn)
+    finally:
+        monkeypatch.undo()
+
+
+def _timeout_reclaim(conn, task_id, dispatch):
+    conn.execute("UPDATE tasks SET max_runtime_seconds=1 WHERE id=?", (task_id,))
+    return dispatch.enforce_max_runtime(conn, signal_fn=lambda *_: None)
+
+
+def _expired_reclaim(conn, task_id, now, db):
+    conn.execute("UPDATE tasks SET claim_expires=?, worker_pid=NULL WHERE id=?", (now - 1, task_id))
+    return [task_id] if db.release_stale_claims(conn, signal_fn=lambda *_: None) == 1 else []
+
+
+def _orphan_reclaim(conn, task_id, dispatch):
+    conn.execute("UPDATE tasks SET claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?", (task_id,))
+    return dispatch.reconcile_orphaned_running(conn)
 
 
 def test_zero_retry_fresh_task_gets_one_initial_claim(lifecycle):

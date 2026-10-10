@@ -318,7 +318,8 @@ class GatewayKanbanWatchersMixin:
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
                 now = int(time.time())
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
-                    held = _kbd.describe_suppression(res for _slug, res in (results or []))
+                    from hermes_cli.kanban_dispatch_reporting import describe_suppression
+                    held = describe_suppression(res for _slug, res in (results or []))
                     logger.warning(
                         "kanban dispatcher stuck: ready queue non-empty for "
                         "%d consecutive ticks but 0 workers spawned.%s Check "
