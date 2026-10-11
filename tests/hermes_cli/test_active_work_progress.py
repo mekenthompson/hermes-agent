@@ -116,6 +116,9 @@ def test_delegation_scan_ignores_stopped_rows(tmp_path, monkeypatch):
 
 
 class _Adapter(BasePlatformAdapter):
+    def __init__(self, config, platform):
+        super().__init__(config, platform)
+        self.last_send: dict = {}
     async def connect(self, *, is_reconnect=False):
         return True
 
@@ -126,6 +129,7 @@ class _Adapter(BasePlatformAdapter):
         return {}
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.last_send = {"chat_id": chat_id, "content": content, "metadata": metadata or {}}
         return SendResult(success=True, message_id="wire-1")
 
 
@@ -164,10 +168,19 @@ async def test_due_check_delivers_to_originating_chat_and_silence_is_not_a_send(
     assert event.source.chat_id == "D-origin"
     assert event.source.thread_id == "1791695152.254539"
     assert event.source.platform == Platform.SLACK
+    assert ACTIVE_WORK_PROMPT in event.text
     assert "[SILENT]" in event.text
     assert "child-process" in event.text
+    from gateway.platforms.base import _thread_metadata_for_source
+    progress = "Build still running, next is the canary."
     assert is_intentional_silence_response("[SILENT]") is True
-    assert is_intentional_silence_response("Build still running, next is the canary.") is False
+    assert is_intentional_silence_response(progress) is False
+    sent = await adapter.send(
+        event.source.chat_id, progress, metadata=_thread_metadata_for_source(event.source),
+    )
+    assert sent.success is True
+    assert adapter.last_send["chat_id"] == "D-origin"
+    assert adapter.last_send["metadata"]["thread_id"] == "1791695152.254539"
 
 
 @pytest.mark.asyncio
@@ -224,7 +237,28 @@ def test_internal_platforms_are_not_progress_destinations():
 
 
 def test_notifier_terminal_kinds_are_not_gated_on_the_progress_interval():
-    from gateway.kanban_watchers_notifier import _WAKE_KINDS
+    import inspect
+    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+    from gateway.kanban_watchers_notifier import _EVENT_FORMATTERS, _WAKE_KINDS
+
     assert "completed" in _WAKE_KINDS
     assert "blocked" in _WAKE_KINDS
     assert ACTIVE_WORK_INTERVAL_SECONDS == 180
+    signature = inspect.signature(GatewayKanbanWatchersMixin._kanban_notifier_watcher)
+    assert signature.parameters["interval"].default == 5.0
+    notifier_source = inspect.getsource(__import__("gateway.kanban_watchers_notifier", fromlist=["*"]))
+    assert "active_work_progress" not in notifier_source
+    assert "ACTIVE_WORK_INTERVAL_SECONDS" not in notifier_source
+    note = SimpleNamespace(head="Kanban", title="canary", task=SimpleNamespace(result="shipped"))
+    completed_fmt = _EVENT_FORMATTERS["completed"]
+    blocked_fmt = _EVENT_FORMATTERS["blocked"]
+    completed, handoff, _review = completed_fmt(
+        SimpleNamespace(kind="completed", payload={"summary": "shipped the canary"}), note,
+    )
+    blocked, _handoff, _review = blocked_fmt(
+        SimpleNamespace(kind="blocked", payload={"reason": "needs a credential"}), note,
+    )
+    assert completed and "shipped" in completed
+    assert handoff == "shipped the canary"
+    assert blocked and "credential" in blocked
+    assert "180" not in completed and "180" not in blocked
