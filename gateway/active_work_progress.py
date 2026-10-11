@@ -45,8 +45,8 @@ def _reconcile_sync(runner: Any, home: Any) -> tuple[list[tuple], list[str]]:
         if store is not None:
             try:
                 entries = store.list_sessions()
-            except Exception as exc:
-                logger.debug("active-work progress: session list failed: %s", exc)
+            except Exception:
+                logger.debug("active-work progress: session list failed", exc_info=True)
                 entries = []
             for entry in entries:
                 sid = getattr(entry, "session_id", None)

@@ -8,6 +8,7 @@ on their own event path and are not delayed by this cadence.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from pathlib import Path
@@ -83,13 +84,14 @@ def _managed_session_ids() -> list[str]:
     found = []
     try:
         rows = db.list_meta_prefix(_META_PREFIX)
-    except Exception as exc:
-        logger.debug("active-work progress: heartbeat list failed: %s", exc)
+    except Exception:
+        logger.debug("active-work progress: heartbeat list failed", exc_info=True)
         return []
     for key, raw in rows:
         try:
             state = HeartbeatState.from_json(raw)
-        except Exception:
+        except (TypeError, ValueError, json.JSONDecodeError):
+            logger.debug("active-work progress: skipped unreadable heartbeat %s", key, exc_info=True)
             continue
         if state.origin == ACTIVE_WORK_HEARTBEAT_ORIGIN and state.status == "active":
             found.append(key[len(_META_PREFIX):])
@@ -120,33 +122,33 @@ def _scan_kanban_sessions() -> set[str]:
     try:
         from hermes_cli import kanban_db as kb
         from hermes_cli.kanban_db_connect import connect as kanban_connect
-    except Exception as exc:
-        logger.debug("active-work progress: kanban import failed: %s", exc)
+    except Exception:
+        logger.debug("active-work progress: kanban import failed", exc_info=True)
         return set()
     found: set[str] = set()
     try:
         boards = kb.list_boards(include_archived=False)
-    except Exception as exc:
-        logger.debug("active-work progress: kanban board list failed: %s", exc)
+    except Exception:
+        logger.debug("active-work progress: kanban board list failed", exc_info=True)
         boards = [{"slug": getattr(kb, "DEFAULT_BOARD", None)}]
     for board in boards:
         slug = (board or {}).get("slug") or getattr(kb, "DEFAULT_BOARD", None)
         try:
             conn = kanban_connect(board=slug)
-        except Exception as exc:
-            logger.debug("active-work progress: kanban connect %s failed: %s", slug, exc)
+        except Exception:
+            logger.debug("active-work progress: kanban connect %s failed", slug, exc_info=True)
             continue
         try:
             for task in kb.list_tasks(conn, status=_ACTIVE_KANBAN_STATUS):
                 if task.session_id:
                     found.add(task.session_id)
-        except Exception as exc:
-            logger.debug("active-work progress: kanban list %s failed: %s", slug, exc)
+        except Exception:
+            logger.debug("active-work progress: kanban list %s failed", slug, exc_info=True)
         finally:
             try:
                 conn.close()
             except Exception:
-                pass
+                logger.debug("active-work progress: kanban close %s failed", slug, exc_info=True)
     return found
 
 
@@ -157,8 +159,8 @@ def _scan_delegation_sessions() -> set[str]:
     found: set[str] = set()
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    except Exception as exc:
-        logger.debug("active-work progress: state.db open failed: %s", exc)
+    except Exception:
+        logger.debug("active-work progress: state.db open failed", exc_info=True)
         return set()
     try:
         rows = conn.execute(
@@ -166,8 +168,8 @@ def _scan_delegation_sessions() -> set[str]:
             "WHERE state IN (?, ?) AND COALESCE(stop_state, '') = ''",
             _RUNNING_DELEGATION_STATES,
         ).fetchall()
-    except Exception as exc:
-        logger.debug("active-work progress: delegation scan failed: %s", exc)
+    except sqlite3.Error:
+        logger.debug("active-work progress: delegation scan failed", exc_info=True)
         return set()
     finally:
         conn.close()
@@ -188,8 +190,8 @@ def _scan_background_sessions(registry: object | None = None) -> set[str]:
     if registry is None:
         try:
             from tools.process_registry import process_registry as registry
-        except Exception as exc:
-            logger.debug("active-work progress: process registry unavailable: %s", exc)
+        except ImportError:
+            logger.debug("active-work progress: process registry unavailable", exc_info=True)
             return set()
     found: set[str] = set()
     running = getattr(registry, "_running", {}) or {}
@@ -206,7 +208,8 @@ def _state_db_path() -> Optional[Path]:
     try:
         from hermes_constants import get_hermes_home
         return Path(get_hermes_home()) / "state.db"
-    except Exception:
+    except ImportError:
+        logger.debug("active-work progress: hermes home unavailable", exc_info=True)
         return None
 
 
