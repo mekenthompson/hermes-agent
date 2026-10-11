@@ -38,8 +38,8 @@ def _reconcile_sync(runner: Any, home: Any) -> tuple[list[tuple], list[str]]:
     watches: list[tuple] = []
     drop_keys: list[str] = []
     with _profile_runtime_scope(home):
-        active = collect_active_session_ids()
-        result = reconcile_active_work_result(active)
+        active, scans_complete = collect_active_session_ids()
+        result = reconcile_active_work_result(active, scans_complete=scans_complete)
         by_id: dict[str, Any] = {}
         store = getattr(runner, "session_store", None)
         if store is not None:

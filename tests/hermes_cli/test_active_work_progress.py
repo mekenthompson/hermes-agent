@@ -17,6 +17,7 @@ from hermes_cli.active_work_progress import (
     ACTIVE_WORK_PROMPT,
     collect_active_session_ids,
     reconcile_active_work_result,
+    ScanResult,
 )
 from hermes_cli.heartbeat import (
     ACTIVE_WORK_HEARTBEAT_ORIGIN,
@@ -66,6 +67,23 @@ def test_reconcile_preserves_user_heartbeat_and_clears_when_work_settles(heartbe
     assert load_heartbeat("user-session").prompt == "my own check"
 
 
+def test_failed_scan_does_not_clear_an_existing_check(heartbeat_db, monkeypatch):
+    reconcile_active_work_result(["work-session"])
+    monkeypatch.setattr(
+        "hermes_cli.active_work_progress._scan_kanban_sessions",
+        lambda: ScanResult(set(), False),
+    )
+    ids, complete = collect_active_session_ids(
+        delegation_ids=set(), background_ids=set(),
+    )
+    assert complete is False
+    settled = reconcile_active_work_result(ids, scans_complete=complete)
+    assert settled.cleared == []
+    kept = load_heartbeat("work-session")
+    assert kept is not None
+    assert kept.origin == ACTIVE_WORK_HEARTBEAT_ORIGIN
+
+
 def test_restart_reloads_managed_check_and_does_not_refire_settled_work(heartbeat_db):
     reconcile_active_work_result(["work-session"])
     reloaded = HeartbeatManager("work-session")
@@ -77,9 +95,11 @@ def test_restart_reloads_managed_check_and_does_not_refire_settled_work(heartbea
 
 
 def test_collect_skips_child_handoff_and_stopped_delegations():
-    assert collect_active_session_ids(
+    ids, complete = collect_active_session_ids(
         kanban_ids={"kanban-parent"}, delegation_ids=set(), background_ids=set(),
-    ) == {"kanban-parent"}
+    )
+    assert ids == {"kanban-parent"}
+    assert complete is True
 
     class _Proc:
         def __init__(self, parent, handoff=""):
@@ -91,7 +111,7 @@ def test_collect_skips_child_handoff_and_stopped_delegations():
         "child-build": _Proc("child-session", handoff="subagent handed off npm ci"),
     })
     from hermes_cli import active_work_progress as progress
-    assert progress._scan_background_sessions(registry) == {"human-session"}
+    assert progress._scan_background_sessions(registry).ids == {"human-session"}
 
 
 def test_delegation_scan_ignores_stopped_rows(tmp_path, monkeypatch):
@@ -112,7 +132,7 @@ def test_delegation_scan_ignores_stopped_rows(tmp_path, monkeypatch):
     conn.close()
     monkeypatch.setattr("hermes_cli.active_work_progress._state_db_path", lambda: db)
     from hermes_cli.active_work_progress import _scan_delegation_sessions
-    assert _scan_delegation_sessions() == {"live-parent"}
+    assert _scan_delegation_sessions().ids == {"live-parent"}
 
 
 class _Adapter(BasePlatformAdapter):
@@ -203,7 +223,7 @@ async def test_reconcile_registers_origin_watch_and_drops_it_when_settled(heartb
 
     monkeypatch.setattr(
         "hermes_cli.active_work_progress.collect_active_session_ids",
-        lambda **_kwargs: {"origin-session"},
+        lambda **_kwargs: ({"origin-session"}, True),
     )
     monkeypatch.setattr(
         "gateway.run_heartbeat_restore._watched_homes",
@@ -216,7 +236,7 @@ async def test_reconcile_registers_origin_watch_and_drops_it_when_settled(heartb
 
     monkeypatch.setattr(
         "hermes_cli.active_work_progress.collect_active_session_ids",
-        lambda **_kwargs: set(),
+        lambda **_kwargs: (set(), True),
     )
     await reconcile_active_work_watches(runner)
     assert key not in runner._heartbeat_watch
