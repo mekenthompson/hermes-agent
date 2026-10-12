@@ -37,7 +37,9 @@ ACTIVE_WORK_PROMPT = (
     "a completion or blocker the system already delivered."
 )
 
-_RUNNING_DELEGATION_STATES = ("running", "finalizing")
+# Same live set as tools/async_delegation.py _LIVE_STATES. stalling is still
+# in flight; omitting it clears the originating check while that agent runs.
+_LIVE_DELEGATION_STATES = ("running", "stalling", "finalizing")
 _ACTIVE_KANBAN_STATUS = "running"
 # Child-process completion chatter stays off. This module never enables
 # delegation.surface_child_process_notifications.
@@ -186,8 +188,9 @@ def _scan_delegation_sessions() -> ScanResult:
     try:
         rows = conn.execute(
             "SELECT origin_session_id, parent_session_id FROM async_delegations "
-            "WHERE state IN (?, ?) AND COALESCE(stop_state, '') = ''",
-            _RUNNING_DELEGATION_STATES,
+            f"WHERE state IN ({', '.join('?' * len(_LIVE_DELEGATION_STATES))}) "
+            "AND COALESCE(stop_state, '') = ''",
+            _LIVE_DELEGATION_STATES,
         ).fetchall()
     except sqlite3.Error:
         logger.debug("active-work progress: delegation scan failed", exc_info=True)

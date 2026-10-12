@@ -126,13 +126,24 @@ def test_delegation_scan_ignores_stopped_rows(tmp_path, monkeypatch):
         "INSERT INTO async_delegations VALUES ('live-parent', '', 'running', '')"
     )
     conn.execute(
+        "INSERT INTO async_delegations VALUES ('stalling-parent', '', 'stalling', '')"
+    )
+    conn.execute(
+        "INSERT INTO async_delegations VALUES ('finalizing-parent', '', 'finalizing', '')"
+    )
+    conn.execute(
         "INSERT INTO async_delegations VALUES ('stopped-parent', '', 'running', 'requested')"
+    )
+    conn.execute(
+        "INSERT INTO async_delegations VALUES ('stopped-stalling', '', 'stalling', 'requested')"
     )
     conn.commit()
     conn.close()
     monkeypatch.setattr("hermes_cli.active_work_progress._state_db_path", lambda: db)
     from hermes_cli.active_work_progress import _scan_delegation_sessions
-    assert _scan_delegation_sessions().ids == {"live-parent"}
+    assert _scan_delegation_sessions().ids == {
+        "live-parent", "stalling-parent", "finalizing-parent",
+    }
 
 
 class _Adapter(BasePlatformAdapter):
