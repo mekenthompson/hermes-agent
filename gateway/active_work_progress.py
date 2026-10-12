@@ -17,6 +17,33 @@ _SKIP_PLATFORMS = frozenset({
 })
 
 
+def _continuation_id(store: Any, session_id: str, entries: list) -> str:
+    """Live chat id for work still recorded on a compressed parent.
+
+    Prefer the store's compression tip. A republished routing entry keeps
+    ``prev_session_id`` when the tip lookup is not on the test double.
+    """
+    resolver = getattr(store, "_compression_tip_for_session_id", None)
+    if callable(resolver):
+        try:
+            tip = resolver(session_id)
+        except Exception:
+            logger.debug(
+                "active-work progress: compression tip failed for %s",
+                session_id,
+                exc_info=True,
+            )
+            tip = None
+        if tip:
+            return str(tip)
+    for entry in entries:
+        prev = getattr(entry, "prev_session_id", None)
+        current = getattr(entry, "session_id", None)
+        if prev == session_id and current:
+            return current
+    return session_id
+
+
 def _deliverable(entry: Any) -> bool:
     origin = getattr(entry, "origin", None)
     if origin is None or getattr(entry, "suspended", False):
@@ -39,19 +66,33 @@ def _reconcile_sync(runner: Any, home: Any) -> tuple[list[tuple], list[str]]:
     drop_keys: list[str] = []
     with _profile_runtime_scope(home):
         active, scans_complete = collect_active_session_ids()
-        result = reconcile_active_work_result(active, scans_complete=scans_complete)
         by_id: dict[str, Any] = {}
         store = getattr(runner, "session_store", None)
+        entries: list = []
+        store_ok = store is not None
         if store is not None:
             try:
-                entries = store.list_sessions()
+                entries = list(store.list_sessions())
             except Exception:
                 logger.debug("active-work progress: session list failed", exc_info=True)
-                entries = []
-            for entry in entries:
-                sid = getattr(entry, "session_id", None)
-                if sid and sid not in by_id:
-                    by_id[sid] = entry
+                store_ok = False
+        for entry in entries:
+            sid = getattr(entry, "session_id", None)
+            if sid and sid not in by_id:
+                by_id[sid] = entry
+        if store_ok:
+            live: set[str] = set()
+            for sid in active:
+                tip = _continuation_id(store, sid, entries)
+                entry = by_id.get(tip)
+                # No routing row yet: keep the check on the tip, but do not
+                # invent a watch. A known non-chat origin is not persisted, so
+                # the following restore cannot revive it.
+                if entry is None or _deliverable(entry):
+                    live.add(tip)
+            result = reconcile_active_work_result(live, scans_complete=scans_complete)
+        else:
+            result = reconcile_active_work_result(set(), scans_complete=False)
         for sid, action in result.actions.items():
             if action == "preserved-user":
                 continue

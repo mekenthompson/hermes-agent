@@ -201,6 +201,7 @@ async def test_due_check_delivers_to_originating_chat_and_silence_is_not_a_send(
     assert event.source.platform == Platform.SLACK
     assert ACTIVE_WORK_PROMPT in event.text
     assert "[SILENT]" in event.text
+    assert "nothing has changed" not in event.text
     assert "child-process" in event.text
     from gateway.platforms.base import _thread_metadata_for_source
     progress = "Build still running, next is the canary."
@@ -252,6 +253,113 @@ async def test_reconcile_registers_origin_watch_and_drops_it_when_settled(heartb
     await reconcile_active_work_watches(runner)
     assert key not in runner._heartbeat_watch
     assert load_heartbeat("origin-session") is None
+
+
+def _watch_runner(entries):
+    runner = SimpleNamespace(
+        session_store=SimpleNamespace(
+            list_sessions=lambda: entries,
+            _routing_home=None,
+            peek_session_id=lambda session_key: next(
+                (entry.session_id for entry in entries if entry.session_key == session_key),
+                None,
+            ),
+        ),
+        _heartbeat_watch={},
+        _run_in_executor_with_context=asyncio.to_thread,
+        config=SimpleNamespace(multiplex_profiles=False),
+    )
+    runner._register_heartbeat_watch = lambda quick_key, src, sid: runner._heartbeat_watch.__setitem__(
+        quick_key, (src, sid)
+    )
+    runner._unregister_heartbeat_watch = lambda quick_key: runner._heartbeat_watch.pop(quick_key, None)
+    runner._start_heartbeat_poller = lambda: None
+    runner._restored_source = lambda entry: entry.origin
+    runner._profile_scope_key_for_source = lambda _source: "default"
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _scope(_source):
+        yield
+
+    runner._profile_scope_for_source = _scope
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_reconcile_keeps_watch_on_compression_continuation(heartbeat_db, monkeypatch):
+    source = SessionSource(platform=Platform.SLACK, chat_id="D9", chat_type="dm", thread_id="t1")
+    key = build_session_key(source)
+    entry = SimpleNamespace(
+        session_key=key, session_id="child-session", prev_session_id="parent-session",
+        origin=source, suspended=False,
+    )
+    runner = _watch_runner([entry])
+    runner.session_store._compression_tip_for_session_id = (
+        lambda sid: "child-session" if sid == "parent-session" else sid
+    )
+    HeartbeatManager("child-session").ensure_managed(
+        ACTIVE_WORK_PROMPT, ACTIVE_WORK_INTERVAL_SECONDS, origin=ACTIVE_WORK_HEARTBEAT_ORIGIN,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.active_work_progress.collect_active_session_ids",
+        lambda **_kwargs: ({"parent-session"}, True),
+    )
+    monkeypatch.setattr(
+        "gateway.run_heartbeat_restore._watched_homes",
+        lambda _runner, home: [home],
+    )
+    await reconcile_active_work_watches(runner)
+    assert runner._heartbeat_watch[key][1] == "child-session"
+    assert load_heartbeat("child-session").origin == ACTIVE_WORK_HEARTBEAT_ORIGIN
+    assert load_heartbeat("parent-session") is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_then_restore_skips_non_deliverable_origin(heartbeat_db, monkeypatch):
+    from gateway.run_heartbeat_restore import restore_heartbeat_watches
+
+    source = SessionSource(platform=Platform.API_SERVER, chat_id="api-1", chat_type="dm")
+    key = build_session_key(source)
+    entry = SimpleNamespace(
+        session_key=key, session_id="api-session", origin=source, suspended=False,
+    )
+    runner = _watch_runner([entry])
+    HeartbeatManager("api-session").ensure_managed(
+        ACTIVE_WORK_PROMPT, ACTIVE_WORK_INTERVAL_SECONDS, origin=ACTIVE_WORK_HEARTBEAT_ORIGIN,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.active_work_progress.collect_active_session_ids",
+        lambda **_kwargs: ({"api-session"}, True),
+    )
+    monkeypatch.setattr(
+        "gateway.run_heartbeat_restore._watched_homes",
+        lambda _runner, home: [home],
+    )
+    monkeypatch.setattr(
+        "gateway.run_idle_gates.profile_has_active_heartbeat",
+        lambda _home: True,
+    )
+    await reconcile_active_work_watches(runner)
+    await restore_heartbeat_watches(runner)
+    assert key not in runner._heartbeat_watch
+    assert load_heartbeat("api-session") is None
+
+
+def test_rendered_due_prompt_requires_exact_silence(heartbeat_db):
+    HeartbeatManager("origin-session").ensure_managed(
+        ACTIVE_WORK_PROMPT, ACTIVE_WORK_INTERVAL_SECONDS, origin=ACTIVE_WORK_HEARTBEAT_ORIGIN,
+    )
+    state = load_heartbeat("origin-session")
+    state.created_at = 0
+    state.last_fired_at = 0
+    from hermes_cli.heartbeat import save_heartbeat
+    save_heartbeat("origin-session", state)
+    prompt = HeartbeatManager("origin-session").due_prompt(now=10**12)
+    assert prompt is not None
+    assert "[SILENT]" in prompt
+    assert "nothing has changed" not in prompt
 
 
 def test_internal_platforms_are_not_progress_destinations():

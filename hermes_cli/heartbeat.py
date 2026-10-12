@@ -91,7 +91,17 @@ class HeartbeatState:
         return (time.time() if now is None else now) - (self.last_fired_at or self.created_at) >= self.interval_seconds
 
     def render_prompt(self) -> str:
-        return HEARTBEAT_PROMPT_TEMPLATE.format(interval=format_interval(self.interval_seconds), prompt=self.prompt)
+        interval = format_interval(self.interval_seconds)
+        if self.origin == ACTIVE_WORK_HEARTBEAT_ORIGIN:
+            # The generic footer asks for a visible "nothing has changed" reply.
+            # This check must stay silent unless the marker is exact [SILENT].
+            return (
+                "[Heartbeat — recurring instruction, fires every "
+                f"{interval}]\n{self.prompt}\n\n"
+                "If nothing meaningful changed, reply exactly [SILENT]. "
+                "Do not invent progress."
+            )
+        return HEARTBEAT_PROMPT_TEMPLATE.format(interval=interval, prompt=self.prompt)
 
 
 def _get_session_db() -> Optional[Any]:
