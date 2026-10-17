@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils import base_url_host_matches, base_url_hostname
@@ -204,6 +204,20 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
         pdef.base_url
         or (pdef.auth_type == "api_key" and pdef.api_key_env_vars and pdef.base_url_env_var)
     ):
+        # The profile supplies runtime transport/configuration; overlay-only metadata
+        # (notably aggregator status and configurable base URL) remains authoritative.
+        overlay = HERMES_OVERLAYS.get(canonical)
+        if overlay is not None:
+            env_vars = list(pdef.api_key_env_vars)
+            for env_var in overlay.extra_env_vars:
+                if env_var not in env_vars:
+                    env_vars.append(env_var)
+            return replace(
+                pdef,
+                api_key_env_vars=tuple(env_vars),
+                base_url_env_var=pdef.base_url_env_var or overlay.base_url_env_var,
+                is_aggregator=pdef.is_aggregator or overlay.is_aggregator,
+            )
         return pdef
     mdev_info = _models_dev_info(canonical, allow_network)
     overlay = HERMES_OVERLAYS.get(canonical)
