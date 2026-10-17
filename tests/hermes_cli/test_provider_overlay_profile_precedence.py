@@ -1,43 +1,43 @@
-from __future__ import annotations
+"""The CommandCode catalog collision must not discard its registered API contract."""
 
-from hermes_cli import providers as provider_catalog
-from hermes_cli.providers import ProviderDef, get_provider, is_aggregator
+from types import SimpleNamespace
 
+import pytest
 
-def test_concrete_profile_wins_catalog_collision_without_losing_overlay_semantics(monkeypatch):
-    """A profile owns its transport/endpoint, while Hermes overlay metadata remains authoritative."""
-    profile = ProviderDef(
-        id="openrouter", name="Registered OpenRouter", transport="commandcode",
-        api_key_env_vars=("CMD_API_KEY",), base_url="https://profile.example/v1",
-        base_url_env_var="", is_aggregator=False, auth_type="api_key", source="plugin-profile",
-    )
-    monkeypatch.setattr(provider_catalog, "_plugin_profile_pdef", lambda _name: profile)
-    monkeypatch.setattr(provider_catalog, "_models_dev_info", lambda *_args, **_kwargs: object())
-
-    resolved = get_provider("openrouter", allow_network=False)
-
-    assert resolved is not None
-    assert (resolved.source, resolved.transport, resolved.base_url) == (
-        "plugin-profile", "commandcode", "https://profile.example/v1")
-    assert resolved.is_aggregator is True
-    assert resolved.base_url_env_var == "OPENROUTER_BASE_URL"
-    assert is_aggregator("openrouter") is True
+from hermes_cli import providers as catalog
+from providers import get_provider_profile
 
 
-def test_registered_profile_key_and_transport_survive_catalog_collision(monkeypatch):
-    """The catalog collision cannot replace the registered provider's identity or wire dialect."""
-    profile = ProviderDef(
-        id="commandcode", name="CommandCode", transport="commandcode",
-        api_key_env_vars=("CMD_API_KEY",), base_url="https://commandcode.example/v1",
-        base_url_env_var="CMD_BASE_URL", is_aggregator=False, auth_type="api_key", source="plugin-profile",
-    )
-    monkeypatch.setattr(provider_catalog, "_plugin_profile_pdef", lambda _name: profile)
-    monkeypatch.setattr(provider_catalog, "_models_dev_info", lambda *_args, **_kwargs: object())
-    monkeypatch.setitem(provider_catalog.HERMES_OVERLAYS, "commandcode", provider_catalog.HermesOverlay())
+@pytest.mark.parametrize("name", ["commandcode", "commandcode-chat"])
+def test_registered_commandcode_contract_survives_catalog_collision(name, monkeypatch):
+    """Resolve the real profile, not a mock dialect or the unrelated CMD_API_KEY entry."""
+    profile = get_provider_profile(name)
+    assert profile is not None
+    collision = SimpleNamespace(name="Catalog CommandCode", env=("CMD_API_KEY",),
+                                api="https://catalog.example.test/v1", doc="")
+    monkeypatch.setattr(catalog, "_models_dev_info", lambda *_args, **_kwargs: collision)
 
-    resolved = get_provider("commandcode", allow_network=False)
+    resolved = catalog.resolve_provider_full(name, {}, [])
 
     assert resolved is not None
-    assert resolved.id == "commandcode"
-    assert resolved.transport == "commandcode"
+    assert resolved.id == profile.name == "commandcode"
+    assert resolved.source == "plugin-profile"
+    assert resolved.transport == "openai_chat"
     assert resolved.base_url == profile.base_url
+    assert resolved.api_key_env_vars == ("COMMANDCODE_API_KEY",)
+    assert resolved.base_url_env_var == "COMMANDCODE_BASE_URL"
+    assert catalog.determine_api_mode(name) == profile.api_mode == "chat_completions"
+
+
+def test_commandcode_explicit_user_endpoint_still_wins(monkeypatch):
+    """The compatibility exception must not outrank an explicitly configured endpoint."""
+    monkeypatch.setattr(catalog, "_models_dev_info", lambda *_args, **_kwargs: None)
+    configured = {"commandcode": {"base_url": "https://configured.example.test/v1", "key_env": "USER_API_KEY"}}
+
+    resolved = catalog.resolve_provider_full("commandcode-chat", configured, [])
+
+    assert resolved is not None
+    assert resolved.source == "user-config"
+    assert resolved.id == "commandcode"
+    assert resolved.base_url == configured["commandcode"]["base_url"]
+    assert resolved.api_key_env_vars == ("USER_API_KEY",)

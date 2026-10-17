@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils import base_url_host_matches, base_url_hostname
@@ -195,30 +195,15 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     """Look up a built-in provider by id or alias: models.dev catalog merged with the Hermes overlay;
     Hermes-only overlay (nous, openai-codex, …); plugin provider profiles with a concrete endpoint."""
     canonical = normalize_provider(name)
-    # A registered provider profile is the provider's authoritative runtime
-    # configuration (wire mode, credentials and endpoint).  models.dev is a
-    # useful catalog fallback, but can describe an unrelated provider that
-    # happens to share the same id (for example CommandCode's CMD_API_KEY).
-    pdef = _plugin_profile_pdef(canonical)
-    if pdef is not None and (
-        pdef.base_url
-        or (pdef.auth_type == "api_key" and pdef.api_key_env_vars and pdef.base_url_env_var)
-    ):
-        # The profile supplies runtime transport/configuration; overlay-only metadata
-        # (notably aggregator status and configurable base URL) remains authoritative.
-        overlay = HERMES_OVERLAYS.get(canonical)
-        if overlay is not None:
-            env_vars = list(pdef.api_key_env_vars)
-            for env_var in overlay.extra_env_vars:
-                if env_var not in env_vars:
-                    env_vars.append(env_var)
-            return replace(
-                pdef,
-                api_key_env_vars=tuple(env_vars),
-                base_url_env_var=pdef.base_url_env_var or overlay.base_url_env_var,
-                is_aggregator=pdef.is_aggregator or overlay.is_aggregator,
-            )
-        return pdef
+    # models.dev's commandcode entry uses CMD_API_KEY, not the bundled
+    # CommandCode API's COMMANDCODE_API_KEY and /provider/v1 endpoint. Prefer
+    # that profile (including its aliases) only for this known collision.
+    # Other catalog ids and Hermes overlays retain their routing contracts:
+    # e.g. the profile alias "meta" must not rewrite the catalog id to "meta-ai".
+    if canonical in {"commandcode", "commandcode-chat"}:
+        pdef = _plugin_profile_pdef(canonical)
+        if pdef is not None and pdef.base_url:
+            return pdef
     mdev_info = _models_dev_info(canonical, allow_network)
     overlay = HERMES_OVERLAYS.get(canonical)
     if mdev_info is not None:
