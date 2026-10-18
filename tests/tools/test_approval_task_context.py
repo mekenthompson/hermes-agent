@@ -108,6 +108,68 @@ def test_stop_before_detached_child_starts_removes_request():
             assert current_approval_task_context() is None
 
 
+def test_revoked_parent_child_keeps_hard_denial(monkeypatch):
+    from tools import approval as A, approval_context
+    monkeypatch.setattr(approval_context, '_get_approval_mode', lambda: 'off')
+    leases = []
+    with approval_task_context('Edit src/cli.py', identity='u', profile='p', session='s',
+                               is_current=lambda: True, owner=leases.append):
+        leases[0].revoke()
+        with delegated_approval_task('late-child'):
+            assert approval_context.approval_task_revoked()
+            assert A.check_all_command_guards('python -c "print(1)"', 'local')['approved'] is False
+
+
+def test_background_reservation_release_is_idempotent_and_copied_child_stales():
+    from tools.approval_context import release_background_approval_task, approval_task_revoked
+    with approval_task_context('Edit src/cli.py', identity='u', profile='p', session='s',
+                               is_current=lambda: True):
+        first = reserve_background_approval_task()
+        second = reserve_background_approval_task()
+    with background_approval_task(first, 'first'):
+        copied = copy_context()
+    release_background_approval_task(first)
+    assert copied.run(approval_task_revoked) is True
+    assert second.lease.live()
+    release_background_approval_task(second)
+    release_background_approval_task(second)
+    assert not second.lease.live()
+
+
+def test_copied_parent_binding_cannot_borrow_live_detached_child(monkeypatch):
+    from tools import approval as A, approval_context
+    monkeypatch.setattr(approval_context, '_get_approval_mode', lambda: 'off')
+    with approval_task_context('Edit only alpha.py', identity='u', profile='p', session='s',
+                               is_current=lambda: True):
+        copied_parent = copy_context()
+        child = reserve_background_approval_task()
+    try:
+        assert child.lease.live()
+        assert copied_parent.run(current_approval_task_context) is None
+        assert copied_parent.run(approval_context.approval_task_revoked)
+        assert copied_parent.run(lambda: A.check_all_command_guards(
+            'python -c "print(1)"', 'local')['approved']) is False
+        with background_approval_task(child, 'child'):
+            assert current_approval_task_context().text == 'Edit only alpha.py'
+    finally:
+        child.release()
+
+
+def test_coalesced_completions_with_different_origins_cannot_borrow_scope():
+    from tools.approval_context import completion_approval_task, approval_task_revoked
+    with approval_task_context('Edit only first.py', identity='alice', profile='p', session='s',
+                               is_current=lambda: True):
+        first = reserve_background_approval_task()
+    with approval_task_context('Edit only second.py', identity='bob', profile='p', session='s',
+                               is_current=lambda: True):
+        second = reserve_background_approval_task()
+    with completion_approval_task([first, second], 'batch'):
+        assert current_approval_task_context() is None
+        assert approval_task_revoked()
+    first.release()
+    second.release()
+
+
 def test_concurrent_request_profiles_do_not_mix():
     def review(identity, profile):
         with approval_task_context(f"Task for {profile}", identity=identity, profile=profile,

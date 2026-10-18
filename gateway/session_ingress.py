@@ -312,7 +312,12 @@ async def execute_admission(authority, ref, row):
 def _approval_task_scope(authority, ref, row, live, event, *, is_api):
     """Bind consent evidence to this exact authenticated admission and live owner."""
     from contextlib import nullcontext
-    if (is_api or event.internal or not isinstance(event.text, str)
+    if event.internal:
+        if is_api:
+            return nullcontext()
+        from gateway.session_approval_completion import completion_task_scope
+        return completion_task_scope(authority, row, live)
+    if (is_api or not isinstance(event.text, str)
             or not event.text.strip() or not isinstance(row.get('generation'), int)):
         return nullcontext()
     payload = row.get('payload') or {}
@@ -349,12 +354,22 @@ def _approval_task_scope(authority, ref, row, live, event, *, is_api):
             return (run_generation is not None
                     and authority.runner._is_session_run_current(live.route, run_generation))
         # Detached children may finish after the original turn has settled. Their
-        # reservation is held by the lease and their Stop path explicitly revokes it.
-        return committed['status'] == 'terminal' and committed['outcome'] == 'completed'
+        # reservation is held by the lease. Recheck the live route as well: a
+        # completed historical row alone cannot authorize a replacement session.
+        if committed['status'] != 'terminal' or committed['outcome'] != 'completed':
+            return False
+        entry = authority.runner.session_store.lookup_by_session_key(live.route)
+        return (entry is not None and not entry.suspended
+                and (entry.session_id == ref.session_id
+                     or authority.db.get_compression_tip(ref.session_id) == entry.session_id))
 
     def own(lease):
-        from weakref import ref as weakref_ref
-        live.approval_task_lease = (row['generation'], weakref_ref(lease))
+        from weakref import WeakSet
+        with live.event_stream.lock:
+            leases = getattr(live, 'approval_task_leases', None)
+            if leases is None:
+                leases = live.approval_task_leases = WeakSet()
+            leases.add(lease)
 
     return approval_task_context(
         event.text, identity=row['principal_id'],

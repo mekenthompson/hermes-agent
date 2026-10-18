@@ -38,9 +38,10 @@ def test_authenticated_submit_passes_server_stamped_origin_to_turn(tmp_path, mon
         direct = server.handle_request({"id": "p", "method": "prompt.submit",
                                         "params": {"session_id": sid, "text": "Edit src/cli.py"}})
         assert direct["result"]["status"] == "streaming"
-        requester, task_id, inflight, request = origins[-1]
+        requester, task_id, inflight, request, queued_generation = origins[-1]
         assert requester == "basic:alice" and task_id and inflight is server._sessions[sid]["inflight_turn"]
         assert request == "Edit src/cli.py"
+        assert queued_generation is None
         server._sessions[sid]["running"] = False
         hidden = server.handle_request({"id": "h", "method": "prompt.submit",
                                         "params": {"session_id": sid, "text": "system wake", "display_kind": "hidden"}})

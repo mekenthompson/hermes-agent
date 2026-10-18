@@ -158,6 +158,7 @@ def test_foreign_and_synthetic_rows_cannot_supply_human_request():
     from gateway.config import Platform
     from gateway.session_ingress import _approval_task_scope
     from hermes_state_runtime import RuntimeStoreError
+    from tools.approval_context import current_approval_task_context
 
     source = SimpleNamespace(user_id="owner", platform=Platform.LOCAL, profile=None,
                              chat_id="room", thread_id=None)
@@ -170,7 +171,58 @@ def test_foreign_and_synthetic_rows_cannot_supply_human_request():
     with pytest.raises(RuntimeStoreError, match="permission_denied"):
         _approval_task_scope(authority, ref, row, live, event, is_api=False)
     event.internal = True
-    assert isinstance(_approval_task_scope(authority, ref, row, live, event, is_api=False), type(nullcontext()))
+    with _approval_task_scope(authority, ref, row, live, event, is_api=False):
+        assert current_approval_task_context() is None
     event.internal = False
     row["payload"] = {"text": event.text, "native_text_v1": {}}
     assert isinstance(_approval_task_scope(authority, ref, row, live, event, is_api=False), type(nullcontext()))
+
+
+@pytest.mark.asyncio
+async def test_stop_revokes_older_detached_task_after_new_admission(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_contract import Principal, Submission
+    from gateway.session_local import create_local_session
+    from hermes_state import SessionDB
+    from hermes_state_runtime import list_session_admissions
+    from tools.approval_context import reserve_background_approval_task
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
+    db = SessionDB(tmp_path / 'state.db')
+    runner.session_store._db = runner._session_db = db
+    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner', db=db)
+    viewer = Principal('test-owner', 'default', frozenset(
+        {'session:create', 'session:submit', 'session:read', 'session:control'}), 'viewer')
+    ref = create_local_session(authority, viewer, dict(request_id='cli', source='cli', model='fixture', toolsets=[]))
+    started, release = threading.Event(), threading.Event()
+    reservations = []
+
+    async def answer(*, message, **_kwargs):
+        reservations.append(await asyncio.to_thread(reserve_background_approval_task))
+        if message == 'Second task':
+            started.set()
+            await asyncio.to_thread(release.wait, 10)
+        return {'final_response': 'ok', 'messages': []}
+
+    monkeypatch.setattr(runner, '_run_agent', answer)
+    try:
+        await authority.submit(viewer, Submission('first', ref, {'text': 'First task'}, 'queue'))
+        await async_wait_until(lambda: len(reservations) == 1 and
+                               list_session_admissions(db, session_id=ref.session_id,
+                                                       pending_only=False)[0]['status'] == 'terminal',
+                               timeout=10, what='first task detached')
+        assert reservations[0].lease.live()
+        await authority.submit(viewer, Submission('second', ref, {'text': 'Second task'}, 'queue'))
+        assert await asyncio.to_thread(started.wait, 10)
+        generation = authority.sessions[ref.session_id].event_stream.execution['execution_generation']
+        await authority.interrupt(viewer, ref, generation)
+        assert len(reservations) == 2
+        assert all(not reservation.lease.live() for reservation in reservations)
+    finally:
+        release.set()
+        for reservation in reservations:
+            reservation.release()
+        db.close()

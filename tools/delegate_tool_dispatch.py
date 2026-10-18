@@ -389,9 +389,13 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
     """Hand ONE unit to the async registry; the runner joins on that unit's children only."""
     from tools.async_delegation import dispatch_async_delegation_batch
     from tools.approval_context import (background_approval_task, release_background_approval_task,
-                                        reserve_background_approval_task, revoke_background_approval_task)
+                                        reserve_background_approval_task, revoke_background_approval_task,
+                                        approval_task_revoked)
+    if approval_task_revoked():
+        return {"status": "rejected", "error": "The originating approval task was stopped or superseded."}
     child_agents = [c for (_, _, c) in unit.children]
     reservation = reserve_background_approval_task()
+    completion_reservation = reserve_background_approval_task()
 
     def _interrupt():
         revoke_background_approval_task(reservation)
@@ -409,6 +413,8 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         toolsets=None,  # metadata for the completion block only; subagents inherit the parent's toolsets
         role=unit.top_role, model=unit.creds["model"],
         runner=run_unit,
+        approval_reservation=completion_reservation,
+        on_unstarted=lambda: release_background_approval_task(reservation),
         interrupt_fn=_interrupt, delegation_id=unit_id, slot_key=slot_key,
         task_indexes=[i for (i, _, _) in unit.children] if len(unit.children) < len(unit.task_list) else None,
         # Persist locators before starting workers; live_paths omits failed writers and can be compressed.
@@ -419,9 +425,11 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
     )
     except BaseException:
         release_background_approval_task(reservation)
+        release_background_approval_task(completion_reservation)
         raise
     if result.get("status") != "dispatched":
         release_background_approval_task(reservation)
+        release_background_approval_task(completion_reservation)
     return result
 
 def _restore_parent_cancellation(unit: _Batch) -> None:
