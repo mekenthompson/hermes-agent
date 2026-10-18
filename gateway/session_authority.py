@@ -680,6 +680,10 @@ class SessionAuthority:
         if handle.execution_generation != generation:
             raise RuntimeStoreError('stale_generation')
         live, agent = self.sessions[ref.session_id], None
+        task_lease = getattr(live, 'approval_task_lease', None)
+        if task_lease is not None and task_lease[0] == generation:
+            if lease := task_lease[1]():
+                lease.revoke()
         if handle.execution_state == 'running':
             # Latches are written under the lock adopt_agent takes on the executor thread, BEFORE the
             # agent is called: an adoption racing the call consumes them. The agent is called outside it.

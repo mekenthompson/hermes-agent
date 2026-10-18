@@ -8,6 +8,8 @@ gate in :mod:`tools.approval`.
 import contextvars
 from contextlib import contextmanager
 from dataclasses import dataclass
+from threading import RLock
+from typing import Callable
 import logging
 import os
 from agent.i18n import t
@@ -39,7 +41,7 @@ _hermes_interactive_ctx: contextvars.ContextVar[str | None] = _ctx("hermes_inter
 
 @dataclass(frozen=True)
 class ApprovalTaskContext:
-    """User-task provenance supplied by a trusted producer, not by model tool arguments."""
+    """Immutable human request evidence, with a live owner checked at review time."""
 
     text: str
     identity: str
@@ -47,14 +49,59 @@ class ApprovalTaskContext:
     session: str
     task_id: str = ""
     run_id: str = ""
+    ancestry: tuple[str, ...] = ()
 
 
-_approval_task_context: contextvars.ContextVar[ApprovalTaskContext | None] = _ctx("approval_task_context", None)
+class ApprovalTaskLease:
+    """One admitted turn and its explicitly reserved background children."""
+
+    def __init__(self, is_current: Callable[[], bool]):
+        self.is_current = is_current
+        self._lock = RLock()
+        self._parent_open = True
+        self._children = 0
+        self._revoked = False
+
+    def live(self) -> bool:
+        with self._lock:
+            active = not self._revoked and (self._parent_open or self._children > 0)
+        return active and self._owner_current()
+
+    def _owner_current(self) -> bool:
+        try:
+            return bool(self.is_current())
+        except Exception:
+            logger.warning("Approval task owner could not be verified", exc_info=True)
+            return False
+
+    def reserve_child(self) -> bool:
+        if not self._owner_current():
+            return False
+        with self._lock:
+            if self._revoked or not (self._parent_open or self._children):
+                return False
+            self._children += 1
+            return True
+
+    def release_child(self) -> None:
+        with self._lock:
+            self._children -= 1
+
+    def close_parent(self) -> None:
+        with self._lock:
+            self._parent_open = False
+
+    def revoke(self) -> None:
+        with self._lock:
+            self._revoked = True
+
+
+_approval_task_context: contextvars.ContextVar[tuple[ApprovalTaskLease, ApprovalTaskContext] | None] = _ctx("approval_task_context", None)
 
 
 @contextmanager
 def approval_task_context(text: str, *, identity: str, profile: str, session: str,
-                          task_id: str = "", run_id: str = ""):
+                          task_id: str = "", run_id: str = "", is_current=None, owner=None):
     """Bind explicitly supplied user task provenance for this execution scope.
 
     Callers must derive these values from an authenticated ingress record. This
@@ -64,16 +111,82 @@ def approval_task_context(text: str, *, identity: str, profile: str, session: st
     if not all(isinstance(value, str) for value in (text, identity, profile, session, task_id, run_id)):
         raise TypeError("approval task context fields must be strings")
     value = ApprovalTaskContext(text, identity, profile, session, task_id, run_id)
-    token = _approval_task_context.set(value)
+    lease = ApprovalTaskLease(is_current or (lambda: False))
+    if owner is not None:
+        owner(lease)
+    token = _approval_task_context.set((lease, value))
     try:
         yield
     finally:
+        lease.close_parent()
         _approval_task_context.reset(token)
 
 
 def current_approval_task_context() -> ApprovalTaskContext | None:
-    """Current ingress-bound user task scope, if one was explicitly established."""
-    return _approval_task_context.get()
+    """Return consent evidence only while its admitted owner is still live."""
+    bound = _approval_task_context.get()
+    return bound[1] if bound is not None and bound[0].live() else None
+
+
+def approval_task_revoked() -> bool:
+    bound = _approval_task_context.get()
+    return bound is not None and not bound[0].live()
+
+
+@contextmanager
+def delegated_approval_task(child_id: str):
+    """Narrow inherited context to a real child run; copied contexts alone grant nothing."""
+    bound = _approval_task_context.get()
+    if bound is None or not child_id or not bound[0].reserve_child():
+        token = _approval_task_context.set(None)
+        try:
+            yield
+        finally:
+            _approval_task_context.reset(token)
+        return
+    lease, parent = bound
+    child = ApprovalTaskContext(parent.text, parent.identity, parent.profile, parent.session,
+                                parent.task_id, parent.run_id, (*parent.ancestry, child_id))
+    token = _approval_task_context.set((lease, child))
+    try:
+        yield
+    finally:
+        _approval_task_context.reset(token)
+        lease.release_child()
+
+
+def reserve_background_approval_task():
+    """Reserve one detached unit before its parent turn returns; None if no live task."""
+    bound = _approval_task_context.get()
+    if bound is None or not bound[0].reserve_child():
+        return None
+    return bound
+
+
+def release_background_approval_task(reservation) -> None:
+    if reservation is not None:
+        reservation[0].release_child()
+
+
+def revoke_background_approval_task(reservation) -> None:
+    if reservation is not None:
+        reservation[0].revoke()
+
+
+@contextmanager
+def background_approval_task(reservation, unit_id: str):
+    if reservation is None:
+        yield
+        return
+    lease, parent = reservation
+    child = ApprovalTaskContext(parent.text, parent.identity, parent.profile, parent.session,
+                                parent.task_id, parent.run_id, (*parent.ancestry, unit_id))
+    token = _approval_task_context.set((lease, child))
+    try:
+        yield
+    finally:
+        _approval_task_context.reset(token)
+        lease.release_child()
 
 
 def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:

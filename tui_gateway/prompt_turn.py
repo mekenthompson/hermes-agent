@@ -1091,7 +1091,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    turn_author: dict | None = None) -> bool:
+    turn_author: dict | None = None, approval_origin=None) -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -1128,6 +1128,33 @@ def _run_prompt_submit(
         display_kind or "user", len(text) if isinstance(text, str) else "-", len(images))
     if not muted:
         _emit("message.start", sid)
+
+    def approval_scope():
+        from contextlib import nullcontext
+        if approval_origin is None:
+            return nullcontext()
+        requester, admission_id, inflight, request_text = approval_origin
+        if session.get("inflight_turn") is not inflight:
+            return nullcontext()
+        from hermes_constants import get_process_hermes_home
+        from tools.approval_context import approval_task_context
+        from weakref import WeakSet
+
+        def current():
+            with session["history_lock"]:
+                return (not session.get("_closing") and not session.get("_finalized")
+                        and not session.get("_turn_cancel_requested")
+                        and _sessions.get(sid) is session
+                        and (not session.get("running") or session.get("inflight_turn") is inflight))
+
+        def own(lease):
+            with session["history_lock"]:
+                session.setdefault("_approval_task_leases", WeakSet()).add(lease)
+
+        return approval_task_context(
+            request_text, identity=requester, profile=str(session.get("profile_home") or get_process_hermes_home()),
+            session=str(session.get("session_key") or sid), task_id=admission_id,
+            run_id=admission_id, is_current=current, owner=own)
 
     def run_body():
         # RPC-dispatcher ContextVars do not follow onto this thread: rebind the transport
@@ -1213,7 +1240,7 @@ def _run_prompt_submit(
         # _prepare_turn_input owns profile binding for the worker. The context
         # here only gates presentation; do not introduce a second runtime scope.
         from agent.notification_presentation import notification_policy_snapshot
-        with notification_policy_snapshot(agent, "tui", notification_config), notification_turn(agent, muted=muted, session_id=sid):
+        with notification_policy_snapshot(agent, "tui", notification_config), notification_turn(agent, muted=muted, session_id=sid), approval_scope():
             followup = run_body()
         if followup is not None:
             _run_post_turn_followups(rid, sid, session, *followup)
