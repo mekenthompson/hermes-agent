@@ -178,6 +178,97 @@ def test_foreign_and_synthetic_rows_cannot_supply_human_request():
     assert isinstance(_approval_task_scope(authority, ref, row, live, event, is_api=False), type(nullcontext()))
 
 
+@pytest.mark.parametrize("platform", ["telegram", "slack"])
+@pytest.mark.parametrize("foreign_principal", [False, True])
+@pytest.mark.asyncio
+async def test_native_messaging_fifo_binds_authenticated_request_to_smart_reviewer(
+        platform, foreign_principal, tmp_path, monkeypatch):
+    """The real native admission and FIFO preserve the connector-authenticated request."""
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_ingress_context import native_callback, register_transport_home
+    from hermes_state_runtime import get_session_admission
+    from plugins.platforms.slack.adapter import SlackAdapter
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    from tools import approval as A, approval_context
+    from tools.approval_context import current_approval_task_context
+    from tools.approval_smart import _smart_approve
+
+    monkeypatch.setattr(SessionAuthority, "_schedule", lambda self, ref: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setenv(f"{platform.upper()}_ALLOWED_USERS", "U-42")
+    monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "smart")
+    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
+    prompts = []
+
+    def reviewer(**kwargs):
+        prompt = kwargs["messages"][1]["content"]
+        prompts.append(prompt)
+        answer = "APPROVE" if "Deploy only the reviewed patch" in prompt else "ESCALATE"
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=answer))])
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", reviewer)
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    adapter_cls = TelegramAdapter if platform == "telegram" else SlackAdapter
+    platform_id = Platform.TELEGRAM if platform == "telegram" else Platform.SLACK
+    adapter = adapter_cls(PlatformConfig(enabled=True, typing_indicator=False))
+    from unittest.mock import AsyncMock
+    from gateway.platforms.base import SendResult
+    monkeypatch.setattr(adapter, "send", AsyncMock(return_value=SendResult(success=True, message_id="reply")))
+    runner.adapters = {platform_id: adapter}
+    authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner")
+    runner._wire_adapter_handlers(adapter)
+    from pathlib import Path
+    authority_home = Path(authority.db.db_path).resolve().parent
+    register_transport_home(runner, None, authority_home)
+    source = adapter.build_source(chat_id="C-42", chat_type="dm", user_id="U-42", thread_id="T-9",
+                                  message_id="native-1")
+    adapter._canonicalize(source)
+    text = "Deploy only the reviewed patch"
+    event = MessageEvent(text=text, source=source, message_id="native-1")
+    reviewed = []
+
+    async def handle(*, message, session_key, run_generation, **_kwargs):
+        assert run_generation > 0
+        evidence = current_approval_task_context()
+        reviewed.append((evidence, _smart_approve("python -c 'print(1)'", "script execution")))
+        return {"final_response": "ok", "messages": []}
+
+    # Keep the real handler: it establishes the run-generation fence checked by
+    # task provenance. Replacing it would remove the producer being tested.
+    monkeypatch.setattr(runner, "_run_agent", handle)
+    try:
+        with native_callback(runner, event, authority_home):
+            receipt = await authority.admit_native(event)
+        if foreign_principal:
+            # Fault injection into the real committed row: a mismatched identity
+            # must never lend its request to the actual executing native turn.
+            authority.db._execute_write(lambda conn: conn.execute(
+                'UPDATE session_admissions SET principal_id=? WHERE admission_id=?',
+                ('foreign', receipt.admission_id)))
+        await SessionAuthority._drain(authority, receipt.ref)
+        row = get_session_admission(authority.db, admission_id=receipt.admission_id)
+        assert row is not None
+        assert row["status"] == "terminal"
+    finally:
+        authority.db.close()
+
+    evidence, verdict = reviewed[0]
+    if foreign_principal:
+        assert evidence is None
+        assert verdict == "escalate"
+        assert text not in prompts[0]
+    else:
+        assert evidence.text == text
+        assert evidence.identity == row["principal_id"]
+        assert evidence.identity.startswith('messaging:')
+        assert verdict == "approve"
+        assert text in prompts[0]
+
+
 @pytest.mark.asyncio
 async def test_stop_revokes_older_detached_task_after_new_admission(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
