@@ -241,6 +241,7 @@ async def execute_admission(authority, ref, row):
     from gateway.session_api_turn import api_execution, prepare_api_execution
     from gateway.session_results import execution_result
     is_api = live.source.platform == Platform.API_SERVER
+    task_scope = _approval_task_scope(authority, ref, row, live, event, is_api=is_api)
     author = event.metadata.get('turn_author')
     author_token = admission_author.set(author if author is not None else row_turn_author(local_policy, row))
     from gateway.session_operator import is_viewer_input
@@ -253,7 +254,7 @@ async def execute_admission(authority, ref, row):
     event._turn_marker_handoff = True
     handed = False
     try:
-        with await _execution_scope(authority, home):
+        with await _execution_scope(authority, home), task_scope:
             if is_api:
                 # Committed media resolves under the owning profile's home, like admission did.
                 prepared = prepare_api_execution(authority, ref, row['payload'])
@@ -306,6 +307,29 @@ async def execute_admission(authority, ref, row):
         api_execution.reset(api_token)
         admission_author.reset(author_token)
         viewer_turn.reset(viewer_token)
+
+
+def _approval_task_scope(authority, ref, row, live, event, *, is_api):
+    """Bind raw task evidence only after an authenticated producer's durable admission.
+
+    Native messaging admission validates its live adapter/source; local_operator_v1 is
+    server-stamped by the authenticated local session submitter. Internal notices and API
+    requests are excluded. This is reviewer evidence, never a permission grant.
+    """
+    from contextlib import nullcontext
+    if is_api or event.internal or not isinstance(event.text, str):
+        return nullcontext()
+    payload = row.get('payload') or {}
+    if not (isinstance(payload.get('local_operator_v1'), dict)
+            or isinstance(payload.get('native_text_v1'), dict)):
+        return nullcontext()
+    from tools.approval_context import approval_task_context
+    source = event.source
+    return approval_task_context(
+        event.text, identity=str(getattr(source, 'user_id', '') or ''),
+        profile=str(authority.profile_id), session=str(live.route),
+        task_id=str(row.get('admission_id') or ''), run_id=str(row.get('generation') or ''),
+    )
 
 
 async def _execution_scope(authority, home):

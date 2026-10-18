@@ -6,6 +6,8 @@ gate in :mod:`tools.approval`.
 """
 
 import contextvars
+from contextlib import contextmanager
+from dataclasses import dataclass
 import logging
 import os
 from agent.i18n import t
@@ -33,6 +35,45 @@ _approval_session_id: contextvars.ContextVar[str] = _ctx("approval_session_id")
 # it onto the non-interactive auto-approve path so a dangerous command runs without the approval callback firing
 # (GHSA-96vc-wcxf-jjff). None = unset → env fallback.
 _hermes_interactive_ctx: contextvars.ContextVar[str | None] = _ctx("hermes_interactive", None)
+
+
+@dataclass(frozen=True)
+class ApprovalTaskContext:
+    """User-task provenance supplied by a trusted producer, not by model tool arguments."""
+
+    text: str
+    identity: str
+    profile: str
+    session: str
+    task_id: str = ""
+    run_id: str = ""
+
+
+_approval_task_context: contextvars.ContextVar[ApprovalTaskContext | None] = _ctx("approval_task_context", None)
+
+
+@contextmanager
+def approval_task_context(text: str, *, identity: str, profile: str, session: str,
+                          task_id: str = "", run_id: str = ""):
+    """Bind explicitly supplied user task provenance for this execution scope.
+
+    Callers must derive these values from an authenticated ingress record. This
+    helper deliberately grants no command permissions; the smart reviewer is
+    heuristic and its result remains subject to the existing approval gates.
+    """
+    if not all(isinstance(value, str) for value in (text, identity, profile, session, task_id, run_id)):
+        raise TypeError("approval task context fields must be strings")
+    value = ApprovalTaskContext(text, identity, profile, session, task_id, run_id)
+    token = _approval_task_context.set(value)
+    try:
+        yield
+    finally:
+        _approval_task_context.reset(token)
+
+
+def current_approval_task_context() -> ApprovalTaskContext | None:
+    """Current ingress-bound user task scope, if one was explicitly established."""
+    return _approval_task_context.get()
 
 
 def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:

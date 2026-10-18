@@ -203,6 +203,8 @@ The terminal tool integrates a dangerous-command approval system defined in `too
 
 4. **Session state** — approvals are tracked per-session. Once you approve "recursive delete" for a session, subsequent `rm -rf` commands don't re-prompt.
 
+Smart approval may receive the exact raw request from an authenticated native messaging admission or a server-stamped local Desktop/TUI submission, with the user identity, profile, session, admission and generation identifiers. It is supplied only as **untrusted evidence** to the reviewer, including any exclusions in the request; it is not parsed into permissions and does not authorize implementation or execution. Synthetic/internal events and API requests are excluded. This context is currently turn-scoped and is not inherited by delegated or detached/background workers. Hard-deny, manual, headless, specialist, and operator-policy decisions remain governed by the existing gates. Per `SECURITY.md` §2.4, smart review is an in-process heuristic, not deterministic OS containment; use an OS-level isolation posture for adversarial input.
+
 5. **Permanent allowlist** — the "allow permanently" option writes the pattern to `config.yaml`'s `command_allowlist`, persisting across sessions.
 
 ## Terminal/runtime environments
