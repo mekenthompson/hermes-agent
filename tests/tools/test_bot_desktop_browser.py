@@ -4,8 +4,10 @@ and when a human opened that browser first, the agent attaches to it instead of 
 
 from __future__ import annotations
 
+import json
 import os
 import socket
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -225,6 +227,121 @@ def test_dispatch_attaches_or_refuses_occupied_profile(tmp_path, monkeypatch, cd
     (tmp_path / "SingletonLock").unlink()
     _engine, result = session._dispatch_browser_command("t", info, "agent-browser", "open", ["https://x"], 10, None)
     assert result["success"] is True and "--cdp" not in argvs[-1]
+
+
+@pytest.fixture
+def browser_use_entrypoint(tmp_path, monkeypatch):
+    """Keep browser_exec routing and agent-browser dispatch real; replace only external processes."""
+    from tools import browser_tool_cdp, browser_tool_session as session, browser_use_cli as bu_cli
+    from tools import browser_tool_lightpanda_fallback
+
+    monkeypatch.setattr(runtime, "published_env", lambda: {"DISPLAY": ":37"})
+    monkeypatch.setattr(browser, "profile_dir", lambda: tmp_path)
+    monkeypatch.setattr(session._cloud, "_get_browser_engine", lambda: "auto")
+    monkeypatch.setattr(session._cloud, "_is_headed_mode", lambda: False)
+    monkeypatch.setattr(session._cloud, "_get_cloud_provider", lambda: None)
+    monkeypatch.setattr(browser_tool_cdp, "_get_cdp_override", lambda: "")
+    monkeypatch.setattr(browser_tool_lightpanda_fallback, "_using_lightpanda_engine", lambda: False)
+    monkeypatch.setattr(session, "_browser_command_preflight", lambda: {"browser_cmd": "agent-browser"})
+    monkeypatch.setattr(session, "_agent_browser_argv", lambda cmd: [cmd])
+    monkeypatch.setattr(session._lp, "_lightpanda_fallback_reason", lambda *a: None)
+    monkeypatch.setattr(bu_cli, "_real_profile_consented", lambda: False)
+    monkeypatch.setattr(bu_cli, "_read_browser_cfg", dict)
+    monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["browser-use"])
+    monkeypatch.setattr(bu_cli, "_base_subprocess_env", dict)
+    monkeypatch.setattr(bu_cli, "_live_generation", lambda: 0)
+    monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda *a: None)
+
+    seen: dict = {"session_keys": [], "agent_argv": [], "harness_env": []}
+
+    def session_info(key):
+        seen["session_keys"].append(key)
+        return {"session_name": "h_browser_use", "cdp_url": None, "features": {"local": True}}
+
+    def agent_command(task_id, info, argv, *rest):
+        seen["agent_argv"].append(argv)
+        port = argv[argv.index("--cdp") + 1] if "--cdp" in argv else "0"
+        return {"success": True, "data": {"cdpUrl": f"ws://127.0.0.1:{port}/devtools/browser/abc"}}
+
+    def harness_command(cmd, code, env, timeout):
+        seen["harness_env"].append(dict(env))
+        return subprocess.CompletedProcess(cmd, 0, "ran", "")
+
+    monkeypatch.setattr(session, "_get_session_info", session_info)
+    monkeypatch.setattr(session, "_spawn_and_collect", agent_command)
+    monkeypatch.setattr(bu_cli, "_run_cli_killing_process_group", harness_command)
+    return seen
+
+
+def test_browser_exec_recovers_marker_loss_through_local_session(
+    tmp_path, cdp_listener, chromium_process, browser_use_entrypoint,
+):
+    """Browser Use must receive the recovered CDP endpoint from its real local routing path."""
+    from tools import browser_use_cli as bu_cli
+
+    (tmp_path / "SingletonLock").symlink_to(f"{socket.gethostname()}-{os.getpid()}")
+    result = json.loads(bu_cli.browser_exec("print(1)", session="marker_recovery"))
+
+    assert result["success"] is True
+    assert browser_use_entrypoint["session_keys"] == ["bu-named-marker_recovery"]
+    assert browser_use_entrypoint["agent_argv"][0][:5] == [
+        "agent-browser", "--session", "h_browser_use", "--cdp", str(cdp_listener.server_port),
+    ]
+    assert browser_use_entrypoint["harness_env"][0]["BU_CDP_WS"] == (
+        f"ws://127.0.0.1:{cdp_listener.server_port}/devtools/browser/abc"
+    )
+
+
+def test_browser_exec_refuses_unverified_occupied_profile_before_harness(
+    tmp_path, cdp_listener, chromium_process, browser_use_entrypoint,
+):
+    """An occupied profile with no process-owned listener cannot fall through to harness discovery."""
+    from tools import browser_use_cli as bu_cli
+
+    (tmp_path / "SingletonLock").symlink_to(f"{socket.gethostname()}-{os.getpid()}")
+    chromium_process["owns_listener"] = False
+    result = json.loads(bu_cli.browser_exec("print(1)", session="marker_refusal"))
+
+    assert "profile is in use" in result["error"]
+    assert browser_use_entrypoint["session_keys"] == ["bu-named-marker_refusal"]
+    assert browser_use_entrypoint["agent_argv"] == []
+    assert browser_use_entrypoint["harness_env"] == []
+
+
+def test_browser_exec_preserves_own_session_exclusion(
+    tmp_path, monkeypatch, cdp_listener, chromium_process, browser_use_entrypoint,
+):
+    """The running daemon's Chromium stays on its own session path through browser_exec."""
+    from tools import browser_use_cli as bu_cli
+
+    (tmp_path / "SingletonLock").symlink_to(f"{socket.gethostname()}-{os.getpid()}")
+    monkeypatch.setattr(browser, "_launched_by_session", lambda pid: "h_browser_use")
+    result = json.loads(bu_cli.browser_exec("print(1)", session="own_browser"))
+
+    assert result["success"] is True
+    assert len(browser_use_entrypoint["agent_argv"]) == 1
+    assert "--cdp" not in browser_use_entrypoint["agent_argv"][0]
+    assert len(browser_use_entrypoint["harness_env"]) == 1
+
+
+def test_browser_exec_respects_human_lease_before_launch(
+    tmp_path, monkeypatch, cdp_listener, chromium_process, browser_use_entrypoint,
+):
+    """Browser Use may not launch either subprocess while a human holds the screen."""
+    from tools import browser_use_cli as bu_cli
+    from tools.bot_desktop import lease
+
+    (tmp_path / "SingletonLock").symlink_to(f"{socket.gethostname()}-{os.getpid()}")
+
+    def refuse():
+        raise lease.HumanHasControl("human has control")
+
+    monkeypatch.setattr(lease, "assert_agent_may_act", refuse)
+    result = json.loads(bu_cli.browser_exec("print(1)", session="leased_browser"))
+
+    assert "human has control" in result["error"]
+    assert browser_use_entrypoint["agent_argv"] == []
+    assert browser_use_entrypoint["harness_env"] == []
 
 
 def _install_browsers(tmp_path, monkeypatch, *, playwright: bool, system: bool):
