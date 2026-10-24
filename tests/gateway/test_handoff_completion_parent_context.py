@@ -195,14 +195,44 @@ def test_handed_off_completion_turn_runs_as_the_parent(tmp_path):
                                    timeout=60, what="the parent's own completion re-entering the session")
 
     try:
-        with daemon(root, home, env, barrier=False) as (proc, desc):
-            try:
-                asyncio.run(probe(desc))
-            finally:
-                peer.release.touch()
-                proc.send_signal(signal.SIGINT)
-                proc.wait(timeout=30)
+        try:
+            with daemon(root, home, env, barrier=False) as (proc, desc):
+                try:
+                    asyncio.run(probe(desc))
+                finally:
+                    getattr(peer, 'release').touch()
+                    proc.send_signal(signal.SIGINT)
+                    proc.wait(timeout=30)
+        except AssertionError as exc:
+            # Keep the real end-to-end timeout and assertions, but retain enough causal state
+            # from a hosted timeout to distinguish refusal, absent model calls, and dispatch.
+            requests = []
+            for request in getattr(peer, 'requests'):
+                messages = request.get('messages') or []
+                requests.append({
+                    'model': request.get('model'),
+                    'tool_names': [tool.get('function', {}).get('name') for tool in request.get('tools') or []],
+                    'messages': [{k: message.get(k) for k in ('role', 'name', 'content', 'tool_calls', 'tool_call_id')
+                                  if k in message} for message in messages[-12:]],
+                })
+            sid = out.get('sid')
+            tool_results = _tool_results(secondary, sid) if sid else []
+            daemon_log = home / 'restart.log'
+            log_text = daemon_log.read_text(errors='replace')[-20000:] if daemon_log.exists() else '<daemon log unavailable>'
+            diagnostics = {
+                'scripted_request_count': len(requests),
+                'scripted_requests': requests[-12:],
+                'first_proc': getattr(peer, 'first_proc'),
+                'delegated': getattr(peer, 'delegated'),
+                'second_started': getattr(peer, 'second_started'),
+                'handoff_error': getattr(peer, 'handoff_error'),
+                'tool_results': tool_results[-20:],
+                'daemon_log_tail': log_text,
+            }
+            diagnostic_text = json.dumps(diagnostics, default=str)
+            raise AssertionError(f'{exc}\nHF551 handoff diagnostics (last 40000 chars): {diagnostic_text[-40000:]}') from exc
     finally:
+        peer.release.touch()
         peer.shutdown()
         peer.server_close()
         thread.join(timeout=5)
