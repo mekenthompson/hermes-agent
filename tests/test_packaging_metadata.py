@@ -86,8 +86,8 @@ def test_every_dependency_is_held_to_one_three_day_release_age():
     assert lock_versions == [APPROVED_SECURITY_EXEMPTION["brotlicffi"]]
     hermes = next(row for row in lock["package"] if row["name"] == manifest["project"]["name"])
     locked_requirement = [
-        dep for dep in hermes["optional-dependencies"]["messaging"]
-        if dep["name"] == "brotlicffi"
+        dep for dep in hermes["metadata"]["requires-dist"]
+        if dep["name"] == "brotlicffi" and dep.get("marker") == "extra == 'messaging'"
     ]
     assert len(locked_requirement) == 1
     assert locked_requirement[0]["specifier"] == "==1.2.1.0"

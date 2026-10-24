@@ -200,14 +200,14 @@ def test_handed_off_completion_turn_runs_as_the_parent(tmp_path):
                 try:
                     asyncio.run(probe(desc))
                 finally:
-                    getattr(peer, 'release').touch()
+                    peer.release.touch()
                     proc.send_signal(signal.SIGINT)
                     proc.wait(timeout=30)
         except AssertionError as exc:
             # Keep the real end-to-end timeout and assertions, but retain enough causal state
             # from a hosted timeout to distinguish refusal, absent model calls, and dispatch.
             requests = []
-            for request in getattr(peer, 'requests'):
+            for request in peer.requests:
                 messages = request.get('messages') or []
                 requests.append({
                     'model': request.get('model'),
@@ -222,10 +222,10 @@ def test_handed_off_completion_turn_runs_as_the_parent(tmp_path):
             diagnostics = {
                 'scripted_request_count': len(requests),
                 'scripted_requests': requests[-12:],
-                'first_proc': getattr(peer, 'first_proc'),
-                'delegated': getattr(peer, 'delegated'),
-                'second_started': getattr(peer, 'second_started'),
-                'handoff_error': getattr(peer, 'handoff_error'),
+                'first_proc': peer.first_proc,
+                'delegated': peer.delegated,
+                'second_started': peer.second_started,
+                'handoff_error': peer.handoff_error,
                 'tool_results': tool_results[-20:],
                 'daemon_log_tail': log_text,
             }

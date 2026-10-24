@@ -2432,7 +2432,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                     and s.id not in self._completion_consumed and s.id not in self._poll_observed]
 
     def transfer_ownership(self, session_id: str, *, from_owner: str, to_owner: str, to_task_id: str,
-                           to_session_key: str, note: str = "") -> Optional[ProcessSession]:
+                           to_session_key: str, note: str = "",
+                           child_stop_event: Optional[threading.Event] = None) -> Optional[ProcessSession]:
         """Move a RUNNING process from one owner to another under the registry lock. Ownership is the ``owner_task_id``
         field: completion notices are stamped from it at exit time and teardown kills by it, so flipping it here is the
         whole transfer. Returns the session, or None when it is unknown, already exited, or not owned by ``from_owner``
@@ -2440,6 +2441,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         session = self.get(session_id)
         with self._lock:
             if session is None or session.exited or session.owner_task_id != from_owner:
+                return None
+            # Completion routing and its approval provenance must change under
+            # the same lock. A stop observed before handoff must stay revoked.
+            reservation = getattr(session, "approval_task_reservation", None)
+            if reservation is not None and not reservation.transfer_to_parent(child_stop_event):
                 return None
             session.owner_task_id = to_owner
             session.task_id = to_task_id
@@ -2688,10 +2694,11 @@ def _handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dic
     session = process_registry.transfer_ownership(
         session_id, from_owner=str(task_id or ""), to_owner=parent_owner,
         to_task_id=_resolve_container_task_id(parent_owner),
-        to_session_key=str(getattr(parent, "session_id", "") or ""), note=note)
+        to_session_key=str(getattr(parent, "session_id", "") or ""), note=note,
+        child_stop_event=getattr(child, "_hard_interrupt_requested", None))
     if session is None:
-        return {"error": f"cannot hand off {session_id}: not a running process you own (already exited? read its result "
-                         "with poll/log and report it instead)."}
+        return {"error": f"cannot hand off {session_id}: process exited, ownership changed, or its approval task "
+                         "was stopped; read its result with poll/log and report it instead."}
     handed.append({"session_id": session.id, "command": session.command, "note": note})
     return {"status": "handed_off", "session_id": session.id, "command": session.command,
             "note": "Your parent now owns this process and will receive its completion; you will not. Mention the handoff "
