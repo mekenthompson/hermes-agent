@@ -271,7 +271,7 @@ messaging = [
   "python-telegram-bot[webhooks]==22.8",
   "discord.py[voice]==2.7.1",
   "aiohttp==3.14.5",
-  "brotlicffi==1.2.0.2",
+  "brotlicffi==1.2.1.0",
   "slack-bolt==1.30.0",
   "slack-sdk==3.45.0",
   "qrcode==7.4.2",
@@ -657,7 +657,10 @@ override-dependencies = [
 # the lock the day it ships, because holding it back keeps the bad root trusted.
 # Only packages whose job is CA trust belong in exclude-newer-package.
 exclude-newer = "3 days"
-exclude-newer-package = { certifi = false }
+# Owner-approved security exception (2026-10-24): brotlicffi 1.2.1.0 fixes
+# critical GHSA-9v8h-qqgm-4m35, which blocks image publication. Remove once
+# 1.2.1.0 is older than the 3-day window.
+exclude-newer-package = { certifi = false, brotlicffi = false }
 
 [tool.setuptools]
 # Root single-file modules are derived by setup.py at build time from the
