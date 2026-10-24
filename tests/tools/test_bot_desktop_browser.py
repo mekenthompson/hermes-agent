@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -296,6 +297,67 @@ def test_native_session_recovers_marker_loss_and_refuses_unverified_occupied_pro
         monkeypatch.setattr(launcher, "_UNRESPONSIVE_WAIT_S", 0)
         with pytest.raises(RuntimeError, match="in use by Chromium"):
             session._create_chromium_session("occupied")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.platforms("linux")
+def test_browser_exec_receives_recovered_native_cdp_and_refuses_unverified_owner(
+    tmp_path, monkeypatch, chromium_process,
+):
+    from tools import browser_launcher as launcher, browser_session as session, browser_use_cli as bu_cli
+    from tools import browser_session_cdp, browser_session_cloud, browser_session_lifecycle
+    from tools import browser_lightpanda, browser_session_real_profile
+    from tools.bot_desktop import placement
+
+    server = _devtools_server()
+    try:
+        (tmp_path / "SingletonLock").symlink_to(f"{socket.gethostname()}-{os.getpid()}")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        monkeypatch.setattr(launcher, "_shared_state_dir", lambda _dir: None)
+        monkeypatch.setattr(launcher, "_browsers", {})
+        monkeypatch.setattr(launcher, "_procs", {})
+        monkeypatch.setattr(launcher, "_launch_owned", lambda *a, **k: pytest.fail("occupied profile relaunched"))
+        monkeypatch.setattr(runtime, "tool_placement", lambda: placement.GATEWAY)
+        monkeypatch.setattr(session, "ensure_screen_for_headed_chromium", lambda: None)
+        monkeypatch.setattr(session, "_bot_desktop_target", lambda: (
+            f"profile:{tmp_path}", {"executable": "/usr/bin/chromium", "user_data_dir": str(tmp_path),
+                                     "ephemeral": False}))
+        for name in ("_active_sessions", "_session_last_activity", "_session_owner_homes", "_cleanup_failures"):
+            monkeypatch.setattr(session, name, {})
+        monkeypatch.setattr(browser_session_lifecycle, "start_cleanup_thread", lambda: None)
+        monkeypatch.setattr(browser_session_cdp, "get_cdp_override", lambda: "")
+        monkeypatch.setattr(browser_session_cloud, "get_cloud_provider", lambda: None)
+        monkeypatch.setattr(browser_session_cloud, "use_real_profile", lambda: False)
+        monkeypatch.setattr(browser_session_real_profile, "real_profile_cdp", lambda: (None, None))
+        monkeypatch.setattr(browser_lightpanda, "using_lightpanda_engine", lambda: False)
+        monkeypatch.setattr(session, "run_fenced", lambda _info, dispatch: dispatch())
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["browser-use"])
+        monkeypatch.setattr(bu_cli, "_base_subprocess_env", dict)
+        monkeypatch.setattr(bu_cli, "_read_browser_cfg", dict)
+        monkeypatch.setattr(bu_cli, "_live_generation", lambda: 0)
+        monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda *a: None)
+        monkeypatch.setattr(bu_cli, "_workspace_dir", lambda _task: None)
+        monkeypatch.setattr(bu_cli, "_driven_daemons", {})
+        monkeypatch.setattr(bu_cli, "_exec_route_is_sidecar", {})
+        harness_envs = []
+
+        def harness(_cmd, _code, env, _timeout):
+            harness_envs.append(dict(env))
+            return subprocess.CompletedProcess([], 0, "ran", "")
+
+        monkeypatch.setattr(bu_cli, "_run_cli_killing_process_group", harness)
+        assert json.loads(bu_cli.browser_exec("print(1)", session="recovered"))["success"] is True
+        assert harness_envs[0]["BU_CDP_WS"] == (
+            f"ws://127.0.0.1:{server.server_port}/devtools/browser/abc")
+
+        launcher._browsers.clear()
+        chromium_process["owns_listener"] = False
+        monkeypatch.setattr(launcher, "_UNRESPONSIVE_WAIT_S", 0)
+        refused = json.loads(bu_cli.browser_exec("print(1)", session="unverified"))
+        assert "in use by Chromium" in refused["error"]
+        assert len(harness_envs) == 1
     finally:
         server.shutdown()
         server.server_close()
