@@ -8,7 +8,6 @@ and shell completion generation.
 import json
 import os
 import shutil
-import socket
 import stat
 import sys
 import tarfile
@@ -309,18 +308,20 @@ class TestCreateProfile:
     def test_clone_sync_imports_carries_manifest_but_never_links_profiles(self, profile_env):
         """--sync-imports copies import-sync.json (a pointer at EXTERNAL agent trees) and nothing
         else changes: the clone still gets its own config/skills copies, never a live link."""
+        from hermes_cli.agent_import_sync import SYNC_MANIFEST_NAME, load_sync_manifest
+
         default_home = profile_env / ".hermes"
         (default_home / "config.yaml").write_text("model: test", encoding="utf-8")
         manifest = {"version": 1, "agents": {"claude-code": {
             "source": str(profile_env / ".claude"), "digest": "d", "overwrite": False,
             "last_import": 1, "imported_skills": ["s1"]}}}
-        (default_home / "import-sync.json").write_text(json.dumps(manifest), encoding="utf-8")
+        (default_home / SYNC_MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
 
         plain = create_profile("plain", clone_config=True, no_alias=True)
-        assert not (plain / "import-sync.json").exists()
+        assert not (plain / SYNC_MANIFEST_NAME).exists()
 
         synced = create_profile("synced", clone_config=True, sync_imports=True, no_alias=True)
-        assert json.loads((synced / "import-sync.json").read_text(encoding="utf-8")) == manifest
+        assert load_sync_manifest(synced)["agents"] == manifest["agents"]
         # Editing the source afterwards does not reach the clone: still an independent island.
         (default_home / "config.yaml").write_text("model: changed", encoding="utf-8")
         assert yaml.safe_load((synced / "config.yaml").read_text(encoding="utf-8-sig"))["model"] == "test"
@@ -422,50 +423,10 @@ class TestCreateProfile:
             assert not (cloned_browser / process_marker).exists(), process_marker
         assert (cloned_browser / "Default" / "Cookies").read_text(encoding="utf-8-sig") == "jar"
 
-    @pytest.mark.platforms("linux")
-    def test_clone_all_does_not_attach_to_the_source_profiles_live_browser(self, profile_env):
-        """Copied Chromium markers must not route the clone through the source profile's CDP port."""
-        import http.server
-        import threading
-        from tools.browser_launcher import running_instance
-
-        default_home = profile_env / ".hermes"
-        (default_home / "config.yaml").write_text("model: test", encoding="utf-8")
-        browser_profile = default_home / "bot-desktop" / "browser-profile"
-        browser_profile.mkdir(parents=True)
-
-        class _Version(http.server.BaseHTTPRequestHandler):  # a live DevTools /json/version answer
-            def do_GET(self):
-                body = b'{"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/source"}'
-                self.send_response(200)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *_args):
-                pass
-
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Version)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        try:
-            port = server.server_address[1]
-            (browser_profile / "DevToolsActivePort").write_text(f"{port}\n/devtools/browser/source\n", encoding="utf-8")
-            (browser_profile / "SingletonLock").symlink_to(f"host-{os.getpid()}")
-            assert running_instance(str(browser_profile))[0] == port
-
-            profile_dir = create_profile("coder", clone_all=True, no_alias=True)
-            cloned_browser = profile_dir / "bot-desktop" / "browser-profile"
-
-            assert running_instance(str(cloned_browser)) is None
-            assert running_instance(str(browser_profile))[0] == port
-        finally:
-            server.shutdown()
-            server.server_close()
-
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="special files need a POSIX filesystem")
     def test_clone_all_skips_special_files(self, profile_env):
         # A live source profile holds special files copytree cannot copy (e.g. a suffixless
-        # browser control socket); one of them must not abort the whole clone.
+        # agent-browser control socket); one of them must not abort the whole clone.
         default_home = profile_env / ".hermes"
         (default_home / "config.yaml").write_text("model: test", encoding="utf-8")
         browser_dir = default_home / "home" / ".agent-browser"

@@ -30,8 +30,10 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from http.client import HTTPConnection, HTTPException
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -262,7 +264,7 @@ def _read_devtools_file(user_data_dir: str) -> Optional[tuple[int, str]]:
     try:
         with open(os.path.join(user_data_dir, _DEVTOOLS_FILE), encoding="utf-8-sig") as fh:
             port, path = fh.readline().strip(), fh.readline().strip()
-    except OSError:
+    except (OSError, UnicodeError):
         return None
     if not port.isdigit() or not path.startswith("/devtools/browser/"):
         return None
@@ -373,17 +375,65 @@ def _browser_running_on(user_data_dir: str) -> bool:
     return _pid_naming_dir(user_data_dir) is not None
 
 
-def _devtools_endpoint_live(port: int, path: str) -> bool:
-    """The port answers ``/json/version`` with the browser id the DevToolsActivePort file names (the file
-    outlives a crashed Chromium and its port can be recycled by another CDP server)."""
+def _devtools_browser_path(port: int) -> Optional[str]:
+    """Read a CDP browser endpoint directly from loopback, without proxies or redirects."""
+    if not 1 <= port <= 65535:
+        return None
+    connection = HTTPConnection("127.0.0.1", port, timeout=0.5)
     try:
-        import requests
-        from agent.proxy_bypass import loopback_request_kwargs
-        url = f"http://127.0.0.1:{port}/json/version"
-        ws = str(requests.get(url, timeout=2, **loopback_request_kwargs(url)).json().get("webSocketDebuggerUrl") or "")
-    except Exception:  # health: allow BLE001 -- any probe failure means "not a live browser on this port"
+        connection.request("GET", "/json/version")
+        response = connection.getresponse()
+        if response.status != 200:
+            return None
+        endpoint = urlsplit(json.loads(response.read(8193))["webSocketDebuggerUrl"])
+        if (endpoint.scheme != "ws" or endpoint.hostname != "127.0.0.1" or endpoint.port != port
+                or endpoint.username is not None or endpoint.password is not None
+                or not endpoint.path.startswith("/devtools/browser/")
+                or len(endpoint.path) <= len("/devtools/browser/")
+                or endpoint.query or endpoint.fragment):
+            return None
+        return endpoint.path
+    except (OSError, ValueError, KeyError, TypeError, HTTPException):
+        return None
+    finally:
+        connection.close()
+
+
+def _devtools_endpoint_live(port: int, path: str) -> bool:
+    """A marker is valid only when its exact browser endpoint still answers."""
+    return _devtools_browser_path(port) == path
+
+
+def _verified_local_chromium(pid: int, user_data_dir: str) -> bool:
+    """The lock owner is this user's Chromium browser process for precisely this profile."""
+    import psutil
+    if not hasattr(os, "getuid"):
         return False
-    return ws.endswith(path)
+    try:
+        process = psutil.Process(pid)
+        uids = process.uids()
+        argv = process.cmdline()
+        exe = os.path.basename(process.exe()).lower()
+    except (OSError, psutil.Error):
+        return False
+    if (uids.real != os.getuid() or uids.effective != os.geteuid()
+            or exe not in {"chrome", "chromium", "chromium-browser", "google-chrome",
+                           "google-chrome-stable", "chrome-headless-shell", "chromium-headless-shell"}
+            or any(arg.startswith("--type=") for arg in argv)):
+        return False
+    profiles = [arg.partition("=")[2] for arg in argv if arg.startswith("--user-data-dir=")]
+    profiles += [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "--user-data-dir"]
+    return len(profiles) == 1 and os.path.isabs(profiles[0]) and _same_profile(profiles[0], user_data_dir)
+
+
+def _owned_loopback_ports(pid: int) -> set[int]:
+    """Only the proven browser's IPv4 loopback listening sockets may supply a recovered CDP port."""
+    import psutil
+    try:
+        return {conn.laddr.port for conn in psutil.Process(pid).net_connections(kind="inet")
+                if conn.status == psutil.CONN_LISTEN and conn.laddr.ip == "127.0.0.1"}
+    except (OSError, psutil.Error):
+        return set()
 
 
 def running_instance(user_data_dir: str) -> Optional[tuple[int, str, int]]:
@@ -391,11 +441,19 @@ def running_instance(user_data_dir: str) -> Optional[tuple[int, str, int]]:
     Bot Desktop dock instance, a surviving real-profile browser), else None. A second launch on that dir
     would be forwarded into it by Chromium's singleton and exit without a DevTools endpoint."""
     pid = _singleton_pid(user_data_dir)
-    found = _read_devtools_file(user_data_dir)
-    if pid is None or found is None or not _pid_alive(pid):
+    if pid is None or not _pid_alive(pid) or not _verified_local_chromium(pid, user_data_dir):
         return None
-    port, path = found
-    return (port, path, pid) if _devtools_endpoint_live(port, path) else None
+    ports = _owned_loopback_ports(pid)
+    found = _read_devtools_file(user_data_dir)
+    if found is not None and found[0] in ports and _devtools_endpoint_live(*found):
+        return *found, pid
+    # Chromium can keep serving CDP after DevToolsActivePort is lost or corrupt. A port owned by
+    # this exact browser process is the only safe fallback; an arbitrary local CDP server is not.
+    for port in sorted(ports):
+        path = _devtools_browser_path(port)
+        if path is not None:
+            return port, path, pid
+    return None
 
 
 def _pid_alive(pid: int) -> bool:
