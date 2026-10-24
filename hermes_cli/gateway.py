@@ -1526,8 +1526,8 @@ def _probe_launchd_service_running() -> bool:
 
 def _s6_gateway_snapshot(gateway_pids: tuple[int, ...]) -> GatewayRuntimeSnapshot | None:
     """Snapshot for an s6-supervised container gateway, or None when s6 isn't the service manager."""
-    from hermes_cli.service_manager import detect_service_manager, get_service_manager
-    if detect_service_manager() != "s6":
+    from hermes_cli.service_manager import get_service_manager, s6_serves_home
+    if not s6_serves_home(get_hermes_home()):
         return None
     service_name = f"gateway-{_current_profile_name()}"
     mgr = get_service_manager()
@@ -4834,11 +4834,11 @@ def _dispatch_via_service_manager_if_s6(action: str, profile: str | None = None)
     """Dispatch start/stop/restart via s6 inside an s6 container; True iff dispatched (caller returns).
     Profile defaults to the current one; missing slot / s6 errors become actionable CLI messages."""
     from hermes_cli.service_manager import (
-        GatewayNotRegisteredError, detect_service_manager, get_service_manager,
-        register_unregistered_profile_gateway,
+        GatewayNotRegisteredError, get_service_manager, register_unregistered_profile_gateway,
     )
+    from hermes_cli.service_manager import s6_serves_home  # a foreign home's own gateway: PID path
 
-    if detect_service_manager() != "s6":
+    if not s6_serves_home(get_hermes_home()):
         return False
     if profile is None:
         profile = _current_profile_name()  # root home (Docker /opt/data included) is gateway-default
@@ -4867,8 +4867,8 @@ def _dispatch_all_via_service_manager_if_s6(action: str) -> bool:
     """Dispatch ``--all`` stop/restart to every registered profile gateway under s6; True iff dispatched.
     A bare pkill is seen by s6-supervise as a crash and restarted ~1s later; the service manager flips
     ``want up``/``want down`` correctly. ``start --all`` is not a CLI surface."""
-    from hermes_cli.service_manager import (detect_service_manager, get_service_manager)
-    if detect_service_manager() != "s6" or action not in ("stop", "restart"):
+    from hermes_cli.service_manager import get_service_manager, s6_serves_home
+    if action not in ("stop", "restart") or not s6_serves_home(get_hermes_home()):
         return False
     mgr = get_service_manager()
     profiles = mgr.list_profile_gateways()

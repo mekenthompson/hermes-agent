@@ -1861,12 +1861,12 @@ def delete_profile(name: str, yes: bool = False) -> Path:
     return profile_dir
 
 
-def _s6_runtime_manager():
-    """The s6 service manager inside the container, else None. Silent on host: a failing/
-    absent detector must never print a confusing s6 warning to non-container users."""
+def _s6_runtime_manager(profile_name: str):
+    """The container's s6 manager when its slots serve *profile_name*'s home, else None. Silent on
+    host: a failing/absent detector must never print a confusing s6 warning to non-container users."""
     try:
-        from hermes_cli.service_manager import detect_service_manager, get_service_manager
-        if detect_service_manager() != "s6":
+        from hermes_cli.service_manager import get_service_manager, s6_serves_home
+        if not s6_serves_home(get_profile_dir(profile_name)):
             return None
         mgr = get_service_manager()
     except Exception:
@@ -1885,7 +1885,7 @@ def _maybe_register_gateway_service(profile_name: str) -> None:
     SHA-256-derived range [9200, 9800) as dead code), so two profiles that both leave the port at its
     default will both try to bind 8642 — give each profile a distinct ``API_SERVER_PORT`` in its ``.env``.
     """
-    mgr = _s6_runtime_manager()
+    mgr = _s6_runtime_manager(profile_name)
     if mgr is None:
         return
     try:
@@ -1898,7 +1898,7 @@ def _maybe_register_gateway_service(profile_name: str) -> None:
 
 def _maybe_unregister_gateway_service(profile_name: str) -> None:
     """Tear down a profile's s6 gateway service inside the container; host no-op, idempotent."""
-    mgr = _s6_runtime_manager()
+    mgr = _s6_runtime_manager(profile_name)
     if mgr is None:
         return
     try:
