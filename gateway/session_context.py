@@ -36,7 +36,6 @@ _SESSION_VARS = (
     _SESSION_CHAT_NAME, _SESSION_THREAD_ID, _SESSION_USER_ID, _SESSION_USER_ID_ALT,
     _SESSION_USER_NAME, _SESSION_SCOPE_ID, _SESSION_KEY, _SESSION_ID,
     _SESSION_UI_SESSION_ID, _SESSION_MESSAGE_ID, _SESSION_PROFILE,
-    _BROWSER_CONTROL_PRINCIPAL, _BROWSER_CONTROL_TRANSPORT_FAMILY,
     _BROWSER_CONTROL_PROVIDER, _BROWSER_CONTROL_SUBJECT, _CRON_SESSION, _SESSION_PARENT_CHAT_ID,
     _SESSION_RUN_GENERATION,
 ) = tuple(ContextVar(name, default=_UNSET) for name in (
@@ -45,7 +44,6 @@ _SESSION_VARS = (
     "HERMES_SESSION_USER_ID", "HERMES_SESSION_USER_ID_ALT", "HERMES_SESSION_USER_NAME",
     "HERMES_SESSION_SCOPE_ID", "HERMES_SESSION_KEY", "HERMES_SESSION_ID",
     "HERMES_UI_SESSION_ID", "HERMES_SESSION_MESSAGE_ID", "HERMES_SESSION_PROFILE",
-    "HERMES_BROWSER_CONTROL_PRINCIPAL", "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY",
     "HERMES_BROWSER_CONTROL_PROVIDER", "HERMES_BROWSER_CONTROL_SUBJECT",
     "HERMES_CRON_SESSION", "HERMES_SESSION_PARENT_CHAT_ID", "HERMES_SESSION_RUN_GENERATION",
 ))
@@ -177,8 +175,7 @@ def set_session_vars(
     platform: str = "", source: str = "", chat_id: str = "", chat_type: str = "",
     chat_name: str = "", thread_id: str = "", user_id: str = "", user_id_alt: str = "",
     user_name: str = "", scope_id: str = "", session_key: str = "", session_id: str = "",
-    message_id: str = "", profile: str = "", browser_control_principal: str = "",
-    browser_control_transport_family: str = "", browser_control_provider: str = "",
+    message_id: str = "", profile: str = "", browser_control_provider: str = "",
     browser_control_subject: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
     session_history_delivery: str | None = None,
@@ -199,8 +196,7 @@ def set_session_vars(
     values = (
         platform, source, chat_id, chat_type, chat_name, thread_id, user_id, user_id_alt,
         user_name, scope_id, session_key, session_id, ui_session_id, message_id, profile,
-        browser_control_principal, browser_control_transport_family, browser_control_provider,
-        browser_control_subject, cron_session, parent_chat_id,
+        browser_control_provider, browser_control_subject, cron_session, parent_chat_id,
         "",
     )
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
@@ -234,6 +230,7 @@ def reset_session_vars() -> None:
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _TURN_USER_MESSAGE.set("")
+    _API_TRANSFER_IDENTITY.set(("", "", ""))
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
     _runtime_cwd("clear_session_cwd")

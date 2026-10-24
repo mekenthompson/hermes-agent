@@ -1,6 +1,7 @@
 """Authenticated API runs stamp transfer provenance into the actual tool context."""
 
 import asyncio
+import copy
 import os
 from unittest.mock import MagicMock, patch
 
@@ -10,6 +11,27 @@ from aiohttp import web
 
 from tests.gateway.test_api_server_runs import _create_runs_app, _make_adapter
 from tools.registry import _current_tool_invocation_context
+
+
+def test_transfer_identity_requires_a_configured_matching_bearer():
+    from gateway.platforms import api_server_transfer
+
+    request = MagicMock()
+    request.headers = {"Authorization": "Bearer supplied-by-caller"}
+    adapter = _make_adapter()
+    adapter._api_key = ""
+    token = api_server_transfer.bind_authenticated_request(adapter, request, None)
+    try:
+        assert api_server_transfer.current() == ("", "")
+    finally:
+        api_server_transfer.clear_authenticated_request(token)
+
+    adapter._api_key = "different-configured-key"
+    token = api_server_transfer.bind_authenticated_request(adapter, request, None)
+    try:
+        assert api_server_transfer.current() == ("", "")
+    finally:
+        api_server_transfer.clear_authenticated_request(token)
 
 
 @pytest.mark.asyncio
@@ -187,6 +209,9 @@ async def test_native_api_transfer_provenance_revoked_after_key_rotation(api, ow
         assert response.status == 200, await response.text()
     saved = list_session_admissions(owner.db, session_id="selected-conversation", pending_only=False)[0]["payload"]
     assert saved["api_turn_v1"]["transfer_auth"]["principal"].startswith("principal:")
+    foreign = copy.deepcopy(saved)
+    foreign["api_turn_v1"]["transfer_auth"]["principal"] = api._derive_browser_control_principal("foreign")
+    assert prepare_api_execution(owner, SessionRef("default", "selected-conversation"), foreign)["transfer_auth"] is None
     api._api_key = "rotated-secret-long-enough"
     restored = prepare_api_execution(owner, SessionRef("default", "selected-conversation"), saved)
     assert restored["transfer_auth"] is None

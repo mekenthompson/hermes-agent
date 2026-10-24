@@ -2006,7 +2006,6 @@ def _bridge_terminal_config_to_env(_terminal_cfg: dict) -> None:
         "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
         "docker_image": "TERMINAL_DOCKER_IMAGE",
         "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
-        "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
         "modal_image": "TERMINAL_MODAL_IMAGE",
         "daytona_image": "TERMINAL_DAYTONA_IMAGE",
         "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
@@ -2174,7 +2173,6 @@ from gateway.cwd_placeholder import CWD_PLACEHOLDERS, resolve_placeholder_termin
 
 from gateway.config import (
     ChannelOverride, Platform, GatewayConfig, PlatformConfig, _getenv, load_gateway_config)
-from gateway.run_display import _format_duration
 from gateway.session import (
     AsyncSessionStore, SessionStore, SessionSource, SessionContext, build_session_key,
     profile_from_session_key_namespace)
@@ -2561,6 +2559,15 @@ def _build_document_context_note(
         f"of asking the user to paste the contents.]")
 
 
+def _format_duration(seconds: float) -> str:
+    total = max(0, round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
 async def _probe_audio_duration(path: str) -> Optional[str]:
     """Best-effort duration probe. Returns formatted MM:SS / HH:MM:SS, or None on failure."""
     ext = os.path.splitext(path)[1].lower()
@@ -2891,15 +2898,14 @@ from gateway.session_worker_construct import checkpoint_agent_kwargs as _checkpo
 
 
 def _resolve_gateway_model(config: dict | None = None) -> str:
-    """Read model from config.yaml (single source of truth), else temporary AIAgents (e.g. /compress)
-    use the hardcoded default, which fails under openai-codex."""
-    cfg = config if config is not None else _load_gateway_config()
-    model_cfg = cfg.get("model", {})
-    if isinstance(model_cfg, str):
-        return model_cfg
-    elif isinstance(model_cfg, dict):
-        return model_cfg.get("default") or model_cfg.get("model") or ""
-    return ""
+    """The profile's model when nothing else names one: config.yaml (single source of truth), else the
+    claimed welcome trial's. Temporary AIAgents (e.g. /compress) otherwise use the hardcoded default,
+    which fails under openai-codex."""
+    from hermes_cli.anon_auth import trial_model
+    model_cfg = (config if config is not None else _load_gateway_config()).get("model", {})
+    if isinstance(model_cfg, dict):
+        model_cfg = model_cfg.get("default") or model_cfg.get("model")
+    return (model_cfg if isinstance(model_cfg, str) else "") or trial_model()
 
 
 def _channel_override_lookup_keys(
@@ -3370,7 +3376,7 @@ class GatewayRunner(
     _profile_failed_platforms: Optional[dict[str, dict[Platform, asyncio.Task]]] = None
     _systemd_watchdog: Optional[Any] = None
     _startup_restore_in_progress: bool = False
-    _startup_warmup_task: Optional["asyncio.Task"] = None
+    _startup_warmup_task: Optional[asyncio.Task] = None
     _profile_service_stop: Optional[asyncio.Event] = None
     _profile_service_tasks: list[asyncio.Task] = []
 
@@ -3981,21 +3987,15 @@ class GatewayRunner(
         _adapter = (getattr(self, "adapters", None) or {}).get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
         source_profile = str(getattr(context.source, "profile", "") or "").strip()
-        if not source_profile and getattr(
-            getattr(self, "config", None), "multiplex_profiles", False
-        ):
+        multiplex = bool(getattr(getattr(self, "config", None), "multiplex_profiles", False))
+        if not source_profile and multiplex:
             from gateway.session_identity import identity_of
             identity = identity_of(context.source)
             source_profile = identity.runtime_profile if identity is not None else ""
-        if not source_profile and not getattr(
-            getattr(self, "config", None), "multiplex_profiles", False
-        ):
+        if not source_profile and not multiplex:
             source_profile = getattr(self, "_configured_runtime_profile_name", None) or ""
-        # #98619: an admitted API turn carries its session-id provenance in the admission settings,
-        # and its rebound browser-controller identity; every other platform leaves both undeclared.
         from gateway.session_api_turn import api_session_vars, bind_api_transfer_session
-        _api_vars = api_session_vars()
-        _history_delivery = _api_vars.pop("session_history_delivery", None)
+        _history_delivery = api_session_vars().get("session_history_delivery")
         return bind_api_transfer_session(set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -4014,10 +4014,10 @@ class GatewayRunner(
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=source_profile,
             async_delivery=_async_delivery,
-            cron_session="", session_history_delivery=_history_delivery, **_api_vars), context)
+            cron_session="", session_history_delivery=_history_delivery), context)
 
     def _set_turn_session_env(self, context: SessionContext, run_generation: int) -> list:
-        """Bind ordinary tool identity and the originating logical Stop generation together."""
+        """Bind the claimed turn generation with its tool identity."""
         from gateway.session_context import set_session_run_generation
         tokens = self._set_session_env(context)
         set_session_run_generation(run_generation)

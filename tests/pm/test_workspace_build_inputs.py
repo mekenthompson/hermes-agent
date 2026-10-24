@@ -284,43 +284,61 @@ def test_nested_dist_travels_but_root_dist_stays_out(tmp_path):
     assert not (destination / "dist").exists(), "root build output never enters the snapshot"
 
 
-def test_runtime_payload_dirs_stay_out_of_the_snapshot(tmp_path):
-    """The tools package is copied. The image tool-store entries inside it are not."""
+def test_tool_store_inside_a_package_stays_out_of_the_snapshot(tmp_path):
+    """Published store facts exclude payloads, not ordinary names that resemble them."""
     core = tmp_path / "core"
     tools = core / "tools"
-    (tools / "ffmpeg-9.0.1-linux-x64" / "bin").mkdir(parents=True)
-    (tools / "chromium-1208").mkdir()
-    (tools / "computer_use").mkdir()
+    (tools / "environments").mkdir(parents=True)
+    (tools / "wakewords").mkdir()
+    for entry in ("python-3.14.7-linux-x64", "chromium-1208", "fetch-abc123"):
+        (tools / entry / "bin").mkdir(parents=True)
+        (tools / entry / "bin" / "payload").write_text("BINARY\n", encoding="utf-8")
+    (tools / "ordinary-chromium-named").mkdir()
+    (tools / "ordinary-chromium-named" / "kept.txt").write_text("KEPT\n", encoding="utf-8")
+    (tools / "__init__.py").write_text("", encoding="utf-8")
+    (tools / "environments" / "__init__.py").write_text("", encoding="utf-8")
+    (tools / "wakewords" / "hey.onnx").write_text("DATA\n", encoding="utf-8")
+    (tools / "facts.json").write_text(json.dumps({"packages": {
+        "python": {"entry": "python-3.14.7-linux-x64"}, "chromium": {"entry": "chromium-1208"},
+        "venv": {"entry": None}, "escape": {"entry": "../environments"}}}), encoding="utf-8")
     (core / "pyproject.toml").write_text(
         '[project]\nname="core"\nversion="1"\nrequires-python=">=3.11"\n'
-        '[tool.setuptools.packages.find]\ninclude=["tools"]\n',
-        encoding="utf-8",
-    )
-    (tools / "ffmpeg-9.0.1-linux-x64" / "bin" / "ffmpeg").write_bytes(b"binary")
-    (tools / "chromium-1208" / "chrome").write_bytes(b"browser")
-    (tools / "approval.py").write_text("MODULE\n", encoding="utf-8")
-    (tools / "computer_use" / "__init__.py").write_text("PKG\n", encoding="utf-8")
-
+        '[tool.setuptools.packages.find]\ninclude=["tools", "tools.*"]\n', encoding="utf-8")
     destination = tmp_path / "stage"
     workspace._copy_core_inputs(core, destination)
+    assert (destination / "tools/environments/__init__.py").is_file()
+    assert (destination / "tools/wakewords/hey.onnx").read_text() == "DATA\n"
+    assert (destination / "tools/ordinary-chromium-named/kept.txt").read_text() == "KEPT\n"
+    for entry in ("python-3.14.7-linux-x64", "chromium-1208", "fetch-abc123"):
+        assert not (destination / "tools" / entry).exists()
 
-    assert (destination / "tools/approval.py").read_text(encoding="utf-8") == "MODULE\n"
-    assert (destination / "tools/computer_use/__init__.py").read_text(encoding="utf-8") == "PKG\n"
-    assert not (destination / "tools/ffmpeg-9.0.1-linux-x64").exists()
-    assert not (destination / "tools/chromium-1208").exists()
+
+def test_a_facts_file_without_published_entries_hides_nothing(tmp_path):
+    core = tmp_path / "core"
+    data = core / "agent" / "chromium-1208"
+    data.mkdir(parents=True)
+    (data / "kept.txt").write_text("KEPT\n", encoding="utf-8")
+    (core / "agent" / "facts.json").write_text('{"schema": 1}', encoding="utf-8")
+    (core / "pyproject.toml").write_text(
+        '[project]\nname="core"\nversion="1"\nrequires-python=">=3.11"\n'
+        '[tool.setuptools.packages.find]\ninclude=["agent"]\n', encoding="utf-8")
+    destination = tmp_path / "stage"
+    workspace._copy_core_inputs(core, destination)
+    assert (destination / "agent/chromium-1208/kept.txt").read_text() == "KEPT\n"
 
 
 def test_repair_snapshot_drops_runtime_payloads(tmp_path):
-    """A recorded workspace that already contains payloads must not copy them forward."""
+    """A recorded workspace already containing store payloads must not copy them forward."""
     replay = tmp_path / "replay"
-    (replay / "tools" / "node-26.7.0-linux-x64").mkdir(parents=True)
-    (replay / "tools" / "approval.py").write_text("MODULE\n", encoding="utf-8")
+    tools = replay / "tools"
+    (tools / "node-26.7.0-linux-x64").mkdir(parents=True)
+    (tools / "approval.py").write_text("MODULE\n", encoding="utf-8")
+    (tools / "facts.json").write_text(json.dumps({"packages": {
+        "node": {"entry": "node-26.7.0-linux-x64"}}}), encoding="utf-8")
     (replay / "pyproject.toml").write_text("name\n", encoding="utf-8")
     (replay / "uv.lock").write_text("lock\n", encoding="utf-8")
-
     fresh = tmp_path / "fresh"
     shutil.copytree(replay, fresh, symlinks=True, ignore=workspace._member_ignored)
-
-    assert (fresh / "tools/approval.py").read_text(encoding="utf-8") == "MODULE\n"
+    assert (fresh / "tools/approval.py").read_text() == "MODULE\n"
     assert (fresh / "pyproject.toml").is_file()
     assert not (fresh / "tools/node-26.7.0-linux-x64").exists()

@@ -5,6 +5,7 @@ owning profile's settings, a handoff to the parent, and the stale child pin.
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,6 +13,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner
+from tests.waiting import async_wait_until
 
 OWNERS = ["child", "handoff", "foreground", "live_handoff"]
 
@@ -203,6 +205,49 @@ async def test_process_watcher_follows_the_owning_profile(
         assert rig.adapter.send.await_count == expected_sends
 
     await _for_each_leg(rig, owner, surface_a, path, consume)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_completion_waits_for_profile_policy_before_flushing(monkeypatch, tmp_path, request,
+                                                                              private_db_probe_cleanup):
+    """A slow sibling policy check still belongs to the batch already awaiting delivery."""
+    rig = _build_rig(monkeypatch, tmp_path, request, True, "all")
+    runner = rig.runner
+    runner._completion_notification_batch_window = 0
+    original_scope = runner._completion_event_scope
+
+    async def consume(leg):
+        _transfer_to_parent(rig, leg)
+        leg.proc.output_buffer = "PROCESS_RESULT"
+        event = runner._build_process_completion_event(leg.watcher, leg.proc, leg.proc.id)
+        companion = {**event, "session_id": f"companion-{leg.name}-{leg.index}",
+                     "owner_task_id": "parent-owner", "output": "COMPANION_RESULT"}
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        @asynccontextmanager
+        async def delayed_scope(evt):
+            if evt is companion:
+                entered.set()
+                await release.wait()
+            async with original_scope(evt):
+                yield
+
+        runner._completion_event_scope = delayed_scope
+        first = asyncio.create_task(runner._enqueue_process_completion_notification("PROCESS_RESULT", event))
+        second = asyncio.create_task(runner._enqueue_process_completion_notification("COMPANION_RESULT", companion))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            # Wait until the zero-width flush reaches the pending preflight, then let it finish.
+            await async_wait_until(lambda: bool(runner._completion_batch_preflight_ready), timeout=2,
+                                   what="completion flush to await the sibling's profile check")
+        finally:
+            release.set()
+        assert await asyncio.gather(first, second) == [True, True]
+        assert len(rig.admitted) == 1
+        assert "PROCESS_RESULT" in rig.admitted[0][0].text
+        assert "COMPANION_RESULT" in rig.admitted[0][0].text
+
+    await _for_each_leg(rig, "live_handoff", True, "batch_child_first", consume)
 
 
 @pytest.mark.asyncio

@@ -105,7 +105,10 @@ def test_tool_context_carries_only_server_stamped_desktop_identity(monkeypatch, 
                 identity = _current_tool_invocation_context()
                 assert (identity.browser_control_provider,
                         identity.browser_control_subject) == expected
+                assert identity.platform == "desktop"
                 assert identity.session_key == key
+                assert identity.session_id == key
+                assert identity.ui_session_id == sid
             finally:
                 server._clear_session_context(tokens)
         finally:
