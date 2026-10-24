@@ -312,40 +312,48 @@ class TestRealProfileCdpLaunch:
         assert running is not None and running.owned and not running.ephemeral
 
     @pytest.mark.platforms("posix")
-    @pytest.mark.parametrize("live_browser_id", ["/devtools/browser/x", "/devtools/browser/other"])
-    def test_reattaches_to_surviving_chrome_instead_of_overlaying_its_profile(self, tmp_path, live_browser_id):
-        """A Chrome from an earlier Hermes process can survive holding the copy dir: attach to it (never
-        owned, so never killed), never re-run the snapshot over its open databases. A DevToolsActivePort left
-        by a crash whose port was recycled by ANOTHER CDP server (browser id mismatch) must not be attached
-        to; the normal launch path runs."""
-        import socket
+    @pytest.mark.parametrize("recycled_browser_id", [None, "/devtools/browser/other"])
+    def test_reattaches_to_surviving_chrome_instead_of_overlaying_its_profile(self, tmp_path, recycled_browser_id):
+        """Reuse a live owned listener; reject a recycled port after its owner dies."""
         import subprocess
+        from tests.tools.browser_launcher_fakes import install_fake_chromium_identity, kill_fake, write_fake_chromium
 
-        (tmp_path / "DevToolsActivePort").write_text("41000\n/devtools/browser/x\n", encoding="utf-8")
-        chrome = subprocess.Popen([*_SLEEPER, f"--user-data-dir={tmp_path}"])  # the survivor holding the dir
-        os.symlink(f"{socket.gethostname()}-{chrome.pid}", tmp_path / "SingletonLock")
-        if live_browser_id != "/devtools/browser/x":  # the crash case: the dir's browser is gone, its lock stale
-            chrome.kill()
-            chrome.wait(timeout=30)
-        version = Mock()
-        version.json.return_value = {"webSocketDebuggerUrl": f"ws://127.0.0.1:41000{live_browser_id}"}
+        script = write_fake_chromium(tmp_path / "chromium")
+        install_fake_chromium_identity(script)
+        chrome = subprocess.Popen([str(script), f"--user-data-dir={tmp_path}"],
+                                  env={**os.environ, "FAKE_CHROMIUM_BROWSER_PATH": "/devtools/browser/x"})
         try:
+            from tests.waiting import wait_until
+            wait_until(lambda: (tmp_path / "DevToolsActivePort").exists(), timeout=10)
+            port, marker_browser_path = (tmp_path / "DevToolsActivePort").read_text().splitlines()
+            assert marker_browser_path == "/devtools/browser/x"
+            if recycled_browser_id is not None:
+                kill_fake(chrome.pid, script)
+                chrome.wait(timeout=30)
+            version = Mock()
+            version.json.return_value = {
+                "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}{recycled_browser_id or marker_browser_path}"
+            }
+            from contextlib import nullcontext
+            endpoint_patch = (patch("requests.get", return_value=version)
+                              if recycled_browser_id is not None else nullcontext())
             with patch.object(bs_cloud, "use_real_profile", return_value=True), \
                  patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
                  patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
                  patch("hermes_cli.browser_connect.chromium_executable", return_value="/usr/bin/chrome"), \
                  patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(None, "boom")) as snapshot, \
-                 patch("requests.get", return_value=version):
+                 endpoint_patch:
                 cdp, err = rp.real_profile_cdp()
-            attached = launcher.get_browser(rp.real_profile_key())  # while the stand-in still runs
+            attached = launcher.get_browser(rp.real_profile_key())
         finally:
-            chrome.kill()
+            kill_fake(chrome.pid, script)
             chrome.wait(timeout=30)
-        if live_browser_id == "/devtools/browser/x":
-            assert (cdp, err) == ("ws://127.0.0.1:41000/devtools/browser/x", None)
+        if recycled_browser_id is None:
+            assert (cdp, err) == (f"ws://127.0.0.1:{port}{marker_browser_path}", None)
             snapshot.assert_not_called()
             assert attached is not None and attached.owned is False and attached.pid == chrome.pid
         else:
+            assert recycled_browser_id != marker_browser_path
             snapshot.assert_called_once()
             assert cdp is None and "boom" in err
 

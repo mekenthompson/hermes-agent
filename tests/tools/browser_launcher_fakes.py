@@ -42,7 +42,7 @@ FAKE_CHROMIUM = textwrap.dedent('''\
             os.unlink(lock)
         os._exit(0)
     signal.signal(signal.SIGTERM, on_term)
-    browser_path = f"/devtools/browser/{{os.getpid()}}"
+    browser_path = os.environ.get("FAKE_CHROMIUM_BROWSER_PATH", f"/devtools/browser/{{os.getpid()}}")
     class Version(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             body = json.dumps({{"webSocketDebuggerUrl": f"ws://127.0.0.1:{{port}}{{browser_path}}"}}).encode()
