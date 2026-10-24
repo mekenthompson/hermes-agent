@@ -441,6 +441,18 @@ def _isolate_hermes_home(_hermetic_environment):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_s6_container_identity(monkeypatch, tmp_path):
+    """Inside a Hermes s6 container ``/run/s6/container_environment/HERMES_HOME`` names the live
+    install; tests that fake the s6 branch must not resolve against it. Absent = no container
+    identity, the CI host's view. Tests of the guard point the seam at their own file."""
+    try:
+        from hermes_cli import service_manager as _sm
+    except Exception:
+        return
+    monkeypatch.setattr(_sm, "_S6_CONTAINER_HERMES_HOME", tmp_path / "no-s6-container-env", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _reset_foreground_exit_fence():
     """A test that drives a hard-exit path raises the one-way foreground-spawn fence; lower it after."""
     yield

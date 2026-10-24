@@ -226,6 +226,32 @@ def get_service_manager() -> ServiceManager:
 # on the next rescan.
 S6_DYNAMIC_SCANDIR = Path("/run/service")
 S6_SERVICE_PREFIX = "gateway-"
+# with-contenv exports this to every slot's run script: the one root the container's slots serve.
+_S6_CONTAINER_HERMES_HOME = Path("/run/s6/container_environment/HERMES_HOME")
+
+
+def s6_supervises_home(home: Path) -> bool:
+    """False when ``home`` is outside the root the container's s6 slots run under.
+
+    All slots share one scandir, so without this ``HERMES_HOME=/tmp/x hermes gateway stop`` inside
+    the container stops the container's own ``gateway-default``. A home that is neither that root nor
+    ``<root>/profiles/<name>`` has its own gateway (PID path), never a slot. Images without
+    s6-overlay's container environment keep slot dispatch.
+    """
+    try:
+        text = _S6_CONTAINER_HERMES_HOME.read_text(encoding="utf-8-sig").strip()
+    except (OSError, UnicodeError):
+        return True
+    if not text:
+        return True
+    root = Path(text).resolve()
+    home = Path(home).resolve()
+    return home == root or home.parent == root / "profiles"
+
+
+def s6_serves_home(home: Path) -> bool:
+    """True when the container's s6 slots supervise ``home``'s gateway (gate for every s6 verb)."""
+    return detect_service_manager() == "s6" and s6_supervises_home(home)
 
 
 def _profile_from_service(name: str) -> str:
