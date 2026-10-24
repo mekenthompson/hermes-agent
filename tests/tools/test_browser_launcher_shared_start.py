@@ -17,7 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.tools.browser_launcher_fakes import kill_fake, pids, write_fake_chromium
+from tests.tools.browser_launcher_fakes import (install_fake_chromium_identity, kill_fake, pids,
+                                               write_fake_chromium)
 from tests.waiting import wait_until
 from tools import browser_launcher as launcher
 
@@ -34,6 +35,9 @@ _RACER = textwrap.dedent("""\
     from tools import browser_launcher as launcher
     launcher.needs_chromium_sandbox_bypass = lambda: False
     exe, udd = sys.argv[1], sys.argv[2]
+    from pathlib import Path
+    from tests.tools.browser_launcher_fakes import install_fake_chromium_identity
+    install_fake_chromium_identity(Path(exe))
     print("ready", flush=True)
     sys.stdin.readline()
     browser, err = launcher.launch_chromium("profile:" + udd, executable=exe, user_data_dir=udd, ephemeral=False,
@@ -83,6 +87,7 @@ def test_an_owners_stop_cannot_fall_between_the_attach_probe_and_the_lease(tmp_p
     """The owner exits (its stop runs) right after this process found its browser live: the stop waits for the
     attach's lease and hands the browser over, so the endpoint this process got stays up."""
     script = write_fake_chromium(tmp_path / "chromium")
+    install_fake_chromium_identity(script)
     udd = tmp_path / "pinned-profile"
     owner = _racer(script, udd, dict(os.environ))
     owner.stdin.write("go\n")

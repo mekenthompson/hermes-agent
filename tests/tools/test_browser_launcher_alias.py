@@ -33,6 +33,9 @@ _HOLDER = textwrap.dedent("""\
     from tools import browser_launcher as launcher
     launcher.needs_chromium_sandbox_bypass = lambda: False
     exe, udd = sys.argv[1], sys.argv[2]
+    from pathlib import Path
+    from tests.tools.browser_launcher_fakes import install_fake_chromium_identity
+    install_fake_chromium_identity(Path(exe))
     browser, err = launcher.launch_chromium("profile:" + udd, executable=exe, user_data_dir=udd, ephemeral=False,
                                             headed=False, env=dict(os.environ), timeout=30)
     print(f"{browser.pid} {browser.owned}" if browser else f"ERR {err!r}", flush=True)

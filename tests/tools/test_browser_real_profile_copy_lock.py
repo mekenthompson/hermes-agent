@@ -32,6 +32,9 @@ _SESSION = textwrap.dedent("""\
     from tools import browser_lightpanda, browser_session, browser_session_cloud
     from tools import browser_session_real_profile as rp
     chrome, src, log, gate = sys.argv[1:5]
+    from pathlib import Path
+    from tests.tools.browser_launcher_fakes import install_fake_chromium_identity
+    install_fake_chromium_identity(Path(chrome))
     real_snapshot = bc.snapshot_real_profile
 
     def note(event):

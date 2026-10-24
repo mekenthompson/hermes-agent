@@ -71,6 +71,39 @@ def write_fake_chromium(path: Path) -> Path:
     return path
 
 
+def install_fake_chromium_identity(script: Path) -> None:
+    """Make only this Python test browser pass the launcher's Chromium executable check.
+
+    The fixture has a Python executable even though its argv names ``chromium``. Keep the
+    production identity check intact, and retain its owned-socket and CDP endpoint checks.
+    """
+    import psutil
+
+    from tools import browser_launcher as launcher
+
+    original = launcher._verified_local_chromium
+
+    def verified(pid: int, user_data_dir: str) -> bool:
+        if original(pid, user_data_dir):
+            return True
+        try:
+            process = psutil.Process(pid)
+            argv = process.cmdline()
+            uids = process.uids()
+            if (Path(process.exe()).resolve() != Path(sys.executable).resolve()
+                    or uids.real != os.getuid() or uids.effective != os.geteuid()
+                    or len(argv) < 3 or argv[1] != str(script)
+                    or any(arg.startswith("--type=") for arg in argv)):
+                return False
+        except (OSError, psutil.Error):
+            return False
+        profiles = [arg.partition("=")[2] for arg in argv if arg.startswith("--user-data-dir=")]
+        return (len(profiles) == 1 and os.path.isabs(profiles[0])
+                and launcher._same_profile(profiles[0], user_data_dir))
+
+    launcher._verified_local_chromium = verified
+
+
 def pids(udd: Path, name: str) -> list[int]:
     """The pids the fake noted in ``<udd>/<name>`` (``spawns`` or ``launches``)."""
     try:

@@ -15,7 +15,8 @@ import subprocess
 
 import pytest
 
-from tests.tools.browser_launcher_fakes import kill_fake, pids, write_fake_chromium
+from tests.tools.browser_launcher_fakes import (install_fake_chromium_identity, kill_fake, pids,
+                                               write_fake_chromium)
 from tests.waiting import wait_until
 from tools import browser_launcher as launcher
 
@@ -32,6 +33,7 @@ def _start_fake(script, udd) -> subprocess.Popen:
 
 def test_a_paused_shared_browser_is_refused_then_attached_once_it_answers_again(tmp_path):
     script = write_fake_chromium(tmp_path / "chromium")
+    install_fake_chromium_identity(script)
     udd = tmp_path / "pinned-profile"
     browser = _start_fake(script, udd)
     port_file = (udd / "DevToolsActivePort").read_text()
