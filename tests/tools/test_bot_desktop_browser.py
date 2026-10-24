@@ -139,8 +139,15 @@ def _devtools_server():
     """A loopback server answering ``/json/version`` like the dock's Chromium (browser id ``abc``)."""
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            port = self.server.server_address[1]
-            body = json.dumps({"webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/abc"}).encode()
+            if self.path != "/json/version":
+                self.send_error(404)
+                return
+            if self.server.redirect:
+                self.send_response(302)
+                self.send_header("Location", "http://foreign.example/json/version")
+                self.end_headers()
+                return
+            body = json.dumps({"webSocketDebuggerUrl": self.server.endpoint}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -151,6 +158,8 @@ def _devtools_server():
             pass
 
     server = HTTPServer(("127.0.0.1", 0), Handler)
+    server.endpoint = f"ws://127.0.0.1:{server.server_port}/devtools/browser/abc"
+    server.redirect = False
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
@@ -219,8 +228,28 @@ def test_recovery_refuses_unverified_profile_owner(tmp_path, chromium_process, c
 
 
 @pytest.mark.platforms("linux")
+def test_cdp_probe_rejects_proxy_redirect_and_foreign_endpoint(tmp_path, monkeypatch, chromium_process):
+    from tools import browser_launcher as launcher
+
+    server = _devtools_server()
+    try:
+        _fake_running_instance(tmp_path, os.getpid(), server.server_port)
+        monkeypatch.setenv("HTTP_PROXY", "http://foreign.example:1234")
+        assert launcher.running_instance(str(tmp_path)) is not None
+        server.endpoint = f"ws://127.0.0.1:{server.server_port}@foreign.example/devtools/browser/abc"
+        assert launcher.running_instance(str(tmp_path)) is None
+        server.endpoint = f"ws://127.0.0.1:{server.server_port}/devtools/browser/abc"
+        server.redirect = True
+        assert launcher.running_instance(str(tmp_path)) is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("unverified", ["other_listener", "wrong_profile"])
 def test_native_session_recovers_marker_loss_and_refuses_unverified_occupied_profile(
-    tmp_path, monkeypatch, chromium_process,
+    tmp_path, monkeypatch, chromium_process, unverified,
 ):
     """The session route used by browser_exec inherits the launcher's safe attach decision."""
     from tools import browser_launcher as launcher, browser_session as session
@@ -244,7 +273,10 @@ def test_native_session_recovers_marker_loss_and_refuses_unverified_occupied_pro
         assert info["shared_profile"] is True
 
         launcher._browsers.clear()
-        chromium_process["owns_listener"] = False
+        if unverified == "other_listener":
+            chromium_process["owns_listener"] = False
+        else:
+            chromium_process["profile"] = str(tmp_path / "other")
         monkeypatch.setattr(launcher, "_UNRESPONSIVE_WAIT_S", 0)
         with pytest.raises(RuntimeError, match="in use by Chromium"):
             session._create_chromium_session("occupied")

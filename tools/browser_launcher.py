@@ -318,8 +318,8 @@ def _foreign_holder(user_data_dir: str) -> Optional[int]:
     """The ``SingletonLock`` pid of a Chromium on ``user_data_dir`` that runs in an environment this process cannot
     verify, else None. Foreign: the lock is not a live process here whose argv names the dir, and it was written
     under another hostname (another host or container; Chromium too refuses such a lock) or names the browser
-    of a launch record from another PID namespace. A lock of this hostname with no such record is stale (this
-    environment's crashed browser): Chromium itself takes it over, and so does a launch."""
+    of a launch record from another PID namespace. A lock of this hostname with no such record goes through
+    the local holder check: a live but unverifiable PID is refused; a dead PID is stale."""
     owner = _singleton_owner(user_data_dir)
     if owner is None:
         return None
@@ -407,17 +407,18 @@ def _devtools_endpoint_live(port: int, path: str) -> bool:
 def _verified_local_chromium(pid: int, user_data_dir: str) -> bool:
     """The lock owner is this user's Chromium browser process for precisely this profile."""
     import psutil
-    if not hasattr(os, "getuid"):
-        return False
     try:
         process = psutil.Process(pid)
-        uids = process.uids()
+        if hasattr(os, "getuid"):
+            uids = process.uids()
+            same_user = uids.real == os.getuid() and uids.effective == os.geteuid()
+        else:
+            same_user = process.username() == psutil.Process(os.getpid()).username()
         argv = process.cmdline()
-        exe = os.path.basename(process.exe()).lower()
+        exe = os.path.basename(process.exe()).lower().removesuffix(".exe")
     except (OSError, psutil.Error):
         return False
-    if (uids.real != os.getuid() or uids.effective != os.geteuid()
-            or exe not in {"chrome", "chromium", "chromium-browser", "google-chrome",
+    if (not same_user or exe not in {"chrome", "chromium", "chromium-browser", "google chrome", "google-chrome",
                            "google-chrome-stable", "chrome-headless-shell", "chromium-headless-shell"}
             or any(arg.startswith("--type=") for arg in argv)):
         return False
@@ -546,10 +547,13 @@ def _attach_foreign(key: str, user_data_dir: str, home_key: str, pid: int) -> Op
 
 
 def _live_local_holder(user_data_dir: str) -> Optional[int]:
-    """Pid of the live Chromium of this environment holding ``user_data_dir`` (its ``SingletonLock`` names a live
-    process whose argv carries the dir), else None: no browser, or a stale lock a launch may take over."""
+    """A live PID named by this profile's lock, even if its identity cannot be proven.
+
+    A recycled PID can keep a stale lock blocked until the operator removes it; launching over a
+    genuinely occupied profile would erase its marker, so ambiguous occupancy fails closed.
+    """
     pid = _singleton_pid(user_data_dir)
-    return pid if pid is not None and _pid_alive(pid) and _cmdline_names_dir(pid, user_data_dir) else None
+    return pid if pid is not None and _pid_alive(pid) else None
 
 
 def _attach_local(key: str, user_data_dir: str, home_key: str,
@@ -1018,8 +1022,9 @@ def _cmdline_names_dir(pid: int, user_data_dir: str) -> bool:
         argv = psutil.Process(pid).cmdline()
     except Exception:  # health: allow BLE001 -- unreadable identity fails closed (no kill)
         return False
-    return any(tok.startswith("--user-data-dir=") and _same_profile(tok.split("=", 1)[1], user_data_dir)
-               for tok in argv)
+    values = [tok.split("=", 1)[1] for tok in argv if tok.startswith("--user-data-dir=")]
+    values += [argv[i + 1] for i, tok in enumerate(argv[:-1]) if tok == "--user-data-dir"]
+    return len(values) == 1 and _same_profile(values[0], user_data_dir)
 
 
 def _inside_ephemeral_root(user_data_dir: str, home: Optional[str]) -> bool:
