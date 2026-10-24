@@ -297,11 +297,11 @@ def test_fork_image_workflow_gates_build_and_publish_on_the_docker_lane():
         assert scope not in detect_block
 
 
-def test_fork_python_lane_runs_eight_slices():
+def test_fork_python_lane_runs_sixteen_slices():
     text = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
     line = next(x for x in text.splitlines() if "matrix:" in x)
     fork = json.loads(re.findall(r"'(\{.*?\})'", line)[0])
-    assert fork == {"slice": [1, 2, 3, 4, 5, 6, 7, 8], "slices": [8]}
+    assert fork == {"slice": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], "slices": [16]}
 
 
 @pytest.mark.parametrize(
