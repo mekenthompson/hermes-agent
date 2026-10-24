@@ -417,7 +417,7 @@ def _verified_local_chromium(pid: int, user_data_dir: str) -> bool:
         process = psutil.Process(pid)
         if hasattr(os, "getuid"):
             uids = process.uids()
-            same_user = uids.real == os.getuid() and uids.effective == os.geteuid()
+            same_user = uids.real == os.getuid() and uids.effective == os.geteuid()  # windows-footgun: ok — guarded above
         else:
             same_user = process.username() == psutil.Process(os.getpid()).username()
         argv = process.cmdline()
