@@ -142,7 +142,12 @@ class ForkImageWorkflowTests(unittest.TestCase):
         node = lock["packages"]["node"]
         vulnerable = "sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73"
         self.assertNotIn(vulnerable, dockerfile + lock_text)
-        self.assertEqual(node["version"], "26.7.0")
+        # Preserve the security floor without rejecting reviewed upstream updates.
+        self.assertGreaterEqual(tuple(map(int, node["version"].split("."))), (26, 7, 0))
+        self.assertIn(
+            f'/v{node["version"]}/node-v{node["version"]}-linux-x64.tar.xz',
+            node["artifacts"]["linux-x64"]["url"],
+        )
         self.assertTrue(node["artifacts"])
         for artifact in node["artifacts"].values():
             self.assertRegex(artifact["sha256"], r"^[0-9a-f]{64}$")

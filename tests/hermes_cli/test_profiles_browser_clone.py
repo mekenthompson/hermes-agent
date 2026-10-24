@@ -11,7 +11,7 @@ import psutil
 import pytest
 
 from hermes_cli.profiles import create_profile
-from tools.bot_desktop.browser import running_instance_cdp_port
+from tools.browser_launcher import running_instance
 
 
 @pytest.mark.platforms("linux")
@@ -66,13 +66,13 @@ def test_clone_all_does_not_attach_to_the_source_profiles_live_browser(tmp_path,
             (browser_profile / "DevToolsActivePort").write_text(
                 f"{port}\n/devtools/browser/source\n", encoding="utf-8")
             (browser_profile / "SingletonLock").symlink_to(f"{socket.gethostname()}-{os.getpid()}")
-            assert running_instance_cdp_port(str(browser_profile)) == port
+            assert running_instance(str(browser_profile))[0] == port
 
             profile_dir = create_profile("coder", clone_all=True, no_alias=True)
             cloned_browser = profile_dir / "bot-desktop" / "browser-profile"
 
-            assert running_instance_cdp_port(str(cloned_browser)) is None
-            assert running_instance_cdp_port(str(browser_profile)) == port
+            assert running_instance(str(cloned_browser)) is None
+            assert running_instance(str(browser_profile))[0] == port
         finally:
             listener.shutdown()
             worker.join()

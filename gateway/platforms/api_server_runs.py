@@ -2,7 +2,6 @@
 
 import asyncio
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -537,8 +536,7 @@ class _RunLaunch:
     session_history_delivery: bool
     agent_kwargs: dict  # ``_create_agent`` keyword arguments (prompt, model overrides, route, room policy)
     request_profile: Any
-    browser_control_principal: Any
-    browser_control_transport_family: Any
+    api_transfer_family: str = ""
     turn_author: Optional[dict[str, Any]] = None  # memory-attribution label only; grants nothing
     api_transfer_principal: str = ""
     admission: Any = None
@@ -820,12 +818,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
                 self._run_statuses, self._run_owners)
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
-    expected_api_key = self._expected_api_key()
-    authorization = request.headers.get("Authorization", "")
-    bearer = authorization[7:].strip() if authorization.startswith("Bearer ") else ""
-    api_transfer_principal = (
-        self._derive_browser_control_principal(_api_server._api_request_profile.get() or "default")
-        if expected_api_key and hmac.compare_digest(bearer.encode(), expected_api_key.encode()) else "")
+    api_transfer_principal, api_transfer_family = _api_server._transfer.current()
     launch = _RunLaunch(
         self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
         conversation_history, session_history_delivery,
@@ -834,9 +827,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
             **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
         request_profile=_api_server._api_request_profile.get(),
-        browser_control_principal=_api_server._api_request_browser_control_principal.get(),
-        browser_control_transport_family=(_api_server._api_request_browser_control_transport_family.get() or
-                                          self._browser_control_transport_family(request)),
+        api_transfer_family=api_transfer_family,
         turn_author=turn_author, api_transfer_principal=api_transfer_principal,
         walked_from=walked_from if session_id == stored_session_id else None)
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
@@ -923,8 +914,6 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             session_tokens = self._bind_api_server_session(
                 chat_id=session_id or "", session_key=run.approval_session_key, session_id=session_id or "",
                 profile=run.request_profile or "",
-                browser_control_principal=run.browser_control_principal,
-                browser_control_transport_family=run.browser_control_transport_family,
                 # #98619 audited opt-in: the /v1/runs session id is wake-capable only when its
                 # own continuation path reloads session history — an explicit body/chained
                 # session id or a declared X-Hermes-Session-Key conversation (both load
@@ -940,7 +929,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             if run.api_transfer_principal:
                 set_turn_user_message(run.user_message)
                 set_api_transfer_identity(run.api_transfer_principal,
-                                          run.browser_control_transport_family,
+                                          run.api_transfer_family,
                                           run.session_id)
             if run.agent_kwargs["room_dispatch"] is not None:
                 policy = RoomExecutionPolicy.from_mapping(run.agent_kwargs["room_execution_policy"] or {})

@@ -26,9 +26,7 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.base_exec_approval import ea_default_reason_text
-from gateway.run_turn_runner_approval_settle import _renders_exec_approval_buttons
 from gateway.turn_context import TurnContext
-from gateway.run_turn_runner_titles import SessionTitleCallbacks
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
 
@@ -50,9 +48,18 @@ _CARD_DESTINATION_REFUSALS = {
     "slack task_card requires a thread anchor (Slack streams are thread replies)",
 }
 
-# Upper bound on the internal-plugin launch fence.  The loop-side promotion poller ticks
-# every 50ms; anything approaching this budget means the tracker task died or was cancelled.
+# The loop-side promotion task must release this gate before executor work starts.
 EXECUTION_LAUNCH_GATE_TIMEOUT = 30.0
+
+
+def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
+    """True when the adapter class renders native approval buttons. BasePlatformAdapter subclasses
+    say so through ``supports_exec_approval_buttons``; anything else (test doubles, relay-style
+    duck types) counts when it defines ``send_exec_approval`` itself."""
+    probe = getattr(adapter_cls, "supports_exec_approval_buttons", None)
+    if callable(probe) and issubclass(adapter_cls, BasePlatformAdapter):
+        return bool(probe())
+    return getattr(adapter_cls, "send_exec_approval", None) is not None
 
 
 # Rendered on a native clarify card whose wait ended without a click (mirrors the notice the
@@ -67,6 +74,10 @@ _LEDGER_PASSTHROUGH_KEYS = (
     "estimated_cost_usd", "cost_status", "cost_source", "cache_read_tokens", "cache_write_tokens",
     "reasoning_tokens", "total_tokens", "provider", "turn_exit_reason", "service_tier",
 )
+# Beside ``failure_reason`` and ``error``: what ``agent.error_surface.build_error_surface_from_result`` reads,
+# so the authority's ``message.complete`` carries the same error card the TUI path builds;
+# ``usage_window_message`` also marks a window-plan refusal for the chat rewording.
+_FAILURE_DESCRIPTOR_KEYS = ("free_tier", "failure_retryable", "failure_resets_at", "usage_window_message")
 
 
 def _finite_viewer_turn() -> bool:
@@ -107,7 +118,7 @@ class _ExecApprovalDeclined(RuntimeError):
     """
 
 
-from gateway.run_turn_progress import GatewayTurnProgressMixin
+from gateway.run_turn_runner_titles import SessionTitleCallbacks
 from gateway.session_execution import GatewaySessionAgentMixin
 
 
@@ -164,7 +175,7 @@ def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, 
     return t("gateway.errors.no_credentials"), auth_permanent, False
 
 
-class TurnRunner(SessionTitleCallbacks, GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+class TurnRunner(SessionTitleCallbacks, GatewaySessionAgentMixin):
     """Per-turn collaborator carrying ``GatewayRunner._run_agent_inner``'s tool-progress callbacks."""
 
     # ``None`` is a legitimate state: a turn with no owning session authority (messaging
@@ -322,10 +333,20 @@ class TurnRunner(SessionTitleCallbacks, GatewayTurnProgressMixin, GatewaySession
         from gateway.warning_notifications import is_diagnostic_notice, render_notification
         if self._ctx.mute_notification_reply or not self._status_live():
             return
+        # A usage-window limit line repeats the turn's own reply, which carries the sentence and the
+        # switch button (a chat message cannot be cleared, so it would only pile up). The 90% heads-up
+        # is a desktop / terminal nudge; in a chat it is noise (/usage has the numbers).
+        key = str(getattr(notice, "key", "") or "")
+        if key == "credits.window_limit" or key.startswith("credits.window."):
+            return
         diagnostic = is_diagnostic_notice(notice)
         def present():
             try:
                 line = render_notice_line(notice)
+                if key.startswith("credits."):
+                    # Window plans (e.g. a paused plan's line): a chat's /topup has no credits settings.
+                    from agent.plan_limits import portal_wording
+                    line = portal_wording(line)
             except Exception:
                 logger.debug("render_notice_line failed", exc_info=True)
                 return
@@ -961,6 +982,10 @@ class TurnRunner(SessionTitleCallbacks, GatewayTurnProgressMixin, GatewaySession
                 kwargs["persist_user_display_metadata"] = ctx.persist_user_display_metadata
             if ctx.moa_config is not None:
                 kwargs["moa_config"] = ctx.moa_config
+            from gateway.session_onboarding import arm_onboarding_turn
+            prelude = arm_onboarding_turn(agent, self._approval_owner, agent_history)
+            if prelude is not None and _accepts_keyword(agent.run_conversation, "prelude"):
+                kwargs["prelude"] = prelude
             if persist_user_timestamp_override is not None:
                 kwargs["persist_user_timestamp"] = persist_user_timestamp_override
             # The RAW inbound id (not event_message_id, the reply anchor) rides the persisted user
@@ -1149,13 +1174,7 @@ class TurnRunner(SessionTitleCallbacks, GatewayTurnProgressMixin, GatewaySession
         return final_response + "\n" + "\n".join(unique_tags)
 
     def _await_execution_launch(self, execution_id: str | None) -> bool:
-        """Launch fence for a gateway turn: True iff promotion allowed launch.
-
-        A loop-side promotion decides this real thread boundary, so the wait is bounded: the
-        setter lives in a cancellable task (the tracker is cancelled unconditionally during
-        turn cleanup), and an unbounded wait() parks this executor thread for the process
-        lifetime, which shutdown/drain can never quiesce.  A timeout is fail-closed (denied).
-        """
+        """Start only after promotion allows this claimed execution to launch."""
         ctx = self._ctx
         if ctx.execution_launch_gate is None:
             return True
@@ -1169,13 +1188,23 @@ class TurnRunner(SessionTitleCallbacks, GatewayTurnProgressMixin, GatewaySession
         return bool(ctx.execution_launch_allowed)
 
     def run_sync(self):
-        from gateway.session_policy import bind_turn_workspace, policy_for_source, policy_scope
+        from contextlib import ExitStack
+        from gateway.session_policy import bind_turn_workspace, policy_for_source, policy_scope, workspace_unavailable_result
         from gateway.session_api_turn import api_policy_scope
         from gateway.session_authorities import active_authority
+        from hermes_state_runtime import RuntimeStoreError
         policy = policy_for_source(self._runner, self._ctx.source)
-        with policy_scope(policy, authority=active_authority(self._runner)), api_policy_scope():
-            bind_turn_workspace(policy, self._ctx.session_id)
-            result = self._run_sync_scoped()
+        with ExitStack() as scope:
+            try:
+                scope.enter_context(policy_scope(policy, authority=active_authority(self._runner)))
+            except RuntimeStoreError as exc:
+                if exc.reason != 'workspace_unavailable':
+                    raise
+                result = workspace_unavailable_result(policy)
+            else:
+                scope.enter_context(api_policy_scope())
+                bind_turn_workspace(policy, self._ctx.session_id)
+                result = self._run_sync_scoped()
             from gateway.session_results import execution_result
             captured = execution_result.get()
             if captured is not None:
@@ -1187,38 +1216,6 @@ class TurnRunner(SessionTitleCallbacks, GatewayTurnProgressMixin, GatewaySession
                     if cli_fields else result
                 )
             return result
-
-    def _run_with_local_viewer_sinks(self, agent, reused_cached_agent):
-        """Run the prepared turn and restore its per-turn viewer sinks on every exit."""
-        ctx = self._ctx
-        from gateway.run_turn_progress import local_viewer_turn
-        local_sinks = None
-        if local_viewer_turn(self) and not ctx.mute_notification_reply:
-            # Per turn on the shared cached agent: installed here, restored when the run returns.
-            from gateway import local_viewer_events
-            local_sinks = local_viewer_events.wire(self, agent)
-            from gateway.session_usage import TURN_BASE_ATTR
-            setattr(agent, TURN_BASE_ATTR, int(getattr(agent, "session_output_tokens", 0) or 0))
-        try:
-            agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
-            persist_msg, persist_ts = self._prepare_turn_message(agent_history)
-            compressions = getattr(getattr(agent, "context_compressor", None), "compression_count", None)
-            from gateway.session_cli_turn import run_classic_cli_turn
-            from gateway.session_secret_prompt import secret_prompt_scope
-            from gateway.session_sudo_prompt import sudo_prompt_scope
-            with sudo_prompt_scope(self, agent), secret_prompt_scope(self, agent):
-                result = run_classic_cli_turn(self, lambda: self._run_conversation_with_approval(
-                    agent, agent_history, observed_group_context, persist_msg, persist_ts))
-        finally:
-            if local_sinks is not None:
-                from gateway import local_viewer_events
-                local_viewer_events.restore(agent, local_sinks)
-                from gateway.session_usage import publish_usage
-                publish_usage(self, agent, record=True)  # turn end: the final API call's counters
-                from gateway.session_local_inventory import publish_settled_info
-                publish_settled_info(self, agent)
-        persisted_turn = _persisted_turn(agent, agent_history, result, compressions)
-        return result, agent_history, history_media_paths, persisted_turn, local_sinks
 
     def _run_sync_scoped(self):
         """Executor-thread body of the turn; returns the gateway result dict.
@@ -1317,12 +1314,37 @@ class TurnRunner(SessionTitleCallbacks, GatewayTurnProgressMixin, GatewaySession
             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
             agent._pending_fallback_notice = pending_fallback_notice
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
-        execution_id = ctx.internal_plugin_execution_id
-        if not self._await_execution_launch(execution_id):
+        if not self._await_execution_launch(ctx.internal_plugin_execution_id):
             return {"final_response": "", "messages": [], "api_calls": 0,
                     "tools": [], "completed": True, "interrupted": True}
-        result, agent_history, history_media_paths, persisted_turn, local_sinks = (
-            self._run_with_local_viewer_sinks(agent, reused_cached_agent))
+        from gateway.run_turn_progress import local_viewer_turn
+        local_sinks = None
+        if local_viewer_turn(self) and not ctx.mute_notification_reply:
+            # Per turn on the shared cached agent: installed here, restored when the run returns.
+            from gateway import local_viewer_events
+            local_sinks = local_viewer_events.wire(self, agent)
+            from gateway.session_usage import TURN_BASE_ATTR
+            setattr(agent, TURN_BASE_ATTR, int(getattr(agent, "session_output_tokens", 0) or 0))
+        try:
+            agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
+            persist_msg, persist_ts = self._prepare_turn_message(agent_history)
+            compressions = getattr(getattr(agent, "context_compressor", None), "compression_count", None)
+            from gateway.session_cli_turn import run_classic_cli_turn
+            from gateway.session_secret_prompt import secret_prompt_scope
+            from gateway.session_sudo_prompt import sudo_prompt_scope
+            from gateway.session_vault_prompt import vault_prompt_scope
+            with sudo_prompt_scope(self, agent), secret_prompt_scope(self, agent), vault_prompt_scope(self, agent):
+                result = run_classic_cli_turn(self, lambda: self._run_conversation_with_approval(
+                    agent, agent_history, observed_group_context, persist_msg, persist_ts))
+        finally:
+            if local_sinks is not None:
+                from gateway import local_viewer_events
+                local_viewer_events.restore(agent, local_sinks)
+                from gateway.session_usage import publish_usage
+                publish_usage(self, agent, record=True)  # turn end: the final API call's counters
+                from gateway.session_local_inventory import publish_settled_info
+                publish_settled_info(self, agent)
+        persisted_turn = _persisted_turn(agent, agent_history, result, compressions)
         self._finish_stream_consumer(result, agent_history, stream_consumer)
         if _finite_viewer_turn() and getattr(agent, "_codex_session", None) is not None:
             # The classic `chat -q` process exit bounded the codex app-server child; a finite turn
@@ -1343,6 +1365,8 @@ class TurnRunner(SessionTitleCallbacks, GatewayTurnProgressMixin, GatewaySession
             "input_tokens": getattr(agent, "session_prompt_tokens", 0) if has_comp else 0,
             "output_tokens": getattr(agent, "session_completion_tokens", 0) if has_comp else 0,
             "model": getattr(agent, "model", None) if agent else None,
+            # Most failed results name no provider; the error card's sign-in / update-key action needs it.
+            "provider": getattr(agent, "provider", None) if agent else None,
             "context_length": (getattr(comp, "context_length", 0) or 0) if has_comp else 0,
             # The rest of the `-z --usage-file` ledger (hermes_cli/oneshot._USAGE_KEYS): a finite
             # viewer reads the committed result over `prompt.receipt`, so the projection must keep
@@ -1357,9 +1381,12 @@ class TurnRunner(SessionTitleCallbacks, GatewayTurnProgressMixin, GatewaySession
         common = {
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
+            # Usage-window limit (agent/plan_limits.py): the gateway offers the plan's model as a button.
+            "usage_limit": result.get("usage_limit"),
             "partial": result.get("partial", False), "completed": result.get("completed"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),
+            **{key: result[key] for key in _FAILURE_DESCRIPTOR_KEYS if key in result},
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
             "tools": ctx.tools_holder[0] or [],
