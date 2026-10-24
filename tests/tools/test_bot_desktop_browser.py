@@ -208,6 +208,22 @@ def test_missing_or_corrupt_marker_recovers_only_the_owner_endpoint(tmp_path, ch
 
 
 @pytest.mark.platforms("linux")
+@pytest.mark.parametrize("exe", ["/usr/bin/chromium", "/usr/bin/brave-browser", "/usr/bin/microsoft-edge"])
+def test_supported_chromium_family_profiles_recover(tmp_path, chromium_process, exe):
+    from tools import browser_launcher as launcher
+
+    server = _devtools_server()
+    try:
+        chromium_process["exe"] = exe
+        (tmp_path / "SingletonLock").symlink_to(f"{socket.gethostname()}-{os.getpid()}")
+        assert launcher.running_instance(str(tmp_path)) == (
+            server.server_port, "/devtools/browser/abc", os.getpid())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.platforms("linux")
 @pytest.mark.parametrize("change", ["wrong_exe", "wrong_profile", "wrong_uid", "other_listener"])
 def test_recovery_refuses_unverified_profile_owner(tmp_path, chromium_process, change):
     from tools import browser_launcher as launcher

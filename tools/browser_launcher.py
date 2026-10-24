@@ -64,6 +64,12 @@ _MIN_FIRST_LAUNCH_TIMEOUT_S = 120
 _UNRESPONSIVE_WAIT_S = 10  # how long a live browser whose endpoint went silent (paused, swapped out) is waited for
 _POLL_INTERVAL_S = 0.1
 _STDERR_TAIL_CHARS = 1500
+_CHROMIUM_EXECUTABLE_NAMES = frozenset({
+    "chrome", "chromium", "chromium-browser", "google chrome", "google-chrome",
+    "google-chrome-stable", "chrome-headless-shell", "chromium-headless-shell",
+    "brave", "brave browser", "brave-browser", "brave-browser-stable", "brave origin",
+    "brave-origin", "microsoft edge", "microsoft-edge", "microsoft-edge-stable", "msedge",
+})
 
 
 @dataclass
@@ -418,9 +424,7 @@ def _verified_local_chromium(pid: int, user_data_dir: str) -> bool:
         exe = os.path.basename(process.exe()).lower().removesuffix(".exe")
     except (OSError, psutil.Error):
         return False
-    if (not same_user or exe not in {"chrome", "chromium", "chromium-browser", "google chrome", "google-chrome",
-                           "google-chrome-stable", "chrome-headless-shell", "chromium-headless-shell"}
-            or any(arg.startswith("--type=") for arg in argv)):
+    if not same_user or exe not in _CHROMIUM_EXECUTABLE_NAMES or any(arg.startswith("--type=") for arg in argv):
         return False
     profiles = [arg.partition("=")[2] for arg in argv if arg.startswith("--user-data-dir=")]
     profiles += [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "--user-data-dir"]
