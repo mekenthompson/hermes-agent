@@ -444,6 +444,31 @@ class ToolCallGuardrailController:
             return self._decide("warn", "idempotent_no_progress_warning", tool_name, repeat_count, signature)
         return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
 
+    def after_refusal(
+        self, tool_name: str, args: Mapping[str, Any] | None, result: str,
+    ) -> ToolGuardrailDecision:
+        """Count policy refusals without charging execution caps or recording progress.
+
+        Rejected calls never reach before_call, so apply the failure ceiling here.
+        Unlike a red terminal command, a refused command is not diagnostic execution.
+        """
+        decision = self.after_call(tool_name, args, result, failed=True)
+        signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        exact_count = self._exact_failure_counts.get(signature, 0)
+        same_count = self._same_tool_failure_counts.get(tool_name, 0)
+        if self.config.hard_stop_enabled:
+            if exact_count >= self.config.exact_failure_block_after:
+                decision = self._decide("halt", "repeated_exact_failure_block", tool_name, exact_count, signature)
+            elif same_count >= self.config.same_tool_failure_halt_after:
+                decision = self._decide("halt", "same_tool_failure_halt", tool_name, same_count, signature)
+        if decision.action in {"warn", "halt"}:
+            return self._decide(
+                decision.action, decision.code, tool_name, decision.count, signature,
+                message=f"Policy refused {tool_name} repeatedly; the rejected calls did not execute. "
+                "Report the refusal instead of retrying it or switching tools to bypass it.",
+            )
+        return decision
+
     def _is_idempotent(self, tool_name: str) -> bool:
         return tool_name not in self.config.mutating_tools and tool_name in self.config.idempotent_tools
 

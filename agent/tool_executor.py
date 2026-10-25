@@ -52,6 +52,7 @@ from agent.tool_dispatch_helpers import (
     _append_subdir_hint_to_multimodal,
     _context_pruned_argument_paths,
     _plan_tool_batch_segments,
+    record_persisted_path_for_stub,
     make_tool_result_message,
 )
 from tools.terminal_tool_lifecycle import get_active_env
@@ -59,7 +60,6 @@ from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
-    extract_persisted_path,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 from hermes_cli.observability.shared_metrics_efficiency import note_tool_result, record_tool_batch
@@ -77,20 +77,6 @@ _pairing_tool_call_id = coalesce_tool_call_id  # canonical id used by the persis
 
 def _tc_name(tool_call: Any) -> str:
     return getattr(getattr(tool_call, "function", None), "name", "") or "tool"
-
-
-def _record_persisted_path_for_stub(agent, tool_call_id: str, function_result) -> None:
-    """Record the spillover file path so a later result-reference stub can't dangle (best-effort)."""
-    try:
-        candidates = [function_result] if isinstance(function_result, str) else [
-            function_result.get("text_summary"),
-            *(p.get("text") for p in function_result.get("content") or [] if isinstance(p, dict)),
-        ] if _is_multimodal_tool_result(function_result) else []
-        path = next((p for p in map(extract_persisted_path, candidates) if p), None)
-        if path:
-            agent._tool_guardrails.record_persisted_result(tool_call_id, path)
-    except Exception as exc:
-        logger.debug("persisted-path record for result stub failed: %s", exc)
 
 
 def _ensure_file_checkpoint(agent, function_name: str, function_args: dict, effective_task_id: str) -> None:
@@ -474,6 +460,7 @@ class _ManagedToolResult:
     blocked: bool
     dispatched: bool
     data_use: frozenset[str] = frozenset()
+    refused: bool = False
 
 
 class _ToolTimeoutResult(str):
@@ -738,6 +725,7 @@ def _dispatch_authorized_once(
     if block_body is not None or guardrail_decision is not None:
         _advance_start_order()
         state.blocked = True
+        state.refused = block_body is not None
         return _blocked_tool_result(
             agent, ref,
             block_body=block_body, block_error_type=block_error_type, guardrail_decision=guardrail_decision,
@@ -1092,6 +1080,7 @@ def _commit_tool_result(
     blocked: bool,
     effect_disposition,
     observed: bool = False,
+    refused: bool = False,
     data_use: frozenset[str] = frozenset(),
     error_preview: Callable[[Any], Any] = lambda result: result,
     success_log_chars: Optional[int] = None,
@@ -1099,9 +1088,8 @@ def _commit_tool_result(
 ):
     """Observe (``observed`` results only) and log the outcome; mark the tool done; persist/
     spill, hint, wrap and append the result; flush the session DB; project ``tool.completed``.
-
-    Blocked calls never ran, so they are neither guardrail-observed nor fed to the file-
-    mutation verifier; ``success_log_chars`` (sequential path) also logs the completion line.
+    Observe policy refusals here, not on worker threads: counters and progress are
+    committed in call order. Never count synthetic guardrail denials or record blocked mutations.
     Returns ``(persisted_result, display_result, risk_metadata)`` (``display_result`` =
     pre-persist content for UI previews) or ``None`` when the flush failed (stop the batch).
     """
@@ -1112,9 +1100,10 @@ def _commit_tool_result(
     if not (blocked or is_error):
         function_result = observe_onboarding_result(agent, function_name, function_args, function_result)
     if observed:
-        if not blocked:
+        if not blocked or refused:
             function_result = agent._append_guardrail_observation(
                 function_name, function_args, function_result, failed=is_error, tool_call_id=tool_call_id,
+                refused=refused,
             )
         if is_error:
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, error_preview(function_result))
@@ -1149,7 +1138,7 @@ def _commit_tool_result(
             env=get_active_env(effective_task_id),
             config=budget,
         )
-    _record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
+    record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
     note_tool_result(agent, function_name, tool_call_id, function_result, persisted_result)
 
     subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
@@ -1270,6 +1259,7 @@ class _ToolOutcome:
     is_error: bool
     blocked: bool
     data_use: frozenset[str] = frozenset()
+    refused: bool = False
 
 
 def _start_order_gate_timeout(batch_timeout: float | None) -> float:
@@ -1361,7 +1351,7 @@ class _ConcurrentBatch:
         # Approval/sudo callbacks (thread-local) and the agent turn's ContextVars are propagated by
         # propagate_context_to_thread() at the submit site below (GHSA-qg5c-hvr5-hjgr, #13617).
         start = time.time()
-        blocked = dispatched = False
+        blocked = dispatched = refused = False
         data_use: frozenset[str] = frozenset()
         try:
             managed = _run_agent_tool_execution_middleware(
@@ -1382,6 +1372,7 @@ class _ConcurrentBatch:
             )
             result, ref.args, ref.trace = managed.result, managed.args, managed.middleware_trace
             blocked, dispatched, data_use = managed.blocked, managed.dispatched, managed.data_use
+            refused = managed.refused
         except _BatchAbandoned:
             logger.info("tool %s abandoned at start-order gate; skipping dispatch", ref.name)
             return None
@@ -1406,7 +1397,7 @@ class _ConcurrentBatch:
             logger.info(
                 "tool %s completed (%.2fs, %d chars)", ref.name, duration, result_chars
             )
-        return _ToolOutcome(ref, result, duration, is_error, blocked, data_use)
+        return _ToolOutcome(ref, result, duration, is_error, blocked, data_use, refused)
 
     def run_worker(self, index: int, start_order: int, resource_handle=None) -> None:
         """Worker function executed in a thread."""
@@ -1585,6 +1576,7 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
             agent, messages, ref, function_result,
             budget=budget, tool_duration=tool_duration, is_error=is_error, blocked=blocked,
             effect_disposition=effect_disposition, observed=r is not None, data_use=r.data_use if r else frozenset(),
+            refused=r.refused if r else False,
             error_preview=lambda res: _multimodal_text_summary(res)[:200],
         )
         if committed is None:
@@ -1870,6 +1862,7 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
         agent, messages, ref, function_result,
         budget=budget, tool_duration=tool_duration, is_error=_is_error_result, blocked=managed.blocked,
         effect_disposition="unknown" if _execution_timed_out else None, observed=True, data_use=managed.data_use,
+        refused=managed.refused,
         error_preview=lambda res: res[:200] if isinstance(res, str) and not agent.verbose_logging else res,
         success_log_chars=_result_len,
         verbose_text=_multimodal_text_summary,

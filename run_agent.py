@@ -1257,19 +1257,20 @@ class AIAgent(
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
         # Shown to the user as the reply, so no decision codes; the code stays in result["guardrail"].
         return (
-            f"I stopped retrying because I kept running {decision.tool_name or 'the same tool'} "
+            f"I stopped retrying because I kept trying {decision.tool_name or 'the same tool'} "
             f"{decision.count} times without making progress. The last result above shows what "
             "blocked it. Tell me how you'd like to proceed, or send `continue` and I'll try a "
             "different approach."
         )
 
     def _append_guardrail_observation(self, tool_name: str, function_args: dict, function_result: str, *,
-                                      failed: bool, tool_call_id: str = "") -> str:
-        decision = self._tool_guardrails.after_call(tool_name, function_args, function_result, failed=failed)
+                                      failed: bool, tool_call_id: str = "", refused: bool = False) -> str:
+        decision = (self._tool_guardrails.after_refusal(tool_name, function_args, function_result) if refused else
+                    self._tool_guardrails.after_call(tool_name, function_args, function_result, failed=failed))
         # Identical-call stall guards observe the RAW result (before the per-call loop suffix) and are applied
         # at result construction so tool results stay append-only / cache-safe.
         stall_notice = result_stub = stall_kind = None
-        if self._stall_guards_enabled():
+        if not refused and self._stall_guards_enabled():
             try:
                 observation = self._tool_guardrails.observe_call(
                     tool_name, function_args, function_result if isinstance(function_result, str) else None,
