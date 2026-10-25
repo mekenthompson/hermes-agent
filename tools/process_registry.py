@@ -609,6 +609,9 @@ class ProcessSession:
     _reader_finish_requested: threading.Event = field(default_factory=threading.Event, repr=False)
     _reader_selectable: bool = field(default=False, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
+    _local_launch_pending: bool = field(default=False, repr=False)
+    _local_launch_attempted: bool = field(default=False, repr=False)
+    _native_local_launch: bool = field(default=False, repr=False)
 
     def __post_init__(self):
         # A session built without an explicit owner is owned by its own task, so ownership checks compare
@@ -1121,12 +1124,17 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
     def _track_started(self, session: ProcessSession, reader_target, reader_name: str, extra_args=()) -> None:
         """Register before the reader can publish completion, even for an exited child."""
         from contextvars import copy_context
+        if session._local_launch_pending:
+            from tools.approval_context import require_live_task_setup
+            require_live_task_setup()
 
         # Reader completion must retain the producer's multiplex profile scope.
         reader = threading.Thread(target=copy_context().run, args=(reader_target, session, *extra_args),
                                   daemon=True, name=reader_name)
         session._reader_thread = reader
         with self._lock:
+            if session.exited:
+                return
             self._prune_if_needed()
             # Completion takes this lock too. Starting here also leaves no
             # ghost entry if the interpreter cannot start another thread.
@@ -1136,8 +1144,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
 
     def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
         """PTY spawn for interactive CLI tools (Codex, Claude Code, REPLs).
-        Raises ImportError when no PTY backend is installed and re-raises any spawn
-        failure; ``spawn_local`` falls back to pipe mode in both cases."""
+        Missing backend imports permit pipe fallback; attempted launches keep their descriptor."""
         from tools.process_registry_spawn import spawn_pty
         return spawn_pty(self, session, safe_command, env_vars)
 
@@ -1147,58 +1154,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         persist_on_release: bool = False, _prepare_session=None) -> ProcessSession:
         """Spawn a background process locally (TERMINAL_ENV=local; other backends use
         spawn_via_env()). ``use_pty`` requests a pseudo-terminal via ptyprocess/pywinpty
-        for interactive CLIs, falling back to a plain pipe when unavailable or failing.
+        for interactive CLIs, falling back to a plain pipe when the backend is unavailable.
         ``persist_on_release`` keeps the process out of agent-lifecycle kill sweeps (#41225)."""
-        # Bash parses ``A && B &`` as ``(A && B) &`` — a subshell that holds our stdout
-        # pipe open forever when B is a long-running server. The rewriter turns it into
-        # ``A && { B & }``. Lazy import: terminal_tool imports this module.
-        # Guard against the `A && B &` subshell-wait trap (issue #68915).
-        from tools.terminal_tool_sudo import _rewrite_compound_background as _rewrite_bg
-
-        from tools.approval_context import require_live_task_setup
-        require_live_task_setup()
-        safe_command = _rewrite_bg(command)
-        session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
-                                    persist_on_release=persist_on_release)
-        if _prepare_session: _prepare_session(session)
-        from tools.process_registry_chat_execution import reserve_local_process, spawn_local_pipe
-        resource = reserve_local_process() if _IS_LINUX and not use_pty else None
-        pty_scope_attempted = False
-        # A worker's pipe or PTY dies with the worker (the child's next write is SIGPIPE): write to a log.
-        log = worker_output_log(session.id)
-        if use_pty and log is None:
-            try:
-                return self._spawn_local_pty(session, safe_command, env_vars)
-            except ImportError:
-                logger.warning("ptyprocess not installed, falling back to pipe mode")
-            except Exception as e:
-                require_live_task_setup()
-                logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
-                if session.systemd_unit:
-                    pty_scope_attempted = True
-                    if not _stop_systemd_unit(session.systemd_unit):
-                        raise RuntimeError(
-                            "PTY scope could not be reaped; refusing pipe fallback "
-                            "to avoid duplicate command execution"
-                        ) from e
-                    session.systemd_unit = ""
-        # Pipe path delegates spawn/lineage to the companion while preserving worker logs.
-        return spawn_local_pipe(self, session, safe_command, env_vars, pty_scope_attempted, resource, log=log)
-
-    def _reap_untracked(self, session: ProcessSession, proc: subprocess.Popen) -> None:
-        """Post-Popen setup failed: kill the orphaned subprocess (and any setsid
-        descendants) so nothing leaks untracked."""
-        with suppress(Exception):
-            if session.systemd_unit:
-                # Scope teardown is the authoritative cleanup for the worker cgroup;
-                # the systemd-run wrapper PID is terminated below as fallback.
-                _stop_systemd_unit(session.systemd_unit)
-            # _terminate_host_pid revalidates the kernel start time captured at
-            # spawn before signalling: pgid == pid would only prove the pid leads a
-            # group, and a reaped child can be recycled onto an unrelated leader.
-            self._terminate_host_pid(proc.pid, session.host_start_time)
-        with suppress(Exception):
-            proc.wait(timeout=5)
+        from tools.process_registry_spawn import spawn_local
+        return spawn_local(self, command, cwd, task_id, session_key, env_vars, use_pty,
+                           owner_task_id, persist_on_release, _prepare_session)
 
     def adopt_local(
         self, proc: subprocess.Popen, *, command: str, cwd: Optional[str], task_id: str = "",
@@ -2071,6 +2031,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
+        from tools.process_registry_spawn import cancel_unstarted_local_launch
+        unstarted = cancel_unstarted_local_launch(self, session, source)
+        if unstarted is not None:
+            return unstarted
         if session.exited:
             # A double-forked descendant may still be alive in the systemd scope even
             # though the main process exited — stop the scope to reap survivors.
@@ -2170,6 +2134,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         """Deliver the kill via PTY, local Popen tree, sandbox exec or recovered host
         PID. Returns a final result dict when the kill cannot proceed (recycled/dead
         recovered PID, or no runtime handle), else None."""
+        if session._native_local_launch and session.host_start_time is None:
+            return {"status": "unknown", "session_id": session.id,
+                    "reconciliation_required": session.reconciliation_required}
         if session._pty:
             try:
                 session._pty.terminate(force=True)

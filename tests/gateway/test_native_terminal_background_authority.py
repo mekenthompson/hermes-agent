@@ -101,7 +101,10 @@ async def test_native_background_consumer_waits(tmp_path, monkeypatch, boundary,
         if finish == "stopped":
             assert "stopped" in receipt.get("error", "").lower(), receipt
             assert not effect.exists(), receipt
-            assert not registry.list_sessions()
+            for entry in registry.list_sessions():
+                assert entry["status"] == "exited" and entry["completion_reason"] == "failed_start"
+                assert entry["pid"] is None and entry["exit_code"] is None
+                assert not entry.get("reconciliation_required") and not entry.get("notify_on_complete")
         else:
             assert not receipt.get("error"), receipt
             session = registry.get(receipt["session_id"])
@@ -194,10 +197,12 @@ async def test_stop_after_actual_local_spawn_retains_process_receipt(tmp_path, m
             receipt = json.loads(await asyncio.wait_for(pending, 15))
         session = registry.get(receipt["session_id"])
         assert session.pid == receipt["pid"]
-        assert not session.exited
+        assert session.exited and session.process.poll() is not None, "Stop must terminate the captured local process"
+        assert effect.read_text() == "started", "the effect before Stop remains part of the reconciliation history"
         assert receipt["code"] == "task_authority_revoked"
         assert receipt["reconciliation_required"]
-        assert registry.poll(session.id)["status"] == "unknown"
+        status = registry.poll(session.id)
+        assert status["status"] == "exited" and status["reconciliation_required"]
     finally:
         release.set()
         await asyncio.to_thread(registry.kill_all, source="test-cleanup")
@@ -205,6 +210,7 @@ async def test_stop_after_actual_local_spawn_retains_process_receipt(tmp_path, m
 
 @pytest.mark.asyncio
 async def test_stopped_remote_reader_retains_unknown_state_through_checkpoint(tmp_path, monkeypatch):
+    from hermes_state_runtime import RuntimeStoreError
     from gateway.session_command_approval import command_task_scope
     from model_tools import handle_function_call
     from tests.waiting import async_wait_until
@@ -233,7 +239,10 @@ async def test_stopped_remote_reader_retains_unknown_state_through_checkpoint(tm
             session = registry.get(receipt["session_id"])
             assert await asyncio.to_thread(waiting.wait, 10)
             await async_wait_until(effect.exists, timeout=10, what="actual remote effect")
-            await authority.interrupt(actor, ref, authority._handle(ref).execution_generation)
+            with pytest.raises(RuntimeStoreError) as stopped:
+                await authority.interrupt(actor, ref, authority._handle(ref).execution_generation)
+            assert stopped.value.reason == "unknown_execution"
+            assert not finish.exists() and not session.exited
             release.set()
         await async_wait_until(lambda: bool(session.reconciliation_required), timeout=10, what="remote uncertainty")
         assert not session.exited
@@ -390,6 +399,17 @@ async def test_watch_fallback_keeps_native_completion_scope_through_parent_close
         events = []
         while not registry.completion_queue.empty():
             events.append(registry.completion_queue.get_nowait())
+        if stop:
+            assert session.process.poll() is not None, "Stop must physically terminate this owned process"
+            assert "READY" not in session.output_buffer
+            assert not any(event.get("type") == "watch_match" for event in events), "a killed process cannot emit READY"
+            for event in events:
+                reservation = completion_reservation_for_event(event, route, "default")
+                if reservation is not None:
+                    with completion_approval_task((reservation,), "stopped-watch-completion"):
+                        assert current_approval_task_context() is None
+                    release_background_approval_task(reservation)
+            return
         event = next(event for event in events if event["type"] == "completion")
         reservation = completion_reservation_for_event(event, route, "default")
         assert reservation is not None
@@ -489,6 +509,7 @@ async def test_process_poll_promotion_requires_native_completion_scope(tmp_path,
 
 @pytest.mark.asyncio
 async def test_remote_signal_acknowledgement_does_not_claim_process_exit(tmp_path, monkeypatch):
+    from hermes_state_runtime import RuntimeStoreError
     from gateway.session_command_approval import command_task_scope
     from model_tools import handle_function_call
     from tests.waiting import async_wait_until
@@ -505,7 +526,10 @@ async def test_remote_signal_acknowledgement_does_not_claim_process_exit(tmp_pat
             assert not receipt.get("error"), receipt
             session = registry.get(receipt["session_id"])
             await async_wait_until(effect.exists, timeout=10, what="remote process start")
-            await authority.interrupt(actor, ref, authority._handle(ref).execution_generation)
+            with pytest.raises(RuntimeStoreError) as stopped:
+                await authority.interrupt(actor, ref, authority._handle(ref).execution_generation)
+            assert stopped.value.reason == "unknown_execution"
+            assert not completed.exists() and not session.exited
         await async_wait_until(lambda: bool(session.reconciliation_required), timeout=10, what="revoked remote reader")
         with command_task_scope(authority, ref, actor.subject, "stop the actual remote process", authority.route_epoch(route)):
             result = await asyncio.to_thread(registry.kill_process, session.id)
@@ -517,6 +541,9 @@ async def test_remote_signal_acknowledgement_does_not_claim_process_exit(tmp_pat
     finally:
         finish.touch()
         await async_wait_until(completed.exists, timeout=10, what="the actual remote child to finish")
+        if "session" in locals():
+            await asyncio.to_thread(session._reader_thread.join, 10)
+            assert not session._reader_thread.is_alive()
 
 
 @pytest.mark.asyncio

@@ -230,7 +230,7 @@ def _spawn_background_process(
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
         if proc_session.reconciliation_required and proc_session.pid is None:
             release_background_approval_task(reservation)
-            result_data.update(output="Remote process launch outcome is unknown", status="unknown", exit_code=None,
+            result_data.update(output="Process launch outcome is unknown", status="unknown", exit_code=None,
                 code="process_launch_uncertain", reconciliation_required=proc_session.reconciliation_required)
             return json.dumps(result_data, ensure_ascii=False)
         from tools.approval_context import approval_task_revoked
@@ -241,6 +241,11 @@ def _spawn_background_process(
             process_registry._write_checkpoint()
             release_background_approval_task(reservation)
             result_data.update(code="task_authority_revoked", reconciliation_required=note)
+            return json.dumps(result_data, ensure_ascii=False)
+        if proc_session.reconciliation_required:
+            release_background_approval_task(reservation)
+            result_data.update(output="Process launch outcome is unknown", status="unknown", exit_code=None,
+                code="process_launch_uncertain", reconciliation_required=proc_session.reconciliation_required)
             return json.dumps(result_data, ensure_ascii=False)
         if persist_on_release:
             result_data["persist_on_release"] = True

@@ -1121,31 +1121,23 @@ class TestEnvPollerIncrementalRead:
 class TestPopenLeakOnSetupFailure:
     """Regression for issue #2749: subprocess orphaned when post-Popen setup raises."""
 
-    def test_popen_killed_when_thread_creation_fails(self, registry):
+    @pytest.mark.platforms('posix')
+    def test_popen_killed_when_thread_creation_fails(self, registry, tmp_path):
         """If Thread() raises after Popen, proc must be killed — not orphaned."""
-        proc = MagicMock()
-        proc.pid = 9999
-        proc.stdout = iter([])
-        proc.stdin = MagicMock()
-        proc.poll.return_value = None
-        proc.wait = MagicMock()
-
         def boom(*args, **kwargs):
             raise RuntimeError("Thread creation failed")
-
-        # The orphan path terminates through _terminate_host_pid, which
-        # revalidates the recorded kernel start time before signalling, so a
-        # MagicMock pid can never reach a real killpg/os.kill.
-        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
-             patch("subprocess.Popen", return_value=proc), \
-             patch("threading.Thread", side_effect=boom), \
-             patch.object(ProcessRegistry, "_terminate_host_pid") as terminate, \
-             patch.object(registry, "_write_checkpoint"):
-            with pytest.raises(RuntimeError, match="Thread creation failed"):
-                registry.spawn_local("echo hello", cwd="/tmp")
-
-        assert terminate.call_count == 1, "post-Popen setup failure must terminate the orphan"
-        assert terminate.call_args[0][0] == 9999
+        command = 'exec ' + shlex.quote(sys.executable) + ' -c ' + shlex.quote('import signal; signal.pause()')
+        session = None
+        try:
+            with patch('threading.Thread', side_effect=boom):
+                session = registry.spawn_local(command, cwd=str(tmp_path))
+            assert session.pid and session.exited
+            assert session.reconciliation_required, 'physical cleanup cannot erase prior external-effect uncertainty'
+            assert session.id in registry._finished
+            assert session._reader_thread is None
+            assert not ProcessRegistry._is_host_pid_alive(session.pid)
+        finally:
+            registry.kill_all()
 
 # =========================================================================
 # Spawn rewrite regression (issue #68915)
@@ -2402,13 +2394,13 @@ class TestSystemdCgroupIsolation:
             patch("tools.process_registry._stop_systemd_unit", return_value=True) as stop_unit, \
             patch("os.killpg") as killpg, \
             patch.object(registry, "_write_checkpoint"):
-            with pytest.raises(RuntimeError, match="reader failed"):
-                registry.spawn_local("echo hello", cwd="/tmp")
+            session = registry.spawn_local("echo hello", cwd="/tmp")
 
         stop_unit.assert_called_once()
         assert stop_unit.call_args.args[0].startswith("hermes-worker-proc_")
         assert stop_unit.call_args.args[0].endswith(".scope")
         killpg.assert_not_called()
+        assert session.reconciliation_required and registry.get(session.id) is session
 
     @pytest.mark.platforms("linux")
     def test_pty_spawn_is_wrapped_in_systemd_scope(self, registry, monkeypatch, _gateway_identity):
@@ -2443,10 +2435,10 @@ class TestSystemdCgroupIsolation:
         assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
     @pytest.mark.platforms("linux")
-    def test_pty_spawn_failure_reaps_scope_before_distinct_pipe_fallback(
+    def test_uncertain_pty_spawn_reaps_scope_without_pipe_replay(
         self, registry, monkeypatch, _gateway_identity
     ):
-        """A failed PTY scope must not collide with the pipe fallback scope."""
+        """Scope cleanup cannot prove that the first command had no external effects."""
         from ptyprocess import PtyProcess
 
         events = []
@@ -2486,17 +2478,12 @@ class TestSystemdCgroupIsolation:
             patch.object(registry, "_write_checkpoint"):
             session = registry.spawn_local("codex", cwd="/tmp", use_pty=True)
 
-        assert [event[0] for event in events] == ["pty", "stop", "pipe"]
+        assert [event[0] for event in events] == ["pty", "stop"]
         stopped_unit = events[1][1]
-        fallback_argv = events[2][1]
         assert stopped_unit == f"hermes-worker-{session.id}.scope"
-        unit_idx = fallback_argv.index("--unit")
-        assert fallback_argv[unit_idx + 1] == (
-            f"hermes-worker-{session.id}-pipe-fallback"
-        )
-        assert session.systemd_unit == (
-            f"hermes-worker-{session.id}-pipe-fallback.scope"
-        )
+        assert session.systemd_unit == stopped_unit
+        assert session.reconciliation_required and not session.exited
+        assert registry.get(session.id) is session
 
     @pytest.mark.platforms("linux")
     def test_pty_spawn_failure_does_not_fallback_when_scope_reap_fails(
@@ -2523,11 +2510,12 @@ class TestSystemdCgroupIsolation:
         ), patch("subprocess.Popen") as pipe_spawn, patch(
             "tools.process_registry._stop_systemd_unit", return_value=False
         ) as stop_unit:
-            with pytest.raises(RuntimeError, match="could not be reaped"):
-                registry.spawn_local("codex", cwd="/tmp", use_pty=True)
+            session = registry.spawn_local("codex", cwd="/tmp", use_pty=True)
 
         stop_unit.assert_called_once()
         pipe_spawn.assert_not_called()
+        assert session.reconciliation_required and session._scope_stop_pending
+        assert not session.exited and registry.get(session.id) is session
 
     def test_worker_memory_limit_honors_local_guard_mb_override(self, monkeypatch):
         import tools.process_registry as pr

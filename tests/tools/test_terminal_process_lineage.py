@@ -43,7 +43,7 @@ def cleanup(registry, processes):
 def test_actual_pipe_producer_persistence_boundaries(tmp_path, monkeypatch, phase):
     store = started(tmp_path)
     registry = isolated_registry(monkeypatch)
-    processes, launches, reaps = [], [], []
+    processes, launches = [], []
     real_popen = module.subprocess.Popen
     def popen(*args, **kwargs):
         row = ChatExecutionStore(tmp_path).inspect_resources("key")[0]
@@ -63,18 +63,22 @@ def test_actual_pipe_producer_persistence_boundaries(tmp_path, monkeypatch, phas
         monkeypatch.setattr(ChatExecutionStore, methods[phase], broken)
     if phase == "missing_fingerprint":
         monkeypatch.setattr(registry, "_safe_host_start_time", lambda pid: None)
-    real_reap = registry._reap_untracked
-    def reap(session, proc):
-        reaps.append(proc.pid)
-        real_reap(session, proc)
-    monkeypatch.setattr(registry, "_reap_untracked", reap)
-    errors = {"reserve": sqlite3.OperationalError, "start": sqlite3.OperationalError,
-              "spawn": OSError, "lineage": sqlite3.OperationalError, "missing_fingerprint": RuntimeError}
+    errors = {"reserve": sqlite3.OperationalError, "start": sqlite3.OperationalError}
     try:
         with bind_chat_execution(tmp_path, "key", 1):
             if phase in errors:
                 with pytest.raises(errors[phase]):
                     registry.spawn_local("fixture", cwd=str(tmp_path), use_pty=False)
+            elif phase in {"spawn", "lineage", "missing_fingerprint"}:
+                session = registry.spawn_local("fixture", cwd=str(tmp_path), use_pty=False)
+                assert registry.get(session.id) is session, "uncertain launch must retain its original descriptor"
+                assert session.reconciliation_required
+                if processes:
+                    assert session.pid == processes[0].pid
+                    assert processes[0].poll() is not None, "known owned process must be physically cleaned up"
+                else:
+                    assert session.pid is None
+                    assert registry.poll(session.id)["status"] == "unknown"
             else:
                 session = registry.spawn_local("fixture", cwd=str(tmp_path), use_pty=False)
                 row = store.inspect_resources("key")[0]
@@ -96,7 +100,6 @@ def test_actual_pipe_producer_persistence_boundaries(tmp_path, monkeypatch, phas
     finally:
         cleanup(registry, processes)
     assert launches == ([] if phase in {"reserve", "start"} else ["launch"])
-    assert len(reaps) == (1 if phase in {"lineage", "missing_fingerprint"} else 0)
     expected = {"reserve": [], "start": ["reserved"], "normal": ["started"],
                 "spawn": ["started"], "lineage": ["started"], "missing_fingerprint": ["started"]}
     assert [row["state"] for row in store.inspect_resources("key")] == expected[phase]

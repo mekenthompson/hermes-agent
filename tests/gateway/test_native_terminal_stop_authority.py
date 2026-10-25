@@ -49,8 +49,8 @@ async def _runtime(tmp_path, monkeypatch):
     runner = GatewayRunner(GatewayConfig(sessions_dir=home / 'sessions'))
     db = SessionDB(home / 'state.db')
     runner.session_store._db = runner._session_db = db
-    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner', db=db)
-    actor = Principal('native-user', 'default', frozenset({
+    authority = await initialize_session_authority(runner, profile_id=str(home.resolve()), instance_id='owner', db=db)
+    actor = Principal('native-user', authority.profile_id, frozenset({
         'session:create', 'session:submit', 'session:read', 'session:control'}), 'viewer')
     registry = process_registry.ProcessRegistry()
     monkeypatch.setattr(process_registry, 'process_registry', registry)
@@ -62,8 +62,11 @@ async def _runtime(tmp_path, monkeypatch):
         origin = current_approval_task_context()
         assert origin is not None
         origins[origin.session] = origin
+        entry = runner.session_store.lookup_by_session_key(origin.session)
+        assert entry is not None
+        owner = entry.session_id
         receipts[origin.session] = json.loads(await asyncio.to_thread(handle_function_call, 'terminal',
-            plans[origin.session], task_id='model-tool-call'))
+            plans[origin.session], task_id=owner))
         return {'final_response': 'Background process started', 'messages': []}
 
     monkeypatch.setattr(runner, '_run_agent', model)
@@ -122,7 +125,13 @@ async def test_native_stop_reaps_settled_parents_terminal_tree_only(tmp_path, mo
         assert _alive(shell) and _alive(child) and _alive(other_shell) and _alive(other_child)
         assert session.persist_on_release is persist and separate.persist_on_release is persist
         if stopped:
-            await runtime.authority.interrupt(runtime.actor, ref, runtime.authority._handle(ref).execution_generation)
+            try:
+                await runtime.authority.interrupt(runtime.actor, ref, runtime.authority._handle(ref).execution_generation)
+            except Exception as exc:
+                raise AssertionError({'pid': session.pid, 'shell': shell, 'child': child,
+                    'captured_birth': session.host_start_time,
+                    'current_birth': runtime.registry._safe_host_start_time(session.pid),
+                    'returncode': session.process.poll(), 'reconciliation_required': session.reconciliation_required}) from exc
             assert not _alive(shell) and not _alive(child), vars(session)
             assert _alive(other_shell) and _alive(other_child), 'Stop must preserve another conversation executor'
             assert session.exited and session.process.poll() is not None

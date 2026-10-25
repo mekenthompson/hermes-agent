@@ -68,8 +68,10 @@ class ProcessCheckpointMixin:
             with _FileLock(path.with_name(path.name + ".lock")):
                 entries.extend(self._foreign_handoffs(path, known))
                 atomic_json_write(path, entries)
+            return True
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+            return False
 
     def _foreign_handoffs(self, path, known) -> list[dict[str, Any]]:
         """Keep uncertain effects and foreign logs with a live or unread outcome."""

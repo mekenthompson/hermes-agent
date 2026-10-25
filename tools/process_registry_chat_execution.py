@@ -38,12 +38,13 @@ def spawn_local_pipe(registry, session, safe_command, env_vars, pty_scope_attemp
     if session.systemd_unit:
         env = facade.systemd_user_bus_env(env)
     from tools.approval_context import require_live_task_setup
+    from tools.process_registry_spawn import begin_local_launch, local_process_receipt, publish_local_launch
     require_live_task_setup()
     start_local_process(resource)
     # The scope does not create a new session; preserve TTY/process-group isolation.
     output = facade.open_output_log(log) if log else facade.subprocess.PIPE
     try:
-        require_live_task_setup()
+        begin_local_launch(session)
         proc = facade.subprocess.Popen(
             argv, text=True, cwd=session.cwd, env=env, encoding="utf-8", errors="replace",
             stdout=output, stderr=facade.subprocess.STDOUT,
@@ -51,15 +52,9 @@ def spawn_local_pipe(registry, session, safe_command, env_vars, pty_scope_attemp
     finally:
         if log:
             os.close(output)
-    session.process, session.output_log = proc, str(log or "")
-    session.pid = proc.pid
-    session.host_start_time = registry._safe_host_start_time(session.pid)
-    try:
-        record_local_process(resource, session.id, session.pid, session.host_start_time)
-        registry._track_started(
-            session, registry._log_reader_loop if log else registry._reader_loop, f"proc-reader-{session.id}")
-    except Exception:
-        registry._reap_untracked(session, proc)
-        raise
+    local_process_receipt(registry, session, proc, log=log)
+    record_local_process(resource, session.id, session.pid, session.host_start_time)
+    publish_local_launch(registry, session,
+        registry._log_reader_loop if log else registry._reader_loop, f"proc-reader-{session.id}")
     # Reader exit and checkpoint cleanup cannot settle descendants or external effects.
     return session
