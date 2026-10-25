@@ -3,7 +3,7 @@
 The producer's private registry holds the reservation. Durable completion IDs are
 delivery identities only; replay after owner restart carries no consent evidence.
 """
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 import json
 
 
@@ -91,7 +91,8 @@ def completion_task_scope(authority, row, live):
     completion_kinds = ('completion', 'async_delegation')
     if not any(isinstance(identity, list) and identity and identity[0] in completion_kinds
                for identity in identities):
-        with nullcontext():
+        from tools.approval_context import unverified_approval_task
+        with unverified_approval_task():
             yield
         return
     if any(not isinstance(identity, list) or len(identity) != 3 or identity[0] not in completion_kinds

@@ -293,6 +293,7 @@ async def execute_admission(authority, ref, row):
             if is_api:
                 # Committed media resolves under the owning profile's home, like admission did.
                 prepared = prepare_api_execution(authority, ref, row['payload'])
+                prepared['native_effect_current'] = lambda: _api_execution_current(authority, ref, row, live)
                 api_execution.set(prepared)
                 if isinstance(event.text, list):
                     # The durable transcript keeps the committed media references (the same
@@ -347,21 +348,21 @@ async def execute_admission(authority, ref, row):
 
 def _approval_task_scope(authority, ref, row, live, event, *, is_api):
     """Bind consent evidence to this exact authenticated admission and live owner."""
-    from contextlib import nullcontext
+    from tools.approval_context import unverified_approval_task
     if event.internal:
-        if is_api:
-            return nullcontext()
         from gateway.session_approval_completion import completion_task_scope
         return completion_task_scope(authority, row, live)
-    if (is_api or not isinstance(event.text, str)
+    if is_api:
+        return _api_approval_scope(authority, ref, row, live)
+    if (not isinstance(event.text, str)
             or not event.text.strip() or not isinstance(row.get('generation'), int)):
-        return nullcontext()
+        return unverified_approval_task()
     payload = row.get('payload') or {}
     from gateway.session_operator import is_viewer_input, check_local_input
     native = isinstance(payload.get('native_text_v1'), dict)
     local = not native and is_viewer_input(row)
     if not (native or local) or not getattr(event.source, 'user_id', None):
-        return nullcontext()
+        return unverified_approval_task()
     if local:
         # The server-stamped envelope and live source must name the committed principal.
         check_local_input(authority, ref, row)
@@ -371,7 +372,7 @@ def _approval_task_scope(authority, ref, row, live, event, *, is_api):
         principal = json.dumps([source.profile, source.platform.value, source.chat_id,
                                 source.thread_id, source.user_id], separators=(',', ':'))
         if row['principal_id'] != 'messaging:' + principal:
-            return nullcontext()
+            return unverified_approval_task()
     from gateway.session_native_approval import native_claim_current, native_owner_current, native_task_context
     from hermes_state_runtime import get_session_admission
 
@@ -414,6 +415,32 @@ def _approval_task_scope(authority, ref, row, live, event, *, is_api):
         profile=str(authority.profile_id), session=str(live.route),
         task_id=row['admission_id'], run_id=str(row['generation']), is_current=is_current, owner=own,
     )
+
+
+def _api_approval_scope(authority, ref, row, live):
+    """A validated legacy API admission keeps foreground policy, never caller consent."""
+    from tools.approval_context import standalone_approval_task, unverified_approval_task
+    if (row.get('principal_id') != 'api' or not isinstance(row['payload'].get('api_turn_v1'), dict)
+            or not _api_execution_current(authority, ref, row, live)):
+        return unverified_approval_task()
+    return standalone_approval_task()
+
+
+def _api_execution_current(authority, ref, row, live):
+    """An API turn's foreground effects belong to its live native claim, not its caller."""
+    from gateway.session_native_approval import native_claim_current, native_owner_current
+    from hermes_state_runtime import get_session_admission
+    if (not native_owner_current(authority) or authority.sessions.get(ref.session_id) is not live
+            or live.superseded or row.get('target_session_id') != ref.session_id
+            or not native_claim_current(authority, live, row, parent_returned=False)
+            or authority.pending_stops.get(ref.session_id) == row['generation']
+            or authority.delivered_stops.get(ref.session_id) == row['generation']):
+        return False
+    committed = get_session_admission(authority.db, admission_id=row['admission_id'])
+    return (committed is not None and committed['status'] == 'started'
+            and committed['owner_epoch'] == authority.epoch == row.get('owner_epoch')
+            and committed['generation'] == row['generation']
+            and committed['target_session_id'] == ref.session_id)
 
 
 def _launch_body_if_launch_owner(authority):

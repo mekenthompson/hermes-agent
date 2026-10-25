@@ -213,6 +213,21 @@ def current_approval_task_context() -> ApprovalTaskContext | None:
             and (bound[0].parent_open() if bound[2] is None else bound[2].active()) else None)
 
 
+def unverified_approval_task():
+    """Fence a separate admission without borrowing or clearing its caller's task."""
+    return approval_task_context('', identity='unverified', profile='', session='', is_current=lambda: False)
+
+
+@contextmanager
+def standalone_approval_task():
+    """Keep legacy unscoped execution only when no task binding crossed the boundary."""
+    if _approval_task_context.get() is None:
+        yield
+    else:
+        with unverified_approval_task():
+            yield
+
+
 def revoke_current_approval_task() -> None:
     """A producer that catches its failure must revoke that origin's reserved children."""
     bound = _approval_task_context.get()
@@ -242,8 +257,30 @@ def approval_task_revoked() -> bool:
 
 def require_live_task_setup():
     """Recheck Stop immediately before producer setup that can call hooks or write state."""
-    if approval_task_revoked():
+    from tools.interrupt import is_interrupted
+    if approval_task_revoked() or is_interrupted() or _api_execution_revoked():
         raise ValueError("The originating native task was stopped or superseded.")
+
+
+def _api_execution_revoked():
+    # This callback is private native execution state, not API task-consent evidence.
+    # Independently validated tasks and reserved children check their own native lease.
+    if _approval_task_context.get() is not None:
+        return False
+    # A standalone tool cannot have API execution bound; avoid loading the gateway for it.
+    from sys import modules
+    module = modules.get('gateway.session_api_turn')
+    execution = getattr(module, 'api_execution', None)
+    current = execution.get() if execution is not None else None
+    check = current.get('native_effect_current') if current is not None else None
+    return check is not None and not check()
+
+
+def _revoked_task_message(default):
+    bound = _approval_task_context.get()
+    if bound is not None and bound[1].identity == 'unverified':
+        return "This event has no valid native task authority."
+    return default
 
 
 def background_task_refusal(required=True):
@@ -252,7 +289,7 @@ def background_task_refusal(required=True):
         return None
     if approval_task_revoked():
         return {"status": "rejected", "code": "task_authority_revoked",
-                "error": "The originating native task was stopped or superseded."}
+                "error": _revoked_task_message("The originating native task was stopped or superseded.")}
     if current_approval_task_context() is None:
         return {"status": "rejected", "code": "missing_task_authority",
                 "error": "Background work requires live native task-scoped authority."}
@@ -261,10 +298,10 @@ def background_task_refusal(required=True):
 
 def revoked_task_tool_error():
     """Fence every model tool before hooks, bridge expansion or handler side effects."""
-    if not approval_task_revoked():
+    if not (approval_task_revoked() or _api_execution_revoked()):
         return None
     from tools.registry import tool_error
-    return tool_error("The originating task was stopped or completed; native authority is no longer valid.",
+    return tool_error(_revoked_task_message("The originating task was stopped or completed; native authority is no longer valid."),
                       code="task_authority_revoked")
 
 

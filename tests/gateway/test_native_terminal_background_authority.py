@@ -155,7 +155,8 @@ async def test_real_plugin_admission_cannot_start_background_terminal_without_na
     try:
         assert await asyncio.to_thread(context.inject_message, "continue work", session_key=route)
         await async_wait_until(lambda: len(receipts) == 4, timeout=15, what="plugin terminal refusals")
-        assert all(receipt.get("code") == "missing_task_authority" for receipt in receipts), receipts
+        assert all(receipt.get("code") == "task_authority_revoked" for receipt in receipts), receipts
+        assert all("no valid native task authority" in receipt["error"] for receipt in receipts), receipts
         assert acquired == [], "missing authority must be diagnosed before environment setup"
         assert not effect.exists()
         assert not registry.list_sessions()
