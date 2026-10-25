@@ -347,6 +347,9 @@ def _notify_memory_manager(results, task_list, child_by_index, parent_agent) -> 
     if not memory:
         return
     for entry in results:
+        from tools.approval_context import approval_task_revoked
+        if approval_task_revoked():
+            return  # preserve results/audit; revoked work cannot persist new memory effects
         try:
             task_index = entry.get("task_index", -1)
             in_range = isinstance(task_index, int) and 0 <= task_index < len(task_list)

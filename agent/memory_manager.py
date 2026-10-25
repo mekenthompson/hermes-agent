@@ -836,11 +836,12 @@ class MemoryManager:
     def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
         if not self._owner_allows("on_delegation"):
             return
+        from tools.approval_context import approval_task_revoked
         task, result = _redact_for_provider(task, result)
-        self._each_provider(
-            "on_delegation failed",
-            lambda p: p.on_delegation(task, result, child_session_id=child_session_id, **kwargs),
-        )
+        def notify(provider):
+            if not approval_task_revoked():
+                provider.on_delegation(task, result, child_session_id=child_session_id, **kwargs)
+        self._each_provider("on_delegation failed", notify)
 
     def claim_teardown(self, *, session_end: bool) -> bool:
         """Claim extraction + ``shutdown_all()`` for end-of-session shutdown or soft release. The first

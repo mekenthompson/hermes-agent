@@ -470,6 +470,9 @@ def _run_single_child(
 
     * ``"completed"``       — normal finish. See #97655.
     """
+    from tools.approval_context import approval_task_revoked
+    if approval_task_revoked():
+        return _fabricated_entry(task_index, "interrupted", "Native task authority was revoked before child setup.", child, 0.0)
     # Defense in depth for direct helper/eval callers that bypass
     # delegate_task. This check runs before registration, heartbeat, workspace
     # setup, or the child conversation.
@@ -494,8 +497,12 @@ def _run_single_child(
     admission = None
     if enforce_admission:
         assert isinstance(_preflight_id, str)
+        if approval_task_revoked():
+            return _fabricated_entry(task_index, "interrupted", "Native task authority was revoked before workspace setup.", child, run.elapsed())
         run.seed_workspace()
         from hermes_cli.admission_runtime import admit_writer
+        from tools.approval_context import require_live_task_setup
+        require_live_task_setup()
         admission = admit_writer(
             request_id=_preflight_id,
             caller=AdmissionCaller.DELEGATE,

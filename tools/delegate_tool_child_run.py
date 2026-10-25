@@ -808,6 +808,8 @@ class _ChildRun:
     def seed_workspace(self) -> None:
         """Seed cwd/container aliases and optional worktree isolation for the child;
         ``goal`` is extended with the worktree contract note when isolation engaged."""
+        from tools.approval_context import require_live_task_setup
+        require_live_task_setup()
         import uuid as _uuid
         self.child_task_id = self.subagent_id or f"subagent-{self.task_index}-{_uuid.uuid4().hex[:8]}"
         self.parent_task_id = getattr(self.parent_agent, "_current_task_id", None)
@@ -925,12 +927,13 @@ class _ChildRun:
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
-            from tools.approval_context import delegated_approval_task
+            from tools.approval_context import delegated_approval_task, require_live_task_setup
             from tools.delegate_tool_routes import child_profile_scope
             # A profile-routed child converses as that profile (config, secrets, skills, terminal policy).
             with child_profile_scope(child), delegated_approval_task(
                 self.child_task_id, stop_event=getattr(child, "_hard_interrupt_requested", None),
             ), delegated_child_context(str(getattr(child, "session_id", "") or "")):
+                require_live_task_setup()
                 return child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
                 )
