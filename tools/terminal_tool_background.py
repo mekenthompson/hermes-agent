@@ -208,12 +208,16 @@ def _spawn_background_process(
         mounted_host=mounted_host if mounted_host is not None else getattr(env, "host_cwd", None),
         env=env,
     )
-    from tools.approval_context import reserve_background_approval_task, release_background_approval_task
-    from gateway.session_context import async_delivery_supported
-    reservation = reserve_background_approval_task() if (notify_on_complete or watch_patterns) and async_delivery_supported() else None
+    from tools.approval_context import reserve_background_approval_task
+    # Ownership outlives the producer even when the channel cannot deliver a notice.
+    reservation = reserve_background_approval_task()
+    prepared = None
 
     def prepare_session(session):
+        nonlocal prepared
+        prepared = session
         session.approval_task_reservation = reservation
+        _record_native_origin(session, reservation)
         notify, patterns = _apply_async_support(session, {}, notify_on_complete, watch_patterns)
         patterns, _ = _resolve_notification_flag_conflict(
             notify_on_complete=bool(notify), watch_patterns=patterns, background=True)
@@ -232,7 +236,6 @@ def _spawn_background_process(
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
         if proc_session.reconciliation_required and proc_session.pid is None:
-            release_background_approval_task(reservation)
             result_data.update(output="Process launch outcome is unknown", status="unknown", exit_code=None,
                 code="process_launch_uncertain", reconciliation_required=proc_session.reconciliation_required)
             return json.dumps(result_data, ensure_ascii=False)
@@ -242,11 +245,9 @@ def _spawn_background_process(
                     "reconcile this session before reporting it stopped or retrying the command.")
             proc_session.reconciliation_required = note
             process_registry._write_checkpoint()
-            release_background_approval_task(reservation)
             result_data.update(code="task_authority_revoked", reconciliation_required=note)
             return json.dumps(result_data, ensure_ascii=False)
         if proc_session.reconciliation_required:
-            release_background_approval_task(reservation)
             result_data.update(output="Process launch outcome is unknown", status="unknown", exit_code=None,
                 code="process_launch_uncertain", reconciliation_required=proc_session.reconciliation_required)
             return json.dumps(result_data, ensure_ascii=False)
@@ -267,9 +268,6 @@ def _spawn_background_process(
 
         notify_on_complete, watch_patterns = _apply_async_support(
             proc_session, result_data, notify_on_complete, watch_patterns)
-        if not notify_on_complete and not watch_patterns:
-            release_background_approval_task(reservation)
-            proc_session.approval_task_reservation = None
         watch_patterns, conflict_note = _resolve_notification_flag_conflict(
             notify_on_complete=bool(notify_on_complete), watch_patterns=watch_patterns, background=True,
         )
@@ -299,11 +297,30 @@ def _spawn_background_process(
         return json.dumps(result_data, ensure_ascii=False)
     except Exception as e:
         logger.exception("Background process launch failed")
-        release_background_approval_task(reservation)
+        _release_untracked_reservation(process_registry, prepared, reservation)
         return json.dumps({
             "output": "", "exit_code": -1,
             "error": _redact_terminal_error_text(f"Failed to start background process: {e}"),
         }, ensure_ascii=False)
+
+
+def _release_untracked_reservation(registry, session, reservation):
+    """A retained descriptor's actual finalizer owns its private reservation."""
+    from tools.approval_context import release_background_approval_task
+    with registry._lock:
+        retained = session is not None and (
+            registry._running.get(session.id) is session or registry._finished.get(session.id) is session)
+    if not retained:
+        release_background_approval_task(reservation)
+
+
+def _record_native_origin(session, reservation):
+    """Checkpoint description comes only from the already-minted private native reservation."""
+    if reservation is None:
+        return
+    evidence = reservation.evidence
+    for field in ('profile', 'session', 'task_id', 'run_id'):
+        setattr(session, 'native_origin_' + field, getattr(evidence, field))
 
 
 _SUBAGENT_NOTIFY_NOTE = (
@@ -341,18 +358,22 @@ def yield_to_background_handler(
         reservation = reserve_background_approval_task()
         if reservation is None:
             return None
+        session = None
         try:
             session = process_registry.adopt_local(
                 proc, command=command, cwd=cwd, task_id=effective_task_id,
                 owner_task_id=task_id or effective_task_id, session_key=session_key,
                 output_so_far=output_so_far)
-            session.approval_task_reservation = reservation
-            _stamp_routing_if_gateway(process_registry, session, session_key)
-            if not session.notify_on_complete:
+            with process_registry._lock:
+                finished = getattr(session, '_finish_claimed', False)
+                if not finished:
+                    session.approval_task_reservation = reservation
+                    _record_native_origin(session, reservation)
+            if finished:
                 release_background_approval_task(reservation)
-                session.approval_task_reservation = None
+            _stamp_routing_if_gateway(process_registry, session, session_key)
         except BaseException:
-            release_background_approval_task(reservation)
+            _release_untracked_reservation(process_registry, session, reservation)
             raise
         logger.info("foreground command yielded to background as %s (pid %s)", session.id, session.pid)
         return {

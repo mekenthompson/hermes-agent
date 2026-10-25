@@ -179,20 +179,7 @@ async def operation(authority, name, params, actor=None):
     if row is None or row['target_session_id'] != ref.session_id or row['principal_id'] != actor.subject:
         raise RuntimeStoreError('permission_denied')
     if name == 'cancel':
-        if row['status'] == 'queued':
-            row = await authority.cancel_or_claimed(actor, ref, row['admission_id']) or {'status': 'terminal'}
-        if row['status'] == 'started':
-            # The claim commits before execute() registers its event; latching the
-            # cancellation on the admission here means that window cannot lose it.
-            _cancellations(authority).setdefault(row['admission_id'], threading.Event()).set()
-        # Each cron session is one immutable fire. Its children may outlive the completed
-        # parent; cancel still revokes those existing Stop leases on this exact session.
-        live = authority.sessions.get(ref.session_id)
-        if live is not None:
-            with live.event_stream.lock:
-                for lease in list(getattr(live, 'approval_task_leases', ())):
-                    lease.revoke()
-        return {'ok': True}
+        return await _cancel_fire(authority, actor, ref, row)
     result, flags = None, {}
     if row['status'] == 'terminal':
         from gateway.session_results import admission_result
@@ -204,6 +191,82 @@ async def operation(authority, name, params, actor=None):
     from cron.scheduler_liveness import owner_progress
     return {'status': row['status'], 'result': result, 'job_flags': flags,
             'progress_at': owner_progress.get(row['request_id'].rsplit(':', 1)[-1])}
+
+
+async def _cancel_fire(authority, actor, ref, row):
+    if row['status'] == 'queued':
+        row = await authority.cancel_or_claimed(actor, ref, row['admission_id'])
+        if row is None:
+            return {'ok': True}  # the queued cancellation committed before any effects were admitted
+    generation = row.get('generation')
+    if generation is None and row['status'] == 'terminal' and row.get('outcome') == 'cancelled':
+        return {'ok': True}
+    from gateway.session_native_approval import native_owner_current
+    if (not native_owner_current(authority) or row.get('owner_epoch') != authority.epoch
+            or type(generation) is not int or generation < 1):
+        raise RuntimeStoreError('unknown_execution', detail='Original cron effect ownership is unconfirmed; reconcile its process and effects before retrying.')
+    if row['status'] == 'started':
+        # The claim commits before execute() registers its event: latch before the first await.
+        _cancellations(authority).setdefault(row['admission_id'], threading.Event()).set()
+    # A completed immutable fire may still own native services. Canonical Stop
+    # revokes their leases and joins owned process cleanup, or reports unknown.
+    await authority.interrupt(actor, ref, generation)
+    return {'ok': True}
+
+
+def observed_unknown_processes(authority, ref, candidates):
+    """Read-only attribution of cold cron descriptors; IDs never restore a Stop/execution lease."""
+    live = authority.sessions.get(ref.session_id)
+    if live is None:
+        return []
+    from gateway.config import Platform
+    if live.source is None or live.source.platform != Platform.LOCAL:
+        return []
+    candidates = [p for p in candidates if p.detached and p.reconciliation_required and not p.exited
+                  and p.native_origin_profile == str(authority.profile_id)
+                  and p.native_origin_session == live.route]
+    if not candidates:
+        return []
+    from gateway.session_policy import policy_for_source
+    policy = policy_for_source(authority.runner, live.source)
+    if policy is None or policy.source != 'cron' or policy.platform != 'cron':
+        return []
+    request_id, prompt = _observed_fire_identity(authority, ref, live, policy)
+    observed = []
+    for process in candidates:
+        try:
+            row = get_session_admission(authority.db, admission_id=process.native_origin_task_id)
+            valid = (row is not None and row['target_session_id'] == ref.session_id and row['principal_id'] == CRON_PRINCIPAL_ID
+                     and row['request_id'] == request_id and type(row['generation']) is int and row['generation'] > 0
+                     and str(row['generation']) == process.native_origin_run_id and row['payload'] == {'text': prompt})
+        except (TypeError, ValueError, KeyError) as exc:
+            raise RuntimeStoreError('unknown_execution', detail='Original cron process admission is unreadable; reconcile its process and effects.') from exc
+        if not valid:
+            raise RuntimeStoreError('unknown_execution', detail='Original cron process admission cannot be verified; reconcile its process and effects.')
+        observed.append(process)
+    return observed
+
+
+def _observed_fire_identity(authority, ref, live, policy):
+    from hermes_state_local import local_receipt
+    from gateway.session_policy import restore_policy
+    try:
+        receipt = local_receipt(authority.db, ref.session_id)
+        frozen = json.loads(policy.request_json)
+        request_id, job_id, prompt = frozen['request_id'], frozen['cron_job']['id'], frozen['extra_prompt'] or ''
+        if (receipt['principal_id'] != CRON_PRINCIPAL_ID or receipt['profile_id'] != authority.profile_id
+                or receipt['route'] != live.route or restore_policy(receipt['policy']) != policy
+                or request_id != receipt['request_id'] or not isinstance(request_id, str)
+                or not isinstance(job_id, str) or not job_id
+                or not request_id.startswith(cron_request_id(job_id, ''))):
+            raise RuntimeStoreError('unknown_execution', detail='Original cron process identity cannot be verified; reconcile its process and effects.')
+        return request_id, prompt
+    except RuntimeStoreError as exc:
+        if exc.reason != 'not_found':
+            raise
+        raise RuntimeStoreError('unknown_execution', detail='Original cron process identity is missing; reconcile its process and effects.') from exc
+    except (TypeError, ValueError, KeyError) as exc:
+        raise RuntimeStoreError('unknown_execution', detail='Original cron process identity is unreadable; reconcile its process and effects.') from exc
 
 
 def _cancellations(authority):

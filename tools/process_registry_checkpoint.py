@@ -10,6 +10,26 @@ from agent.redact import redact_sensitive_text
 logger = logging.getLogger("tools.process_registry")
 
 
+# Watcher routing fields, in event-dict key order (``watcher_<key>`` on the session).
+_WATCHER_ROUTE_KEYS = ("platform", "chat_id", "user_id", "user_name", "thread_id", "message_id")
+# Session fields persisted verbatim in the crash-recovery checkpoint (plus
+# ``session_id``; ``command`` is redacted and ``owner_task_id`` defaulted on write).
+_CHECKPOINT_FIELDS = (
+    "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "wsl_chain", "cwd",
+    "started_at", "task_id", "owner_task_id", "session_key",
+    *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
+    "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
+    "heartbeat_seconds", "persist_on_release", "output_log", "reconciliation_required",
+    "custody_kind", "custody_pid", "custody_start_time", "custody_scope_empty", "foreground",
+    "native_origin_profile", "native_origin_session", "native_origin_task_id", "native_origin_run_id")
+
+
+def checkpoint_defaults(session_type):
+    """Defaults for old descriptors, evaluated after the facade defines its dataclass."""
+    return {f.name: ([] if f.name == 'watch_patterns' else f.default)
+            for f in session_type.__dataclass_fields__.values() if f.name in _CHECKPOINT_FIELDS}
+
+
 class ProcessCheckpointMixin:
     def _detached_host_fate(self, pid: Optional[int], expected_start: Optional[int]) -> str:
         """Subclass supplies the live PID decision. See ProcessRegistry."""

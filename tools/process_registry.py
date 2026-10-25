@@ -34,7 +34,8 @@ from hermes_cli.config import get_hermes_home
 
 from tools.process_registry_notifications import (
     format_process_notification, heartbeat_output_tail, is_child_process_notification, should_surface_notification)
-from tools.process_registry_checkpoint import ProcessCheckpointMixin
+from tools.process_registry_checkpoint import (
+    ProcessCheckpointMixin, _WATCHER_ROUTE_KEYS, _CHECKPOINT_FIELDS, checkpoint_defaults)
 from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log
 from tools.process_registry_termination import ProcessTerminationMixin
 from tools.process_registry_results import load_completed_results, save_completed_result, settled_foreground
@@ -587,6 +588,11 @@ class ProcessSession:
     # Session-db id of the spawning conversation; lets the gateway drop completions whose
     # session was closed at a user boundary (/new) instead of injecting into the NEW one.
     parent_session_id: str = ""
+    # Descriptive checkpoint provenance only; never reconstructs a private task lease.
+    native_origin_profile: str = ""
+    native_origin_session: str = ""
+    native_origin_task_id: str = ""
+    native_origin_run_id: str = ""
     notify_on_complete: bool = False            # Queue agent notification on exit
     completion_output_chars: int = 0            # Output chars the completion carries; 0 = COMPLETION_OUTPUT_CHARS
     watch_patterns: list[str] = field(default_factory=list)
@@ -657,23 +663,7 @@ class ProcessSession:
                 self.termination_source = source
 
 
-# Watcher routing fields, in event-dict key order (``watcher_<key>`` on the session).
-_WATCHER_ROUTE_KEYS = ("platform", "chat_id", "user_id", "user_name", "thread_id", "message_id")
-# Session fields persisted verbatim in the crash-recovery checkpoint (plus
-# ``session_id``; ``command`` is redacted and ``owner_task_id`` defaulted on write).
-_CHECKPOINT_FIELDS = (
-    "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "wsl_chain", "cwd",
-    "started_at", "task_id", "owner_task_id", "session_key",
-    *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
-    "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
-    "heartbeat_seconds", "persist_on_release", "output_log", "reconciliation_required",
-    "custody_kind", "custody_pid", "custody_start_time", "custody_scope_empty", "foreground")
-_CHECKPOINT_DEFAULTS = {
-    f.name: ([] if f.name == "watch_patterns" else f.default)
-    for f in ProcessSession.__dataclass_fields__.values()
-    if f.name in _CHECKPOINT_FIELDS
-}
-
+_CHECKPOINT_DEFAULTS = checkpoint_defaults(ProcessSession)
 
 _WSL_CHAIN_NOTE = (
     "Spawned via a wsl[.exe] launcher: the recorded host PID is the short-lived "

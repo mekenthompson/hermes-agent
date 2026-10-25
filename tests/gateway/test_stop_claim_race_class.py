@@ -44,7 +44,7 @@ def _cron(hosted_owner, tmp_path, monkeypatch):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     db = SessionDB(tmp_path / 'cron.db')
     db.create_session('s', source='cron')
-    authority = SessionAuthority(SimpleNamespace(_draining=False), profile_id='p', instance_id='t', db=db,
+    authority = SessionAuthority(SimpleNamespace(_draining=False, _cached_agent_for=lambda _route: None), profile_id='p', instance_id='t', db=db,
                                  epoch=begin_runtime_epoch(db, instance_id='t'))
     authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='cron-owner'), 'route')
     authority._schedule = lambda ref: None

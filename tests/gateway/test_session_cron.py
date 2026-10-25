@@ -20,7 +20,7 @@ def test_cron_admission_uses_job_model_and_exact_retry(tmp_path, monkeypatch):
     db = SessionDB(tmp_path / 'state.db')
     from gateway.config import GatewayConfig
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
-    runner = SimpleNamespace(_draining=False, session_store=store, adapters={})
+    runner = SimpleNamespace(_draining=False, _cached_agent_for=lambda _route: None, session_store=store, adapters={})
     authority = SessionAuthority(runner, profile_id=str(tmp_path), instance_id='test', db=db,
                                  epoch=begin_runtime_epoch(db, instance_id='test'))
     runner.session_authority = authority
@@ -59,7 +59,7 @@ async def test_cron_cancel_between_claim_and_execution_registration_stops_the_jo
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     db = SessionDB(tmp_path / 'state.db')
     db.create_session('s', source='cron')
-    authority = SessionAuthority(SimpleNamespace(_draining=False), profile_id='p', instance_id='test', db=db,
+    authority = SessionAuthority(SimpleNamespace(_draining=False, _cached_agent_for=lambda _route: None), profile_id='p', instance_id='test', db=db,
                                  epoch=begin_runtime_epoch(db, instance_id='test'))
     authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='cron-owner'), 'route')
     actor = Principal('cron-owner', 'p', frozenset({'session:create', 'session:submit', 'session:control'}), 'ticker')
@@ -108,7 +108,7 @@ async def test_owner_execution_binds_the_scheduler_cron_identity_inside_run_job(
     record = mark_execution_running(execution['id'])
     db = SessionDB(tmp_path / 'state.db')
     db.create_session('s', source='cron')
-    authority = SessionAuthority(SimpleNamespace(_draining=False), profile_id='p', instance_id='test', db=db,
+    authority = SessionAuthority(SimpleNamespace(_draining=False, _cached_agent_for=lambda _route: None), profile_id='p', instance_id='test', db=db,
                                  epoch=begin_runtime_epoch(db, instance_id='test'))
     authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='cron-owner'), 'route')
     monkeypatch.setattr(run, '_profile_runtime_scope', lambda home: nullcontext())
@@ -154,7 +154,7 @@ def test_draining_owner_still_answers_status_and_cancel_of_admitted_cron_work(tm
     monkeypatch.setattr(jobs, 'get_job', lambda jid: {'id': jid, 'prompt': 'p', 'model': 'm'})
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'model': {}, 'platform_toolsets': {'cli': []}})
     db = SessionDB(tmp_path / 'state.db')
-    runner = SimpleNamespace(_draining=False, session_store=SessionStore(tmp_path / 'sessions', GatewayConfig()),
+    runner = SimpleNamespace(_draining=False, _cached_agent_for=lambda _route: None, session_store=SessionStore(tmp_path / 'sessions', GatewayConfig()),
                              adapters={})
     authority = SessionAuthority(runner, profile_id=str(tmp_path), instance_id='test', db=db,
                                  epoch=begin_runtime_epoch(db, instance_id='test'))

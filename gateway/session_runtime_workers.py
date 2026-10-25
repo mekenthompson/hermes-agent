@@ -38,10 +38,15 @@ def command_unknowns(authority, route=None):
     routes = {route} if route is not None else {live.route for live in getattr(authority, 'sessions', {}).values()
                                               if getattr(live, 'route', None)}
     with process_registry._lock:
-        uncertain = [session for session in process_registry._running.values()
-                     if session.session_key in routes and session.reconciliation_required and not session.exited]
+        all_uncertain = [session for session in process_registry._running.values()
+                         if session.reconciliation_required and not session.exited]
+        uncertain = [session for session in all_uncertain if session.session_key in routes]
+        private_ownership = any(getattr(session, 'approval_task_reservation', None) is not None
+                                for session in all_uncertain)
+        described_ownership = any(session.detached and session.native_origin_profile == str(authority.profile_id)
+                                  and session.native_origin_session in routes for session in all_uncertain)
     found = {session.id: session for session in uncertain if session.owner_task_id.startswith('command:')}
-    if len(found) == len(uncertain):
+    if len(found) == len(uncertain) and not private_ownership and not described_ownership:
         return list(found.values())
     from gateway.session_ancillary import _owner_objects, _ownership, _owned_locked
     from gateway.session_contract import SessionRef
@@ -60,6 +65,9 @@ def command_unknowns(authority, route=None):
         with process_registry._lock:
             found.update((session.id, session) for session in _owned_locked(process_registry, keys, owners, authority, live)
                          if session.reconciliation_required and not session.exited)
+        from gateway.session_cron import observed_unknown_processes
+        found.update((session.id, session) for session in observed_unknown_processes(
+            authority, ref, all_uncertain))
     return list(found.values())
 
 

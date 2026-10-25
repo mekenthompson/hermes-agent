@@ -130,9 +130,12 @@ def _claim_notify_if_running(registry, session) -> bool:
         reservation = reserve_background_approval_task()
         if reservation is None:
             return False
+        previous = getattr(session, 'approval_task_reservation', None)
         session.approval_task_reservation = reservation
         session.notify_on_complete = True
-        return True
+    from tools.approval_context import release_background_approval_task
+    release_background_approval_task(previous)
+    return True
 
 
 def _promote(registry, session) -> None:

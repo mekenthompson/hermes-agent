@@ -599,14 +599,16 @@ def _ownership(authority, ref, agent, records):
 
 
 def _owned_locked(registry, keys, owners, authority, live):
-    """Matching process objects; the caller holds ``registry._lock``. Read directly:
+    """Private native leases prove ownership independently of notification routing.
+
+    Legacy descriptors still need both route and owner. Read directly under the lock:
     ``list_sessions`` refreshes recovered processes and writes checkpoints."""
     leases = tuple(getattr(live, 'approval_task_leases', ()))
-    return [p for p in (*registry._running.values(), *registry._finished.values()) if p.session_key in keys
-            and ((p.owner_task_id or p.task_id) in owners or p.parent_session_id in owners
+    return [p for p in (*registry._running.values(), *registry._finished.values())
+            if (p.session_key in keys and ((p.owner_task_id or p.task_id) in owners or p.parent_session_id in owners))
                  or ((reservation := getattr(p, 'approval_task_reservation', None)) is not None
                      and reservation.lease in leases and reservation.evidence.session == live.route
-                     and reservation.evidence.profile == str(authority.profile_id)))]
+                     and reservation.evidence.profile == str(authority.profile_id))]
 
 
 def process_snapshot(authority, ref, agent, records):
@@ -616,7 +618,12 @@ def process_snapshot(authority, ref, agent, records):
     registry = module.process_registry
     keys, owners = _ownership(authority, ref, agent, records)
     from tools.process_registry_results import settled_foreground
-    # Keep ownership and output together.
+    with registry._lock:
+        owned = {p.id: p for p in _owned_locked(registry, keys, owners, authority, authority.sessions[ref.session_id])}
+        candidates = list(registry._running.values())
+    from gateway.session_cron import observed_unknown_processes
+    owned.update((p.id, p) for p in observed_unknown_processes(authority, ref, candidates))
+    # Descriptive cold records are read-only; owned_process_targets still requires a live proof.
     with registry._lock:
         return [{'session_id': p.id, 'command': p.command[:200],
                  'status': 'unknown' if p.reconciliation_required and not p.exited else ('exited' if p.exited else 'running'),
@@ -625,5 +632,4 @@ def process_snapshot(authority, ref, agent, records):
                  # The classic CLI dock's elapsed / exit-age / verdict and its 32k tail view.
                  'started_epoch': p.started_at, 'exited_at': p.exited_at or None,
                  'completion_reason': p.completion_reason if p.exited else None,
-                 'output_tail': p.output_buffer[-_PROCESS_TAIL_CHARS:]} for p in _owned_locked(
-                     registry, keys, owners, authority, authority.sessions[ref.session_id]) if not settled_foreground(p)]
+                 'output_tail': p.output_buffer[-_PROCESS_TAIL_CHARS:]} for p in owned.values() if not settled_foreground(p)]

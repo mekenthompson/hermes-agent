@@ -24,10 +24,26 @@ def test_yielded_process_reserves_origin_only_for_supported_completion(monkeypat
     finally:
         reservation.release()
 
-    session.notify_on_complete = True
+
+
+def test_unsupported_yield_notification_keeps_process_ownership_until_finalization(monkeypatch):
+    from tools import process_registry
+    registry = process_registry.ProcessRegistry()
+    monkeypatch.setattr(process_registry, 'process_registry', registry)
+    session = registry._new_session('yielded', 'task', 'task', 'route', '.')
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, 'adopt_local', lambda *_a, **_k: session)
     monkeypatch.setattr('tools.terminal_tool_background._stamp_routing_if_gateway',
                         lambda *_a: setattr(session, 'notify_on_complete', False))
+    handler = yield_to_background_handler(command='build', env_type='local', cwd='.',
+        effective_task_id='task', task_id='task', session_key='route')
     with approval_task_context('Build only beta.py', identity='local:user', profile='profile',
                                session='route', task_id='second', is_current=lambda: True):
         handler(object(), 'partial')
+    reservation = session.approval_task_reservation
+    assert reservation is not None and reservation.lease.live()
+    assert reservation.evidence.task_id == 'second'
+    assert not session.notify_on_complete
+    registry._finish_exited(session, 0)
     assert session.approval_task_reservation is None
+    assert not reservation.active() and not reservation.lease.live()
