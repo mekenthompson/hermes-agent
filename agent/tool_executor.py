@@ -1702,6 +1702,10 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     def _observed(execute):
         def _call(args):
             from agent.chat_execution_context import observe_tool_before_execution
+            from tools.approval_context import revoked_task_tool_error
+            denied = revoked_task_tool_error()
+            if denied is not None:
+                return denied
             observe_tool_before_execution()
             return execute(args)
         return _call

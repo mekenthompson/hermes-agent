@@ -1152,7 +1152,12 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         stop_epoch = self._route_stop_epoch(_quick_key)
         _handled, _result, command, canonical = await self._hm_resolve_command(event, source, _quick_key)
         if not _handled:
-            _handled, _result = await self._hm_dispatch_canonical_command(event, source, _quick_key, canonical)
+            from contextlib import nullcontext
+            from gateway.session_command_approval import messaging_command_scope
+            scope = (await messaging_command_scope(self, event, _quick_key, stop_epoch)
+                     if canonical == 'review' else nullcontext())
+            with scope:
+                _handled, _result = await self._hm_dispatch_canonical_command(event, source, _quick_key, canonical)
         if not _handled:
             _handled, _result, command = await self._hm_dispatch_quick_and_plugin_commands(event, source, command)
         if not _handled:

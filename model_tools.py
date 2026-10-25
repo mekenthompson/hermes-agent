@@ -815,6 +815,9 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
         dispatch_kwargs["user_task"] = user_task
 
     def _dispatch(next_args: dict[str, Any]) -> Any:
+        from tools.approval_context import revoked_task_tool_error
+        if refusal := revoked_task_tool_error():
+            return refusal
         from tools.connectors import dispatch_connector_call, is_connector_name
         if is_connector_name(function_name):
             return dispatch_connector_call(function_name, next_args, ids.tool_call_id, ids.turn_id, ids.task_id)
@@ -868,6 +871,9 @@ def handle_function_call(
     it (single-fire contract). enabled/disabled_toolsets scope the Tool Search
     bridge catalog to this session's grant (None = unrestricted).
     """
+    from tools.approval_context import revoked_task_tool_error
+    if refusal := revoked_task_tool_error():
+        return refusal
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}

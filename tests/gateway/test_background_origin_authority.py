@@ -24,6 +24,14 @@ async def test_background_admission_and_completion_authority(tmp_path, monkeypat
     from tools.approval import check_dangerous_command
     from tools.delegate_tool_dispatch import _dispatch_unit
     from tools.process_registry import process_registry
+    from tools import file_tools
+    from tools.environments.local import LocalEnvironment
+    from tools.file_operations import ShellFileOperations
+
+    operations = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path), timeout=15, persistent=False),
+                                    cwd=str(tmp_path))
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda _task_id="default": operations)
+    effect = tmp_path / "completion-effect.txt"
 
     def denied_connect(sock, address):
         raise AssertionError("external socket forbidden")
@@ -52,7 +60,7 @@ async def test_background_admission_and_completion_authority(tmp_path, monkeypat
     target = runner.session_store.lookup_by_session_key(live.route).session_id
     ctx, manager = _context(tmp_path)
     _publish(runner, manager)
-    dispatched, observed = [], []
+    dispatched, observed, writes, creates, memories = [], [], [], [], []
     delegation_id = "deleg_authority_" + origin
 
     async def answer(*, message, **kwargs):
@@ -66,6 +74,20 @@ async def test_background_admission_and_completion_authority(tmp_path, monkeypat
             dispatched.append(await asyncio.to_thread(_dispatch_unit, unit, delegation_id, None, routing))
         else:
             observed.append(await asyncio.to_thread(check_dangerous_command, "printf fixture", "local"))
+            from model_tools import handle_function_call
+            writes.append(await asyncio.to_thread(handle_function_call, "write_file",
+                {"path": str(effect), "content": "authorized completion"}, task_id="completion-fixture"))
+            from agent.agent_runtime_helpers import invoke_tool
+            from tools.memory_tool_store import MemoryStore
+            memory_agent = SimpleNamespace(session_id=target, _memory_store=MemoryStore(),
+                                           _memory_manager=None, _build_memory_write_metadata=lambda **kw: kw)
+            memories.append(await asyncio.to_thread(invoke_tool, memory_agent, "memory",
+                {"action": "add", "target": "user", "content": "Authorized completion memory"}, "completion",
+                pre_tool_block_checked=True, skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True))
+            creates.append(await asyncio.to_thread(handle_function_call, "kanban_create",
+                {"title": "remaining work", "assignee": "default", "initial_status": "blocked",
+                 "idempotency_key": "completion-task"}, task_id="completion-fixture"))
         return {"final_response": "ok", "messages": []}
 
     monkeypatch.setattr(runner, "_run_agent", answer)
@@ -91,8 +113,18 @@ async def test_background_admission_and_completion_authority(tmp_path, monkeypat
             assert not reservation.lease.live()
         event = await asyncio.to_thread(process_registry.completion_queue.get, True, 10)
         assert await runner._deliver_completion_notification("completion", event)
-        await async_wait_until(lambda: bool(observed), timeout=10, what="completion command guard")
+        await async_wait_until(lambda: bool(creates), timeout=10, what="completion tool guard")
         assert observed[0]["approved"] is (origin == "human")
+        assert effect.exists() is (origin == "human")
+        if origin == "human_stop":
+            assert json.loads(writes[0])["code"] == "task_authority_revoked"
+            assert json.loads(creates[0])["code"] == "task_authority_revoked"
+            assert json.loads(memories[0])["code"] == "task_authority_revoked"
+            assert not (tmp_path / "memories" / "USER.md").exists()
+        else:
+            assert json.loads(creates[0])["ok"] is True
+            assert json.loads(memories[0])["success"] is True
+            assert "Authorized completion memory" in (tmp_path / "memories" / "USER.md").read_text()
     finally:
         delegation._reset_for_tests()
         db.close()

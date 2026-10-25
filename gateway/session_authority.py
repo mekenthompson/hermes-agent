@@ -871,6 +871,7 @@ class SessionAuthority:
         # A later admission can finish while an earlier detached child is still
         # running. Stop revokes every task owned by this live conversation.
         with live.event_stream.lock:
+            self.fence_route(live.route)
             for lease in list(getattr(live, 'approval_task_leases', ())):
                 lease.revoke()
         if handle.execution_state == 'running':

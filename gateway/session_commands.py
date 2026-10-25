@@ -418,6 +418,7 @@ def _session_workspace(runner, source):
 async def execute_command(connection, ref, params, *, dispatch=False):
     authority, actor = connection.authority, connection.actor
     authority.authorize(actor, ref, 'session:read')
+    arrival_epoch = authority.route_epoch(authority.sessions[ref.session_id].route)
     name, arg = _parse(params, dispatch)
     from hermes_cli.commands import resolve_command
     from hermes_cli.profiles import profile_matches_home
@@ -508,7 +509,12 @@ async def execute_command(connection, ref, params, *, dispatch=False):
                 await commit_reasoning_command(authority, actor, ref,
                                                *GatewayConfigLoadersMixin._parse_reasoning_command_args(arg))
             handler = runner._command_handler_table((canonical,))[canonical]
-            output = await handler(event)
+            from gateway.session_command_approval import command_task_scope
+            from contextlib import nullcontext
+            scope = (command_task_scope(authority, ref, actor.subject, typed, arrival_epoch)
+                     if canonical == 'review' else nullcontext())
+            with scope:
+                output = await handler(event)
     if canonical in _APPROVAL_COMMANDS:
         # Settle the answered prompt for every viewer now (`approval.settled`), as approval.respond does.
         handle = authority._handle(ref)

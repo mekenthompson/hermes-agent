@@ -92,7 +92,7 @@ def _media_clause(event):
     return None
 
 
-def _event_clause(runner, event, provenance, fresh_roles):
+def _event_clause(runner, event, provenance, fresh_roles, *, allow_command=False):
     source = event.source
     if source is None:
         return 'source'
@@ -101,7 +101,7 @@ def _event_clause(runner, event, provenance, fresh_roles):
     if not isinstance(event.message_type, MessageType):
         return 'message_type'
     # The ingress router's own classifier: ``/tmp/x is broken`` is text, not a command.
-    if event.get_command():
+    if event.get_command() and not allow_command:
         return 'command'
     if event.internal:
         return 'internal'
@@ -122,9 +122,9 @@ def _event_clause(runner, event, provenance, fresh_roles):
     return None
 
 
-def _validate_native(runner, event, provenance=None, fresh_roles=False):
+def _validate_native(runner, event, provenance=None, fresh_roles=False, *, allow_command=False):
     source = event.source
-    if (clause := _event_clause(runner, event, provenance, fresh_roles)) is not None:
+    if (clause := _event_clause(runner, event, provenance, fresh_roles, allow_command=allow_command)) is not None:
         _refuse(event, 'invalid_params', clause)
     if provenance is not None:
         from gateway.session_ingress_context import restore_provenance

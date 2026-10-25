@@ -64,7 +64,7 @@ class _Event:
         return self._args
 
 @pytest.mark.asyncio
-async def test_review_command_dispatches_background_subagent(monkeypatch):
+async def test_review_command_dispatches_background_subagent(monkeypatch, tmp_path):
     import tools.delegate_tool as dt
     from agent import review_engine as re_mod
 
@@ -93,8 +93,27 @@ async def test_review_command_dispatches_background_subagent(monkeypatch):
     monkeypatch.setattr(re_mod, "_load_review_credentials_cfg", lambda: None)
 
     agent = _make_agent()
-    runner = _make_runner(agent)
-    out = await runner._handle_review_command(_Event("check tests"))
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_contract import Principal
+    from gateway.session_local import create_local_session
+    from gateway.session_commands import execute_command
+    from types import SimpleNamespace
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner")
+    actor = Principal("owner", "default", frozenset({"session:create", "session:submit",
+                       "session:read", "session:control"}), "native-viewer")
+    ref = create_local_session(authority, actor, {"request_id": "review", "source": "cli",
+                                                "model": "fixture", "toolsets": []})
+    await authority.attach(actor, ref)
+    route = authority.sessions[ref.session_id].route
+    agent.session_id = ref.session_id
+    runner._agent_cache[route] = agent
+    reply = await execute_command(SimpleNamespace(authority=authority, actor=actor, subscriptions={}), ref,
+                                  {"name": "review", "arg": "check tests"}, dispatch=True)
+    out = reply["output"]
 
     assert out == re_mod.format_dispatch_note({"status": "dispatched"})
     assert "PR #5 opened" in built["context"]
@@ -112,7 +131,7 @@ async def test_review_command_dispatches_background_subagent(monkeypatch):
             continue
     assert evt is not None
     assert evt["type"] == "async_delegation"
-    assert evt["session_key"] == SESSION_KEY
+    assert evt["session_key"] == route
     assert evt["results"][0]["summary"] == "review done"
 
 @pytest.mark.asyncio

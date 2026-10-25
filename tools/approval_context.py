@@ -220,6 +220,15 @@ def approval_task_revoked() -> bool:
                                       else not bound[2].active()))
 
 
+def revoked_task_tool_error():
+    """Fence every model tool before hooks, bridge expansion or handler side effects."""
+    if not approval_task_revoked():
+        return None
+    from tools.registry import tool_error
+    return tool_error("The originating task was stopped or completed; native authority is no longer valid.",
+                      code="task_authority_revoked")
+
+
 @contextmanager
 def delegated_approval_task(child_id: str, *, stop_event: Event | None = None):
     """Narrow inherited context to a real child run; copied contexts alone grant nothing."""
