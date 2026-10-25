@@ -307,9 +307,11 @@ def _spawn_background_process(
 def _release_untracked_reservation(registry, session, reservation):
     """A retained descriptor's actual finalizer owns its private reservation."""
     from tools.approval_context import release_background_approval_task
+    if session is None:
+        release_background_approval_task(reservation)
+        return
     with registry._lock:
-        retained = session is not None and (
-            registry._running.get(session.id) is session or registry._finished.get(session.id) is session)
+        retained = registry._running.get(session.id) is session or registry._finished.get(session.id) is session
     if not retained:
         release_background_approval_task(reservation)
 

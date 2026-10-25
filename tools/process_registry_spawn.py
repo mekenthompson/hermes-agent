@@ -70,7 +70,7 @@ def cancel_unstarted_local_launch(registry, session, source):
             return {'status': 'already_exited', 'session_id': session.id, 'not_started': True}
         if not session._local_launch_pending or session._local_launch_attempted:
             return None
-        session.termination_source = source  # a request fences GO even if custody cleanup is unknown
+        session.termination_source = session.termination_source or source  # a request fences GO even if custody cleanup is unknown
         if session._custody is not None:
             from tools.process_registry_custody import stop_before_go
             if result := stop_before_go(registry, session):
@@ -79,7 +79,7 @@ def cancel_unstarted_local_launch(registry, session, source):
         session.custody_scope_empty = True  # no target fork, and any armed keeper is physically settled
         session.exit_code = None  # no OS process or collected exit exists
         session.completion_reason = 'failed_start'
-        session.termination_source = source
+        session.termination_source = session.termination_source or source
         session.reconciliation_required = ''
         session._local_launch_pending = False
         session.notify_on_complete = False

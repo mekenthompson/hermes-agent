@@ -195,6 +195,18 @@ def stop_before_go(registry, session):
     return None
 
 
+def _refuse_custodian_start(registry, session, custody=None):
+    """Only definite creation refusal may settle a keeper that never received GO."""
+    if custody is not None:
+        custody.close()
+        custody.child_socket.close()
+    from tools.process_registry_spawn import cancel_unstarted_local_launch
+    with session._lock:
+        session._custody = None
+        session.custody_kind = ''
+    cancel_unstarted_local_launch(registry, session, 'local_custodian_spawn_refused')
+
+
 def spawn_custodied(registry, session, argv, env, *, pty=False, quick=False, log=None, reserve=True, stdin=False):
     """Arm custody and checkpoint its identity before authorizing the target's first fork."""
     from hermes_cli.process_custody import NATIVE_CUSTODIAN_SOURCE
@@ -205,13 +217,21 @@ def spawn_custodied(registry, session, argv, env, *, pty=False, quick=False, log
     with session._lock:
         if session.exited or session.termination_source:
             raise CustodyUnknown('Native process was cancelled before custody start.')
-    custody = LocalCustody(registry, session)
+    try:
+        custody = LocalCustody(registry, session)
+    except OSError:
+        _refuse_custodian_start(registry, session)
+        raise
     session._custody = custody
     session.custody_kind = 'linux_subreaper'
     if reserve and getattr(session, 'approval_task_reservation', None) is None:
         session.approval_task_reservation = reserve_background_approval_task()
     config = json.dumps({'argv': argv, 'pty': pty, 'persist': session.persist_on_release, 'grace': registry._daemon_term_grace_seconds()})
-    output = facade.open_output_log(log) if log else subprocess.PIPE
+    try:
+        output = facade.open_output_log(log) if log else subprocess.PIPE
+    except OSError:
+        _refuse_custodian_start(registry, session, custody)
+        raise
     try:
         proc = facade.subprocess.Popen([sys.executable, '-I', '-S', '-c', NATIVE_CUSTODIAN_SOURCE,
             str(custody.child_socket.fileno()), config], cwd=session.cwd, env=env,
@@ -219,11 +239,16 @@ def spawn_custodied(registry, session, argv, env, *, pty=False, quick=False, log
             stderr=subprocess.PIPE if quick else subprocess.STDOUT,
             pass_fds=(custody.child_socket.fileno(),), start_new_session=True,
             text=not (quick or pty), **({'encoding': 'utf-8', 'errors': 'replace'} if not (quick or pty) else {}))
+    except OSError:
+        _refuse_custodian_start(registry, session, custody)
+        raise
+    else:
+        # Retain the returned resource even if closing a parent FD now fails.
+        custody.proc = session.process = proc
     finally:
         custody.child_socket.close()
         if log:
             os.close(output)
-    custody.proc = session.process = proc
     session.output_log = str(log or '')
     session.custody_pid = proc.pid
     session.custody_start_time = registry._safe_host_start_time(proc.pid)

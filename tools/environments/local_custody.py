@@ -94,7 +94,8 @@ def spawn_foreground(argv, command, cwd, environment, *, stdin=False):
         require_live_task_setup()
         return ForegroundCustody(registry, session)
     except Exception as exc:
-        reconcile_local_launch(registry, session)
+        if not (session.exited and session.pid is None and session.completion_reason == 'failed_start'):
+            reconcile_local_launch(registry, session)
         if session._local_launch_attempted:
             from tools.process_registry_custody import CustodyUnknown
             raise CustodyUnknown(session.reconciliation_required or str(exc)) from exc
