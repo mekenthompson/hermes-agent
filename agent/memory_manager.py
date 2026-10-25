@@ -236,11 +236,15 @@ class MemoryManager:
         self._tool_call_keywords_cache: dict[int, Optional[frozenset[str]]] = {}
 
     def _each_provider(self, label: str, call: Callable[[MemoryProvider], Any], *, level: int = logging.DEBUG,
-                       providers: Optional[list[MemoryProvider]] = None, exc_info: bool = False) -> list[Any]:
+                       providers: Optional[list[MemoryProvider]] = None, exc_info: bool = False,
+                       allow_revoked: bool = False) -> list[Any]:
         """Call ``call(provider)`` per provider, logging+swallowing failures; returns successes in order.
         ``label`` completes the log line ``Memory provider '<name>' <label>: <exc>``."""
+        from tools.approval_context import approval_task_revoked
         results: list[Any] = []
         for provider in self._providers if providers is None else providers:
+            if not allow_revoked and approval_task_revoked():
+                break
             try:
                 results.append(call(provider))
             except Exception as e:
@@ -482,7 +486,11 @@ class MemoryManager:
         """Queue ``fn`` on the serialized worker (created lazily; None once shutting down) and track its
         durability class. Runs under the caller's contextvars (``ctx_bound``). If the executor is
         unavailable outside shutdown, run inline — the historical fail-safe."""
-        fn = ctx_bound(in_owner_home(self._bound_scope, fn))
+        from agent.memory_task_authority import bind_memory_task
+        fn, release = bind_memory_task(in_owner_home(self._bound_scope, fn))
+        if fn is None:
+            return
+        fn = ctx_bound(fn)
         executor = None if self._shutting_down else self._sync_executor
         if executor is None and not self._shutting_down:
             with self._sync_executor_lock:
@@ -501,6 +509,7 @@ class MemoryManager:
             with self._sync_executor_lock:
                 if self._shutting_down:
                     logger.warning("Memory manager is shutting down; rejecting late %s task", kind)
+                    release()
                     return
                 if executor is not None:
                     future = executor.submit(fn)
@@ -508,8 +517,13 @@ class MemoryManager:
         except RuntimeError:
             if self._shutting_down:
                 logger.warning("Memory manager shut down during %s submission; task rejected", kind)
+                release()
                 return
+        except BaseException:
+            release()
+            raise
         if future is not None:
+            future.add_done_callback(release)
             future.add_done_callback(self._forget_background_future)
             return
         try:
@@ -521,8 +535,10 @@ class MemoryManager:
         """Run a background provider call unless _BACKGROUND_GATE skips it (the provider has stuck calls);
         skipping costs that turn's write/prefetch but stops a wedged backend from pinning one more
         thread per fresh manager. The builtin provider is never gated."""
+        from tools.approval_context import approval_task_revoked
         if provider.name == "builtin":
-            call()
+            if not approval_task_revoked():
+                call()
             return
         key = self._registry_key(provider)
         token = object()
@@ -538,8 +554,9 @@ class MemoryManager:
             return
         ok = False
         try:
-            call()
-            ok = True
+            if not approval_task_revoked():
+                call()
+                ok = True
         finally:
             self._BACKGROUND_GATE.leave(key, token, ok=ok)
 
@@ -867,7 +884,7 @@ class MemoryManager:
         """Drain the background executor (bounded), then shut providers down in reverse order."""
         self._drain_sync_executor()
         self._each_provider("shutdown failed", lambda p: p.shutdown(), level=logging.WARNING,
-                            providers=self._providers[::-1])
+                            providers=self._providers[::-1], allow_revoked=True)
 
     @property
     def shutdown_drain_state(self) -> dict[str, Any]:

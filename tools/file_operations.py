@@ -24,6 +24,7 @@ from typing import Optional, Dict
 from pathlib import Path
 
 from tools.binary_extensions import has_binary_extension
+from tools.approval_context import require_live_task_setup
 from agent.file_safety import get_write_denied_error
 from tools.file_operations_common import (
     ExecuteResult, PatchResult, ReadResult, SearchResult, WriteResult,
@@ -580,6 +581,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         doesn't =word-expand. ``trap ... EXIT`` removes the temp on every failure.
         The local POSIX backend does the same in-process (``tools.file_operations_native``).
         """
+        # Reads, validation and path-lock waits may outlive the native task.
+        require_live_task_setup()
         if self._native_read_enabled():
             error = _native_io.atomic_write(self._native_path(path), content.encode("utf-8", "surrogateescape"))
             return ExecuteResult(stdout=error or "", exit_code=1 if error else 0)
@@ -1330,11 +1333,13 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             "    print(str(exc), file=sys.stderr); sys.exit(1)\n"
         )
 
+        require_live_task_setup()
         result = self._exec_python_snippet(snippet)
 
         # Fall back to ``python`` (remote backends / older systems where there's no
         # ``python3`` symlink but a ``python`` binary is on PATH).
         if result.exit_code != 0 and "python3" in (result.stdout or ""):
+            require_live_task_setup()
             result = self._exec_python_snippet(snippet, py="python")
 
         if result.exit_code != 0:
@@ -1349,6 +1354,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             denied = get_write_denied_error(p, verb="Move", entry=True)
             if denied:
                 return WriteResult(error=denied)
+        require_live_task_setup()
         result = self._exec(f"mv {self._escape_shell_arg(src)} {self._escape_shell_arg(dst)}")
         if result.exit_code != 0:
             return WriteResult(error=f"Failed to move {src} -> {dst}: {result.stdout}")

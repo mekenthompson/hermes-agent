@@ -21,6 +21,7 @@ from pathlib import Path
 from agent.file_safety import get_nt_namespace_error, get_read_block_error
 from agent.tool_result_classification import GUARDRAIL_REFUSAL_KEY
 from tools.binary_extensions import has_binary_extension
+from tools.approval_context import revoked_task_tool_error
 from tools.skill_provenance import is_background_review
 from tools.file_operations import (
     ShellFileOperations, normalize_read_pagination, normalize_search_pagination)
@@ -890,6 +891,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 # Per-path lock serializes read→modify→write across concurrent
                 # subagents; different paths stay fully parallel.
                 _lock.enter_context(file_state.lock_path(_resolved))
+            # Stop may revoke this task while another edit holds the path lock.
+            revoked = revoked_task_tool_error()
+            if revoked:
+                return revoked
             # A whole-file overwrite of content this task never saw, or that
             # changed since, is refused HERE — before the write — instead of
             # warning after the clobber (#65604). Nothing below runs.
@@ -986,6 +991,9 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
         with ExitStack() as _locks:
             for _r in sorted({_r for _r in (*_path_to_resolved.values(), *_path_to_entry.values()) if _r}):
                 _locks.enter_context(file_state.lock_path(_r))
+            revoked = revoked_task_tool_error()
+            if revoked:
+                return revoked
             stale_warnings = _edit_warnings(_paths_to_check, _path_to_resolved, task_id)
             file_ops = _get_file_ops(task_id)
             # Whole-file knowledge held BEFORE the patch reads, under the same locks. Like

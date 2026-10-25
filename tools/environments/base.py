@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from hermes_constants import get_hermes_home
+from tools.approval_context import require_live_task_setup
 from tools.interrupt import consume_yield, is_interrupted, is_thread_interrupted
 from tools.environments.base_output import (
     ProcessHandle, _finalize_wait_result, _new_output_collector, _start_drain_thread,
@@ -674,6 +675,7 @@ class BaseEnvironment(ABC):
         is drained (head/tail window) instead of holding the full output in memory (#64435).
         See #94285.
         """
+        require_live_task_setup()
         self._before_execute()
 
         exec_command, sudo_stdin = self._prepare_command(command)
@@ -711,6 +713,9 @@ class BaseEnvironment(ABC):
                 return {"output": "[host is exiting: command not started]", "returncode": 130}
             spawned = None
             try:
+                # Preparation and spawn serialization can wait past native Stop.
+                # Check on the context-carrying worker, after the common spawn lock.
+                require_live_task_setup()
                 spawned = self._run_bash(wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin)
             finally:
                 fenced = _leave_foreground_spawn(self, spawned)
