@@ -21,7 +21,7 @@ class ProcessCheckpointMixin:
         A completion is not queued here: recovery has no waitable handle, so it
         never collected an exit status.
         """
-        if session is None or session.exited or not session.detached or session.pid_scope != "host" or session.output_log or session.reconciliation_required:
+        if session is None or session.exited or not session.detached or session.pid_scope != "host" or session.output_log or session.reconciliation_required or session.custody_kind:
             return session  # a log-backed adoption's reader collects the recorded exit itself
         fate = self._detached_host_fate(session.pid, session.host_start_time)
         if fate == "running":
@@ -45,7 +45,7 @@ class ProcessCheckpointMixin:
                         continue
                     # Backfill the start time so recovery can detect PID recycling
                     # even for sessions spawned before this field existed.
-                    if s.host_start_time is None and s.pid_scope == "host" and s.pid and not s.reconciliation_required:
+                    if s.host_start_time is None and s.pid_scope == "host" and s.pid and not (s.reconciliation_required or s.custody_kind):
                         s.host_start_time = self._safe_host_start_time(s.pid)
                     entry = {"session_id": s.id, **{f: getattr(s, f) for f in _CHECKPOINT_FIELDS}}
                     # Redact inline credentials before persisting (~/.hermes/processes.json).
@@ -82,7 +82,7 @@ class ProcessCheckpointMixin:
         except (OSError, ValueError):
             return []
         def retained(entry):
-            if entry.get("reconciliation_required") or entry.get("pid_scope", "host") != "host":
+            if entry.get("custody_kind") or entry.get("reconciliation_required") or entry.get("pid_scope", "host") != "host":
                 # A sandbox PID is never a host liveness probe. Both acknowledged
                 # launches and missing receipts need native external reconciliation.
                 return True
@@ -114,7 +114,7 @@ class ProcessCheckpointMixin:
         unresolved_scope_entries: list[dict[str, Any]] = []
         for entry in entries:
             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
-            if not pid and pid_scope == "host" and not entry.get("reconciliation_required"):
+            if not pid and pid_scope == "host" and not entry.get("reconciliation_required") and not entry.get('custody_kind'):
                 continue
             # The registry is process-global, so every profile's checkpoint carries every live
             # process; a multiplexer recovering several homes must adopt each session once.
@@ -123,10 +123,10 @@ class ProcessCheckpointMixin:
             if already_tracked:
                 continue
             # A PID's death/reuse cannot settle uncertain descendants or external effects.
-            if pid_scope != "host" or entry.get("reconciliation_required"):
+            if pid_scope != "host" or entry.get("reconciliation_required") or entry.get('custody_kind'):
                 fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
                 fields["reconciliation_required"] = entry.get("reconciliation_required") or (
-                    "The runtime restarted; remote process state is unknown. Reconcile with current native "
+                    "The runtime restarted; process custody or remote state is unknown. Reconcile with current native "
                     "authorization before reporting it stopped or retrying work.")
                 session = ProcessSession(id=entry["session_id"], detached=True, **fields)
                 with self._lock:

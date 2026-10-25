@@ -59,14 +59,19 @@ def begin_local_launch(session):
 
 def cancel_unstarted_local_launch(registry, session, source):
     """One lock orders the no-effect cancellation against the producer's launch attempt."""
-    if not session._local_launch_pending and not (
-            session.exited and session.pid is None and session.completion_reason == 'failed_start'):
+    if (session._local_launch_attempted and not session.exited) or (not session._local_launch_pending and not (
+            session.exited and session.pid is None and session.completion_reason == 'failed_start')):
         return None
     with session._lock:
         if session.exited and session.pid is None and session.completion_reason == 'failed_start':
             return {'status': 'already_exited', 'session_id': session.id, 'not_started': True}
         if not session._local_launch_pending or session._local_launch_attempted:
             return None
+        session.termination_source = source  # a request fences GO even if custody cleanup is unknown
+        if session._custody is not None:
+            from tools.process_registry_custody import stop_before_go
+            if result := stop_before_go(registry, session):
+                return result
         session.exited = True
         session.exit_code = None  # no OS process or collected exit exists
         session.completion_reason = 'failed_start'
@@ -95,13 +100,13 @@ def publish_local_launch(registry, session, reader_target, reader_name):
     from tools.approval_context import require_live_task_setup
     require_live_task_setup()
     with session._lock:
-        if (not session._native_local_launch or session.host_start_time is not None) and session.reconciliation_required == _LOCAL_PENDING:
+        if (not session._native_local_launch or session.host_start_time is not None or session.custody_start_time is not None) and session.reconciliation_required == _LOCAL_PENDING:
             session.reconciliation_required = ''
     registry._write_checkpoint()
     registry._track_started(session, reader_target, reader_name)
     require_live_task_setup()
     with session._lock:
-        if not session._native_local_launch or session.host_start_time is not None:
+        if not session._native_local_launch or session.host_start_time is not None or session.custody_start_time is not None:
             session._local_launch_pending = False
     registry._write_checkpoint()
 
@@ -123,6 +128,15 @@ def reconcile_local_launch(registry, session):
 
 def spawn_pty(registry, session, safe_command, env_vars):
     from tools import process_registry as facade
+    if session._native_local_launch and facade._IS_LINUX:
+        from tools.process_registry_custody import spawn_custodied
+        argv = registry._scope_argv(session, safe_command, session.id, 'PTY')
+        env = registry._spawn_env(env_vars)
+        env.setdefault('GIT_PAGER', 'cat')
+        env.setdefault('PAGER', 'cat')
+        spawn_custodied(registry, session, argv, env, pty=True)
+        publish_local_launch(registry, session, registry._pty_reader_loop, f'proc-pty-reader-{session.id}')
+        return session
     if facade._IS_WINDOWS:
         from winpty import PtyProcess
     else:

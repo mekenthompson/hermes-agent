@@ -41,6 +41,13 @@ def spawn_local_pipe(registry, session, safe_command, env_vars, pty_scope_attemp
     from tools.process_registry_spawn import begin_local_launch, local_process_receipt, publish_local_launch
     require_live_task_setup()
     start_local_process(resource)
+    if session._native_local_launch and facade._IS_LINUX:
+        from tools.process_registry_custody import spawn_custodied
+        spawn_custodied(registry, session, argv, env, log=log)
+        record_local_process(resource, session.id, session.pid, session.host_start_time)
+        publish_local_launch(registry, session,
+            registry._log_reader_loop if log else registry._reader_loop, f'proc-reader-{session.id}')
+        return session
     # The scope does not create a new session; preserve TTY/process-group isolation.
     output = facade.open_output_log(log) if log else facade.subprocess.PIPE
     try:

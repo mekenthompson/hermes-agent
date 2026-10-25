@@ -278,8 +278,6 @@ def test_websocket_stop_reaps_its_actual_quick_shell_tree_and_preserves_other_co
 @pytest.mark.platforms('linux')
 @pytest.mark.parametrize('failure', ['cleanup_denied', 'stale_identity'])
 async def test_native_stop_reports_unknown_when_quick_process_cleanup_cannot_be_proven(tmp_path, monkeypatch, failure):
-    from agent import deadline
-    from gateway.session_command_process import stop_exec_tree
     from gateway.session_commands import execute_command
     from gateway.session_runtime_workers import join_authority_work, uncounted_runtime_work
     from hermes_state_runtime import RuntimeStoreError
@@ -289,21 +287,14 @@ async def test_native_stop_reports_unknown_when_quick_process_cleanup_cannot_be_
     runtime = await _native_session(tmp_path, monkeypatch, {'waiting-effect': tree.command})
     registry = process_registry.ProcessRegistry()
     monkeypatch.setattr(process_registry, 'process_registry', registry)
-    actual_spawn, processes = asyncio.create_subprocess_shell, []
-
-    async def spawn(*args, **kwargs):
-        proc = await actual_spawn(*args, **kwargs)
-        processes.append(proc)
-        return proc
-
-    monkeypatch.setattr(asyncio, 'create_subprocess_shell', spawn)
     pending = asyncio.create_task(execute_command(runtime.connection, runtime.ref, {'command': '/waiting-effect'}))
     try:
         await async_wait_until(tree.entered.exists, timeout=15, what='native quick process before cleanup failure')
-        proc, = processes
+        session, = registry._running.values()
         shell, child = _pid(tree.shell), _pid(tree.child)
-        assert proc.pid == shell and _alive(shell) and _alive(child)
-        assert proc._hermes_host_start_time is not None
+        await async_wait_until(lambda: session.pid == shell, timeout=10, what='actual target birth receipt')
+        assert _alive(shell) and _alive(child) and _alive(session.custody_pid)
+        assert session.host_start_time is not None and session.custody_start_time is not None
         actual_start = registry._safe_host_start_time
 
         def deny_cleanup(*_args, **_kwargs):
@@ -311,11 +302,11 @@ async def test_native_stop_reports_unknown_when_quick_process_cleanup_cannot_be_
 
         def changed_identity(pid):
             value = actual_start(pid)
-            return value + 1 if pid == shell and value is not None else value
+            return value + 1 if pid == session.custody_pid and value is not None else value
 
         with pytest.MonkeyPatch.context() as patch:
             if failure == 'cleanup_denied':
-                patch.setattr(deadline, 'kill_process_tree', deny_cleanup)
+                patch.setattr(session._custody, 'stop', deny_cleanup)
             else:
                 patch.setattr(process_registry.ProcessRegistry, '_safe_host_start_time', staticmethod(changed_identity))
             with pytest.raises(RuntimeStoreError) as refused:
@@ -330,6 +321,8 @@ async def test_native_stop_reports_unknown_when_quick_process_cleanup_cannot_be_
             assert retained[0].reconciliation_required and not retained[0].exited
             checkpoint = json.loads(process_registry._checkpoint_path().read_text())
             assert any(row['session_id'] == retained[0].id and row['pid'] == shell
+                       and row['custody_pid'] == session.custody_pid
+                       and row['custody_start_time'] == session.custody_start_time
                        and row['reconciliation_required'] for row in checkpoint)
             assert not tree.effect.exists()
             assert uncounted_runtime_work(runtime.authority.runner) > 0
@@ -337,9 +330,7 @@ async def test_native_stop_reports_unknown_when_quick_process_cleanup_cannot_be_
                 await join_authority_work(runtime.authority, timeout=2)
             assert _alive(shell) and _alive(child), 'profile retirement cannot claim unconfirmed cleanup succeeded'
     finally:
-        for proc in processes:
-            if proc.returncode is None:
-                await stop_exec_tree(proc)
+        await asyncio.to_thread(registry.kill_all, source='test-cleanup')
         tree.release.touch()
         await asyncio.gather(pending, return_exceptions=True)
         runtime.authority.db.close()
@@ -348,21 +339,15 @@ async def test_native_stop_reports_unknown_when_quick_process_cleanup_cannot_be_
 @pytest.mark.asyncio
 @pytest.mark.platforms('linux')
 async def test_profile_retirement_joins_the_actual_owned_quick_shell_tree(tmp_path, monkeypatch):
-    from gateway.session_command_process import stop_exec_tree
     from gateway.session_commands import execute_command
     from gateway.session_runtime_workers import (command_effects, join_authority_work,
                                                 stop_authority_work, uncounted_runtime_work)
+    from tools import process_registry
 
     tree = _waiting_shell(tmp_path)
     runtime = await _native_session(tmp_path, monkeypatch, {'waiting-effect': tree.command})
-    actual_spawn, processes = asyncio.create_subprocess_shell, []
-
-    async def spawn(*args, **kwargs):
-        proc = await actual_spawn(*args, **kwargs)
-        processes.append(proc)
-        return proc
-
-    monkeypatch.setattr(asyncio, 'create_subprocess_shell', spawn)
+    registry = process_registry.ProcessRegistry()
+    monkeypatch.setattr(process_registry, 'process_registry', registry)
     pending = asyncio.create_task(execute_command(runtime.connection, runtime.ref, {'command': '/waiting-effect'}))
     try:
         await async_wait_until(tree.entered.exists, timeout=15, what='profile-owned quick shell tree')
@@ -376,9 +361,7 @@ async def test_profile_retirement_joins_the_actual_owned_quick_shell_tree(tmp_pa
         await asyncio.wait_for(pending, 15)
         assert not tree.effect.exists() and not command_effects(runtime.authority)
     finally:
-        for proc in processes:
-            if proc.returncode is None:
-                await stop_exec_tree(proc)
+        await asyncio.to_thread(registry.kill_all, source='test-cleanup')
         tree.release.touch()
         await asyncio.gather(pending, return_exceptions=True)
         runtime.authority.db.close()
@@ -388,31 +371,37 @@ async def test_profile_retirement_joins_the_actual_owned_quick_shell_tree(tmp_pa
 @pytest.mark.platforms('linux')
 @pytest.mark.parametrize('stopped', [False, True, pytest.param('repeated_cancel', id='repeated_observer_cancel')])
 async def test_native_stop_reconciles_actual_spawn_before_its_receipt_returns(tmp_path, monkeypatch, stopped):
-    from gateway.session_command_process import stop_exec_tree
     from gateway.session_commands import execute_command
     from gateway.session_runtime_workers import command_effects, join_authority_work, uncounted_runtime_work
-    from tools.process_registry import ProcessRegistry
+    from tools import process_registry
+    from tools.process_registry_custody import LocalCustody
 
     tree = _waiting_shell(tmp_path)
     runtime = await _native_session(tmp_path, monkeypatch, {'waiting-effect': tree.command})
-    entered, receipt = asyncio.Event(), asyncio.Event()
-    actual_spawn, processes = asyncio.create_subprocess_shell, []
+    registry = process_registry.ProcessRegistry()
+    monkeypatch.setattr(process_registry, 'process_registry', registry)
+    entered, receipt = threading.Event(), threading.Event()
+    actual_wait, sessions = LocalCustody.wait_event, []
 
-    async def spawn_then_wait(*args, **kwargs):
-        proc = await actual_spawn(*args, **kwargs)
-        processes.append(proc)
-        entered.set()
-        await receipt.wait()
-        return proc
+    def wait_for_target_then_hold(custody, event, timeout=15):
+        result = actual_wait(custody, event, timeout)
+        if event is custody.started:
+            # Hold the producer's actual target receipt, leaving the independent
+            # control receiver free to collect whole-scope Stop evidence.
+            sessions.append(custody.session)
+            entered.set()
+            assert receipt.wait(20)
+        return result
 
-    monkeypatch.setattr(asyncio, 'create_subprocess_shell', spawn_then_wait)
+    monkeypatch.setattr(LocalCustody, 'wait_event', wait_for_target_then_hold)
     pending = asyncio.create_task(execute_command(runtime.connection, runtime.ref, {'command': '/waiting-effect'}))
     stopping = None
     try:
-        await asyncio.wait_for(entered.wait(), 15)
+        assert await asyncio.to_thread(entered.wait, 15)
         await async_wait_until(tree.entered.exists, timeout=15, what='real shell launched before receipt')
+        session, = sessions
         shell, child = _pid(tree.shell), _pid(tree.child)
-        assert _alive(shell) and _alive(child)
+        assert session.pid == shell and _alive(shell) and _alive(child)
         if stopped:
             route = runtime.authority.sessions[runtime.ref.session_id].route
             arrival = runtime.authority.route_epoch(route)
@@ -449,12 +438,7 @@ async def test_native_stop_reconciles_actual_spawn_before_its_receipt_returns(tm
             assert tree.effect.read_text() == 'current'
     finally:
         receipt.set()
-        for proc in processes:
-            if proc.returncode is None:
-                # Cleanup only this test's captured real process after assertions.
-                if getattr(proc, '_hermes_host_start_time', None) is None:
-                    proc._hermes_host_start_time = ProcessRegistry._safe_host_start_time(proc.pid)
-                await stop_exec_tree(proc)
+        await asyncio.to_thread(registry.kill_all, source='test-cleanup')
         tree.release.touch()
         if stopping is not None:
             await asyncio.gather(stopping, return_exceptions=True)
@@ -464,10 +448,9 @@ async def test_native_stop_reconciles_actual_spawn_before_its_receipt_returns(tm
 
 @pytest.mark.asyncio
 @pytest.mark.platforms('linux')
-async def test_native_stop_keeps_exited_root_with_live_descendant_unknown(tmp_path, monkeypatch):
+async def test_native_stop_settles_custodied_descendant_after_actual_root_exit(tmp_path, monkeypatch):
     from gateway.session_commands import execute_command
-    from gateway.session_runtime_workers import join_authority_work, uncounted_runtime_work
-    from hermes_state_runtime import RuntimeStoreError
+    from gateway.session_runtime_workers import command_effects, join_authority_work, uncounted_runtime_work
     from tools import process_registry
 
     shell_file, child_file, entered, exit_root, release, effect = [tmp_path / name for name in (
@@ -479,46 +462,39 @@ async def test_native_stop_keeps_exited_root_with_live_descendant_unknown(tmp_pa
     runtime = await _native_session(tmp_path, monkeypatch, {'orphan-effect': command})
     registry = process_registry.ProcessRegistry()
     monkeypatch.setattr(process_registry, 'process_registry', registry)
-    actual_spawn, processes = asyncio.create_subprocess_shell, []
-
-    async def spawn(*args, **kwargs):
-        proc = await actual_spawn(*args, **kwargs)
-        processes.append(proc)
-        return proc
-
-    monkeypatch.setattr(asyncio, 'create_subprocess_shell', spawn)
     pending = asyncio.create_task(execute_command(runtime.connection, runtime.ref, {'command': '/orphan-effect'}))
     child = None
     try:
         await async_wait_until(lambda: entered.exists() and _pid(child_file), timeout=15,
                                what='actual quick descendant retaining the output pipe')
-        proc, = processes
+        session, = registry._running.values()
         shell, child = _pid(shell_file), _pid(child_file)
-        birth = proc._hermes_host_start_time
-        assert birth is not None and proc.pid == shell and _alive(shell) and _alive(child)
+        await async_wait_until(lambda: session.pid == shell, timeout=10, what='actual root birth receipt')
+        birth, custody = session.host_start_time, session._custody
+        assert birth is not None and _alive(shell) and _alive(child)
         exit_root.touch()
-        await async_wait_until(lambda: proc.returncode == 0, timeout=10, what='actual shell root exit')
+        await async_wait_until(custody.main_exited.is_set, timeout=10, what='actual shell root exit receipt')
+        assert custody.main_code == 0 and custody.main_remaining
         assert not _alive(shell) and _alive(child) and not pending.done()
-        with pytest.raises(RuntimeStoreError) as refused:
-            await runtime.authority.interrupt(runtime.actor, runtime.ref,
-                                               runtime.authority._handle(runtime.ref).execution_generation)
-        assert refused.value.reason == 'unknown_execution'
-        await asyncio.wait_for(pending, 15)
-        retained = list(registry._running.values())
-        assert len(retained) == 1 and retained[0].pid == shell and retained[0].host_start_time == birth
-        assert retained[0].reconciliation_required and not retained[0].exited
-        assert registry.poll(retained[0].id)['status'] == 'unknown'
+        assert not custody.settled() and not session.exited
         checkpoint = json.loads(process_registry._checkpoint_path().read_text())
-        assert any(row['pid'] == shell and row['host_start_time'] == birth
-                   and row['reconciliation_required'] for row in checkpoint)
+        assert any(row['session_id'] == session.id and row['pid'] == shell and row['host_start_time'] == birth
+                   and row['custody_pid'] == session.custody_pid
+                   and not row['custody_scope_empty'] for row in checkpoint)
         assert uncounted_runtime_work(runtime.authority.runner) > 0
-        with pytest.raises((RuntimeStoreError, TimeoutError)):
-            await join_authority_work(runtime.authority, timeout=2)
-        assert _alive(child) and not effect.exists(), 'unknown descendant must not be blindly signalled'
+        await runtime.authority.interrupt(runtime.actor, runtime.ref,
+                                          runtime.authority._handle(runtime.ref).execution_generation)
+        assert not _alive(child) and not _alive(session.custody_pid) and not effect.exists()
+        assert custody.empty.is_set() and custody.settled() and session.custody_scope_empty
+        assert session.exited and not session.reconciliation_required
+        await asyncio.wait_for(pending, 15)
+        await join_authority_work(runtime.authority, timeout=10)
+        assert not command_effects(runtime.authority) and not uncounted_runtime_work(runtime.authority.runner)
+        checkpoint = json.loads(process_registry._checkpoint_path().read_text())
+        assert not any(row['session_id'] == session.id for row in checkpoint)
     finally:
-        # The exited root no longer proves ownership of a reparented PID. Release
-        # this test's child through its own explicit control instead of signalling it.
         exit_root.touch()
+        await asyncio.to_thread(registry.kill_all, source='test-cleanup')
         release.touch()
         if child is not None:
             await async_wait_until(lambda: not _alive(child), timeout=10, what='released test descendant exit')

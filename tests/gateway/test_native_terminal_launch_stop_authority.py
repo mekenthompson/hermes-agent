@@ -189,6 +189,7 @@ def register(ctx):
 async def test_late_os_receipt_retains_cancelled_stop_cleanup_and_unrelated_native_work(tmp_path, monkeypatch):
     from gateway.session_runtime_workers import mutation_tasks, uncounted_runtime_work
     from tools import process_registry
+    from tools.process_registry_custody import LocalCustody
 
     runtime = await _runtime(tmp_path, monkeypatch)
     old, other = _tree(tmp_path, 'late'), _tree(tmp_path, 'other')
@@ -196,14 +197,25 @@ async def test_late_os_receipt_retains_cancelled_stop_cleanup_and_unrelated_nati
     old.command += ' # ' + marker
     entered, receipt, killing, cleanup = (threading.Event() for _ in range(4))
     actual_spawn, actual_kill = process_registry.subprocess.Popen, runtime.registry.kill_process
+    actual_wait = LocalCustody.wait_event
     stopping = None
 
     def spawn_then_wait(*args, **kwargs):
         proc = actual_spawn(*args, **kwargs)
-        if marker in str(args[0] if args else kwargs.get('args')):
+        argv = args[0] if args else kwargs.get('args')
+        if marker in str(argv) and not (isinstance(argv, list) and '-I' in argv and '-S' in argv):
             entered.set()
             assert receipt.wait(20)
         return proc
+
+    def started_then_wait(custody, event, timeout=15):
+        result = actual_wait(custody, event, timeout)
+        # Hold the producer after its real target receipt, leaving the private
+        # control reader free to deliver Stop and whole-scope settlement.
+        if event is custody.started and marker in custody.session.command:
+            entered.set()
+            assert receipt.wait(20)
+        return result
 
     def kill_then_wait(process_id, **kwargs):
         if not killing.is_set():
@@ -212,11 +224,12 @@ async def test_late_os_receipt_retains_cancelled_stop_cleanup_and_unrelated_nati
         return actual_kill(process_id, **kwargs)
 
     monkeypatch.setattr(process_registry.subprocess, 'Popen', spawn_then_wait)
+    monkeypatch.setattr(LocalCustody, 'wait_event', started_then_wait)
     monkeypatch.setattr(runtime.registry, 'kill_process', kill_then_wait)
     ref, route, _ = await _submit(runtime, old)
     try:
         assert await asyncio.to_thread(entered.wait, 10)
-        await async_wait_until(old.ready.exists, timeout=10, what='OS process before Popen receipt')
+        await async_wait_until(old.ready.exists, timeout=10, what='actual target before producer receipt returns')
         shell, child = int(old.shell.read_text()), int(old.child.read_text())
         assert _alive(shell) and _alive(child)
         stopping = asyncio.create_task(runtime.authority.interrupt(runtime.actor, ref,
@@ -288,6 +301,7 @@ async def test_process_stop_before_native_launch_attempt_keeps_no_start_tombston
     from types import SimpleNamespace
     from gateway.session_ancillary import handlers
     from tools import process_registry
+    from tools.process_registry_custody import LocalCustody
 
     runtime = await _runtime(tmp_path, monkeypatch)
     tree = _tree(tmp_path, 'cancel-before-start')
@@ -295,6 +309,7 @@ async def test_process_stop_before_native_launch_attempt_keeps_no_start_tombston
     tree.command += ' # ' + marker
     entered, release = threading.Event(), threading.Event()
     actual_env, actual_spawn = runtime.registry._spawn_env, process_registry.subprocess.Popen
+    actual_send = LocalCustody.send
     spawns = []
 
     def held_env(*args, **kwargs):
@@ -304,12 +319,19 @@ async def test_process_stop_before_native_launch_attempt_keeps_no_start_tombston
         return env
 
     def observed_spawn(*args, **kwargs):
-        if marker in str(args[0] if args else kwargs.get('args')):
+        argv = args[0] if args else kwargs.get('args')
+        if marker in str(argv) and not (isinstance(argv, list) and '-I' in argv and '-S' in argv):
             spawns.append(args)
         return actual_spawn(*args, **kwargs)
 
+    def observed_send(custody, operation, **values):
+        if operation == 'go' and marker in custody.session.command:
+            spawns.append(('target-go', custody.session.id))
+        return actual_send(custody, operation, **values)
+
     monkeypatch.setattr(runtime.registry, '_spawn_env', held_env)
     monkeypatch.setattr(process_registry.subprocess, 'Popen', observed_spawn)
+    monkeypatch.setattr(LocalCustody, 'send', observed_send)
     ref, route, _ = await _submit(runtime, tree)
     try:
         assert await asyncio.to_thread(entered.wait, 10)

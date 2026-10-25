@@ -98,6 +98,15 @@ async def _settle(task):
 async def _execute(exec_cmd, cwd, timeout, stop_tree, evidence):
     from tools.approval_context import require_live_task_setup, revoke_current_approval_task
     from tools.environments.local import build_subprocess_env
+    if evidence is not None and os.sys.platform.startswith('linux'):
+        from gateway.session_command_custody import run_custodied_quick
+        try:
+            return await run_custodied_quick(exec_cmd, cwd, timeout, evidence)
+        except CommandProcessUnknown:
+            raise
+        except Exception as exc:
+            logger.debug('Native quick command refused or failed', exc_info=True)
+            return t('gateway.quick_command.error', error=exc)
     proc = None
 
     async def cleanup():

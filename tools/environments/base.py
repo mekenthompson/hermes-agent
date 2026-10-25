@@ -780,6 +780,8 @@ class BaseEnvironment(ABC):
             self._kill_process(spawned)
         except Exception:
             logger.debug("terminal wait-bound kill_process failed", exc_info=True)
+        if getattr(spawned, '_hermes_process_session', None) is not None:
+            return  # only the existing keeper can prove this native scope stopped
         pid = getattr(spawned, "pid", None)
         if not pid:
             return

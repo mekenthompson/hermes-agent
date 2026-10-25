@@ -554,6 +554,10 @@ class ProcessSession:
     cwd: Optional[str] = None
     started_at: float = 0.0                     # time.time() of spawn
     host_start_time: Optional[int] = None       # kernel start ticks (/proc/<pid>/stat f22) — PID-reuse guard
+    custody_kind: str = ''
+    custody_pid: Optional[int] = None
+    custody_start_time: Optional[int] = None
+    custody_scope_empty: bool = False
     exited: bool = False
     exited_at: float = 0.0                      # time.time() of the FIRST move to finished (0 = unknown)
     exit_code: Optional[int] = None             # None while running
@@ -612,6 +616,7 @@ class ProcessSession:
     _local_launch_pending: bool = field(default=False, repr=False)
     _local_launch_attempted: bool = field(default=False, repr=False)
     _native_local_launch: bool = field(default=False, repr=False)
+    _custody: Any = field(default=None, repr=False)
 
     def __post_init__(self):
         # A session built without an explicit owner is owned by its own task, so ownership checks compare
@@ -660,7 +665,8 @@ _CHECKPOINT_FIELDS = (
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
-    "heartbeat_seconds", "persist_on_release", "output_log", "reconciliation_required")
+    "heartbeat_seconds", "persist_on_release", "output_log", "reconciliation_required",
+    "custody_kind", "custody_pid", "custody_start_time", "custody_scope_empty")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -1169,6 +1175,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         The caller has stopped its own drain thread; the registry's reader continues from
         the pipe's current position and ``output_so_far`` seeds the buffer so nothing
         already captured is lost."""
+        session = getattr(proc, '_hermes_process_session', None)
+        if session is not None:
+            session.notify_on_complete = notify_on_complete
+            if output_so_far:
+                session.append_output(output_so_far)
+            self._track_started(session, self._reader_loop, f"proc-reader-{session.id}")
+            return session
         session = self._new_session(command, task_id, owner_task_id, session_key, cwd)
         session.process = proc
         session.pid = proc.pid
@@ -1294,6 +1307,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             tail = decoder.decode(b"", final=True)
             if tail:
                 append(tail)
+        if session._custody is not None:
+            from tools.process_registry_custody import finish_custodied
+            finish_custodied(self, session)
+            return
         try:
             wait()
         except Exception as e:
@@ -1516,6 +1533,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         kill anything — the child has already exited — it only releases the
         parent's pipe FDs, which is exactly the retained-resource leak.
         """
+        if session._custody is not None:
+            session._custody.close()
         proc = session.process
         if proc is not None:
             for stream in (proc.stdout, proc.stderr, proc.stdin):
@@ -1819,8 +1838,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         stdout pipe open, the reader blocks forever and poll() keeps returning "running" indefinitely (issue
         #17327 — 74 polls over 7 minutes on Feishu).
         """
-        if session is None or session.exited:
-            return
+        if session is None or session.exited or session.custody_kind:
+            return  # custody's reader requires both whole-scope receipt and keeper exit
         proc = getattr(session, "process", None)
         if proc is None:
             return
@@ -2056,7 +2075,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 self._completion_consumed.add(session_id)
             return result
         try:
-            early = self._signal_kill(session, session_id, consume_output)
+            early = self._signal_kill(session, session_id, consume_output, source)
             if early is not None:
                 return early
             # Additive to the PID kill: stopping the scope reaps double-forked
@@ -2130,10 +2149,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         session._scope_stop_pending = not stopped
         return stopped
 
-    def _signal_kill(self, session: ProcessSession, session_id: str, consume_output: bool) -> Optional[dict]:
+    def _signal_kill(self, session: ProcessSession, session_id: str, consume_output: bool, source: str = 'process.kill') -> Optional[dict]:
         """Deliver the kill via PTY, local Popen tree, sandbox exec or recovered host
         PID. Returns a final result dict when the kill cannot proceed (recycled/dead
         recovered PID, or no runtime handle), else None."""
+        if session.custody_kind:
+            from tools.process_registry_custody import stop_custodied
+            return stop_custodied(self, session, source)
         if session._native_local_launch and session.host_start_time is None:
             return {"status": "unknown", "session_id": session.id,
                     "reconciliation_required": session.reconciliation_required}

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import psutil
 import pytest
 
+from tests.fakes.loopback_remote_process import LoopbackRemoteEnvironment
 from tests.waiting import async_wait_until, wait_until
 
 
@@ -164,7 +165,10 @@ async def test_native_stop_retains_actual_terminal_process_when_cleanup_fails(tm
             raise PermissionError('test cleanup signals denied')
 
         with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(runtime.registry, '_terminate_host_pid', deny)
+            if session._custody is not None:
+                patch.setattr(session._custody, 'stop', deny)
+            else:
+                patch.setattr(runtime.registry, '_terminate_host_pid', deny)
             with pytest.raises(RuntimeStoreError) as failure:
                 await runtime.authority.interrupt(runtime.actor, ref, runtime.authority._handle(ref).execution_generation)
             assert failure.value.reason == 'unknown_execution'
@@ -192,7 +196,8 @@ async def test_native_stop_keeps_remote_inspection_failure_unknown_without_host_
     spawn = terminal_tool.spawn_background_process
 
     def remote_spawn(**kwargs):
-        return spawn(**{**kwargs, 'env_type': 'fixture-remote'})
+        return spawn(**{**kwargs, 'env': LoopbackRemoteEnvironment(kwargs['env']),
+                        'env_type': 'fixture-remote'})
 
     monkeypatch.setattr(terminal_tool, 'spawn_background_process', remote_spawn)
     session = None

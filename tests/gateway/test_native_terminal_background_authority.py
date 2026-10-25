@@ -7,6 +7,8 @@ from contextlib import ExitStack
 
 import pytest
 
+from tests.fakes.loopback_remote_process import LoopbackRemoteEnvironment
+
 
 async def _runtime(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
@@ -46,7 +48,8 @@ def _hold_background_boundary(monkeypatch, boundary, registry, waiting, release)
     def spawn(**kwargs):
         phase.background = True
         if boundary == "remote":
-            # Exercise the real remote shell protocol with the local test backend.
+            # Exercise the real remote shell protocol across an SDK boundary.
+            kwargs["env"] = LoopbackRemoteEnvironment(kwargs["env"])
             kwargs["env_type"] = "fixture-remote"
         return original_spawn(**kwargs)
 
@@ -292,7 +295,7 @@ async def test_remote_effect_before_missing_receipt_retains_unknown_session(tmp_
     launches, artifacts = [], []
 
     def remote_spawn(**kwargs):
-        env = kwargs["env"]
+        env = kwargs["env"] = LoopbackRemoteEnvironment(kwargs["env"])
         execute = env.execute
 
         def lose_response(command, **options):
@@ -720,7 +723,7 @@ async def test_remote_launch_survives_another_interpreter_checkpoint(tmp_path, m
     effect, finish, completed = tmp_path / "started", tmp_path / "finish", tmp_path / "completed"
 
     def remote_spawn(**kwargs):
-        env = kwargs["env"]
+        env = kwargs["env"] = LoopbackRemoteEnvironment(kwargs["env"])
         execute = env.execute
 
         def lose_response(command, **options):

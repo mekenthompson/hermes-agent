@@ -177,6 +177,9 @@ class ProcessTerminationMixin:
             time.sleep(0.05)
 
     def _probe_survivors(self, session: "ProcessSession") -> list[int]:
+        if session.custody_kind:
+            return ([] if session.custody_scope_empty else
+                    [session.custody_pid] if session.custody_pid is not None else [])
         survivors: list[int] = []
         proc = getattr(session, "process", None)
         if proc is not None:

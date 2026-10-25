@@ -57,7 +57,7 @@ def _launch(wire, tree, name):
     receipt = wire.call('slash.exec', session_id=sid, command='/' + name)
     assert receipt['output'].splitlines()[0] == 'launched', receipt
     diagnostic = receipt['output'].lower()
-    assert 'unconfirmed' in diagnostic and 'reconcile' in diagnostic and 'proc_' in diagnostic, receipt
+    assert 'running descendants' in diagnostic and 'reconcile' in diagnostic and 'proc_' in diagnostic, receipt
     pid = wait_until(lambda: _pid(tree.pid), timeout=10, what='actual redirected quick child')
     assert _alive(pid) and not tree.effect.exists()
     return sid, pid
@@ -114,7 +114,8 @@ def test_native_wire_quick_parent_return_keeps_child_resource_until_reconciled(t
             try:
                 sid, pid = _launch(wire, tree, 'launch-child')
                 records = json.loads((home / 'processes.json').read_text())
-                assert records and any(row.get('reconciliation_required') for row in records), records
+                assert records and all(row.get('custody_kind') and row.get('custody_pid')
+                                       and row.get('custody_start_time') for row in records), records
                 assert all(row.get('owner_task_id') and row.get('session_key') for row in records)
                 cold = _cold_registry(root, home, env)
                 assert cold['count'] and all(row['note'] and row['poll'] == 'unknown'
@@ -173,12 +174,10 @@ def test_cold_quick_descendant_unknown_birth_never_becomes_a_pid_kill_grant(tmp_
         with daemon(root, home, env, barrier=False) as (_proc, desc):
             wire = _Wire(home, desc)
             try:
-                sid, pid = _launch(wire, tree, 'launch-identity')
-                _, unknown = _stop(wire, sid, home)
-                assert unknown and _alive(pid)
+                _sid, pid = _launch(wire, tree, 'launch-identity')
                 path = home / 'processes.json'
                 records = json.loads(path.read_text())
-                assert records and all(row.get('reconciliation_required') for row in records)
+                assert records and all(row.get('custody_kind') for row in records)
                 # Only corrupt the birth baseline in a negative checkpoint fixture;
                 # producer-derived ownership/session/command fields stay untouched.
                 for row in records:
@@ -233,7 +232,8 @@ child.wait()
     try:
         ref, process = await _start(runtime, tree, notify=True)
         parent, child = int(tree.shell.read_text()), int(tree.child.read_text())
-        assert process.process.pid == parent and _alive(parent) and _alive(child)
+        assert process.pid == parent and _alive(parent) and _alive(child)
+        assert process.custody_pid == process.process.pid and process.custody_pid != parent
         assert process.host_start_time is not None
         await runtime.authority.interrupt(runtime.actor, ref, runtime.authority._handle(ref).execution_generation)
         assert process.exited and process.process.poll() is not None
@@ -247,7 +247,7 @@ child.wait()
 
 
 @pytest.mark.platforms('linux')
-def test_postfork_quick_checkpoint_failure_reports_actual_memory_resource_and_unknown_stop(tmp_path):
+def test_postfork_quick_checkpoint_and_cleanup_failure_report_actual_resource_and_unknown_stop(tmp_path):
     tree = _child(tmp_path, 'checkpoint-denied')
     marker = 'quick-descendant-checkpoint-denied'
     checkpoint = tmp_path / 'state' / 'processes.json'
@@ -256,12 +256,23 @@ def test_postfork_quick_checkpoint_failure_reports_actual_memory_resource_and_un
 def register(ctx):
     import utils
     from tools import process_registry
+    from tools.process_registry_custody import LocalCustody
     actual_write = utils.atomic_json_write
+    actual_stop = LocalCustody.stop
+    def denied_after_output():
+        return any({marker!r} in p.command and p._custody is not None
+            and p._custody.output_ready.is_set()
+            for p in process_registry.process_registry._running.values())
     def deny_process_checkpoint(path, *args, **kwargs):
-        if str(path) == {str(checkpoint)!r}:
+        if str(path) == {str(checkpoint)!r} and denied_after_output():
             raise PermissionError('test descendant checkpoint denied')
         return actual_write(path, *args, **kwargs)
+    def deny_cleanup(custody):
+        if {marker!r} in custody.session.command and custody.output_ready.is_set():
+            raise PermissionError('test descendant cleanup denied')
+        return actual_stop(custody)
     utils.atomic_json_write = deny_process_checkpoint
+    LocalCustody.stop = deny_cleanup
     def inspect(arg):
         return json.dumps([dict(id=p.id, pid=p.pid, birth=p.host_start_time,
             owner=p.owner_task_id, route=p.session_key, note=p.reconciliation_required,
@@ -278,11 +289,13 @@ def register(ctx):
                                 toolsets=[], cwd=str(tree.pid.parent))['session_id']
                 receipt = wire.call('slash.exec', session_id=sid, command='/launch-denied')
                 output = receipt['output'].lower()
-                assert 'launched' in output and 'checkpoint' in output and 'failed' in output, receipt
-                assert 'in-memory' in output and 'original pid' in output and 'birth' in output, receipt
+                assert 'checkpoint' in output and 'failed' in output, receipt
+                assert 'in-memory' in output and 'custodian pid' in output and 'birth' in output, receipt
                 assert 'reconcile' in output and 'retry' in output, receipt
                 pid = wait_until(lambda: _pid(tree.pid), timeout=10, what='actual child after checkpoint denial')
-                assert _alive(pid) and not tree.effect.exists() and not checkpoint.exists()
+                assert _alive(pid) and not tree.effect.exists() and checkpoint.exists()
+                initial = json.loads(checkpoint.read_text())
+                assert initial and all(row.get('custody_pid') and row.get('custody_start_time') for row in initial)
                 inspected = wire.call('slash.exec', session_id=sid, command='/inspect-quick-resource')
                 resource, = json.loads(inspected['output'])
                 assert resource['id'] in receipt['output'] and resource['pid']
@@ -291,7 +304,8 @@ def register(ctx):
                 with pytest.raises(Exception, match='unknown_execution'):
                     wire.call('session.interrupt', session_id=sid,
                               execution_generation=snapshot['execution_generation'])
-                assert _alive(pid) and not tree.effect.exists() and not checkpoint.exists()
+                assert _alive(pid) and not tree.effect.exists()
+                assert json.loads(checkpoint.read_text()) == initial, 'failed writes preserve the last known process identity'
             finally:
                 _release(tree)
                 wire.close()

@@ -624,7 +624,9 @@ def _join_launcher_python() -> str:
 #   status back; it leaves the caller's group too, or a terminal's Ctrl-C would reach node twice. Killed, it leaves the custodian to settle: node gets the same 10 s it gets after
 #   a forwarded signal (it is usually still cleaning up from the same Ctrl-C), then the tree is
 #   killed as above and only then is the fd dropped.
-_REAP_TREE = r"""
+from hermes_cli.process_custody import LINUX_REAPER_SOURCE
+
+_REAP_TREE = LINUX_REAPER_SOURCE + r"""
 import os, signal, subprocess, sys, time
 KILL = signal.SIGKILL  # windows-footgun: ok - POSIX-only launcher
 fds = tuple(int(fd) for fd in sys.argv[1].split(','))
@@ -645,27 +647,10 @@ if custodian:
     sys.exit(code if code >= 0 else 128 - code)
 os.setpgid(0, 0)
 me = os.getpid()
-reaper = False
-if sys.platform.startswith('linux'):
-    try:
-        import ctypes
-        reaper = ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0  # PR_SET_CHILD_SUBREAPER
-    except (OSError, AttributeError):
-        reaper = False
+reaper = arm_subreaper()
 
 def children():
-    found = []
-    for entry in os.listdir('/proc'):
-        if not entry.isdigit():
-            continue
-        try:
-            with open('/proc/%s/stat' % entry, 'rb') as fh:
-                stat = fh.read()
-            if int(stat[stat.rindex(b')') + 2:].split()[1]) == me:
-                found.append(int(entry))
-        except (OSError, ValueError, IndexError):
-            continue
-    return found
+    return owned_children()
 
 def table():
     try:

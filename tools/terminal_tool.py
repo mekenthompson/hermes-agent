@@ -1392,6 +1392,12 @@ def _run_foreground(
             )
             break
         except Exception as e:
+            from tools.approval_context import revoked_task_tool_error
+            from tools.process_registry_custody import CustodyUnknown
+            if isinstance(e, CustodyUnknown) or revoked_task_tool_error():
+                return _error_json(_redact_terminal_error_text(str(e)),
+                    status="unknown" if isinstance(e, CustodyUnknown) else "rejected",
+                    code="process_execution_uncertain" if isinstance(e, CustodyUnknown) else "task_authority_revoked")
             # A backend exception (e.g. an SSH connect timeout) never reached an exit status, so it
             # is not a terminal outcome; Hermes' own deadline arrives as ``hermes_timed_out``.
             if "timeout" in str(e).lower():

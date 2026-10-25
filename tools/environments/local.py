@@ -1113,12 +1113,18 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = shell_init + cmd_string
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
-        proc = subprocess.Popen(
-            args, text=True, env=run_env, encoding="utf-8", errors="replace",
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            start_new_session=True, cwd=self.cwd,
-            **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+        from tools.environments.local_custody import native_local_custody, spawn_foreground
+        if native_local_custody():
+            proc = spawn_foreground(args, cmd_string, self.cwd, run_env, stdin=stdin_data is not None)
+        else:
+            from tools.approval_context import require_live_task_setup
+            require_live_task_setup()
+            proc = subprocess.Popen(
+                args, text=True, env=run_env, encoding="utf-8", errors="replace",
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+                start_new_session=True, cwd=self.cwd,
+                **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):
                 proc._hermes_pgid = os.getpgid(proc.pid)
@@ -1134,6 +1140,8 @@ class LocalEnvironment(BaseEnvironment):
 
     def _kill_process(self, proc):
         """Kill the entire process group (all children)."""
+        if getattr(proc, '_hermes_process_session', None) is not None:
+            return proc.terminate()
         try:
             (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
         except OSError:  # ProcessLookupError / PermissionError included
@@ -1142,7 +1150,7 @@ class LocalEnvironment(BaseEnvironment):
 
     def _force_kill_process(self, proc):
         """SIGKILL the whole group with no TERM grace or wait: the caller os._exit()s next."""
-        if _IS_WINDOWS:  # already a forced tree kill
+        if _IS_WINDOWS or getattr(proc, '_hermes_process_session', None) is not None:
             return self._kill_process(proc)
         with contextlib.suppress(OSError):
             pgid = getattr(proc, "_hermes_pgid", None) or os.getpgid(proc.pid)
