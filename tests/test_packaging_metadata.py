@@ -54,22 +54,43 @@ def test_starlette_server_pins_and_lock_exclude_cve_2026_48710():
 
 
 CA_TRUST_PACKAGES = {"certifi"}
+APPROVED_SECURITY_EXEMPTION = {"brotlicffi": "1.2.1.0"}
 
 
 def test_every_dependency_is_held_to_one_three_day_release_age():
-    """Hermes's deps must be >= 3 days old when locked, exact pins included (Teknium ruling).
+    """Keep the three-day quarantine except for individually reviewed necessities.
 
-    A per-package exemption or date would quietly let a fresh release into the lock; the
-    check runs at lock time only, so users never need a mirror that serves upload times.
-    The sole exception is CA trust stores: a CA revocation must ship the day it is released.
+    The sole CA exception is certifi. brotlicffi 1.2.1.0 is separately approved to ship
+    immediately for GHSA-9v8h-qqgm-4m35; the exemption must not authorize any other pin.
     """
     manifest = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     uv = manifest["tool"]["uv"]
     lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
     assert uv["exclude-newer"] == "3 days"
     exempt = uv.get("exclude-newer-package", {})
-    assert set(exempt) <= CA_TRUST_PACKAGES, exempt
+    assert set(exempt) == CA_TRUST_PACKAGES | APPROVED_SECURITY_EXEMPTION.keys(), exempt
     assert all(value is False for value in exempt.values()), exempt
+    assert exempt.get("brotlicffi") is False
+    brotlicffi_requirements = [
+        Requirement(dep)
+        for dep in manifest["project"]["optional-dependencies"].get("messaging", [])
+        if Requirement(dep).name == "brotlicffi"
+    ]
+    assert len(brotlicffi_requirements) == 1
+    pins = list(brotlicffi_requirements[0].specifier)
+    assert len(pins) == 1 and pins[0].operator == "=="
+    assert pins[0].version == APPROVED_SECURITY_EXEMPTION["brotlicffi"]
+    lock_versions = [
+        row["version"] for row in lock["package"] if row["name"] == "brotlicffi"
+    ]
+    assert lock_versions == [APPROVED_SECURITY_EXEMPTION["brotlicffi"]]
+    hermes = next(row for row in lock["package"] if row["name"] == manifest["project"]["name"])
+    locked_requirement = [
+        dep for dep in hermes["metadata"]["requires-dist"]
+        if dep["name"] == "brotlicffi" and dep.get("marker") == "extra == 'messaging'"
+    ]
+    assert len(locked_requirement) == 1
+    assert locked_requirement[0]["specifier"] == "==1.2.1.0"
     assert lock["options"].get("exclude-newer-span") == "P3D"
     assert lock["options"].get("exclude-newer-package", {}) == exempt
 

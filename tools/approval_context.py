@@ -124,15 +124,35 @@ class ApprovalTaskReservation:
     def active(self) -> bool:
         # Native child owners supply cancellation; settling here also prevents a
         # later clearing of their interrupt latch from reviving observed stale work.
-        if any(event.is_set() for event in self.stop_events):
-            self.release()
         with self._lock:
+            if any(event.is_set() for event in self.stop_events):
+                self.release()
             return not self._released
 
     def child(self, child_id: str) -> ApprovalTaskContext:
         parent = self.evidence
         return ApprovalTaskContext(parent.text, parent.identity, parent.profile, parent.session,
                                    parent.task_id, parent.run_id, (*parent.ancestry, child_id))
+
+    def transfer_to_parent(self, child_stop_event: Event | None) -> bool:
+        """Detach this producer from the handed-off child's stop fence only.
+
+        The reservation remains on the same authenticated parent lease and keeps
+        every ancestor stop fence. A child stop must not revoke work the live
+        parent explicitly accepted ownership of.
+        """
+        if child_stop_event is None:
+            return self.active()
+        with self._lock:
+            if self._released:
+                return False
+            # A stop observed before ownership moves is permanent. Do not let
+            # detaching its event revive a reservation that has not yet been read.
+            if any(event.is_set() for event in self.stop_events):
+                self.release()
+                return False
+            self.stop_events = tuple(event for event in self.stop_events if event is not child_stop_event)
+            return True
 
 
 class _ReservationBundle:
