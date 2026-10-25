@@ -123,11 +123,26 @@ class ProcessTerminationMixin:
             if cls._proc_alive(parent):
                 known = {proc.pid for proc in targets}
                 targets.extend(p for p in parent.children(recursive=True) if p.pid not in known)
-        for proc in targets:
-            with suppress(gone):
-                if cls._proc_alive(proc):
-                    proc.kill()  # SIGKILL on POSIX
-                    logger.info("Escalated to SIGKILL for pid %d (ignored SIGTERM within %.1fs grace)", proc.pid, grace)
+        cls._hard_kill_host_targets(parent, targets, expected_start, grace)
+
+    @classmethod
+    def _hard_kill_host_targets(cls, parent, targets, expected_start, grace):
+        """Freeze a verified live tree, then signal children before ancestry disappears."""
+        import psutil
+        from contextlib import nullcontext
+        from agent.deadline import _process_tree_snapshot
+
+        current = (expected_start is not None and cls._proc_alive(parent)
+                   and cls._host_pid_is_ours(parent.pid, expected_start))
+        snapshot = _process_tree_snapshot(parent.pid, hard_kill=True) if current else nullcontext(())
+        with snapshot as descendants:
+            known = {proc.pid for proc in targets}
+            targets.extend(proc for proc in descendants if proc.pid not in known)
+            for proc in reversed(targets):
+                with suppress(psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                    if cls._proc_alive(proc):
+                        proc.kill()
+                        logger.info("Escalated to SIGKILL for pid %d (ignored SIGTERM within %.1fs grace)", proc.pid, grace)
 
     @staticmethod
     def _live_descendants(pid: int) -> list[int]:

@@ -179,12 +179,21 @@ def test_kill_process_never_killpgs_the_callers_own_group(monkeypatch):
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group semantics")
-class TestReapUntrackedGroupGuard:
-    """ProcessRegistry._reap_untracked terminates through _terminate_host_pid,
+class TestLocalLaunchReconciliationIdentityGuard:
+    """Local launch reconciliation terminates through _terminate_host_pid,
     which revalidates the kernel start time captured at spawn before signalling.
     pgid == pid only proves group leadership, not identity: a reaped child can
     be recycled onto an unrelated process that leads its own group, and the old
     raw killpg arm would have tree-killed the stranger."""
+
+    @staticmethod
+    def _registered_receipt(registry, proc, birth):
+        session = registry._new_session('pending local launch', 'owner', 'owner', 'route', None)
+        session.process, session.pid, session.host_start_time = proc, proc.pid, birth
+        session._native_local_launch = session._local_launch_pending = session._local_launch_attempted = True
+        session.reconciliation_required = 'Local launch setup was unconfirmed.'
+        registry._running[session.id] = session
+        return session
 
     def test_termination_delegates_with_recorded_identity(self, monkeypatch):
         """The shared terminate path receives the pid AND the start time
@@ -192,20 +201,23 @@ class TestReapUntrackedGroupGuard:
         from unittest.mock import MagicMock
 
         from tools.process_registry import ProcessRegistry
+        from tools.process_registry_spawn import reconcile_local_launch
 
         reg = ProcessRegistry()
         proc = MagicMock()
         proc.pid = 999
-        session = SimpleNamespace(systemd_unit="", host_start_time=4242)
+        proc.poll.return_value = None
+        session = self._registered_receipt(reg, proc, 4242)
         calls, forbidden = [], []
         monkeypatch.setattr(
             ProcessRegistry, "_terminate_host_pid",
             classmethod(
                 lambda cls, pid, expected_start=None: calls.append((pid, expected_start))))
+        monkeypatch.setattr(reg, '_post_kill_survivors', lambda _session: [])
         monkeypatch.setattr(os, "getpgid", lambda pid: forbidden.append(("getpgid", pid)))
         monkeypatch.setattr(os, "killpg", lambda pgid, sig: forbidden.append(("killpg", pgid)))
 
-        reg._reap_untracked(session, proc)
+        reconcile_local_launch(reg, session)
 
         assert calls == [(999, 4242)]
         assert forbidden == []
@@ -214,6 +226,7 @@ class TestReapUntrackedGroupGuard:
         """Control: a real start_new_session child whose recorded start time
         still matches is terminated."""
         from tools.process_registry import ProcessRegistry
+        from tools.process_registry_spawn import reconcile_local_launch
 
         monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds",
                             staticmethod(lambda: 0.5))
@@ -223,11 +236,13 @@ class TestReapUntrackedGroupGuard:
         try:
             real_start = ProcessRegistry._safe_host_start_time(proc.pid)
             assert real_start is not None, "no /proc start time on this platform?"
-            session = SimpleNamespace(systemd_unit="", host_start_time=real_start)
+            registry = ProcessRegistry()
+            session = self._registered_receipt(registry, proc, real_start)
 
-            ProcessRegistry()._reap_untracked(session, proc)
+            reconcile_local_launch(registry, session)
 
             assert proc.poll() is not None, "matching-identity child must be reaped"
+            assert registry.get(session.id) is session and session.exited
         finally:
             if proc.poll() is None:
                 proc.kill()
@@ -238,6 +253,7 @@ class TestReapUntrackedGroupGuard:
         (the recycled-PID shape: same numeric pid, different process) must NOT
         be signalled, even though getpgid(pid) == pid authorized the old arm."""
         from tools.process_registry import ProcessRegistry
+        from tools.process_registry_spawn import reconcile_local_launch
 
         monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds",
                             staticmethod(lambda: 0.5))
@@ -248,14 +264,15 @@ class TestReapUntrackedGroupGuard:
             real_start = ProcessRegistry._safe_host_start_time(proc.pid)
             assert real_start is not None, "no /proc start time on this platform?"
             assert os.getpgid(proc.pid) == proc.pid  # leads its group: old arm fired here
-            session = SimpleNamespace(systemd_unit="", host_start_time=real_start + 1)
-            # A stub Popen keeps the wait tail from parking 5s on the still-live child.
-            stub = SimpleNamespace(pid=proc.pid, wait=lambda timeout=None: None)
+            registry = ProcessRegistry()
+            session = self._registered_receipt(registry, proc, real_start + 1)
 
-            ProcessRegistry()._reap_untracked(session, stub)
+            reconcile_local_launch(registry, session)
 
             assert not _wait_for_pid_exit(proc.pid, timeout=0.5)
             assert proc.poll() is None
+            assert not session.exited and registry.poll(session.id)['status'] == 'unknown'
+            assert session.host_start_time == real_start + 1 and session.reconciliation_required
         finally:
             proc.kill()
             proc.wait()

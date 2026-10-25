@@ -1,6 +1,7 @@
 """Bound native quick-shell effects to their existing command lease and process evidence."""
 import asyncio
 import logging
+import os
 
 from agent.i18n import t
 
@@ -11,23 +12,40 @@ class CommandProcessUnknown(RuntimeError):
     """A stopped command is not evidence that its process or external effects stopped."""
 
 
+def _group_remains(proc):
+    """Group existence is uncertainty evidence, never permission to signal its members."""
+    if os.name != 'posix':
+        return False
+    try:
+        os.killpg(proc.pid, 0)  # windows-footgun: ok — POSIX-only existence probe
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def _retain_unknown(proc, command, cwd, evidence):
     from tools.process_registry import process_registry as registry
     existing = getattr(proc, '_hermes_unknown_process', None)
-    if existing:
-        return existing
-    owner = evidence.task_id if evidence is not None else ''
-    session = registry._new_session(command, owner, owner, evidence.session if evidence else '', cwd)
-    session.detached = True
-    session.pid = getattr(proc, 'pid', None)
-    session.host_start_time = getattr(proc, '_hermes_host_start_time', None)
-    session.reconciliation_required = 'Native quick-command cleanup is unconfirmed. Reconcile the actual process and external effects before retrying.'
-    with registry._lock:
-        registry._running[session.id] = session
-    registry._write_checkpoint()
-    if proc is not None:
-        proc._hermes_unknown_process = session.id
-    return session.id
+    if not existing:
+        owner = evidence.task_id if evidence is not None else ''
+        session = registry._new_session(command, owner, owner, evidence.session if evidence else '', cwd)
+        session.detached = True
+        session.pid = getattr(proc, 'pid', None)
+        session.host_start_time = getattr(proc, '_hermes_host_start_time', None)
+        session.reconciliation_required = 'Native quick-command cleanup is unconfirmed. Reconcile the actual process and external effects before retrying.'
+        with registry._lock:
+            registry._running[session.id] = session
+        existing = session.id
+        if proc is not None:
+            proc._hermes_unknown_process = existing
+    if registry._write_checkpoint() is False:
+        raise CommandProcessUnknown('Process checkpoint write failed; only the in-memory record ' + existing
+            + ' remains (original PID ' + str(getattr(proc, 'pid', None))
+            + ', birth ' + str(getattr(proc, '_hermes_host_start_time', None))
+            + '). Reconcile the process and effects before retrying.')
+    return existing
 
 
 async def stop_exec_tree(proc):
@@ -92,6 +110,8 @@ async def _execute(exec_cmd, cwd, timeout, stop_tree, evidence):
             try:
                 process_id = _retain_unknown(proc, exec_cmd, cwd, evidence)
                 detail = 'Reconcile native process ' + process_id + ' and external effects before retrying.'
+            except CommandProcessUnknown as retained_failure:
+                detail = str(retained_failure)
             except Exception:
                 logger.exception('Could not retain native quick command process reconciliation')
                 detail = 'Process ' + str(proc.pid) + ' remains unconfirmed; inspect its identity and effects before retrying.'
@@ -120,7 +140,16 @@ async def _execute(exec_cmd, cwd, timeout, stop_tree, evidence):
         if output:
             from agent.redact import redact_sensitive_text
             output = redact_sensitive_text(output)
-        return output or t('gateway.quick_command.no_output')
+        output = output or t('gateway.quick_command.no_output')
+        # A background child can close every capture FD and outlive a successful shell.
+        # Reparenting erased the tree proof: keep the native resource fenced for inspection.
+        if _group_remains(proc):
+            try:
+                process_id = _retain_unknown(proc, exec_cmd, cwd, evidence)
+            except CommandProcessUnknown as exc:
+                raise CommandProcessUnknown(output + '\n' + str(exc)) from exc
+            return output + '\nShell descendants remain unconfirmed. Reconcile native process ' + process_id + ' before retrying.'
+        return output
     except (TimeoutError, asyncio.CancelledError) as stopped:
         revoke_current_approval_task()
         await cleanup()

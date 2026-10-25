@@ -59,6 +59,9 @@ def begin_local_launch(session):
 
 def cancel_unstarted_local_launch(registry, session, source):
     """One lock orders the no-effect cancellation against the producer's launch attempt."""
+    if not session._local_launch_pending and not (
+            session.exited and session.pid is None and session.completion_reason == 'failed_start'):
+        return None
     with session._lock:
         if session.exited and session.pid is None and session.completion_reason == 'failed_start':
             return {'status': 'already_exited', 'session_id': session.id, 'not_started': True}
