@@ -241,6 +241,9 @@ _SYNC_FALLBACK_NOTES = {
 
 def _run_sync_with_note(batch: _Batch, reason: str) -> str:
     """Inline fallback: run the batch now and explain why it was not detached."""
+    from tools.approval_context import background_task_refusal
+    if refusal := background_task_refusal():
+        return json.dumps(refusal)
     result = _execute_and_aggregate(batch)
     if isinstance(result, dict):
         result["note"] = _SYNC_FALLBACK_NOTES[reason]

@@ -220,6 +220,12 @@ def approval_task_revoked() -> bool:
                                       else not bound[2].active()))
 
 
+def require_live_task_setup():
+    """Recheck Stop immediately before producer setup that can call hooks or write state."""
+    if approval_task_revoked():
+        raise ValueError("The originating native task was stopped or superseded.")
+
+
 def background_task_refusal(required=True):
     """Validate native provenance before any background producer setup or fallback."""
     if not required:

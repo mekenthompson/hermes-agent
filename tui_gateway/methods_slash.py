@@ -44,6 +44,9 @@ def _format_live_review_output(sid: str, session: Optional[dict], arg: str) -> s
         return "Nothing to review yet — send a message first."
     if session.get("running"):
         return "session busy — wait for the current turn to finish, then /review"
+    from tui_gateway import server
+    from tui_gateway.command_approval import command_scope
+    scope = command_scope(server, sid, session, "/review " + (arg or ""))
     with session.get("history_lock") or contextlib.nullcontext():
         snapshot = list(session.get("history", []))
     snapshot = snapshot or list(getattr(agent, "_session_messages", None) or [])
@@ -58,7 +61,7 @@ def _format_live_review_output(sid: str, session: Optional[dict], arg: str) -> s
         # reads HERMES_CODEX_BASE_URL via get_secret; under multiplex that raises
         # UnscopedSecretError unless the same runtime scope a turn binds is here
         # (#117544; same wrap as _compress_live_with_feedback / #116611).
-        with _session_profile_runtime_scope(session):
+        with _session_profile_runtime_scope(session), scope:
             result = start_review(agent, snapshot, arg or "")
     except ValueError as exc:
         return str(exc)

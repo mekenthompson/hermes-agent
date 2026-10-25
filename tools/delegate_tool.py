@@ -289,9 +289,12 @@ def _build_child_agent(
         else:
             request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
         parent_sid = getattr(parent_agent, "session_id", None)
+        from tools.approval_context import require_live_task_setup
+        require_live_task_setup()
         child_session_db = _open_child_session_db(parent_agent)
         with delegated_child_context():
             try:
+                require_live_task_setup()
                 child = AIAgent(
                     **rt, max_iterations=max_iterations, prefill_messages=getattr(parent_agent, "prefill_messages", None),
                     enabled_toolsets=child_toolsets, disabled_toolsets=child_disabled_toolsets, quiet_mode=True,
@@ -607,6 +610,8 @@ def _build_children(
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
         try:
+            from tools.approval_context import require_live_task_setup
+            require_live_task_setup()
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
@@ -799,6 +804,8 @@ def delegate_task(
     _live_home = _parent_live_home(parent_agent)
 
     from tools.delegation_live_log import create_live_transcripts
+    if refusal := background_task_refusal(background):
+        return json.dumps(refusal)
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
         task_list, context, model=creds.get("model"), provider=creds.get("provider"),
         home=_live_home,
@@ -813,7 +820,8 @@ def delegate_task(
         live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
     )
     if err:
-        return tool_error(err)
+        from tools.approval_context import revoked_task_tool_error
+        return revoked_task_tool_error() or tool_error(err)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
