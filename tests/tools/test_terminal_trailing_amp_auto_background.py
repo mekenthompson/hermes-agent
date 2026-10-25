@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tools.approval_context import approval_task_context, current_approval_task_context
+
 
 def _env_config(cwd):
     return {
@@ -31,12 +33,15 @@ def test_trailing_amp_runs_as_tracked_background_through_the_same_guards(tmp_pat
     seen = []
 
     def guard(command, env_type, **kw):
+        assert current_approval_task_context() is not None
         seen.append(command)
         return {"approved": True}
 
     with patch("tools.terminal_tool._get_env_config", return_value=_env_config(tmp_path)), \
          patch("tools.terminal_tool._start_cleanup_thread"), \
-         patch("tools.terminal_tool._check_all_guards", side_effect=guard):
+         patch("tools.terminal_tool._check_all_guards", side_effect=guard), \
+         approval_task_context("Run the marker command once", identity="local:user", profile=str(tmp_path),
+                               session="trailing-amp", task_id="marker", is_current=lambda: True):
         result = json.loads(terminal_tool(command=f"echo x >> {marker} && sleep 0.2 &"))
 
     assert result.get("error") is None, result
@@ -79,7 +84,9 @@ def test_converted_command_never_gets_relaunch_hint_even_with_another_hint(tmp_p
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
     with patch("tools.terminal_tool._get_env_config", return_value=_env_config(tmp_path)), \
          patch("tools.terminal_tool._start_cleanup_thread"), \
-         patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
+         patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}), \
+         approval_task_context("Run the hint fixture", identity="local:user", profile=str(tmp_path),
+                               session="trailing-amp-hint", task_id="hint", is_current=lambda: True):
         result = json.loads(terminal_tool(command="echo statusCheckRollup >/dev/null &"))
 
     assert result.get("error") is None, result

@@ -5,6 +5,7 @@ import json
 import pytest
 
 import tools.process_registry as pr
+from tools.approval_context import approval_task_context
 
 
 @pytest.fixture
@@ -26,7 +27,9 @@ def test_second_unchanged_wait_enables_notify_and_tells_model_to_stop(sleeper):
     _home, session = sleeper
     first = _wait(session.id)
     assert first["status"] == "timeout" and not session.notify_on_complete
-    second = _wait(session.id)
+    with approval_task_context("Notify when this process completes", identity="local:user", profile=str(_home),
+                               session="auto-notify", task_id="t-autonotify", is_current=lambda: True):
+        second = _wait(session.id)
     assert second["status"] == "timeout" and second["process_running"] is True
     assert session.notify_on_complete is True
     assert "Do NOT call process_manage wait or poll" in second["timeout_note"]
@@ -76,6 +79,8 @@ def test_exit_racing_promotion_is_never_lost(sleeper, monkeypatch):
         return real_can_deliver()
 
     monkeypatch.setattr(policy, "_can_deliver_completion", exit_lands_now)
-    result = _wait(session.id)
+    with approval_task_context("Notify when this process completes", identity="local:user", profile=str(_home),
+                               session="auto-notify-race", task_id="t-autonotify", is_current=lambda: True):
+        result = _wait(session.id)
     queued = [e for e in list(pr.process_registry.completion_queue.queue) if e.get("session_id") == session.id]
     assert queued or result["status"] == "exited", result

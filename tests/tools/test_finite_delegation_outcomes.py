@@ -15,6 +15,7 @@ import pytest
 from agent.interrupt_control import InterruptControlMixin
 from gateway import session_context as sc
 from tools import async_delegation, delegate_tool as dt
+from tools.approval_context import approval_task_context
 from tools.delegate_tool_child_run import _attach_child
 from tools.process_registry import process_registry
 
@@ -108,10 +109,12 @@ def harness(monkeypatch, tmp_path):
 
     def dispatch(*outcomes):
         children.extend(_Child(outcome) for outcome in outcomes)
-        return json.loads(dt.delegate_task(
-            tasks=[{"goal": f"Exercise child outcome {i}"} for i in range(len(children))],
-            background=True, parent_agent=parent,
-        ))
+        with approval_task_context("exercise finite child outcomes", identity="fixture-owner", profile="default",
+                                   session=parent.session_id, task_id="finite-outcomes", is_current=lambda: True):
+            return json.loads(dt.delegate_task(
+                tasks=[{"goal": f"Exercise child outcome {i}"} for i in range(len(children))],
+                background=True, parent_agent=parent,
+            ))
 
     yield parent, children, dispatch
     # Release on assertion failure too. Never leave conversation workers behind.

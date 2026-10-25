@@ -15,6 +15,7 @@ import pytest
 
 from agent.interrupt_control import InterruptControlMixin
 from tools import interrupt as interrupt_mod
+from tools.approval_context import approval_task_context
 from tools.process_registry import process_registry
 from tools.terminal_tool import terminal_tool
 
@@ -51,7 +52,9 @@ def test_redirect_mid_command_yields_it_to_background_without_killing_it(tmp_pat
         with agent._tool_worker_threads_lock:
             agent._tool_worker_threads.add(threading.current_thread().ident)
         t0 = time.monotonic()
-        res["result"] = json.loads(terminal_tool("echo started; sleep 60; echo done", task_id="yield-test", timeout=90))
+        with approval_task_context("Run this command and follow the user's interruption", identity="local:user",
+                                   profile=str(tmp_path), session="yield-test", task_id="yield-test", is_current=lambda: True):
+            res["result"] = json.loads(terminal_tool("echo started; sleep 60; echo done", task_id="yield-test", timeout=90))
         res["elapsed"] = time.monotonic() - t0
 
     t = threading.Thread(target=worker, daemon=True)

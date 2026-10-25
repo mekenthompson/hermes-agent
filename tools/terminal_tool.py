@@ -26,6 +26,7 @@ import sys
 import time
 import threading
 import atexit
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
@@ -1524,6 +1525,7 @@ def terminal_tool(
     """
     from hermes_cli.observability.shared_metrics_loop import record_terminal_backend as _metered
     plan = None
+    authority = ExitStack()
     try:
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
@@ -1533,7 +1535,14 @@ def terminal_tool(
             # From here on this IS a background=true call for the stripped command: every guard
             # below (lifecycle, workdir, self-repo, dangerous-command approval) sees what runs.
             command, background = auto_bg, True
+        if plan.promoted_from_foreground_timeout is not None:
+            background, notify_on_complete, watch_patterns = True, True, None
+        from tools.terminal_tool_background import background_spawn_authority
+        if refusal := authority.enter_context(background_spawn_authority(required=background)):
+            raise _Rejected(json.dumps(refusal))
         env = _acquire_env(plan, task_id)
+        from tools.approval_context import require_live_task_setup
+        require_live_task_setup()
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
         # Session key for cwd records: the contextvar doesn't cross tool-worker
@@ -1583,10 +1592,6 @@ def terminal_tool(
             raise _Rejected(_error_json("The originating task was stopped or completed before execution.", status="error"))
 
         pty_disabled = pty and _command_requires_pipe_stdin(command)
-        if plan.promoted_from_foreground_timeout is not None:
-            # Promotion implies notify_on_complete; watch_patterns is a background-only flag the
-            # caller could not have meant for a foreground call, and the two are exclusive anyway.
-            background, notify_on_complete, watch_patterns = True, True, None
         if background:
             result = spawn_background_process(
                 command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
@@ -1615,6 +1620,8 @@ def terminal_tool(
         return _metered(None if _host_local else plan, _degraded_result(e, task_id), error_class="tool_error")
     except Exception as e:
         return _metered(None if _host_local else plan, _fatal_error_json(e), error_class="exception")
+    finally:
+        authority.close()
 
 
 def check_terminal_requirements() -> bool:

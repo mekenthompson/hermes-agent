@@ -7,6 +7,8 @@ re-sent lower/split/background, 251 of them test suites).
 import json
 from unittest.mock import patch, MagicMock
 
+from tools.approval_context import approval_task_context
+
 # ---------------------------------------------------------------------------
 # Shared test config dict — mirrors _get_env_config() return shape.
 # ---------------------------------------------------------------------------
@@ -38,7 +40,9 @@ class TestForegroundTimeoutCap:
         marker = tmp_path / "ran"
         with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config(cwd=str(tmp_path))), \
              patch("tools.terminal_tool._start_cleanup_thread"), \
-             patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
+             patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}), \
+             approval_task_context("Run the marker build once", identity="local:user", profile=str(tmp_path),
+                                   session="timeout-promotion", task_id="marker", is_current=lambda: True):
             result = json.loads(terminal_tool(command=f"echo x >> {marker}", timeout=9999))
 
         assert result.get("error") is None

@@ -123,6 +123,14 @@ def _claim_notify_if_running(registry, session) -> bool:
     with registry._lock:
         if session._finish_claimed or session.id not in registry._running:
             return False
+        if session.notify_on_complete:
+            reservation = getattr(session, "approval_task_reservation", None)
+            return bool(reservation and reservation.active() and reservation.lease.live())
+        from tools.approval_context import reserve_background_approval_task
+        reservation = reserve_background_approval_task()
+        if reservation is None:
+            return False
+        session.approval_task_reservation = reservation
         session.notify_on_complete = True
         return True
 
@@ -170,8 +178,14 @@ def apply_wait_poll_policy(action: str, session_id: str, result: dict) -> dict:
         return result
     if not _caller_receives_completion(session):
         return result  # the completion would reach its owner, not this caller: keep plain polling
+    reservation = getattr(session, "approval_task_reservation", None)
+    if session.notify_on_complete and not (reservation and reservation.active() and reservation.lease.live()):
+        return result
     if not session.notify_on_complete:
         if not _claim_notify_if_running(process_registry, session):
+            from tools.approval_context import background_task_refusal
+            if background_task_refusal():
+                return result
             # Exited between the wait/poll and this check, before the flag was set: no completion
             # was queued, so hand back the exit itself instead of promising a message.
             _forget(session.id)

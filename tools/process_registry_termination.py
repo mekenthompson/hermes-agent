@@ -152,7 +152,8 @@ class ProcessTerminationMixin:
         Fail-closed: anything unverifiable counts as a survivor, so a kill
         that leaves a live tree can never write a killed receipt. Sandbox
         (env) sessions have no host-visible tree and are unverifiable by
-        design — they return no survivors, preserving existing behavior."""
+        design — they return no host survivors; the remote signal path keeps an
+        unverified exit explicitly unknown."""
         deadline = time.monotonic() + self._KILL_SETTLE_SECONDS
         while True:
             survivors = self._probe_survivors(session)

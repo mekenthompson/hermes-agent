@@ -3117,106 +3117,20 @@ def edit_task(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    idempotency_key: Optional[str] = None, expected_event_id: Optional[int] = None,
 ) -> bool:
-    """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
-    :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
-    re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
-    promote it into a context-free respawn. ``transient`` still counts
-    toward the loop breaker so a forever-flaky task escalates. True on any
-    transition.
+    """Block through the native lifecycle boundary.
 
-    An already-``blocked`` card that the failure breaker parked UNTYPED
-    (``block_kind IS NULL``, no live run) is classified in place when *kind*
-    is supplied: ``block_kind``/``block_recurrences`` are set and a ``blocked``
-    audit event is appended, while status, failure evidence and the terminal
-    runs stay exactly as the breaker left them. A typed block, a card with a
-    live run, or a kind-less call on a blocked card are still refused.
-
-    ``expected_run_id`` is the worker's proof that it is blocking its own run.
-    A block without it comes from a supervisor (dashboard, CLI, an integration
-    such as a Linear Stop), so the run's live, fingerprint-verified host-local
-    worker is ended once the txn commits and the hook has fired
-    (:func:`halt_blocked_worker`, which never raises) instead of running on
-    until the reaper's grace expires.
+    ``idempotency_key`` binds the original parameters and bool outcome; a retry
+    returns that outcome even after later state changes. Conflicting reuse raises
+    ValueError. ``expected_event_id`` refuses a request superseded by a later
+    native status/ownership event. A supervisor Stop on an already-blocked card
+    still returns False and records ``block_requested`` to fence pending resumes.
     """
-    if kind is not None and kind not in VALID_BLOCK_KINDS:
-        raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
-    with write_txn(conn):
-        cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if cur_row is None:
-            return False
-        # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
-        # ``block_kind`` and no ``blocked`` event -- the policy is the
-        # supervisor's, not the kernel's -- but the transition guard below only
-        # matches running/ready, so that policy could never be attached later
-        # (#117363). Classify in place; never re-type or flap status. A caller
-        # asserting run ownership (``expected_run_id``) cannot own a parked
-        # card -- its run is over -- so it is refused like any stale worker.
-        if cur_row["status"] == "blocked":
-            if kind is None or expected_run_id is not None or _row_get(cur_row, "block_kind") is not None:
-                return False
-            classified = conn.execute(
-                "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
-                "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
-                "AND current_run_id IS NULL",
-                (kind, task_id),
-            ).rowcount
-            if classified != 1:
-                return False
-            _append_event(conn, task_id, "blocked", {
-                "kind": kind, "reason": reason, "classified_in_place": True,
-            })
-            return True
-        source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
-        requested_kind = kind
-        rekind_reason = None
-        # ``dependency`` only waits on incomplete parents. A worker filing that
-        # kind with none open would park in ``todo`` and ``recompute_ready``
-        # would promote+respawn it context-free on the next tick. Re-kind to
-        # ``needs_input`` so it is sticky until a human unblocks.
-        if kind == "dependency" and _parents_satisfied(conn, task_id):
-            kind = "needs_input"
-            rekind_reason = "no_open_parent"
-        new_status, event_kind, set_sql, params, payload = _route_block(
-            kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
-            prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
-        )
-        if rekind_reason:
-            payload["requested_kind"] = requested_kind
-            payload["rekind_reason"] = rekind_reason
-        sql = f"""
-                UPDATE tasks
-                   SET status        = '{new_status}',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       {set_sql}
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """
-        params = (*params, task_id)
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params = (*params, int(expected_run_id))
-        if conn.execute(sql, params).rowcount != 1:
-            return False
-        run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
-        )
-        _append_event(conn, task_id, event_kind, payload, run_id=run_id)
-        blocked_task = get_task(conn, task_id)
-        dependency_block = kind == "dependency"
-        if dependency_block:
-            # Historical ordering: the dependency lane fires inside the txn.
-            _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-    _release_kanban_admission(task_id, run_id)
-    if not dependency_block:
-        _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-    if expected_run_id is None:  # filed by a supervisor, not the worker: halt it now, no reap grace
-        halt_blocked_worker(conn, run_id)
-    return True
+    from hermes_cli.kanban_db_lifecycle import block_task as block
+
+    return block(conn, task_id, reason=reason, kind=kind, expected_run_id=expected_run_id,
+                 idempotency_key=idempotency_key, expected_event_id=expected_event_id)
 
 
 def redact_review_value(value: Any) -> Any:
@@ -3534,48 +3448,31 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
-    now = int(time.time())
-    with write_txn(conn):
-        resume_status = (
-            _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
-            else "ready"
-        )
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
-            note="invariant recovery on unblock",
-        )
-        # Re-gate on parent completion before restoring the source phase.
-        landing_status = _landing_status_after_parents(conn, task_id)
-        new_status = (
-            "review"
-            if landing_status == "ready" and resume_status == "review"
-            else landing_status
-        )
-        # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
-        # resetting them is the amnesia that let cron-unblock <-> re-block loop
-        # unbounded; only complete_task clears them. ``consecutive_failures``
-        # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
-        # is a fresh start for the retry budget.
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
-        )
-        if cur.rowcount != 1:
-            return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
-        )
-        return True
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *, idempotency_key: Optional[str] = None,
+    origin_comment_key: Optional[str] = None, expected_event_id: Optional[int] = None,
+) -> bool:
+    """Resume with an optional immutable request receipt and native event fence.
+
+    Keyed retries return the original bool outcome without repeating effects;
+    conflicting parameter reuse raises ValueError. ``origin_comment_key`` anchors
+    to an existing native comment receipt. It and ``expected_event_id`` refuse
+    missing anchors or later native status/ownership changes. These ordering
+    checks supply no caller identity or execution permission.
+    """
+    from hermes_cli.kanban_db_lifecycle import unblock_task as unblock
+
+    return unblock(conn, task_id, idempotency_key=idempotency_key,
+                   origin_comment_key=origin_comment_key, expected_event_id=expected_event_id)
+
+
+def lifecycle_request_received(
+    conn: sqlite3.Connection, task_id: str, operation: str, idempotency_key: str,
+) -> Optional[bool]:
+    """Return the saved native request result, or None when no receipt exists."""
+    from hermes_cli.kanban_db_lifecycle import request_received
+
+    return request_received(conn, task_id, operation, idempotency_key)
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -4011,18 +3908,16 @@ def _retention_seconds(older_than_seconds: int) -> int:
 
 
 def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
-    """Prune old done/archived events, retaining decomposition identity until task deletion.
+    """Prune old terminal history, retaining request identity and latest control fences.
 
     ``older_than_seconds=0`` means everything older than now; the CLI maps
     ``--event-retention-days 0`` to "disabled" before calling this.
     """
+    from hermes_cli.kanban_db_lifecycle import prune_events
+
     cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
     with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
-        )
-    return int(cur.rowcount or 0)
+        return prune_events(conn, cutoff)
 
 
 def gc_worker_logs(*, older_than_seconds: int = 30 * 24 * 3600, board: Optional[str] = None) -> int:

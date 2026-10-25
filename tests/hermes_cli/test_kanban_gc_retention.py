@@ -22,6 +22,7 @@ def _done_task_with_old_event(conn):
     tid = kb.create_task(conn, title="finished")
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+        kb._append_event(conn, tid, "heartbeat", {"progress": "finished"})
         conn.execute("UPDATE task_events SET created_at=0 WHERE task_id=?", (tid,))
     return tid
 
@@ -86,7 +87,10 @@ def test_cmd_gc_retention_bounds(board, days, expect_rc, expect_kept):
     log = _old_log_file()
     assert kanban_ops._cmd_gc(_args(event_days=days, log_days=days)) == expect_rc
     with kbc.connect_closing() as conn:
-        assert (_event_rows(conn, tid) > 0) is expect_kept
+        # Positive retention prunes ordinary progress while keeping the latest
+        # native control fence, so retained request anchors cannot regain validity.
+        kinds = [event.kind for event in kb.list_events(conn, tid)]
+        assert kinds == (["created", "heartbeat"] if expect_kept else ["created"])
     assert log.exists() is expect_kept
     assert (ws / "scratch.txt").exists() is (expect_rc != 0)
 

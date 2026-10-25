@@ -8,6 +8,7 @@ monkeypatch points authoritative.
 import json
 import logging
 import sys
+from contextlib import contextmanager
 from typing import Any, List, Optional
 
 logger = logging.getLogger("tools.terminal_tool")
@@ -93,10 +94,10 @@ def _stamp_gateway_routing(proc_session, get_session_env) -> None:
 
 
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
-           session_key, effective_pty, persist_on_release: bool = False):
+           session_key, effective_pty, persist_on_release: bool = False, prepare_session=None):
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
                   owner_task_id=task_id or effective_task_id, session_key=session_key,
-                  persist_on_release=persist_on_release)
+                  persist_on_release=persist_on_release, _prepare_session=prepare_session)
     if env_type == "local":
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty, **common)
@@ -145,7 +146,36 @@ def _register_completion_watcher(process_registry, proc_session, session_key) ->
     process_registry.pending_watchers.append(watcher)
 
 
-def spawn_background_process(
+@contextmanager
+def background_spawn_authority(required=True):
+    """Reserve the existing native child scope before terminal setup can wait."""
+    from tools.approval_context import (
+        background_approval_task, background_task_refusal, reserve_background_approval_task,
+    )
+    if not required:
+        yield None
+        return
+    if refusal := background_task_refusal():
+        yield refusal
+        return
+    reservation = reserve_background_approval_task()
+    if reservation is None:
+        yield {"status": "rejected", "code": "task_authority_revoked",
+               "error": "The originating native task was stopped before background setup."}
+        return
+    with background_approval_task(reservation, "terminal-spawn"):
+        yield None
+
+
+def spawn_background_process(**kwargs) -> str:
+    """Native background launch, also guarded for direct internal callers."""
+    with background_spawn_authority() as refusal:
+        if refusal:
+            return json.dumps(refusal)
+        return _spawn_background_process(**kwargs)
+
+
+def _spawn_background_process(
     *, command: str, env: Any, env_type: str, effective_task_id: str, task_id: Optional[str],
     session_key: str, workdir: Optional[str], cwd: str, effective_pty: bool,
     notify_on_complete: bool, watch_patterns: Optional[list[str]], approval_note: Optional[str],
@@ -176,18 +206,42 @@ def spawn_background_process(
         env=env,
     )
     from tools.approval_context import reserve_background_approval_task, release_background_approval_task
-    reservation = reserve_background_approval_task() if notify_on_complete else None
+    from gateway.session_context import async_delivery_supported
+    reservation = reserve_background_approval_task() if (notify_on_complete or watch_patterns) and async_delivery_supported() else None
+
+    def prepare_session(session):
+        session.approval_task_reservation = reservation
+        notify, patterns = _apply_async_support(session, {}, notify_on_complete, watch_patterns)
+        patterns, _ = _resolve_notification_flag_conflict(
+            notify_on_complete=bool(notify), watch_patterns=patterns, background=True)
+        session.notify_on_complete = bool(notify)
+        session.watch_patterns = list(patterns or [])
+
     try:
         proc_session = _spawn(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
             effective_pty=effective_pty, persist_on_release=persist_on_release,
+            prepare_session=prepare_session,
         )
         # This is process-owned in-memory evidence. Checkpoint recovery deliberately
         # omits it, so an owner restart cannot recreate a human grant from IDs.
-        proc_session.approval_task_reservation = reservation
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
+        if proc_session.reconciliation_required and proc_session.pid is None:
+            release_background_approval_task(reservation)
+            result_data.update(output="Remote process launch outcome is unknown", status="unknown", exit_code=None,
+                code="process_launch_uncertain", reconciliation_required=proc_session.reconciliation_required)
+            return json.dumps(result_data, ensure_ascii=False)
+        from tools.approval_context import approval_task_revoked
+        if approval_task_revoked():
+            note = ("Stop arrived while this process was starting. Its actual process is tracked; "
+                    "reconcile this session before reporting it stopped or retrying the command.")
+            proc_session.reconciliation_required = note
+            process_registry._write_checkpoint()
+            release_background_approval_task(reservation)
+            result_data.update(code="task_authority_revoked", reconciliation_required=note)
+            return json.dumps(result_data, ensure_ascii=False)
         if persist_on_release:
             result_data["persist_on_release"] = True
         if approval_note:
@@ -205,7 +259,7 @@ def spawn_background_process(
 
         notify_on_complete, watch_patterns = _apply_async_support(
             proc_session, result_data, notify_on_complete, watch_patterns)
-        if not notify_on_complete:
+        if not notify_on_complete and not watch_patterns:
             release_background_approval_task(reservation)
             proc_session.approval_task_reservation = None
         watch_patterns, conflict_note = _resolve_notification_flag_conflict(
@@ -236,6 +290,7 @@ def spawn_background_process(
             result_data["watch_patterns"] = proc_session.watch_patterns
         return json.dumps(result_data, ensure_ascii=False)
     except Exception as e:
+        logger.exception("Background process launch failed")
         release_background_approval_task(reservation)
         return json.dumps({
             "output": "", "exit_code": -1,
@@ -270,10 +325,14 @@ def yield_to_background_handler(
     if env_type != "local":
         return None
 
-    def _handler(proc, output_so_far: str) -> dict:
+    def _handler(proc, output_so_far: str) -> dict | None:
         from tools.process_registry import process_registry
-        from tools.approval_context import reserve_background_approval_task, release_background_approval_task
+        from tools.approval_context import background_task_refusal, reserve_background_approval_task, release_background_approval_task
+        if background_task_refusal():
+            return None
         reservation = reserve_background_approval_task()
+        if reservation is None:
+            return None
         try:
             session = process_registry.adopt_local(
                 proc, command=command, cwd=cwd, task_id=effective_task_id,

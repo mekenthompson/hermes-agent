@@ -59,7 +59,10 @@ if os.environ['REPRO_MISSING'] == '1':
         return ident, writers, paths[1:]
     live.create_live_transcripts = missing
 kwargs = {'tasks': [{'goal': 'first diagnostic task'}, {'goal': 'second diagnostic task'}]} if os.environ['REPRO_SPLIT'] == '1' else {'goal': 'unfinished diagnostic task'}
-handle = json.loads(dt.delegate_task(**kwargs, background=True, parent_agent=parent))
+from tools.approval_context import approval_task_context
+with approval_task_context("run recovery diagnostic", identity="fixture-owner", profile="default",
+                           session=parent.session_id, task_id="diagnostic", is_current=lambda: True):
+    handle = json.loads(dt.delegate_task(**kwargs, background=True, parent_agent=parent))
 assert handle["status"] == "dispatched", handle
 assert started.wait(10), "child did not start"
 Path(os.environ["REPRO_HANDLE"]).write_text(json.dumps(handle), encoding="utf-8")

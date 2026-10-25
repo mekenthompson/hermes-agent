@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from agent import redact
 from tools import terminal_tool
+from tools.approval_context import approval_task_context, current_approval_task_context
 
 
 SECRET = "OPENAI_API_KEY=sk-testterminalerrorredaction1234567890"
@@ -115,7 +116,7 @@ def test_environment_creation_import_error_redacts_exception_text(monkeypatch):
     assert_secret_redacted(result, "error")
 
 
-def test_background_start_error_redacts_exception_text(monkeypatch):
+def test_background_start_error_redacts_exception_text(monkeypatch, tmp_path):
     class Env:
         env = {}
 
@@ -123,6 +124,7 @@ def test_background_start_error_redacts_exception_text(monkeypatch):
         pending_watchers = []
 
         def spawn_local(self, **kwargs):
+            assert current_approval_task_context() is not None
             raise RuntimeError(f"spawn failed with {SECRET}")
 
     import tools.process_registry as process_registry_mod
@@ -130,7 +132,9 @@ def test_background_start_error_redacts_exception_text(monkeypatch):
     _patch_common(monkeypatch, Env())
     monkeypatch.setattr(process_registry_mod, "process_registry", FailingRegistry())
 
-    result = json.loads(terminal_tool.terminal_tool(command="echo ok", background=True))
+    with approval_task_context("Run the background command", identity="local:user", profile=str(tmp_path),
+                               session="error-redaction", task_id="spawn-error", is_current=lambda: True):
+        result = json.loads(terminal_tool.terminal_tool(command="echo ok", background=True))
 
     assert result["exit_code"] == -1
     assert_secret_redacted(result, "error")

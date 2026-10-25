@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from hermes_constants import get_hermes_home
-from tools.approval_context import require_live_task_setup
 from tools.interrupt import consume_yield, is_interrupted, is_thread_interrupted
 from tools.environments.base_output import (
     ProcessHandle, _finalize_wait_result, _new_output_collector, _start_drain_thread,
@@ -675,6 +674,7 @@ class BaseEnvironment(ABC):
         is drained (head/tail window) instead of holding the full output in memory (#64435).
         See #94285.
         """
+        from tools.approval_context import require_live_task_setup
         require_live_task_setup()
         self._before_execute()
 

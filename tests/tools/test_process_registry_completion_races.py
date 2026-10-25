@@ -277,7 +277,7 @@ def _poll_sandbox(registry, session, env):
     registry._env_poller_loop(session, env, "/tmp/bg.log", "/tmp/bg.pid", "/tmp/bg.exit")
 
 
-def test_a_sandbox_exit_read_after_a_kill_keeps_the_kill(monkeypatch):
+def test_a_signal_ack_during_exit_read_keeps_the_observed_exit(monkeypatch):
     registry = ProcessRegistry()
     killed = []
     env = _SandboxEnv(hooks={"exit": lambda: killed.append(registry.kill_process("proc_sandbox"))})
@@ -285,12 +285,12 @@ def test_a_sandbox_exit_read_after_a_kill_keeps_the_kill(monkeypatch):
 
     _poll_sandbox(registry, session, env)
 
-    assert killed[0]["status"] == "killed"
+    assert killed[0]["status"] == "unknown"
     assert (session.exit_code, session.completion_reason, session.termination_source) == (
-        -15, "killed", "process.kill")
+        0, "exited", "")
 
 
-def test_a_sandbox_lost_after_a_kill_keeps_the_kill(monkeypatch):
+def test_a_sandbox_lost_after_a_signal_ack_keeps_unknown_state(monkeypatch):
     registry = ProcessRegistry()
 
     def kill_then_lose_the_backend():
@@ -302,11 +302,12 @@ def test_a_sandbox_lost_after_a_kill_keeps_the_kill(monkeypatch):
 
     _poll_sandbox(registry, session, env)
 
-    assert (session.exit_code, session.completion_reason, session.termination_source) == (
-        -15, "killed", "process.kill")
+    assert not session.exited and session.exit_code is None
+    assert session.id in registry._running and session.id not in registry._finished
+    assert session.reconciliation_required and not session._completion_event.is_set()
 
 
-def test_a_lost_sandbox_without_a_kill_is_reported_lost(monkeypatch):
+def test_a_lost_sandbox_without_a_kill_keeps_unknown_state(monkeypatch):
     registry = ProcessRegistry()
 
     def lose_the_backend():
@@ -317,10 +318,9 @@ def test_a_lost_sandbox_without_a_kill_is_reported_lost(monkeypatch):
 
     _poll_sandbox(registry, session, env)
 
-    assert (session.exit_code, session.completion_reason, session.termination_source) == (
-        -1, "lost", "backend_lost")
-    assert session.id in registry._finished
-    assert session._completion_event.is_set()
+    assert not session.exited and session.exit_code is None
+    assert session.id in registry._running and session.id not in registry._finished
+    assert session.reconciliation_required and not session._completion_event.is_set()
 
 
 def test_sandbox_output_fetched_before_a_kill_is_not_added_after_it(monkeypatch):
@@ -328,15 +328,20 @@ def test_sandbox_output_fetched_before_a_kill_is_not_added_after_it(monkeypatch)
     the session's output past what the caller and the completion were given."""
     registry = ProcessRegistry()
     killed = []
-    env = _SandboxEnv(delta="FINAL", alive=True,
-                      hooks={"delta": lambda: killed.append(registry.kill_process("proc_sandbox"))})
+    def signal_then_observe_exit():
+        killed.append(registry.kill_process("proc_sandbox"))
+        registry._finish_exited(session, -15)
+
+    env = _SandboxEnv(delta="FINAL", alive=True, hooks={"delta": signal_then_observe_exit})
     session = _sandbox_session(registry, monkeypatch, env)
     session.append_output("partial")
 
     _poll_sandbox(registry, session, env)
 
-    assert killed[0]["output"] == "partial"
+    assert killed[0]["status"] == "unknown"
+    assert session.exit_code == -15 and session._completion_event.is_set()
     assert session.output_buffer == "partial"
+    assert registry.completion_queue.get_nowait()["output"] == "partial"
 
 
 def test_a_log_rotation_seen_after_a_kill_does_not_clear_its_output(monkeypatch):
@@ -347,7 +352,8 @@ def test_a_log_rotation_seen_after_a_kill_does_not_clear_its_output(monkeypatch)
 
     def rotated_on_the_second_read(command, **kwargs):
         if command.startswith("O=7;"):  # second log read: the log shrank, so the offset restarts
-            registry.kill_process("proc_sandbox")
+            assert registry.kill_process("proc_sandbox")["status"] == "unknown"
+            registry._finish_exited(session, -15)
             return {"output": "3 0\nnew"}
         return execute(command, **kwargs)
 

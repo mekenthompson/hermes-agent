@@ -913,7 +913,7 @@ class TestSpawnEnvSanitization:
         assert f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}TELEGRAM_BOT_TOKEN" not in env
         assert env["PYTHONUNBUFFERED"] == "1"
 
-    def test_spawn_via_env_checks_returncode_when_wrapper_fails(self, registry):
+    def test_spawn_via_env_retains_uncertain_record_without_pid(self, registry):
         class FakeEnv:
             def __init__(self):
                 self.commands = []
@@ -921,18 +921,18 @@ class TestSpawnEnvSanitization:
             def execute(self, command, **kwargs):
                 self.commands.append((command, kwargs))
                 return {"output": "syntax error", "returncode": 2}
-
         env = FakeEnv()
         fake_thread = MagicMock()
-
         with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
-            patch.object(registry, "_write_checkpoint"):
-            with pytest.raises(RuntimeError, match="exited 2 without a PID: syntax error"):
-                registry.spawn_via_env(env, "echo hello")
+            patch.object(registry, "_write_checkpoint") as checkpoint:
+            session = registry.spawn_via_env(env, "echo hello")
 
         fake_thread.start.assert_not_called()
-        # A failed launch must not be exposed as a running/tracked session.
-        assert not registry._running and not registry._finished
+        assert session.pid is None and session.pid_scope == "sandbox"
+        assert session.reconciliation_required and not session.exited
+        assert registry._running == {session.id: session} and not registry._finished
+        assert len(env.commands) == 1, "a missing receipt must not cause a replay"
+        checkpoint.assert_called_once()
 
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")

@@ -14,6 +14,7 @@ import pytest
 from agent.interrupt_control import InterruptControlMixin
 from agent.turn_context import _bind_interrupt_scope
 from tools import async_delegation
+from tools.approval_context import approval_task_context
 from tools.delegate_tool_dispatch import _Batch, _dispatch_background
 from tools.interrupt import is_interrupted, set_interrupt
 from tools.process_registry import process_registry
@@ -88,9 +89,23 @@ class _ControlledChild(_Parent):
         return {"api_call_count": 0}
 
     def close(self):
-        self.closed_while_running |= not self.finished.is_set()
+        self.closed_while_running |= self.started.is_set() and not self.finished.is_set()
         self.close_count += 1
         self.closed.set()
+
+
+def _assert_stopped_before_conversation(child, entry):
+    assert child.stop_received.is_set()
+    assert child._hard_interrupt_requested.is_set()
+    assert not child.started.is_set(), "hard Stop must fence the child before conversation effects"
+    assert not child.unwinding.is_set()
+    assert not child.finished.is_set()
+    assert child.closed.wait(5)
+    assert child.close_count == 1
+    assert not child.closed_while_running
+    assert entry["api_calls"] == 0
+    assert entry["status"] in {"error", "interrupted"}
+    assert any(word in str(entry.get("error")).lower() for word in ("stopped", "interrupt"))
 
 
 def _batch(parent, *children):
@@ -205,7 +220,11 @@ def test_rejected_background_child_stops_with_parent(
 
     def run_dispatch():
         try:
-            outcome.set_result(json.loads(_dispatch_background(batch)))
+            # This probe interrupts the parent turn, not the admitted native task.
+            # Detached units retain that task until the registry receives cancellation.
+            with approval_task_context("exercise capacity rejection", identity="fixture-owner", profile="default",
+                                       session=parent.session_id, task_id="capacity", is_current=lambda: True):
+                outcome.set_result(json.loads(_dispatch_background(batch)))
         except BaseException as exc:
             outcome.set_exception(exc)
 
@@ -220,31 +239,40 @@ def test_rejected_background_child_stops_with_parent(
         if stop_timing == "during_admission":
             request_stop(stop_message)
         continue_admission.set()
-        assert child.started.wait(5)
-        if stop_timing == "running":
-            request_stop(stop_message)
-
-        assert child.stop_received.wait(5), "fallback lost parent cancellation ownership"
-        assert child.unwinding.wait(5)
-        assert child.observed_interrupt == (stop_message, stop_kind == "hard")
+        stopped_before_conversation = stop_kind == "hard" and stop_timing == "during_admission"
+        if not stopped_before_conversation:
+            assert child.started.wait(5)
+            if stop_timing == "running":
+                request_stop(stop_message)
+            assert child.stop_received.wait(5), "fallback lost parent cancellation ownership"
+            assert child.unwinding.wait(5)
+            assert child.observed_interrupt == (stop_message, stop_kind == "hard")
+            assert not outcome.done(), "dispatch returned while its child still owned resources"
+            assert child.close_count == 0
         if background_child is not None:
             assert not background_child.stop_received.is_set()
             assert pending_child.stop_received.is_set(), "unsubmitted unit lost parent cancellation ownership"
             assert not pending_child.started.is_set()
-        assert not outcome.done(), "dispatch returned while its child still owned resources"
-        assert child.close_count == 0
         child.allow_finish.set()
         result = outcome.result(timeout=5)
         if background_child is None:
             assert "SYNCHRONOUSLY" in result["note"]
-            assert result["results"][0]["status"] == "interrupted"
+            inline = result["results"][0]
         else:
             assert result["status"] == "dispatched"
-            assert result["inline_results"][0]["status"] == "interrupted"
+            inline = result["inline_results"][0]
             assert not background_child.stop_received.is_set()
-            assert pending_child.unwinding.wait(5)
-            assert pending_child.observed_interrupt == (stop_message, stop_kind == "hard")
-        assert child.finished.is_set()
+            if stop_kind == "hard":
+                assert pending_child.closed.wait(5)
+                assert not pending_child.started.is_set()
+            else:
+                assert pending_child.unwinding.wait(5)
+                assert pending_child.observed_interrupt == (stop_message, False)
+        if stopped_before_conversation:
+            _assert_stopped_before_conversation(child, inline)
+        else:
+            assert inline["status"] == "interrupted"
+            assert child.finished.is_set()
         assert child.close_count == 1
         assert not child.closed_while_running
         assert parent._active_children == []
@@ -260,11 +288,15 @@ def test_rejected_background_child_stops_with_parent(
             for extra in (background_child, pending_child):
                 extra.allow_finish.set()
                 assert extra.closed.wait(5)
-                assert extra.finished.is_set()
+                assert extra.finished.is_set() == extra.started.is_set()
                 assert extra.close_count == 1
                 assert not extra.closed_while_running
-            completed_ids = {registry_state.get(timeout=5)["delegation_id"] for _ in accepted_ids}
-            assert completed_ids == set(accepted_ids)
+            completions = [registry_state.get(timeout=5) for _ in accepted_ids]
+            assert {event["delegation_id"] for event in completions} == set(accepted_ids)
+            if stop_kind == "hard":
+                denied, = [entry for event in completions for entry in event["results"]
+                           if entry["task_index"] == 2]
+                _assert_stopped_before_conversation(pending_child, denied)
         if rejection == "capacity":
             completion = registry_state.get(timeout=5)
             assert completion["delegation_id"] == accepted["delegation_id"]
@@ -274,7 +306,9 @@ def test_rejected_background_child_stops_with_parent(
 def test_accepted_background_child_keeps_registry_cancellation_ownership(registry_state):
     parent, child = _Parent(), _ControlledChild()
     try:
-        result = json.loads(_dispatch_background(_batch(parent, child)))
+        with approval_task_context("exercise detached cancellation", identity="fixture-owner", profile="default",
+                                   session=parent.session_id, task_id="capacity", is_current=lambda: True):
+            result = json.loads(_dispatch_background(_batch(parent, child)))
         assert result["status"] == "dispatched"
         assert child.started.wait(5)
         parent.interrupt()

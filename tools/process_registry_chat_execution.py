@@ -37,10 +37,13 @@ def spawn_local_pipe(registry, session, safe_command, env_vars, pty_scope_attemp
     env = registry._spawn_env(env_vars)
     if session.systemd_unit:
         env = facade.systemd_user_bus_env(env)
+    from tools.approval_context import require_live_task_setup
+    require_live_task_setup()
     start_local_process(resource)
     # The scope does not create a new session; preserve TTY/process-group isolation.
     output = facade.open_output_log(log) if log else facade.subprocess.PIPE
     try:
+        require_live_task_setup()
         proc = facade.subprocess.Popen(
             argv, text=True, cwd=session.cwd, env=env, encoding="utf-8", errors="replace",
             stdout=output, stderr=facade.subprocess.STDOUT,

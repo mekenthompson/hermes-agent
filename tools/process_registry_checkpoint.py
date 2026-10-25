@@ -89,7 +89,7 @@ class ProcessCheckpointMixin:
         unresolved_scope_entries: list[dict[str, Any]] = []
         for entry in entries:
             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
-            if not pid:
+            if not pid and not (pid_scope != "host" and entry.get("reconciliation_required")):
                 continue
             # The registry is process-global, so every profile's checkpoint carries every live
             # process; a multiplexer recovering several homes must adopt each session once.
@@ -98,6 +98,13 @@ class ProcessCheckpointMixin:
             if already_tracked:
                 continue
             if pid_scope != "host":  # in-sandbox PIDs mean nothing once the env handle is gone
+                if entry.get("reconciliation_required"):
+                    fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
+                    session = ProcessSession(id=entry["session_id"], detached=True, **fields)
+                    with self._lock:
+                        self._running[session.id] = session
+                    recovered += 1
+                    continue
                 logger.info(
                     "Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
                     entry.get("command", "unknown")[:60], pid, pid_scope)
