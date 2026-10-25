@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 STOP_TIMEOUT_SECONDS = 25
 _STOP_REFUSALS = frozenset({'stale_generation', 'unknown_execution', 'permission_denied',
                             'not_found', 'profile_mismatch', 'stale_epoch'})
+_ABORTED_OWNER_OUTCOMES = frozenset({'reclaimed', 'stale', 'timed_out', 'crashed', 'gave_up', 'spawn_failed'})
 
 
 def _stop_intent(conn, task_id, run_id):
@@ -228,8 +229,39 @@ def interrupt_owner_run(conn, run_id, *, allow_running=False):
 
 
 def owner_termination_ready(conn, run_id):
-    """The existing reclaim/timeout may end its submitter only after native cleanup."""
-    return run_id is None or interrupt_owner_run(conn, run_id, allow_running=True) is not False
+    """Cancel explicit/aborted scopes before killing their submitter; normal release is distinct."""
+    return (run_id is None or not owner_scope_stop_required(conn, run_id)
+            or interrupt_owner_run(conn, run_id, allow_running=True) is not False)
+
+
+def owner_scope_stop_required(conn, run_id):
+    """A retained submitter's exit is not a request to cancel its released services."""
+    row = conn.execute('SELECT task_id,outcome,ended_at FROM task_runs WHERE id=?', (run_id,)).fetchone()
+    if row is None:
+        return False
+    task_id = row['task_id']
+    if row['ended_at'] is None or row['outcome'] in _ABORTED_OWNER_OUTCOMES:
+        return True
+    if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? "
+                    "AND kind='native_owner_stop' LIMIT 1", (task_id, run_id)).fetchone():
+        return True
+    # Older supervisor Stops may have only the task-scoped request event. Its
+    # event boundary covers prior admitted scopes, never a successor admission.
+    if conn.execute("SELECT 1 FROM task_events s JOIN task_events o ON o.task_id=s.task_id "
+                    "AND o.id<s.id WHERE s.task_id=? AND s.kind='block_requested' "
+                    "AND o.kind='owner_admitted' AND o.run_id=? LIMIT 1", (task_id, run_id)).fetchone():
+        return True
+    blocks = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                          "AND kind IN ('blocked','block_loop_detected','dependency_wait')", (task_id, run_id))
+    for block in blocks:
+        try:
+            payload = json.loads(block['payload'])
+        except (TypeError, ValueError):
+            logger.warning('kanban: unreadable terminal Stop intent for task %s run %s', task_id, run_id)
+            continue
+        if isinstance(payload, dict) and payload.get('supervisor_stop') is True:
+            return True
+    return False
 
 
 def finish_aborted_owner_run(conn, task_id, run_id):
@@ -237,5 +269,5 @@ def finish_aborted_owner_run(conn, task_id, run_id):
     if run_id is None:
         return
     row = conn.execute('SELECT outcome FROM task_runs WHERE task_id=? AND id=?', (task_id, run_id)).fetchone()
-    if row and row['outcome'] in {'reclaimed', 'stale', 'timed_out', 'crashed', 'gave_up', 'spawn_failed'}:
+    if row and row['outcome'] in _ABORTED_OWNER_OUTCOMES:
         interrupt_owner_run(conn, run_id)

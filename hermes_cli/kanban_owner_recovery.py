@@ -55,7 +55,9 @@ def owner_stop_unresolved(conn, task_id):
             requested = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? "
                                     "AND kind='native_owner_stop' LIMIT 1", (task_id, run_id)).fetchone()
             if marker['outcome'] == 'blocked' and blocked.get('supervisor_stop') is False and not requested:
-                continue
+                from hermes_cli.kanban_owner_control import owner_scope_stop_required
+                if not owner_scope_stop_required(conn, run_id):
+                    continue
             binding = json.loads(marker['payload'])
             if owner_stop_confirmed(conn, task_id, run_id, binding):
                 continue
