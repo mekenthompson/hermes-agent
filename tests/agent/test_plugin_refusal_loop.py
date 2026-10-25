@@ -100,3 +100,39 @@ def test_guardrail_synthetic_block_does_not_count_itself_as_another_refusal():
         agent._execute_tool_calls_sequential(SimpleNamespace(tool_calls=[call]), [], "refusal-test")
     dispatch.assert_not_called()
     observe.assert_not_called()
+
+
+def test_parallel_refusals_do_not_lose_failure_counts():
+    """Force a real worker overlap at the counter read, not a fabricated dispatch."""
+    from threading import Barrier, BrokenBarrierError
+    from agent.tool_guardrails import ToolCallSignature
+
+    agent = _make_agent("web_search", config=_hard_stop_config())
+    agent._stall_guards = False
+    barrier = Barrier(2)
+    args = {"query": "same"}
+    signature = ToolCallSignature.from_call("web_search", args)
+
+    class OverlappingReads(dict):
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            if key == signature and value == 0:
+                try:
+                    barrier.wait(timeout=2)
+                except BrokenBarrierError:
+                    pass  # Serialized observation has no second concurrent reader.
+            return value
+
+    agent._tool_guardrails._exact_failure_counts = OverlappingReads()
+    calls = [_mock_tool_call("web_search", json.dumps(args), f"parallel-{i}") for i in range(2)]
+    messages = []
+    with (
+        patch("hermes_cli.plugins._dispatch_pre_tool_call_hooks", return_value=("policy refused", None)),
+        patch("model_tools.handle_function_call") as dispatch,
+    ):
+        agent._execute_tool_calls_concurrent(SimpleNamespace(content="", tool_calls=calls), messages, "parallel-test")
+    dispatch.assert_not_called()
+    assert len(messages) == 2
+    assert agent._tool_guardrails._exact_failure_counts[signature] == 2
+    assert agent._tool_guardrail_halt_decision.should_halt
+    assert agent._tool_guardrails._turn_web_search_count == 0
