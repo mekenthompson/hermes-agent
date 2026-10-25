@@ -264,9 +264,12 @@ def finish_custodied(registry, session):
     except (CustodyUnknown, OSError, subprocess.SubprocessError) as exc:
         mark_unknown(registry, session, str(exc))
         return True
+    finally:
+        custody.output_ready.set()
     session.custody_scope_empty = True
-    registry._finish_exited(session, code, reason='killed' if custody.stop_source else 'exited',
-                            source=custody.stop_source)
+    if custody.stop_source:
+        return True  # the existing kill caller snapshots/consumes output before publishing exit
+    registry._finish_exited(session, code)
     custody.close()
     return True
 
@@ -280,20 +283,16 @@ def stop_custodied(registry, session, source):
         return {'status': 'unknown', 'session_id': session.id, 'reconciliation_required': session.reconciliation_required}
     custody.stop_source = source
     try:
-        code = custody.stop()
+        custody.stop()
     except (CustodyUnknown, OSError, subprocess.SubprocessError) as exc:
         mark_unknown(registry, session, str(exc))
         return {'status': 'unknown', 'session_id': session.id, 'reconciliation_required': session.reconciliation_required}
+    reader = session._reader_thread
+    if reader is not None and reader is not threading.current_thread() and not custody.output_ready.wait(5):
+        mark_unknown(registry, session, 'Custody scope ended, but its output receipt is not yet drained.')
+        return {'status': 'unknown', 'session_id': session.id, 'reconciliation_required': session.reconciliation_required}
     with session._lock:
-        session.exited = True
-        session.exit_code = code
-        session.completion_reason = 'killed' if session.pid is not None else 'failed_start'
-        session.termination_source = source
         session.custody_scope_empty = True
         session._local_launch_pending = False
         session.reconciliation_required = ''
-    if not registry._move_to_finished(session):
-        from tools.process_registry import save_completed_result
-        save_completed_result(session)
-    custody.close()
-    return {'status': 'killed' if session.pid is not None else 'already_exited', 'session_id': session.id}
+    return None  # preserve the existing kill/output/consumption/notification finalizer

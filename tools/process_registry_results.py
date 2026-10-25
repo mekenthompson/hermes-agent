@@ -26,6 +26,12 @@ _RESULT_FIELDS = (
 )
 
 
+def settled_foreground(session) -> bool:
+    """Projection-only: a visible active/unknown resource is never hidden by its role."""
+    return bool(session.foreground and session.exited and session.custody_scope_empty
+                and not session.reconciliation_required)
+
+
 def _result_paths():
     """Prune by completion time, not start time (jobs can take days)."""
     directory = get_hermes_home() / "logs" / "process-results"
@@ -52,6 +58,8 @@ def save_completed_result(session) -> None:
 
     with session._lock:
         record = {key: getattr(session, key) for key in _RESULT_FIELDS}
+        record.update(foreground=getattr(session, "foreground", False),
+                      custody_scope_empty=getattr(session, "custody_scope_empty", False))
         record["output"] = session.output_buffer[-MAX_OUTPUT_CHARS:]
     # Live-output opt-out must not persist raw credentials in durable receipts.
     record["output"] = redact_terminal_output(record["output"], record["command"], force=True)
@@ -110,6 +118,8 @@ def load_completed_results(prefix: str = "") -> dict:
                 continue
             session = ProcessSession(
                 **{key: record[key] for key in _RESULT_FIELDS},
+                foreground=record.get("foreground") is True,
+                custody_scope_empty=record.get("custody_scope_empty") is True,
                 exited=True, output_buffer=record["output"],
             )
             session._completion_event.set()

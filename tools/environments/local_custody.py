@@ -50,7 +50,11 @@ class ForegroundCustody:
         return result
 
     def finish(self):
+        if not self.custody.settled():
+            from tools.process_registry_custody import CustodyUnknown
+            raise CustodyUnknown('Foreground scope exit has not been confirmed.')
         if not self.session.exited:
+            self.session.custody_scope_empty = True
             # The foreground drain owns its pipe. Do not close it before BaseEnvironment
             # joins that drain; moving the descriptor must not discard buffered output.
             self.session.process = None
@@ -75,7 +79,7 @@ def spawn_foreground(argv, command, cwd, environment, *, stdin=False):
     evidence = current_approval_task_context()
     route = evidence.session if evidence else get_session_env('HERMES_SESSION_KEY', '')
     owner = evidence.task_id if evidence else get_session_env('HERMES_SESSION_ID', '')
-    session = registry._new_session(command, owner, owner, route, cwd)
+    session = registry._new_session(command, owner, owner, route, cwd, foreground=True)
     session._native_local_launch = session._local_launch_pending = True
     if retain_remote_unknown(registry, session, _LOCAL_PENDING) is False:
         registry.kill_process(session.id, source='foreground_checkpoint_refused', consume_output=False)

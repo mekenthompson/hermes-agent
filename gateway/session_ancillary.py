@@ -599,6 +599,7 @@ def process_snapshot(authority, ref, agent, records):
         return []
     registry = module.process_registry
     keys, owners = _ownership(authority, ref, agent, records)
+    from tools.process_registry_results import settled_foreground
     # Keep ownership and output together.
     with registry._lock:
         return [{'session_id': p.id, 'command': p.command[:200],
@@ -609,4 +610,4 @@ def process_snapshot(authority, ref, agent, records):
                  'started_epoch': p.started_at, 'exited_at': p.exited_at or None,
                  'completion_reason': p.completion_reason if p.exited else None,
                  'output_tail': p.output_buffer[-_PROCESS_TAIL_CHARS:]} for p in _owned_locked(
-                     registry, keys, owners, authority, authority.sessions[ref.session_id])]
+                     registry, keys, owners, authority, authority.sessions[ref.session_id]) if not settled_foreground(p)]

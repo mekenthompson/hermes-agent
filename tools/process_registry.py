@@ -37,7 +37,7 @@ from tools.process_registry_notifications import (
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log
 from tools.process_registry_termination import ProcessTerminationMixin
-from tools.process_registry_results import load_completed_results, save_completed_result
+from tools.process_registry_results import load_completed_results, save_completed_result, settled_foreground
 from tools.process_registry_env_log import log_delta_command
 from tools.process_registry_wsl import _is_wsl_launcher_command
 
@@ -558,6 +558,7 @@ class ProcessSession:
     custody_pid: Optional[int] = None
     custody_start_time: Optional[int] = None
     custody_scope_empty: bool = False
+    foreground: bool = False                    # projection only; never execution authority
     exited: bool = False
     exited_at: float = 0.0                      # time.time() of the FIRST move to finished (0 = unknown)
     exit_code: Optional[int] = None             # None while running
@@ -666,7 +667,7 @@ _CHECKPOINT_FIELDS = (
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
     "heartbeat_seconds", "persist_on_release", "output_log", "reconciliation_required",
-    "custody_kind", "custody_pid", "custody_start_time", "custody_scope_empty")
+    "custody_kind", "custody_pid", "custody_start_time", "custody_scope_empty", "foreground")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -1177,6 +1178,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         already captured is lost."""
         session = getattr(proc, '_hermes_process_session', None)
         if session is not None:
+            session.foreground = False
             session.notify_on_complete = notify_on_complete
             if output_so_far:
                 session.append_output(output_so_far)
@@ -2123,9 +2125,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 if consume_output:
                     self._completion_consumed.add(session_id)
                 session.exited = True
-                session.exit_code = -15  # SIGTERM
-                session.completion_reason = "killed"
+                session.exit_code = session._custody.main_code if session._custody is not None else -15
+                session.completion_reason = "failed_start" if session.custody_kind and session.pid is None else "killed"
                 session.termination_source = source
+                if session.completion_reason == "failed_start":
+                    session.notify_on_complete = False
             # The reader thread can finalise the session while the signal path
             # blocks in the SIGKILL grace window: its ``save_completed_result``
             # then persists this kill as a plain ``exited``. Re-write the receipt
@@ -2321,6 +2325,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             # List-only refreshes must observe child exit even while descendants
             # keep the capture pipe open; retain the existing completion owner.
             self._reconcile_local_exit(s)
+            if settled_foreground(s):
+                continue  # settled foreground/setup receipts remain available by ID, not as background jobs
             entry = {
                 "session_id": s.id,
                 "command": s.command[:200],

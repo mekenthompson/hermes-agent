@@ -25,10 +25,6 @@ def _completion_notes(home):
                           ("[IMPORTANT: Background process %",)).fetchall()
 
 
-def _process_receipts(home):
-    return list((home / "logs" / "process-results").glob("*.json"))
-
-
 def _cli_closed(home):
     """The gateway processed the one-shot CLI's exit: its ``session.detach`` stamped the idle row."""
     import sqlite3
@@ -195,7 +191,11 @@ def test_headless_terminal_result_survives_cli_exit(tmp_path, request):
         # so the completion arrives with no viewer: it is written into the session as a note,
         # never an unattended follow-up turn (#134889 LC-7). The model stays reachable so a
         # wrong turn would be seen.
-        exited_before_completion = not _process_receipts(home)
+        # Foreground setup also retains physical execution history. Only the
+        # actual background IDs returned to this model establish its closeout.
+        exited_before_completion = bool(observed) and all(
+            not (home / "logs" / "process-results" / f"{item['session_id']}.json").exists()
+            for item in observed)
         deadline = time.monotonic() + 30
         while not _cli_closed(home) and time.monotonic() < deadline:
             time.sleep(0.05)

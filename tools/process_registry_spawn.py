@@ -73,6 +73,7 @@ def cancel_unstarted_local_launch(registry, session, source):
             if result := stop_before_go(registry, session):
                 return result
         session.exited = True
+        session.custody_scope_empty = True  # no target fork, and any armed keeper is physically settled
         session.exit_code = None  # no OS process or collected exit exists
         session.completion_reason = 'failed_start'
         session.termination_source = source
@@ -178,7 +179,14 @@ def spawn_via_env(registry, env, command, cwd, task_id, session_key, timeout, ow
         require_live_task_setup()
         # The same record survives owner death or a lost backend receipt. It is
         # not proof a process started, and its sandbox PID is never a host PID.
-        retain_remote_unknown(registry, session, "Remote launch receipt is unknown; reconcile this session before retrying.")
+        persisted = retain_remote_unknown(registry, session, "Remote launch receipt is unknown; reconcile this session before retrying.")
+        try:
+            if reader_reservation is not None and persisted is False:
+                raise OSError('Native remote launch checkpoint could not be written; target was not started.')
+            require_live_task_setup()  # writing the checkpoint can wait across Stop or owner replacement
+        except Exception:
+            fail_unstarted_remote(registry, session)
+            raise
         try:
             result = env.execute(script, cwd=cwd or "", timeout=timeout, rewrite_compound_background=False)
         except Exception:
@@ -196,6 +204,18 @@ def spawn_via_env(registry, env, command, cwd, task_id, session_key, timeout, ow
     finally:
         if not reader_started:
             release_background_approval_task(reader_reservation)
+
+
+def fail_unstarted_remote(registry, session):
+    """The producer never entered its backend: preserve a no-effect receipt, not an OS exit."""
+    with session._lock:
+        session.exited = True
+        session.exit_code = None
+        session.completion_reason = 'failed_start'
+        session.termination_source = 'remote_launch_refused'
+        session.reconciliation_required = ''
+        session.notify_on_complete = False
+    registry._move_to_finished(session)
 
 
 def retain_remote_unknown(registry, session, note):
