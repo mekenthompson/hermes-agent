@@ -66,6 +66,8 @@ class _PendingReview:
     kwargs: dict[str, Any]
     enqueued_at: float
     context: contextvars.Context
+    invoke: Callable
+    release: Callable
 
 
 class ReviewIdleQueue:
@@ -97,12 +99,25 @@ class ReviewIdleQueue:
     def enqueue(self, agent: Any, session_key: str, kwargs: dict[str, Any]) -> None:
         """Add (or replace — newest snapshot wins) a session's pending review, keeping the ORIGINAL
         enqueue time on coalesce so a busy session cannot push its age-out forever."""
+        from agent.memory_task_authority import bind_memory_task
+        invoke, release = bind_memory_task(lambda: agent._spawn_background_review_now(**kwargs))
+        if invoke is None:
+            return
         with self._lock:
             existing = self._pending.get(session_key)
             enqueued_at = existing.enqueued_at if existing is not None else self._now()
-            self._pending[session_key] = _PendingReview(
-                agent, session_key, kwargs, enqueued_at, contextvars.copy_context())
-        self._ensure_thread()
+            item = self._pending[session_key] = _PendingReview(
+                agent, session_key, kwargs, enqueued_at, contextvars.copy_context(), invoke, release)
+        if existing is not None:
+            existing.release()
+        try:
+            self._ensure_thread()
+        except BaseException:
+            with self._lock:
+                if self._pending.get(session_key) is item:
+                    del self._pending[session_key]
+            release()
+            raise
         self._wake.set()
         logger.info("Background review deferred (session=%s, queued=%d)", session_key[-12:], len(self._pending))
 
@@ -161,6 +176,12 @@ class ReviewIdleQueue:
                 time.sleep(_POLL_INTERVAL_S)
 
     def _dispatch(self, item: _PendingReview) -> None:
+        try:
+            self._dispatch_current(item)
+        finally:
+            item.release()
+
+    def _dispatch_current(self, item: _PendingReview) -> None:
         if not self._still_enabled(item):
             logger.info(
                 "Deferred background review dropped: reviews were disabled while it was queued (session=%s)",
@@ -169,7 +190,7 @@ class ReviewIdleQueue:
         logger.info(
             "Dispatching deferred background review (session=%s, waited=%.0fs, queued=%d)",
             item.session_key[-12:], self._now() - item.enqueued_at, self.pending_count())
-        item.agent._spawn_background_review_now(**item.kwargs)
+        item.invoke()
 
     @staticmethod
     def _still_enabled(item: _PendingReview) -> bool:

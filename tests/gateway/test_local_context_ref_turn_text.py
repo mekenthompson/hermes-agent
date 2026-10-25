@@ -130,6 +130,8 @@ async def _history():
 def _managed(tmp_path, monkeypatch, text):
     from gateway import session_managed_worker as managed
     from gateway.session_local import _bypass_policy
+    from hermes_state import SessionDB
+    from hermes_state_runtime import begin_runtime_epoch
     policy = _bypass_policy({'cwd': str(tmp_path), 'model': 'fixture', 'provider': 'custom',
                              'base_url': 'http://127.0.0.1:9/v1', 'safe_mode': True}, private_secrets={})
     monkeypatch.setattr('gateway.session_policy.launch_key', lambda *args: None)
@@ -176,12 +178,20 @@ def _managed(tmp_path, monkeypatch, text):
     live = SimpleNamespace(source=SimpleNamespace(user_id='u', chat_id='c', platform=None), route='managed-refs',
                            event_stream=SimpleNamespace(lock=threading.Lock(), publish=lambda *a, **k: None),
                            controls=SimpleNamespace(snapshot=lambda *a: None))
-    authority = SimpleNamespace(profile_id=str(tmp_path), sessions={'sid': live}, runner=None, pending_results={},
+    db = SessionDB(tmp_path / 'managed-state.db')
+    epoch = begin_runtime_epoch(db, instance_id='managed-reference-owner')
+    authority = SimpleNamespace(profile_id=str(tmp_path), db=db, epoch=epoch, sessions={'sid': live}, runner=None, pending_results={},
                                 waiters={}, adopt_agent=lambda *a: None, _publish_pending=lambda ref: None)
     row = {'request_id': 'typed', 'admission_id': 'adm', 'generation': 1, 'principal_id': 'u',
            'payload': {'text': text}}
     authority.executing = {'sid': 1}
-    run = managed.execute_managed(authority, SimpleNamespace(session_id='sid'), row, policy)
+    async def run_owned():
+        try:
+            return await managed.execute_managed(authority, SimpleNamespace(session_id='sid'), row, policy)
+        finally:
+            db.close()
+
+    run = run_owned()
     return run, authority, sent, spawned
 
 

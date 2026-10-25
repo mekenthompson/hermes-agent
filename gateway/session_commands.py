@@ -226,6 +226,8 @@ async def _run_runner_command(runner, live, name, arg, kind, shell):
         # The argument as typed, like main's CLI: no messaging dash repair.
         return await runner._hm_run_plugin_handler(handler, event, live.source, entry, args=arg)
     except Exception as e:  # main's CLI printed it; messaging (run_inbound_hooks) still only logs it
+        from tools.approval_context import revoke_current_approval_task
+        revoke_current_approval_task()
         logger.warning("Plugin command dispatch failed: %s", e, exc_info=True)
         return t('cli.plugin.command_error', error=str(e) or type(e).__name__)
 

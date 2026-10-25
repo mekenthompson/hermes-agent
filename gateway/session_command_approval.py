@@ -8,10 +8,11 @@ from weakref import WeakSet
 def command_task_scope(authority, ref, identity, text, arrival_epoch):
     from gateway.session_authorities import require_serving
     from hermes_state_runtime import RuntimeStoreError, _epoch
-    from tools.approval_context import approval_task_context, approval_task_revoked, current_approval_task_context
+    from tools.approval_context import (approval_task_context, approval_task_failure_scope,
+                                        approval_task_revoked, current_approval_task_context)
 
     if approval_task_revoked() or current_approval_task_context() is not None:
-        return nullcontext()  # never replace an inherited revocation or broaden an existing grant
+        return approval_task_failure_scope(nullcontext())  # never replace or broaden inherited authority
     live = authority.sessions[ref.session_id]
 
     def current():
@@ -35,9 +36,9 @@ def command_task_scope(authority, ref, identity, text, arrival_epoch):
             if not current():
                 lease.revoke()
 
-    return approval_task_context(text, identity=identity, profile=str(authority.profile_id),
+    return approval_task_failure_scope(approval_task_context(text, identity=identity, profile=str(authority.profile_id),
         session=live.route, task_id="command:" + uuid.uuid4().hex, run_id=str(arrival_epoch),
-        is_current=current, owner=own)
+        is_current=current, owner=own))
 
 
 async def messaging_command_scope(runner, event, route, arrival_epoch):

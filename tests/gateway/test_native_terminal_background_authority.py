@@ -669,3 +669,70 @@ async def test_native_timeout_promotion_and_foreground_control(tmp_path, monkeyp
         release_background_approval_task(session.approval_task_reservation)
     finally:
         await asyncio.to_thread(registry.kill_all, source="test-cleanup")
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipt_lost", [True, False])
+async def test_remote_launch_survives_another_interpreter_checkpoint(tmp_path, monkeypatch, receipt_lost):
+    """A worker's empty registry cannot erase another worker's external effect."""
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    from gateway.session_command_approval import command_task_scope
+    from model_tools import handle_function_call
+    from tools import terminal_tool
+    from tools.process_registry import ProcessRegistry
+    from tests.waiting import async_wait_until
+
+    _runner, authority, actor, ref, registry = await _runtime(tmp_path, monkeypatch)
+    route = authority.sessions[ref.session_id].route
+    spawn = terminal_tool.spawn_background_process
+    effect, finish, completed = tmp_path / "started", tmp_path / "finish", tmp_path / "completed"
+
+    def remote_spawn(**kwargs):
+        env = kwargs["env"]
+        execute = env.execute
+
+        def lose_response(command, **options):
+            execute(command, **options)
+            raise OSError("lost remote launch response")
+
+        if receipt_lost:
+            monkeypatch.setattr(env, "execute", lose_response)
+        kwargs["env_type"] = "fixture-remote"
+        try:
+            return spawn(**kwargs)
+        finally:
+            monkeypatch.setattr(env, "execute", execute)
+
+    monkeypatch.setattr(terminal_tool, "spawn_background_process", remote_spawn)
+    try:
+        with command_task_scope(authority, ref, actor.subject, "authorized remote work", authority.route_epoch(route)):
+            receipt = json.loads(await asyncio.to_thread(handle_function_call, "terminal", {
+                "command": f"printf started > {effect}; while [ ! -e {finish} ]; do sleep 0.05; done; printf done > {completed}",
+                "background": True, "notify": True}, task_id="remote-worker"))
+        assert not receipt.get("error"), receipt
+        assert (receipt.get("status") == "unknown") is receipt_lost, receipt
+        await async_wait_until(effect.exists, timeout=10, what="actual remote launch effect")
+        other = await asyncio.to_thread(subprocess.run, [sys.executable, "-c",
+            "from tools.process_registry import ProcessRegistry; ProcessRegistry()._write_checkpoint()"],
+            cwd=str(Path(__file__).resolve().parents[2]), capture_output=True, timeout=20, check=False)
+        assert other.returncode == 0, other.stderr.decode()
+        restarted = ProcessRegistry()
+        assert restarted.recover_from_checkpoint() == 1
+        session = restarted.get(receipt["session_id"])
+        assert session.pid_scope == "sandbox" and session.env_ref is None
+        assert restarted.poll(session.id)["status"] == "unknown"
+        # Repeated unrelated writes and restarts also preserve the same fenced record.
+        other = await asyncio.to_thread(subprocess.run, [sys.executable, "-c",
+            "from tools.process_registry import ProcessRegistry; ProcessRegistry()._write_checkpoint()"],
+            cwd=str(Path(__file__).resolve().parents[2]), capture_output=True, timeout=20, check=False)
+        assert other.returncode == 0, other.stderr.decode()
+        assert ProcessRegistry().recover_from_checkpoint() == 1
+    finally:
+        finish.touch()
+        await async_wait_until(completed.exists, timeout=10, what="test remote process exit")
+        if not receipt_lost:
+            assert await asyncio.to_thread(registry.get(receipt["session_id"])._completion_event.wait, 10)

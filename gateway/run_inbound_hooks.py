@@ -197,6 +197,8 @@ class GatewayInboundHooksMixin:
                 output = redact_sensitive_text(output)
             return output or t("gateway.quick_command.no_output")
         except (TimeoutError, asyncio.CancelledError) as stopped:
+            from tools.approval_context import revoke_current_approval_task
+            revoke_current_approval_task()
             # One cleanup for both: a cancelled await must not leave the command running either.
             if proc is not None:
                 await asyncio.shield(_stop_exec_tree(proc))
@@ -204,6 +206,8 @@ class GatewayInboundHooksMixin:
                 raise
             return t("gateway.quick_command.timed_out")
         except Exception as e:  # health: allow BLE001 -- moved unchanged from run_inbound.py (main has the same handler): an operator quick command's failure is its reply
+            from tools.approval_context import revoke_current_approval_task
+            revoke_current_approval_task()
             return t("gateway.quick_command.error", error=e)
 
     async def _hm_dispatch_quick_and_plugin_commands(
@@ -256,6 +260,8 @@ class GatewayInboundHooksMixin:
                 if plugin_handler:
                     return True, await self._hm_run_plugin_handler(plugin_handler, event, source), command
             except Exception as e:
+                from tools.approval_context import revoke_current_approval_task
+                revoke_current_approval_task()
                 logger.warning("Plugin command dispatch failed: %s", e, exc_info=True)
         return False, None, command
 

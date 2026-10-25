@@ -31,9 +31,11 @@ class _FakeCronAgent:
     def run_conversation(self, prompt, *, task_id=None):
         assert isinstance(task_id, str)
         assert task_id.startswith("cron:ctx-isolation:")
-        result = approval_module.check_execute_code_guard(
-            "import os; print(1)", "local"
-        )
+        # This unit fixture bypasses admission to exercise scheduler context restoration.
+        # Scope only its guard call; persisted native cron authority has separate boundary tests.
+        with approval_context.approval_task_context(prompt, identity="cron-policy-fixture",
+                profile="test-profile", session=self.session_id, is_current=lambda: True):
+            result = approval_module.check_execute_code_guard("import os; print(1)", "local")
         assert result["approved"] is False
         assert result["outcome"] == "blocked"
         assert get_session_env("HERMES_CRON_SESSION") == "1"

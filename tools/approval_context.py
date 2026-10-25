@@ -213,6 +213,26 @@ def current_approval_task_context() -> ApprovalTaskContext | None:
             and (bound[0].parent_open() if bound[2] is None else bound[2].active()) else None)
 
 
+def revoke_current_approval_task() -> None:
+    """A producer that catches its failure must revoke that origin's reserved children."""
+    bound = _approval_task_context.get()
+    if bound is not None:
+        bound[0].revoke()
+
+
+@contextmanager
+def approval_task_failure_scope(scope):
+    """Keep normal child ownership, but fence a command that fails or is cancelled."""
+    with scope:
+        bound = _approval_task_context.get()
+        try:
+            yield
+        except BaseException:
+            if bound is not None:
+                bound[0].revoke()
+            raise
+
+
 def approval_task_revoked() -> bool:
     bound = _approval_task_context.get()
     return bound is not None and (not bound[0].live()

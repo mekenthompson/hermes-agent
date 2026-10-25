@@ -4,10 +4,11 @@ from weakref import WeakSet
 
 
 def command_scope(server, sid, session, text):
-    from tools.approval_context import approval_task_context, approval_task_revoked, current_approval_task_context
+    from tools.approval_context import (approval_task_context, approval_task_failure_scope,
+                                        approval_task_revoked, current_approval_task_context)
 
     if approval_task_revoked() or current_approval_task_context() is not None:
-        return nullcontext()
+        return approval_task_failure_scope(nullcontext())
     origin = server._approval_origin_for_direct_submit(session, text, text,
         internal_hosted_submit=False, raw_author=None, display_kind=None, turn_isolation=False, queued=True)
     if origin is None:
@@ -32,7 +33,7 @@ def command_scope(server, sid, session, text):
                 lease.revoke()
 
     from hermes_constants import get_process_hermes_home
-    return approval_task_context(text, identity=requester,
+    return approval_task_failure_scope(approval_task_context(text, identity=requester,
         profile=str(session.get("profile_home") or get_process_hermes_home()),
         session=str(session.get("session_key") or sid), task_id="command:" + request_id,
-        run_id=str(generation), is_current=current, owner=own)
+        run_id=str(generation), is_current=current, owner=own))

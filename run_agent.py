@@ -787,45 +787,7 @@ class AIAgent(
             return
         self._spawn_background_review_now(**kwargs)
 
-    def _spawn_background_review_now(self, messages_snapshot: list[dict], review_memory: bool = False,
-                                     review_skills: bool = False, focus: Optional[str] = None,
-                                     task_cfg: Optional[dict[str, Any]] = None, _requeue_attempts: int = 0,
-                                     explicit: bool = False) -> None:
-        """Spawn the background memory/skill review thread.
-
-        ``threading.Thread`` is constructed here so tests patching ``run_agent.threading.Thread`` keep working.
-        ``focus`` is /refine steering text; ``task_cfg`` is the pre-loaded config block (None on direct calls).
-        ``explicit`` (/refine) forks under the ``refine_review`` write origin, keeping the full
-        memory operation set. A deferred review preempted by a live turn is requeued (bounded)
-        rather than lost.
-        """
-        from agent.background_review import (
-            finish_background_review_run, prepare_background_review_run, spawn_background_review_thread,
-        )
-        from tools.thread_context import propagate_context_to_thread
-
-        review_run = prepare_background_review_run(self)
-        if review_run is None:
-            return
-        try:
-            target, _prompt = spawn_background_review_thread(
-                self, messages_snapshot, review_memory=review_memory, review_skills=review_skills,
-                focus=focus, task_cfg=task_cfg, review_run=review_run, explicit=explicit,
-            )
-
-            def _target_with_requeue() -> None:
-                target()
-                self._maybe_requeue_preempted_review(review_run, dict(
-                    messages_snapshot=messages_snapshot, review_memory=review_memory, review_skills=review_skills,
-                    focus=focus, task_cfg=task_cfg, _requeue_attempts=_requeue_attempts + 1,
-                    explicit=explicit))
-
-            # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
-            # right profile.
-            threading.Thread(target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review").start()
-        except Exception:
-            finish_background_review_run(self, review_run)
-            raise
+    _spawn_background_review_now = _forward("agent.background_review_spawn", "spawn_background_review_now")
 
     _REVIEW_REQUEUE_MAX_ATTEMPTS = 3
 

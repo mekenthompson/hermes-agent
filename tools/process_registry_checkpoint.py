@@ -46,9 +46,9 @@ class ProcessCheckpointMixin:
             from hermes_cli.active_sessions import _FileLock
             from utils import atomic_json_write
             path = _checkpoint_path()
-            # Every interpreter of the profile (owner, each managed worker) rewrites this file from
-            # its own table; a worker's output-log handoff is its only path to the next one, so a
-            # writer keeps the handoffs it does not track (read-merge-write under one file lock).
+            # Every interpreter of the profile rewrites this file from its own table.
+            # Keep foreign handoffs, including remote launches whose receipt or environment
+            # was lost: another interpreter's empty table proves nothing about their effects.
             with _FileLock(path.with_name(path.name + ".lock")):
                 entries.extend(self._foreign_handoffs(path, known))
                 atomic_json_write(path, entries)
@@ -56,18 +56,25 @@ class ProcessCheckpointMixin:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
     def _foreign_handoffs(self, path, known) -> list[dict[str, Any]]:
-        """On-disk worker handoffs this registry never tracked whose log still decides an outcome:
-        the process is alive (same start time) or its recorded exit is waiting to be read."""
+        """Keep foreign remote effects and host logs with a live or unread outcome."""
         from pathlib import Path
         from tools.process_registry_output_log import _exit_path, adoptable_log
         try:
             on_disk = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             return []
-        return [entry for entry in on_disk if isinstance(entry, dict) and entry.get("session_id") not in known
-                and (log := adoptable_log(entry.get("output_log"))) and Path(log).exists()
-                and (_exit_path(log).exists() or self._detached_host_fate(
-                    entry.get("pid"), entry.get("host_start_time")) == "running")]
+        def retained(entry):
+            if entry.get("pid_scope", "host") != "host":
+                # A sandbox PID is never a host liveness probe. Both acknowledged
+                # launches and missing receipts need native external reconciliation.
+                return True
+            log = adoptable_log(entry.get("output_log"))
+            return bool(log and Path(log).exists() and (
+                _exit_path(log).exists() or self._detached_host_fate(
+                    entry.get("pid"), entry.get("host_start_time")) == "running"))
+
+        return [entry for entry in on_disk if isinstance(entry, dict)
+                and entry.get("session_id") not in known and retained(entry)]
 
     def recover_from_checkpoint(self) -> int:
         """On gateway startup, probe PIDs from the checkpoint file; returns how many
