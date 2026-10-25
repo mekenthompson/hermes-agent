@@ -320,6 +320,9 @@ KANBAN_COMMENT_SCHEMA = _schema(
                 "kanban_list to discover ids."
         )),
         "body": _prop("string", "Markdown-supported comment body."),
+        "idempotency_key": _prop("string", "Stable follow-up request key. Reuse the same key and body after a lost response; "
+                                 "a retry returns the original comment and a conflicting body is refused. "
+                                 "Saving a comment does not resume a stopped task."),
     },
     ["task_id", "body"],
 )

@@ -400,10 +400,23 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
                                         reserve_background_approval_task,
                                         approval_task_revoked)
     if approval_task_revoked():
-        return {"status": "rejected", "error": "The originating approval task was stopped or superseded."}
+        return {"status": "rejected", "code": "task_authority_revoked",
+                "error": "The originating approval task was stopped or superseded."}
     child_agents = [c for (_, _, c) in unit.children]
     reservation = reserve_background_approval_task()
     completion_reservation = reserve_background_approval_task()
+    if reservation is None or completion_reservation is None:
+        # Admission and completion need the same native origin. Starting without it
+        # only discovers the missing grant after the child has produced effects.
+        release_background_approval_task(reservation)
+        release_background_approval_task(completion_reservation)
+        revoked = approval_task_revoked()
+        return {"status": "rejected",
+                "code": "task_authority_revoked" if revoked else "missing_task_authority",
+                "error": ("The originating approval task was stopped or superseded." if revoked else
+                          "Background delegation requires current native task authority; "
+                          "this notification or recovered producer has none. Reconcile the native task "
+                          "before admitting further work.")}
 
     def _interrupt():
         # Only this unit ends. Native child interrupts fence its descendants;
@@ -487,6 +500,10 @@ def _dispatch_background(batch: _Batch) -> str:
             dispatched.append((unit, dispatch["delegation_id"]))
             continue
         _restore_parent_cancellation(unit)
+        if dispatch.get("code") in {"missing_task_authority", "task_authority_revoked"}:
+            # An authorization refusal is never a capacity fallback. Earlier units
+            # retain their real handles so the caller can reconcile partial admission.
+            return json.dumps({**dispatch, "dispatched": [handle for _, handle in dispatched]})
         if not dispatched:
             logger.info(
                 "delegate_task: async pool at capacity (%s); running the whole batch synchronously instead.",

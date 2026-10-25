@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from tools import async_delegation
 from tools.delegate_tool_dispatch import _Batch, _dispatch_unit
+from tools.approval_context import approval_task_context
 
 
 def _unit(configured_model):
@@ -23,6 +24,8 @@ def test_completion_model_falls_back_to_inherited_child_model(monkeypatch):
         return {"status": "dispatched"}
 
     monkeypatch.setattr(async_delegation, "dispatch_async_delegation_batch", dispatch)
-    _dispatch_unit(_unit(None), None, None, {})  # delegation.model blank: children inherit the parent's model
-    _dispatch_unit(_unit("configured/model"), None, None, {})
+    with approval_task_context("work", identity="fixture", profile="fixture", session="fixture",
+                               task_id="fixture", run_id="1", is_current=lambda: True):
+        _dispatch_unit(_unit(None), None, None, {})  # blank: children inherit the parent's model
+        _dispatch_unit(_unit("configured/model"), None, None, {})
     assert seen == ["inherited/model", "configured/model"]

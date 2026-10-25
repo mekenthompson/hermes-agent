@@ -123,10 +123,13 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
         async_delivery=False,
     )
 
-    out = dt.delegate_task(
-        goal="bg on api_server", context="ctx",
-        background=True, parent_agent=_fake_parent(),
-    )
+    from tools.approval_context import approval_task_context
+    with approval_task_context("bg on api_server", identity="api:fixture", profile="default",
+                               session="raw-sid-7", task_id="admission", run_id="1", is_current=lambda: True):
+        out = dt.delegate_task(
+            goal="bg on api_server", context="ctx",
+            background=True, parent_agent=_fake_parent(),
+        )
     parsed = json.loads(out)
     assert parsed["status"] == "dispatched", parsed
     assert parsed["mode"] == "background"

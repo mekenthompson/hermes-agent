@@ -10,6 +10,13 @@ The `delegate_task` tool spawns child AIAgent instances with isolated context, i
 
 Top-level model calls run in the background automatically. Hermes returns a handle immediately so the conversation can continue, then posts the result back as a new message. An orchestrator subagent waits for its own workers so it can synthesize their results before returning.
 
+Detached delegation requires a live native task authority reservation for both the child and its
+completion. A plugin notification, a recovered delivery ID, or a conversation ID alone supplies
+no execution authority. Missing authority is refused before the child starts, with
+`missing_task_authority`; revoked authority returns `task_authority_revoked`. Neither refusal
+falls back to inline execution. Reconcile and continue the existing native task instead of
+replaying the notification.
+
 ## Completion delivery
 
 Messaging gateways acknowledge background completions only after their adapter actually

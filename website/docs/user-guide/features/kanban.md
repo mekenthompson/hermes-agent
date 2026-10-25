@@ -129,6 +129,12 @@ They also coexist inside one run. A kanban task executes in an isolated managed 
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
 - **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
+
+Creation retries with the same idempotency key resolve to the same task, including after archival.
+Concurrent retries are serialized before insertion. Use a new key for a new increment of work;
+an ambiguous key left by older duplicate records requires reconciliation. `kanban_comment` also
+accepts an `idempotency_key`: retrying the same instruction returns its original comment, while
+reusing that key with different content is refused. Saving a follow-up never unblocks a task.
 - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`. Adding a link to a running child is rejected because it cannot gate work already claimed; the one exception is an active worker linking its own card, with dispatcher-provided run ownership, immediately before a dependency-block handoff.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
