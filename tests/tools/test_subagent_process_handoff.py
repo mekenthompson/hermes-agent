@@ -19,7 +19,8 @@ from tools.process_registry_notifications import _process_accounting_lines, form
 
 class _Parent:
     def __init__(self):
-        self.session_id = "sess-handoff"
+        self.session_id = "physical-session-handoff"
+        self._gateway_session_key = "sess-handoff"
         self._current_task_id = "parent-turn-1"
 
 
@@ -65,7 +66,8 @@ def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(c
         out = json.loads(_handle_process(
             {"action": "handoff", "session_id": handed.id, "data": "CI watcher for PR 1"}, task_id=sid))
         assert out["status"] == "handed_off"
-        assert handed.owner_task_id == "parent-turn-1" and handed.session_key == "sess-handoff"
+        assert handed.owner_task_id == "parent-turn-1"
+        assert handed.session_key == parent._gateway_session_key != parent.session_id
         assert child._handed_off_processes[0]["session_id"] == handed.id
 
         # Only the un-handed sibling is left in the child's name — this is what the result entry reports as orphaned.
