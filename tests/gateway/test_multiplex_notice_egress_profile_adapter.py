@@ -79,7 +79,7 @@ async def test_loop_wakeup_from_secondary_route_fires_through_its_own_bot(monkey
     fired = []
 
     class _Mgr:
-        state = SimpleNamespace(ticks_fired=1)
+        state = loops.LoopState(prompt="tick", ticks_fired=1, awaiting_response=True)
 
         def __init__(self, session_id=None):
             pass

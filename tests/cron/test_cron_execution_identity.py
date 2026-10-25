@@ -27,17 +27,31 @@ def register(ctx):
 '''
 
 _TICK = '''
-import json, sys
-from cron import scheduler, scheduler_authority
+import asyncio, json, os
+from pathlib import Path
+from cron import scheduler
 from cron.executions import list_executions
-from tests.cron.conftest import owner_execution_runner
-# Cron executes inside the profile's owner; run the owner's execution seam in-process.
-scheduler_authority.run_canonical_job = owner_execution_runner()
+from gateway.config import GatewayConfig
+from gateway.run import GatewayRunner
+from gateway.session_authority import initialize_session_authority
+from gateway.session_cron import unbind_owner
 from hermes_cli.plugins import get_plugin_manager
-scheduler.tick(verbose=False, sync=True)
-ctx = get_plugin_manager()._plugins["cron-identity-probe"].module.CTX
-print(json.dumps({"outside": ctx.current_cron_execution(), "profile": ctx.profile_name,
-                  "executions": list_executions(job_id="probe")}, default=str))
+
+async def main():
+    home = Path(os.environ['HERMES_HOME'])
+    runner = GatewayRunner(GatewayConfig(sessions_dir=home / 'sessions'))
+    authority = await initialize_session_authority(runner, profile_id=str(home), instance_id='cron-identity-owner')
+    try:
+        # The real ticker submits the stored fire to its live native owner loop.
+        await asyncio.to_thread(scheduler.tick, verbose=False, sync=True)
+        ctx = get_plugin_manager()._plugins['cron-identity-probe'].module.CTX
+        print(json.dumps({'outside': ctx.current_cron_execution(), 'profile': ctx.profile_name,
+                          'executions': list_executions(job_id='probe')}, default=str))
+    finally:
+        unbind_owner(authority)
+        runner.session_store.close_all_db_handles()
+
+asyncio.run(main())
 '''
 
 
@@ -69,6 +83,7 @@ def test_tool_hook_in_a_ticked_job_sees_its_execution_and_none_outside(tmp_path)
                                 capture_output=True, text=True, timeout=180, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
     report = json.loads(result.stdout.strip().splitlines()[-1])
+    assert (home / "seen.json").exists(), result.stdout + result.stderr
     seen = json.loads((home / "seen.json").read_text())
     (execution,) = report["executions"]
 

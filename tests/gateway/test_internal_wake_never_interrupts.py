@@ -128,26 +128,19 @@ async def test_idle_loop_tick_runs_as_a_fifo_turn_not_beside_it(monkeypatch):
                            what='the first turn to settle and release the session')
     owner = runner.session_store.peek_session_id(key)
 
-    class Loop:
-        state = SimpleNamespace(ticks_fired=1)
-
-        def __init__(self, session_id=None):
-            pass
-
-        def is_due(self, now):
-            return True
-
-        def fire_tick(self):
-            return 'loop tick prompt'
-
-        def abandon_tick(self):
-            raise AssertionError('the tick was not admitted')
-    monkeypatch.setattr(loops, 'LoopManager', Loop)
-    monkeypatch.setattr(loops, 'goal_blocks_loop_tick', lambda sid: False)
+    # Exercise the persisted producer state that native recurring admission validates.
+    from hermes_cli import goals
+    monkeypatch.setattr(goals, '_get_session_db', lambda: authority.db)
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(loops, 'time', SimpleNamespace(time=lambda: clock.now))
     route = {'platform': 'discord', 'chat_id': '42', 'chat_type': 'dm', 'user_id': '42'}
-    await runner._loop_wakeup_fire_one(owner, SimpleNamespace(awaiting_response=False, next_due_at=0, route=route),
-                                       1e12, set())
+    manager = loops.LoopManager(owner)
+    manager.set('loop tick prompt', interval_seconds=60, route=route)
+    clock.now += 61
+    await runner._loop_wakeup_fire_one(owner, manager.state, clock.now, set())
     await async_wait_until(lambda: len(started) >= 2, what='the loop tick turn to start')
-    assert started == [('hello', True), ('loop tick prompt', True)], 'the tick ran outside the FIFO'
+    assert started[0] == ('hello', True)
+    assert 'Recurring task: loop tick prompt' in started[1][0]
+    assert started[1][1] is True, 'the tick ran outside the FIFO'
     await async_wait_until(lambda: [r['status'] for r in rows()] == ['terminal', 'terminal'],
                            what='both admissions to settle')

@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -46,11 +47,22 @@ def _worker_frame(authority, sid, monkeypatch):
     from gateway import session_managed_worker as smw
     from gateway.session_contract import SessionRef
     from gateway.session_policy import policy_for_source
+    from hermes_state_runtime import admit_session_input, claim_session_input, settle_session_input
     monkeypatch.setattr('gateway.session_worker_construct.construct_inputs', lambda *args: {})
     policy = policy_for_source(authority.runner, authority.sessions[sid].source)
-    scope = {'profile_id': authority.profile_id, 'session_id': sid, 'execution_id': 'x', 'generation': 1,
-             'pid': os.getpid(), 'birth': 0, 'secret': 's', 'epoch': 1}
-    return smw._bootstrap(authority, SessionRef(authority.profile_id, sid), {'request_id': 'local-automation', 'payload': {'text': 'hi', 'local_automation_v1': {}}}, policy, scope)
+    admit_session_input(authority.db, epoch=authority.epoch, principal_id='automation:' + authority.sessions[sid].route,
+                        session_id=sid, request_id='mcp-policy-probe:' + uuid4().hex,
+                        payload={'text': 'hi', 'local_automation_v1': {}})
+    row = claim_session_input(authority.db, epoch=authority.epoch, session_id=sid)
+    scope = {'profile_id': authority.profile_id, 'session_id': sid, 'execution_id': 'x', 'generation': row['generation'],
+             'pid': os.getpid(), 'birth': 0, 'secret': 's', 'epoch': authority.epoch}
+    try:
+        frame = smw._bootstrap(authority, SessionRef(authority.profile_id, sid), row, policy, scope)
+        assert frame['approval_task_v1']['identity'] == 'unverified', 'MCP config inspection lends no task authority'
+        return frame
+    finally:
+        settle_session_input(authority.db, epoch=authority.epoch, admission_id=row['admission_id'],
+                             generation=row['generation'], outcome='rejected')
 
 
 def _worker_servers(frame, monkeypatch):
@@ -84,6 +96,7 @@ async def test_a_new_mcp_server_reaches_a_session_only_through_a_committed_gener
         # A turn admitted (or queued) now runs the generation it was admitted under: no capability appears
         # without a committed transition.
         assert 'fixt' not in _worker_frame(authority, sid, monkeypatch)['policy']['toolsets']
+        generation = _generation(store, sid)  # the real bootstrap probe claimed one native turn
         result = await _call(owner, 'reload.mcp', session_id=sid, confirm=True)
         assert result['session'] == 'applied' and 'unavailable' not in result, result
         assert _generation(store, sid) == generation + 1
@@ -95,7 +108,8 @@ async def test_a_new_mcp_server_reaches_a_session_only_through_a_committed_gener
         assert 'sekret' not in json.dumps(local_receipt(store._db, sid))  # the private value stays private
         # Another session of the profile is not changed implicitly...
         assert 'fixt' not in _worker_frame(authority, other, monkeypatch)['policy']['toolsets']
-        assert _generation(store, other) == other_generation
+        assert _generation(store, other) == other_generation + 1  # only the native probe, no config refresh
+        other_generation = _generation(store, other)
         # ...until a client attaches to it.
         await _call(later, 'session.resume', session_id=other)
         assert _generation(store, other) == other_generation + 1
@@ -310,13 +324,13 @@ async def test_a_server_disabled_after_the_chat_picked_it_stops_on_resume_and_on
         result = await _call(owner, 'reload.mcp', session_id=reloaded, confirm=True)
         assert result['session'] == 'applied' and result['session_servers'] == [], result
         for sid in (resumed, reloaded):
+            assert _generation(store, sid) == generations[sid] + 1
             frame = _worker_frame(authority, sid, monkeypatch)
             servers, toolsets = _worker_servers(frame, monkeypatch)
             assert 'terminal' in toolsets and 'old' not in toolsets and 'old' not in servers, (toolsets, servers)
             assert json.loads(frame['policy']['config_json'])['mcp_servers']['old']['enabled'] is False
             from gateway.session_policy import policy_for_source
             assert 'old' not in policy_for_source(authority.runner, authority.sessions[sid].source).toolsets
-            assert _generation(store, sid) == generations[sid] + 1
     finally:
         for connection in (owner, later):
             await connection.close()
@@ -380,11 +394,11 @@ async def test_a_pick_whose_only_server_is_gone_selects_no_server_not_every_enab
             result = await _call(owner, 'reload.mcp', session_id=reloaded, confirm=True)
             assert result['session'] == 'applied' and result['session_servers'] == [], result
         for sid in sids:
+            assert _generation(store, sid) == generations[sid] + 1
             frame = _worker_frame(authority, sid, monkeypatch)
             servers, toolsets = _worker_servers(frame, monkeypatch)
             assert 'terminal' in toolsets and not {'old', 'other'} & (toolsets | set(servers)), (toolsets, servers)
             assert not {'old', 'other'} & set(policy_for_source(authority.runner, authority.sessions[sid].source).toolsets)
-            assert _generation(store, sid) == generations[sid] + 1
     finally:
         for connection in (owner, later):
             await connection.close()
@@ -413,13 +427,14 @@ async def test_a_removed_pick_keeps_later_refreshes_following_config_after_a_res
         await _call(_connect(authority), 'session.resume', session_id=sid)
         assert _generation(store, sid) == generation + 1
         assert set(_worker_servers(_worker_frame(authority, sid, monkeypatch), monkeypatch)[0]) == {'keep'}
+        generation = _generation(store, sid)
         await owner.close()
         (home / 'config.yaml').write_text(both.replace('old: {command: old-mcp}, ', '').replace(
             '{command: keep-mcp}', '{command: keep-mcp, enabled: false}'))
         cold = await initialize_session_authority(_runner(store), profile_id=str(home), instance_id='restarted')
         viewer = _connect(cold)
         await _call(viewer, 'session.resume', session_id=sid)
-        assert _generation(store, sid) == generation + 2
+        assert _generation(store, sid) == generation + 1
         frame = _worker_frame(cold, sid, monkeypatch)
         servers, toolsets = _worker_servers(frame, monkeypatch)
         assert 'terminal' in toolsets and not {'old', 'keep'} & (toolsets | set(servers)), (toolsets, servers)

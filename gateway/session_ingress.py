@@ -363,7 +363,8 @@ def _approval_task_scope(authority, ref, row, live, event, *, is_api):
     if hosted is not None:
         return hosted
     if (not isinstance(event.text, str)
-            or not event.text.strip() or not isinstance(row.get('generation'), int)):
+            or (not event.text.strip() and not getattr(event, 'media_urls', None))
+            or not isinstance(row.get('generation'), int)):
         return unverified_approval_task()
     payload = row.get('payload') or {}
     from gateway.session_operator import is_viewer_input, check_local_input

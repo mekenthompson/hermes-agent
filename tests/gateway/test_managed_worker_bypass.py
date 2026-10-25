@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from contextlib import closing
 from types import SimpleNamespace
 
 import pytest
@@ -15,11 +16,20 @@ def _policy(tmp_path, **extra):
                            'base_url': 'http://127.0.0.1:9/v1', **extra}, private_secrets={})
 
 
-def test_bypass_policy_routes_to_managed_worker_and_bootstrap_carries_flags(tmp_path, monkeypatch):
+@pytest.fixture
+def native_owner(tmp_path):
+    from hermes_state import SessionDB
+    from hermes_state_runtime import begin_runtime_epoch
+    with closing(SessionDB(tmp_path / 'state.db')) as db:
+        db.create_session('sid', 'cli')
+        yield db, begin_runtime_epoch(db, instance_id='bypass-bootstrap-owner')
+
+
+def test_bypass_policy_routes_to_managed_worker_and_bootstrap_carries_flags(tmp_path, monkeypatch, native_owner):
     from gateway import session_managed_worker as smw
     from gateway.session_policy import build_policy
     from agent.managed_worker import validate_bootstrap
-    from hermes_state_runtime import RuntimeStoreError
+    from hermes_state_runtime import admit_session_input, claim_session_input
 
     safe = _policy(tmp_path, safe_mode=True)
     config_only = _policy(tmp_path, ignore_user_config=True)
@@ -27,7 +37,8 @@ def test_bypass_policy_routes_to_managed_worker_and_bootstrap_carries_flags(tmp_
     opted = build_policy({'cwd': str(tmp_path), 'model': 'm', 'provider': 'custom', 'base_url': 'http://127.0.0.1:9/v1'},
                          {'gateway': {'managed_workers': True}})
     live = SimpleNamespace(source=SimpleNamespace(user_id='u', chat_id='c'), route='route')
-    authority = SimpleNamespace(sessions={'sid': live}, runner=None, profile_id=str(tmp_path))
+    db, epoch = native_owner
+    authority = SimpleNamespace(sessions={'sid': live}, runner=None, profile_id=str(tmp_path), db=db, epoch=epoch)
     ref = SimpleNamespace(session_id='sid')
     for policy, expected in ((safe, safe), (config_only, config_only), (ordinary, None), (opted, opted)):
         monkeypatch.setattr('gateway.session_policy.policy_for_source', lambda runner, source, p=policy: p)
@@ -35,12 +46,15 @@ def test_bypass_policy_routes_to_managed_worker_and_bootstrap_carries_flags(tmp_
     # A bypass launch never depends on the profile's gateway.managed_workers opt-in.
     assert 'gateway' not in safe.config() or safe.config()['gateway'].get('managed_workers') is not True
     monkeypatch.setattr('gateway.session_policy.launch_key', lambda authority, policy: None)
-    row = {'request_id': 'local-automation', 'payload': {'text': 'SAFE_PROBE', 'local_automation_v1': {}}}
-    scope = {'profile_id': str(tmp_path), 'session_id': 'sid', 'execution_id': 'x', 'generation': 1,
-             'pid': os.getpid(), 'birth': 0, 'secret': 's', 'epoch': 1}
+    admit_session_input(db, epoch=epoch, principal_id='automation:route', session_id='sid',
+                        request_id='local-automation', payload={'text': 'SAFE_PROBE', 'local_automation_v1': {}})
+    row = claim_session_input(db, epoch=epoch, session_id='sid')
+    scope = {'profile_id': str(tmp_path), 'session_id': 'sid', 'execution_id': 'x', 'generation': row['generation'],
+             'pid': os.getpid(), 'birth': 0, 'secret': 's', 'epoch': epoch}
     frame = smw._bootstrap(authority, ref, row, safe, scope)
     assert frame['safe_mode'] is True and frame['ignore_user_config'] is True
     assert isinstance(frame['policy']['config_json'], str)
+    assert frame['approval_task_v1']['identity'] == 'unverified', 'policy metadata cannot grant a notification authority'
     wire = json.loads(json.dumps(frame))
     assert validate_bootstrap(wire) is wire
     frame = smw._bootstrap(authority, ref, row, config_only, scope)
