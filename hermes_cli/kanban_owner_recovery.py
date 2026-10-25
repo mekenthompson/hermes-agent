@@ -8,6 +8,10 @@ import psutil
 
 
 def owner_stop_confirmed(conn, task_id, run_id, binding):
+    bindings = conn.execute("SELECT COUNT(DISTINCT payload) FROM task_events WHERE task_id=? AND run_id=? "
+                            "AND kind='owner_admitted'", (task_id, run_id)).fetchone()[0]
+    if bindings != 1:
+        return False
     row = conn.execute(
         "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
         "AND kind='native_owner_stop' AND json_extract(payload,'$.status')='confirmed' "
@@ -28,6 +32,10 @@ def owner_stop_unresolved(conn, task_id):
     only its confirmed canonical Stop releases this fence. Old ambiguous blocks
     remain fenced; new worker self-blocks explicitly retain ordinary semantics.
     """
+    if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id IS NULL "
+                    "AND kind='native_owner_stop' AND json_extract(payload,'$.status')='unknown' LIMIT 1",
+                    (task_id,)).fetchone():
+        return True
     markers = conn.execute(
         "SELECT e.run_id,e.payload,r.outcome FROM task_events e JOIN task_runs r ON r.id=e.run_id "
         "AND r.task_id=e.task_id WHERE e.task_id=? AND e.kind='owner_admitted' "
@@ -44,7 +52,9 @@ def owner_stop_unresolved(conn, task_id):
             blocked = json.loads(block['payload']) if block else {}
             if not isinstance(blocked, dict):
                 return True
-            if marker['outcome'] == 'blocked' and blocked.get('supervisor_stop') is False:
+            requested = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? "
+                                    "AND kind='native_owner_stop' LIMIT 1", (task_id, run_id)).fetchone()
+            if marker['outcome'] == 'blocked' and blocked.get('supervisor_stop') is False and not requested:
                 continue
             binding = json.loads(marker['payload'])
             if owner_stop_confirmed(conn, task_id, run_id, binding):

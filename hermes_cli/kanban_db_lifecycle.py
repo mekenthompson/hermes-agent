@@ -34,11 +34,11 @@ def _validate_key(value, name):
 
 def _request_event(conn, task_id, idempotency_key):
     row = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id=? AND kind='lifecycle_request' "
+        "SELECT id,payload FROM task_events WHERE task_id=? AND kind='lifecycle_request' "
         "AND json_extract(payload, '$.idempotency_key')=? ORDER BY id LIMIT 1",
         (task_id, idempotency_key),
     ).fetchone()
-    return json.loads(row["payload"]) if row else None
+    return dict(json.loads(row["payload"]), _event_id=row['id']) if row else None
 
 
 def request_received(conn, task_id, operation, idempotency_key):
@@ -82,6 +82,7 @@ class _Request:
         ):
             raise ValueError("expected_event_id must be a positive native event ID")
         self.conn, self.task_id, self.operation, self.key = conn, task_id, operation, key
+        self.saved, self.stop_run_ids = None, None
         self.expected_event_id, self.origin_comment_key = expected_event_id, origin_comment_key
         self.fingerprint = hashlib.sha256(json.dumps(
             [operation, expected_event_id, origin_comment_key, parameters], sort_keys=True,
@@ -93,6 +94,7 @@ class _Request:
             return None
         if saved["request_sha256"] != self.fingerprint:
             raise ValueError("lifecycle idempotency_key conflicts with its original request")
+        self.saved = saved
         return bool(saved["result"])
 
     def stale(self):
@@ -129,6 +131,8 @@ class _Request:
                        "request_sha256": self.fingerprint, "result": result}
             if refusal is not None:
                 payload["refusal"] = refusal
+            if self.stop_run_ids is not None:
+                payload['stop_run_ids'] = list(self.stop_run_ids)
             _kb._append_event(self.conn, self.task_id, "lifecycle_request", payload)
         return result
 
@@ -154,10 +158,10 @@ def block_task(
 
     ``expected_run_id`` is the worker's proof that it is blocking its own run.
     A block without it comes from a supervisor (dashboard, CLI, an integration
-    such as a Linear Stop), so the run's live, fingerprint-verified host-local
-    worker is ended once the txn commits and the hook has fired
-    (:func:`halt_blocked_worker`, which never raises) instead of running on
-    until the reaper's grace expires.
+    such as a Linear Stop). Its original native scopes and retained workers are
+    cleaned after commit even when no status transition occurs. Keyed retries
+    keep their original run coordinates and bool result; they never target a
+    later task run. A worker's own block keeps ordinary finalization semantics.
     """
     from hermes_cli import kanban_db as _kb
 
@@ -165,96 +169,104 @@ def block_task(
         raise ValueError(f"block kind must be one of {sorted(_kb.VALID_BLOCK_KINDS)} or None")
     request = _Request(conn, task_id, "block", idempotency_key, expected_event_id=expected_event_id,
                        reason=reason, kind=kind, expected_run_id=expected_run_id)
-    with _kb.write_txn(conn):
-        replay = request.replay()
-        if replay is not None:
-            return replay
-        cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if cur_row is None:
-            return False
-        refusal = request.stale()
-        if refusal:
-            return request.finish(False, refusal=refusal)
-        # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
-        # ``block_kind`` and no ``blocked`` event -- the policy is the
-        # supervisor's, not the kernel's -- but the transition guard below only
-        # matches running/ready, so that policy could never be attached later
-        # (#117363). Classify in place; never re-type or flap status. A caller
-        # asserting run ownership (``expected_run_id``) cannot own a parked
-        # card -- its run is over -- so it is refused like any stale worker.
-        if cur_row["status"] == "blocked":
-            if kind is None or expected_run_id is not None or _kb._row_get(cur_row, "block_kind") is not None:
-                # A supervisor's explicit Stop still supersedes a previously
-                # saved resume instruction when the card was already blocked.
+    from hermes_cli.kanban_db_block import supervisor_halt_scope
+    with supervisor_halt_scope(conn) as stop_runs:
+        with _kb.write_txn(conn):
+            replay = request.replay()
+            if replay is not None:
                 if expected_run_id is None:
-                    _kb._append_event(conn, task_id, "block_requested", {"kind": kind, "reason": reason})
+                    from hermes_cli.kanban_owner_control import replay_supervisor_stop
+                    stop_runs.extend(replay_supervisor_stop(conn, task_id, request.saved))
+                return replay
+            cur_row = conn.execute(
+                "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if cur_row is None:
+                return False
+            refusal = request.stale()
+            if refusal:
+                return request.finish(False, refusal=refusal)
+            if expected_run_id is None:
+                from hermes_cli.kanban_owner_control import capture_supervisor_stop
+                stop_runs.extend(capture_supervisor_stop(conn, task_id))
+                request.stop_run_ids = list(stop_runs)
+            # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
+            # ``block_kind`` and no ``blocked`` event -- the policy is the
+            # supervisor's, not the kernel's -- but the transition guard below only
+            # matches running/ready, so that policy could never be attached later
+            # (#117363). Classify in place; never re-type or flap status. A caller
+            # asserting run ownership (``expected_run_id``) cannot own a parked
+            # card -- its run is over -- so it is refused like any stale worker.
+            if cur_row["status"] == "blocked":
+                if kind is None or expected_run_id is not None or _kb._row_get(cur_row, "block_kind") is not None:
+                    # A supervisor's explicit Stop still supersedes a previously
+                    # saved resume instruction when the card was already blocked.
+                    if expected_run_id is None:
+                        _kb._append_event(conn, task_id, "block_requested", {"kind": kind, "reason": reason})
+                    return request.finish(False)
+                classified = conn.execute(
+                    "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
+                    "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
+                    "AND current_run_id IS NULL",
+                    (kind, task_id),
+                ).rowcount
+                if classified != 1:
+                    if expected_run_id is None:
+                        _kb._append_event(conn, task_id, "block_requested", {"kind": kind, "reason": reason})
+                    return request.finish(False)
+                _kb._append_event(conn, task_id, "blocked", {
+                    "kind": kind, "reason": reason, "classified_in_place": True,
+                })
+                return request.finish(True)
+            source_status = _kb._retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+            requested_kind = kind
+            rekind_reason = None
+            # ``dependency`` only waits on incomplete parents. A worker filing that
+            # kind with none open would park in ``todo`` and ``recompute_ready``
+            # would promote+respawn it context-free on the next tick. Re-kind to
+            # ``needs_input`` so it is sticky until a human unblocks.
+            if kind == "dependency" and _kb._parents_satisfied(conn, task_id):
+                kind = "needs_input"
+                rekind_reason = "no_open_parent"
+            new_status, event_kind, set_sql, params, payload = _kb._route_block(
+                kind, reason, source_status, prev_kind=_kb._row_get(cur_row, "block_kind"),
+                prev_recurrences=int(_kb._row_get(cur_row, "block_recurrences") or 0),
+            )
+            payload['supervisor_stop'] = expected_run_id is None
+            if rekind_reason:
+                payload["requested_kind"] = requested_kind
+                payload["rekind_reason"] = rekind_reason
+            sql = f"""
+                    UPDATE tasks
+                       SET status        = '{new_status}',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           {set_sql}
+                     WHERE id = ?
+                       AND status IN ('running', 'ready')
+                    """
+            params = (*params, task_id)
+            if expected_run_id is not None:
+                sql += " AND current_run_id = ?"
+                params = (*params, int(expected_run_id))
+            if conn.execute(sql, params).rowcount != 1:
                 return request.finish(False)
-            classified = conn.execute(
-                "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
-                "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
-                "AND current_run_id IS NULL",
-                (kind, task_id),
-            ).rowcount
-            if classified != 1:
-                if expected_run_id is None:
-                    _kb._append_event(conn, task_id, "block_requested", {"kind": kind, "reason": reason})
-                return request.finish(False)
-            _kb._append_event(conn, task_id, "blocked", {
-                "kind": kind, "reason": reason, "classified_in_place": True,
-            })
-            return request.finish(True)
-        source_status = _kb._retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
-        requested_kind = kind
-        rekind_reason = None
-        # ``dependency`` only waits on incomplete parents. A worker filing that
-        # kind with none open would park in ``todo`` and ``recompute_ready``
-        # would promote+respawn it context-free on the next tick. Re-kind to
-        # ``needs_input`` so it is sticky until a human unblocks.
-        if kind == "dependency" and _kb._parents_satisfied(conn, task_id):
-            kind = "needs_input"
-            rekind_reason = "no_open_parent"
-        new_status, event_kind, set_sql, params, payload = _kb._route_block(
-            kind, reason, source_status, prev_kind=_kb._row_get(cur_row, "block_kind"),
-            prev_recurrences=int(_kb._row_get(cur_row, "block_recurrences") or 0),
-        )
-        payload['supervisor_stop'] = expected_run_id is None
-        if rekind_reason:
-            payload["requested_kind"] = requested_kind
-            payload["rekind_reason"] = rekind_reason
-        sql = f"""
-                UPDATE tasks
-                   SET status        = '{new_status}',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       {set_sql}
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """
-        params = (*params, task_id)
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params = (*params, int(expected_run_id))
-        if conn.execute(sql, params).rowcount != 1:
-            return request.finish(False)
-        run_id = _kb._end_or_synthesize_run(
-            conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
-        )
-        _kb._append_event(conn, task_id, event_kind, payload, run_id=run_id)
-        request.finish(True)
-        blocked_task = _kb.get_task(conn, task_id)
-        dependency_block = kind == "dependency"
-        if dependency_block:
-            # Historical ordering: the dependency lane fires inside the txn.
+            run_id = _kb._end_or_synthesize_run(
+                conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
+            )
+            _kb._append_event(conn, task_id, event_kind, payload, run_id=run_id)
+            request.finish(True)
+            blocked_task = _kb.get_task(conn, task_id)
+            dependency_block = kind == "dependency"
+            if dependency_block:
+                # Historical ordering: the dependency lane fires inside the txn.
+                _kb._fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
+        _kb._release_kanban_admission(task_id, run_id)
+        if not dependency_block:
             _kb._fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-    _kb._release_kanban_admission(task_id, run_id)
-    if not dependency_block:
-        _kb._fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-    if expected_run_id is None:  # filed by a supervisor, not the worker: halt it now, no reap grace
-        _kb.halt_blocked_worker(conn, run_id)
-    return True
+        return True
+
 def unblock_task(
     conn: sqlite3.Connection, task_id: str, *, idempotency_key: Optional[str] = None,
     origin_comment_key: Optional[str] = None, expected_event_id: Optional[int] = None,

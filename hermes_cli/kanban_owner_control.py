@@ -17,6 +17,83 @@ _STOP_REFUSALS = frozenset({'stale_generation', 'unknown_execution', 'permission
                             'not_found', 'profile_mismatch', 'stale_epoch'})
 
 
+def _stop_intent(conn, task_id, run_id):
+    from hermes_cli import kanban_db as kb
+    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                       "AND kind='native_owner_stop' ORDER BY id DESC LIMIT 1", (task_id, run_id)).fetchone()
+    try:
+        payload = json.loads(row['payload']) if row else {}
+    except (ValueError, TypeError):
+        payload = {}
+    if isinstance(payload, dict) and payload.get('status') == 'pending':
+        return
+    kb._append_event(conn, task_id, 'native_owner_stop',
+                     {'status': 'pending', 'reason': 'supervisor_stop'}, run_id=run_id)
+
+
+def _missing_stop_scope(conn, task_id):
+    from hermes_cli import kanban_db as kb
+    kb._append_event(conn, task_id, 'native_owner_stop',
+        {'status': 'unknown', 'reason': 'missing_original_stop_scope'})
+    logger.warning('kanban: native Stop unknown for task %s; original run scope is missing or ambiguous', task_id)
+
+
+def capture_supervisor_stop(conn, task_id, *, before_event_id=None, run_ids=None):
+    """Freeze known original run coordinates and deny effects inside the existing writer.
+
+    Request replays supply their saved IDs and event boundary. No lookup of the
+    task's current run or current owner generation may widen an old Stop.
+    """
+    from hermes_cli.kanban_owner_recovery import owner_stop_confirmed
+    boundary = '' if before_event_id is None else ' AND e.id<?'
+    args = (task_id,) if before_event_id is None else (task_id, before_event_id)
+    markers = conn.execute(
+        "SELECT e.run_id,e.payload,r.id FROM task_events e LEFT JOIN task_runs r "
+        "ON r.task_id=e.task_id AND r.id=e.run_id WHERE e.task_id=? AND e.kind='owner_admitted'" +
+        boundary + ' ORDER BY e.id', args).fetchall()
+    native = {row['run_id']: row for row in markers if row['id'] is not None}
+    if run_ids is None:
+        targets = set(native)
+        if before_event_id is None:
+            targets.update(row['id'] for row in conn.execute(
+                'SELECT id FROM task_runs WHERE task_id=? AND worker_pid IS NOT NULL', (task_id,)))
+        if any(row['id'] is None for row in markers):
+            _missing_stop_scope(conn, task_id)
+    else:
+        if not isinstance(run_ids, list) or any(type(value) is not int or value < 1 for value in run_ids):
+            _missing_stop_scope(conn, task_id)
+            return []
+        targets = set(run_ids)
+        for run_id in targets:
+            known = conn.execute('SELECT 1 FROM task_runs r WHERE r.task_id=? AND r.id=? AND EXISTS '
+                '(SELECT 1 FROM task_events e WHERE e.task_id=r.task_id AND e.run_id=r.id AND e.id<?)',
+                (task_id, run_id, before_event_id)).fetchone()
+            if known is None:
+                _missing_stop_scope(conn, task_id)
+                return []
+    for run_id in sorted(targets & native.keys()):
+        try:
+            if owner_stop_confirmed(conn, task_id, run_id, json.loads(native[run_id]['payload'])):
+                continue
+        except (ValueError, TypeError, KeyError):
+            # Unreadable bindings are denied here and reported unknown by exact-run cleanup.
+            logger.warning('kanban: native Stop binding unreadable for task %s run %s', task_id, run_id)
+        _stop_intent(conn, task_id, run_id)
+    return sorted(targets)
+
+
+def replay_supervisor_stop(conn, task_id, saved):
+    """Retry physical cleanup at a receipt's immutable original scope, with its bool unchanged."""
+    if saved.get('refusal'):
+        return []
+    if 'stop_run_ids' in saved:
+        return capture_supervisor_stop(conn, task_id, before_event_id=saved['_event_id'],
+                                       run_ids=saved['stop_run_ids'])
+    # Pre-scope receipts retain their original event boundary. Only native scopes
+    # already admitted before that request can be retried, including after GC.
+    return capture_supervisor_stop(conn, task_id, before_event_id=saved['_event_id'])
+
+
 def _admission(binding):
     """Read the exact producer request without opening a writable SessionDB."""
     if not Path(binding['db']).is_absolute():
@@ -33,7 +110,9 @@ def _admission(binding):
     if len(rows) != 1 or epoch is None:
         raise ValueError('original native admission is missing or ambiguous')
     row = dict(rows[0])
-    if (row['status'] not in {'started', 'terminal'} or type(row['generation']) is not int
+    # Unknown admits cancellation of this same scope, never new execution.
+    if (row['status'] not in {'started', 'terminal', 'unknown'} or type(row['generation']) is not int
+            or row['generation'] < 1
             or row['owner_epoch'] != epoch['epoch']):
         raise ValueError('original native admission is not a current execution generation')
     return dict(row, home=path.parent, epoch=epoch['epoch'], instance_id=epoch['instance_id'])
@@ -88,16 +167,18 @@ def interrupt_owner_run(conn, run_id, *, allow_running=False):
                        (run_id,)).fetchone()
     if run is None:
         return None
-    marker = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
-                          "AND kind='owner_admitted' ORDER BY id DESC LIMIT 1",
-                          (run['task_id'], run_id)).fetchone()
-    if marker is None:
+    markers = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                          "AND kind='owner_admitted' ORDER BY id DESC",
+                          (run['task_id'], run_id)).fetchall()
+    if not markers:
         return None
     payload = {'status': 'unknown', 'reason': 'invalid_owner_marker'}
     try:
         if conn.in_transaction:
             raise ValueError('native Stop requires a committed supervisor block')
-        binding = json.loads(marker['payload'])
+        if len({row['payload'] for row in markers}) != 1:
+            raise ValueError('native owner marker is ambiguous')
+        binding = json.loads(markers[0]['payload'])
         if not isinstance(binding, dict) or not isinstance(binding.get('request_id'), str):
             raise ValueError('native owner marker is unreadable')
         request = json.loads(binding['request_id'].removeprefix('kanban:'))
@@ -111,9 +192,7 @@ def interrupt_owner_run(conn, run_id, *, allow_running=False):
         if owner_stop_confirmed(conn, run['task_id'], run_id, binding):
             return True  # an old Stop replay never controls a later generation
         with kb.write_txn(conn):
-            kb._append_event(conn, run['task_id'], 'native_owner_stop',
-                {'status': 'pending', 'session_id': binding['session_id'],
-                 'request_id': binding['request_id']}, run_id=run_id)
+            _stop_intent(conn, run['task_id'], run_id)
         payload['reason'] = 'missing_or_stale_admission'
         admitted = _admission(binding)
         payload.update(admission_id=admitted['admission_id'], generation=admitted['generation'])

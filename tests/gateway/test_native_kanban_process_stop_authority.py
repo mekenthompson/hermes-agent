@@ -31,6 +31,9 @@ class TaskModel(BaseHTTPRequestHandler):
             command = self.server.command
             if self.server.allow_successor.is_set():
                 command, call_id = self.server.successor_command, 'successor-task'
+        elif len(tools) == 1 and self.server.worker_block:
+            self.server.waiting.set()
+            command = 'worker-self-block'
         elif len(tools) == 1 and not self.server.idle and not successor:
             self.server.waiting.set()
             self.server.release.wait(50)
@@ -38,10 +41,13 @@ class TaskModel(BaseHTTPRequestHandler):
         else:
             self.server.waiting.set()
             command = None
+        name, arguments = 'terminal', {'command': command,
+            'background': True, 'persist_on_release': self.server.persist}
+        if command == 'worker-self-block':
+            name, arguments = 'kanban_block', {'reason': 'Awaiting a supervisor decision', 'kind': 'needs_input'}
         message = ({'role': 'assistant', 'content': None, 'tool_calls': [{
             'id': call_id, 'index': 0, 'type': 'function',
-            'function': {'name': 'terminal', 'arguments': json.dumps({'command': command,
-                'background': True, 'persist_on_release': self.server.persist})}}]}
+            'function': {'name': name, 'arguments': json.dumps(arguments)}}]}
             if command else {'role': 'assistant', 'content': 'NATIVE_TASK_END'})
         frame = {'id': 'native-task', 'choices': [{'index': 0, 'message': message,
             'finish_reason': 'tool_calls' if command else 'stop'}],
@@ -62,8 +68,12 @@ class TaskModel(BaseHTTPRequestHandler):
 
 
 def _owner_launcher(path):
-    path.write_text('''from tools.process_registry_custody import LocalCustody
+    path.write_text('''from pathlib import Path
+from tools.process_registry_custody import LocalCustody
+original_stop = LocalCustody.stop
 def denied(self):
+    if (Path(__file__).parent / 'cleanup.allowed').exists():
+        return original_stop(self)
     raise PermissionError('Test OS custody control denied')
 LocalCustody.stop = denied
 from gateway.run import main
@@ -81,7 +91,8 @@ def _native_owner(conn, task_id, run_id):
 @pytest.mark.platforms('linux')
 @pytest.mark.parametrize('mode,persist', [('live', False), ('active', False), ('active', True),
                                        ('idle', True), ('unknown', False), ('reclaim', False),
-                                       ('self-block', True), ('reclaim-unknown', True), ('successor', True)])
+                                       ('self-block', True), ('reclaim-unknown', True), ('successor', True),
+                                       ('self-supervisor', True), ('repeat-stop', True)])
 def test_native_task_block_preserves_real_execution_authority_and_stop_truth(tmp_path, monkeypatch, mode, persist):
     from hermes_cli import kanban_db as kb, kanban_db_dispatch as dispatch
     from hermes_cli.kanban_db_connect import connect
@@ -104,6 +115,7 @@ def test_native_task_block_preserves_real_execution_authority_and_stop_truth(tmp
     peer = ThreadingHTTPServer(('127.0.0.1', 0), TaskModel)
     peer.command, peer.followup = command, 'printf next > ' + shlex.quote(str(next_effect))
     peer.persist, peer.idle = persist, mode == 'idle'
+    peer.worker_block = mode == 'self-supervisor'
     peer.allow_successor, peer.successor_command = threading.Event(), (
         successor_command if mode == 'successor' else None)
     peer.waiting, peer.release = threading.Event(), threading.Event()
@@ -129,18 +141,22 @@ def test_native_task_block_preserves_real_execution_authority_and_stop_truth(tmp
     launcher = tmp_path / 'native_task_owner.py'
     _owner_launcher(launcher)
     try:
-        with daemon(ROOT, home, env, barrier=mode == 'unknown', fixture=str(launcher)) as (_owner, desc):
+        with daemon(ROOT, home, env, barrier=mode in {'unknown', 'repeat-stop'}, fixture=str(launcher)) as (_owner, desc):
             with closing(connect(board='owned')) as conn:
                 spawned = dispatch.dispatch_once(conn, board='owned', max_spawn=1)
                 assert [item[0] for item in spawned.spawned] == [task_id], spawned
-                assert peer.waiting.wait(35), (home / ('first.log' if mode == 'unknown' else 'restart.log')).read_text()
+                assert peer.waiting.wait(35), (home / ('first.log' if mode in {'unknown', 'repeat-stop'} else 'restart.log')).read_text()
                 try:
                     wait_until((tree / 'ready').exists, timeout=10, what='real native task kernel body')
                 except AssertionError as exc:
                     raise AssertionError({'tools': peer.results, 'log': (home / 'restart.log').read_text()}) from exc
                 pid = int((tree / 'pid').read_text())
+                if mode == 'self-supervisor':
+                    wait_until(lambda: kb.get_task(conn, task_id).status == 'blocked', timeout=15,
+                               what='actual registered kanban_block worker tool')
                 task = kb.get_task(conn, task_id)
-                original_run = task.current_run_id
+                original_run = task.current_run_id or conn.execute(
+                    'SELECT id FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1', (task_id,)).fetchone()[0]
                 binding = _native_owner(conn, task_id, original_run)
                 original_worker = json.loads(conn.execute(
                     "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_bound'",
@@ -165,11 +181,39 @@ def test_native_task_block_preserves_real_execution_authority_and_stop_truth(tmp
                         monkeypatch.setattr(kanban_owner_control, '_interrupt', unavailable)
                     assert kb.reclaim_task(conn, task_id, reason='Reconcile the original native executor') is (
                         mode == 'reclaim')
-                else:
+                elif mode != 'self-supervisor':
                     assert kb.block_task(conn, task_id, kind='needs_input', reason='Stop this native task now',
-                        expected_run_id=original_run if mode == 'self-block' else None)
+                        expected_run_id=original_run if mode in {'self-block', 'self-supervisor'} else None,
+                        idempotency_key='original-stop' if mode in {'repeat-stop', 'successor'} else None)
                 events = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='native_owner_stop'",
                                       (task_id, original_run)).fetchall()
+                if mode == 'self-supervisor':
+                    assert not events and _alive(pid), 'Normal worker self-block preserves its service'
+                    assert kb.get_task(conn, task_id).status == 'blocked'
+                    worker_block = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? "
+                        "AND run_id=? AND kind='blocked'", (task_id, original_run)).fetchone()[0])
+                    assert worker_block['supervisor_stop'] is False
+                    assert kb.block_task(conn, task_id, kind='needs_input', reason='Explicit supervisor service Stop') is False
+                    events = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                                          "AND kind='native_owner_stop'", (task_id, original_run)).fetchall()
+                if mode == 'repeat-stop':
+                    first = [json.loads(row[0]) for row in events]
+                    assert [row['status'] for row in first] == ['pending', 'unknown'] and _alive(pid), first
+                    checkpoint, = json.loads((home / 'processes.json').read_text())
+                    assert checkpoint['reconciliation_required'] and checkpoint['parent_session_id'] == binding['session_id']
+                    peer.release.set()
+                    wait_until(lambda: not _alive(original_worker), timeout=35,
+                               what='original stopped model returns before physical cleanup retry')
+                    assert _alive(pid) and not next_effect.exists()
+                    (tmp_path / 'cleanup.allowed').touch()
+                    assert kb.block_task(conn, task_id, kind='needs_input', reason='Stop this native task now',
+                                         idempotency_key='original-stop')
+                    events = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                                          "AND kind='native_owner_stop'", (task_id, original_run)).fetchall()
+                    assert [json.loads(row[0])['status'] for row in events] == ['pending', 'unknown', 'pending', 'confirmed']
+                    assert json.loads(events[-1][0])['generation'] == first[-1]['generation']
+                    assert json.loads(events[-1][0])['admission_id'] == first[-1]['admission_id']
+                    events = events[-2:]
                 if mode in {'self-block', 'reclaim-unknown'}:
                     if mode == 'self-block':
                         assert not events, 'A worker self-block must not manufacture a supervisor Stop'
@@ -212,6 +256,11 @@ def test_native_task_block_preserves_real_execution_authority_and_stop_truth(tmp
                     current = kb.get_task(conn, task_id)
                     assert current.status == 'running' and current.current_run_id == successor_run
                     assert _alive(successor_pid) and not next_effect.exists()
+                    assert kb.block_task(conn, task_id, kind='needs_input', reason='Stop this native task now',
+                                         idempotency_key='original-stop')
+                    current = kb.get_task(conn, task_id)
+                    assert current.status == 'running' and current.current_run_id == successor_run
+                    assert _alive(successor_pid), 'A delayed original Stop replay controlled the successor'
                     assert not (tree / 'effect').exists() and not (successor_tree / 'effect').exists()
                     assert kb.block_task(conn, task_id, kind='needs_input', reason='Stop the successor itself')
                     assert not _alive(successor_pid)

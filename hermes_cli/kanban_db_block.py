@@ -8,10 +8,20 @@ late-bound via ``_kb`` so monkeypatching ``kanban_db.<name>`` keeps working.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 import sqlite3
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def supervisor_halt_scope(conn):
+    """Close only captured original runs, after the writer and transition hook finish."""
+    runs = []
+    yield runs
+    for run_id in runs:
+        _kb.halt_blocked_worker(conn, run_id)
 
 
 def _route_block(
@@ -67,7 +77,7 @@ def halt_blocked_worker(conn: sqlite3.Connection, run_id: Optional[int]) -> bool
     reaped: list[str] = []
     try:
         from hermes_cli.kanban_owner_control import interrupt_owner_run
-        native_stopped = interrupt_owner_run(conn, int(run_id))
+        native_stopped = interrupt_owner_run(conn, int(run_id), allow_running=True)
         if native_stopped is False:
             return False  # the submitter is not the owner of its background effects
         row = conn.execute(

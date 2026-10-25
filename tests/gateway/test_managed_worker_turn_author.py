@@ -25,23 +25,32 @@ def owner_epoch(tmp_path):
 
 def test_bootstrap_frame_carries_the_admitted_author(tmp_path, monkeypatch, owner_epoch):
     from gateway import session_managed_worker as smw
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+    from gateway.session_local import LocalSessionAdapter
     from agent.managed_worker import validate_bootstrap
 
     monkeypatch.setattr('gateway.session_policy.launch_key', lambda authority, policy: None)
-    live = SimpleNamespace(source=SimpleNamespace(user_id='u', chat_id='c'), route='route')
+    source = SessionSource(platform=Platform.LOCAL, user_id='u', chat_id='c')
+    live = SimpleNamespace(source=source, route='route')
     db, epoch = owner_epoch
-    authority = SimpleNamespace(sessions={'sid': live}, runner=None, profile_id=str(tmp_path), db=db, epoch=epoch)
+    authority = SimpleNamespace(sessions={'sid': live}, profile_id=str(tmp_path), db=db, epoch=epoch)
+    policy = _policy(tmp_path)
+    adapter = LocalSessionAdapter(authority)
+    adapter.register_source(source)
+    adapter.policies[source.chat_id] = policy
+    authority.runner = SimpleNamespace(_adapter_for_source=lambda candidate: adapter if candidate is source else None)
     ref = SimpleNamespace(session_id='sid')
     scope = {'profile_id': str(tmp_path), 'session_id': 'sid', 'execution_id': 'x', 'generation': 1,
              'pid': os.getpid(), 'birth': 0, 'secret': 's', 'epoch': 1}
     author = {'id': 'bot-7', 'name': 'Seven', 'is_bot': True}
     row = {'request_id': 'local-automation', 'admission_id': 'author-admission', 'generation': 1,
            'payload': {'text': 'hi', 'local_automation_v1': {'turn_author': author}}}
-    frame = smw._bootstrap(authority, ref, row, _policy(tmp_path), scope)
+    frame = smw._bootstrap(authority, ref, row, policy, scope)
     assert frame['turn_author'] == author
     wire = json.loads(json.dumps(frame))
     assert validate_bootstrap(wire) is wire
-    plain = smw._bootstrap(authority, ref, {**row, 'payload': {'text': 'hi', 'local_automation_v1': {}}}, _policy(tmp_path), scope)
+    plain = smw._bootstrap(authority, ref, {**row, 'payload': {'text': 'hi', 'local_automation_v1': {}}}, policy, scope)
     assert plain['turn_author'] is None
     assert validate_bootstrap(json.loads(json.dumps(plain)))['turn_author'] is None
     for bad in ('bot-7', {}, {'is_bot': True}):

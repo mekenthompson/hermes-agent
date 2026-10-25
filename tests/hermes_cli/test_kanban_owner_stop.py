@@ -48,7 +48,7 @@ def _endpoint(attempt):
         supervisor='none', capabilities=frozenset())
 
 
-def _control(monkeypatch, attempt, *, refusal=None):
+def _control(monkeypatch, attempt, *, refusal=None, execution_state='running'):
     calls = []
     def discover(home, **kwargs):
         assert home == attempt.home
@@ -61,7 +61,7 @@ def _control(monkeypatch, attempt, *, refusal=None):
             if refusal:
                 raise gateway_client.GatewayRPCError(refusal)
             return {'ref': {'session_id': params['session_id']},
-                    'execution_generation': params['execution_generation'], 'execution_state': 'running'}
+                    'execution_generation': params['execution_generation'], 'execution_state': execution_state}
     @asynccontextmanager
     async def connect(*, endpoint):
         assert endpoint == _endpoint(attempt)
