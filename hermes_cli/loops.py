@@ -413,6 +413,29 @@ class LoopManager:
         save_loop(self.session_id, self._state)
         return self._state
 
+    def _save_tick(self, expected: str, *, _authorize_write=None) -> bool:
+        """Fence a tick claim or closeout with the existing native metadata transaction."""
+        db = _get_session_db() if self.session_id else None
+        if db is None:
+            return False
+        value = self._state.to_json()
+
+        def write(conn):
+            if _authorize_write is not None:
+                _authorize_write(conn)
+            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(self.session_id),)).fetchone()
+            fresh = _parse_state(row[0], self.session_id) if row else None
+            if (fresh is None or fresh.to_json() != expected
+                    or set(json.loads(row[0])) - {f.name for f in fields(LoopState)}):
+                return False
+            db.set_meta(_meta_key(self.session_id), value, cursor=conn.cursor())
+            return True
+
+        saved = _db_op("tick compare-and-swap", lambda: db._execute_write(write), False)
+        if not saved:
+            self.refresh()
+        return saved
+
     def status_line(self) -> str:
         s = self._state
         if s is None or s.status == "cleared":
@@ -512,13 +535,15 @@ class LoopManager:
         s = self._state
         if s is None or not self.is_due():
             return None
+        expected = s.to_json()
         s.ticks_fired += 1
         s.last_fired_at = time.time()
         s.awaiting_response = True
         # Provisional schedule from NOW: complete_tick reschedules from turn end, but if the
         # process dies mid-turn this keeps the persisted loop from being 'due' in a tight loop.
         s.next_due_at = s.last_fired_at + (s.current_delay or s.interval_seconds or self_paced_floor_seconds())
-        self._save()
+        if not self._save_tick(expected):
+            return None
 
         if s.prompt.lstrip().startswith("/"):
             return s.prompt.strip()
@@ -526,27 +551,40 @@ class LoopManager:
         template = WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE if s.until else WAKEUP_PROMPT_TEMPLATE
         return template.format(tick=s.ticks_fired, cadence=cadence, prompt=s.prompt, until=s.until)
 
-    def abandon_tick(self) -> None:
+    def abandon_tick(self, *, _authorize_write=None) -> None:
         """Roll back a fired tick whose injection failed (nothing ran)."""
         s = self._state
         if s is None or not s.awaiting_response:
             return
+        expected = s.to_json()
         s.awaiting_response = False
         s.ticks_fired = max(0, s.ticks_fired - 1)
-        self._save()
+        self._save_tick(expected, _authorize_write=_authorize_write)
 
     def _stop(self, status: str, reason: str, message: str) -> dict[str, Any]:
-        """Persist a terminal (``done``) or recoverable (``paused``) stop and build the result."""
+        """Prepare a terminal or recoverable stop for the tick's fenced closeout."""
         s = self._state
         s.status = status
         if status == "done":
             s.last_stop_reason = reason
         else:
             s.paused_reason = reason
-        self._save()
         return {"status": status, "stopped": True, "reason": reason, "message": message}
 
-    def complete_tick(self, last_response: str) -> dict[str, Any]:
+    def complete_tick(self, last_response: str, *, _authorize_write=None) -> dict[str, Any]:
+        """Commit this tick's result only while its persisted claim remains current."""
+        state = self._state
+        if state is None or not state.awaiting_response:
+            return {"status": state.status if state else None, "stopped": False,
+                    "reason": "no tick in flight", "message": ""}
+        expected = state.to_json()
+        decision = self._evaluate_tick(last_response)
+        if self._save_tick(expected, _authorize_write=_authorize_write):
+            return decision
+        return {"status": self._state.status if self._state else None, "stopped": False,
+                "reason": "tick ownership changed", "message": ""}
+
+    def _evaluate_tick(self, last_response: str) -> dict[str, Any]:
         """Evaluate the finished wakeup turn and schedule what's next.
 
         Returns ``{"status": "active|done|paused", "stopped": bool, "reason": str, "message": str}``;
@@ -571,6 +609,7 @@ class LoopManager:
 
                 verdict, reason, _pf, _wait, _tf = judge_goal(s.until, last_response)
             except Exception as exc:
+                logger.warning("Loop completion judge unavailable", exc_info=True)
                 verdict, reason = "continue", f"judge unavailable: {type(exc).__name__}"
             if verdict == "done":
                 return self._stop("done", f"stop condition met: {reason}",
@@ -606,7 +645,6 @@ class LoopManager:
         else:
             s.current_delay = s.interval_seconds
         s.next_due_at = now + s.current_delay
-        self._save()
         return {"status": "active", "stopped": False, "reason": "loop continues", "message": ""}
 
 

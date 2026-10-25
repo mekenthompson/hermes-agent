@@ -4,7 +4,6 @@ import asyncio
 import logging
 import threading
 import time
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -113,6 +112,7 @@ async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
+    loops.save_loop(mgr.session_id, mgr.state)
     assert mgr.fire_tick() is not None
 
     entry = _FakeSessionEntry()
@@ -167,6 +167,7 @@ async def test_streamed_already_sent_completes_loop_tick(loop_env):
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
+    loops.save_loop(mgr.session_id, mgr.state)
     assert mgr.fire_tick() is not None
     assert mgr.state.awaiting_response is True
     assert mgr.is_due() is False
@@ -195,6 +196,7 @@ async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
+    loops.save_loop(mgr.session_id, mgr.state)
     assert mgr.fire_tick() is not None
     assert mgr.state.awaiting_response is True
 
@@ -225,6 +227,7 @@ async def test_failed_turn_with_text_never_drives_goal_or_until_judge(loop_env, 
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI --until CI is green"))
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
+    loops.save_loop(mgr.session_id, mgr.state)
     assert mgr.fire_tick() is not None
 
     judged = []
@@ -252,6 +255,7 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
+    loops.save_loop(mgr.session_id, mgr.state)
     assert mgr.fire_tick() is not None
 
     runner._post_turn_goal_continuation = AsyncMock(side_effect=RuntimeError("judge failed"))
@@ -272,32 +276,28 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
 
 
 @pytest.mark.asyncio
-async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loop_env):
+async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(tmp_path, monkeypatch):
     """Full wakeup path (slash-command loop, adapter present): list_active_loops,
     fire_tick and complete_tick must each execute on an executor thread, never
     on the event-loop thread (#92413)."""
-    runner = _make_runner()
+    from tests.gateway.test_native_periodic_task_authority import _finish, _runtime
+
+    runtime = await _runtime(tmp_path, monkeypatch)
+    runner = runtime.runner
     runner._running = True
-    runner._running_agents = {}
+    handled = []
+    actual_handle = runtime.adapter.handle_message
 
-    class _Adapter:
-        handled = []
+    async def handle_message(event, **options):
+        handled.append(event.text)
+        return await actual_handle(event, **options)
 
-        async def handle_message(self, event):
-            self.handled.append(event.text)
-
-    runner.adapters = {Platform.DISCORD: _Adapter()}
-    runner._build_process_event_source = lambda evt: SimpleNamespace(
-        platform=Platform.DISCORD, chat_id=evt["chat_id"], chat_type=evt["chat_type"],
-        thread_id=evt["thread_id"] or None, user_id=evt["user_id"], user_name=evt["user_name"],
-    )
-    runner._session_key_for_source = lambda source: "agent:main:discord:channel:chat-loop"
-
-    # A slash-command loop that is due now.
-    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m /status"))
-    state = loops.load_loop("sid-gateway-loop")
-    state.next_due_at = time.time() - 1
-    loops.save_loop("sid-gateway-loop", state)
+    monkeypatch.setattr(runtime.adapter, 'handle_message', handle_message)
+    manager = loops.LoopManager(runtime.entry.session_id)
+    manager.set('/status', interval_seconds=60, route={
+        'platform': 'discord', 'chat_id': '42', 'chat_type': 'dm', 'user_id': '42'})
+    runtime.clock.now += 61
+    replies_before = len(runtime.replies)
 
     loop_thread = threading.current_thread()
     on_loop_calls = []
@@ -322,9 +322,9 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
         _record("fire_tick")
         return real_fire(self)
 
-    def _complete_tick(self, last_response):
+    def _complete_tick(self, last_response, **kwargs):
         _record("complete_tick")
-        return real_complete(self, last_response)
+        return real_complete(self, last_response, **kwargs)
 
     orig_sleep = asyncio.sleep
     calls = {"n": 0}
@@ -335,18 +335,23 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
             runner._running = False
         return await orig_sleep(0)
 
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(loops, "list_active_loops", _list_active_loops)
-        mp.setattr(loops.LoopManager, "fire_tick", _fire_tick)
-        mp.setattr(loops.LoopManager, "complete_tick", _complete_tick)
-        mp.setattr(asyncio, "sleep", _one_pass_sleep)
-        await GatewayRunner._loop_wakeup_watcher(runner, interval=0)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(loops, "list_active_loops", _list_active_loops)
+            mp.setattr(loops.LoopManager, "fire_tick", _fire_tick)
+            mp.setattr(loops.LoopManager, "complete_tick", _complete_tick)
+            mp.setattr(asyncio, "sleep", _one_pass_sleep)
+            await asyncio.wait_for(runner._loop_wakeup_watcher(interval=0), 15)
 
-    assert _Adapter.handled == ["/status"], _Adapter.handled
-    assert seen_calls == ["list_active_loops", "fire_tick", "complete_tick"], seen_calls
-    assert on_loop_calls == [], f"SessionDB calls ran on the event-loop thread: {on_loop_calls}"
-    # complete_tick ran (slash-command loops complete immediately).
-    assert loops.load_loop("sid-gateway-loop").ticks_fired == 1
+        assert handled == ["/status"], handled
+        assert len(runtime.replies) > replies_before and runtime.replies[-1]
+        assert seen_calls == ["list_active_loops", "fire_tick", "complete_tick"], seen_calls
+        assert on_loop_calls == [], f"SessionDB calls ran on the event-loop thread: {on_loop_calls}"
+        state = loops.load_loop(runtime.entry.session_id)
+        assert state.ticks_fired == 1 and not state.awaiting_response
+    finally:
+        runner._running = False
+        await _finish(runtime)
 
 
 @pytest.mark.asyncio

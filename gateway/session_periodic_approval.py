@@ -114,3 +114,83 @@ def periodic_task_scope(authority, ref, row, live, event):
     from gateway.session_ingress import _native_task_scope
     return _native_task_scope(authority, ref, row, live, event, origin['text'],
                               producer_current=lambda: periodic_origin(authority, ref, row) is not None)
+
+
+def loop_command_scope(runner, source, session_id, state, arrival_epoch):
+    """A saved slash tick uses the existing command lease and its native Stop owner."""
+    from gateway.session_authorities import active_authority
+    from gateway.session_command_approval import _native_command_task_scope
+    from gateway.session_contract import SessionRef
+    from gateway.platforms.event import MessageEvent
+    from tools.approval_context import unverified_approval_task
+
+    authority = active_authority(runner)
+    route = runner._session_key_for_source(source)
+    entry = runner.session_store.lookup_by_session_key(route) if authority is not None else None
+    if entry is None:
+        return unverified_approval_task()
+    ref = SessionRef(authority.profile_id, authority.logical_owner(entry.session_id))
+    live = authority.sessions.get(ref.session_id)
+    if (live is None or live.route != route or authority.logical_owner(session_id) != ref.session_id
+            or not state.prompt.lstrip().startswith('/')):
+        return unverified_approval_task()
+    event = MessageEvent(text=state.prompt.strip(), source=source, internal=True)
+    policy = snapshot_policy(authority, event, 'loop-command', ('loop-tick', session_id, state.to_json()))
+    tick = (state.ticks_fired, state.last_fired_at)
+
+    def current():
+        fresh = _state(authority, 'loop-tick', session_id)
+        return (fresh is not None and fresh.status in ('active', 'done')
+                and (fresh.ticks_fired, fresh.last_fired_at) == tick
+                and _configuration('loop-tick', fresh) == policy['configuration']
+                and _instruction('loop-tick', fresh) == policy['instruction'])
+
+    return _native_command_task_scope(authority, ref, 'automation:' + route, policy['instruction'],
+                              arrival_epoch, producer_current=current)
+
+
+def loop_command_write_guard(runner, source, session_id, arrival_epoch):
+    """Recheck native ownership on the caller's locked journal, without reentering its writer."""
+    from gateway.session_authorities import active_authority, require_serving
+    from hermes_state_runtime import _epoch
+    from pathlib import Path
+
+    authority = active_authority(runner)
+    owner = authority.logical_owner(session_id)
+    live = authority.sessions[owner]
+    route = runner._session_key_for_source(source)
+    database = str(Path(authority.db.db_path).resolve())
+
+    def guard(conn):
+        require_serving(authority)
+        if str(Path(conn.execute('PRAGMA database_list').fetchone()[2]).resolve()) != database:
+            raise RuntimeStoreError('profile_mismatch')
+        _epoch(conn, authority.epoch)
+        if (authority.sessions.get(owner) is not live or live.superseded or live.route != route
+                or authority.route_epoch(route) != arrival_epoch):
+            raise RuntimeStoreError('stale_generation')
+    return guard
+
+
+async def dispatch_loop_command(runner, adapter, source, session_id, manager, arrival_epoch):
+    """Keep native tick closeout inside its command lease; uncertain dispatch is not replayed."""
+    from tools.approval_context import approval_task_revoked
+    from functools import partial
+    with loop_command_scope(runner, source, session_id, manager.state, arrival_epoch):
+        if approval_task_revoked():
+            raise RuntimeStoreError('permission_denied', detail='native loop tick authority is no longer current')
+        write_guard = loop_command_write_guard(runner, source, session_id, arrival_epoch)
+        event = runner._synthetic_prompt_event(source, manager.state.prompt.strip(), internal=True)
+        import asyncio
+        try:
+            await adapter.handle_message(event, _wait_for_processing=True, _require_idle=True)
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                raise
+            raise RuntimeStoreError('interrupted', detail='native loop command was stopped') from None
+        if not getattr(event, '_gateway_accepted', False):
+            await runner._run_in_executor_with_context(partial(manager.abandon_tick, _authorize_write=write_guard))
+            return
+        if approval_task_revoked():
+            raise RuntimeStoreError('permission_denied', detail='native loop tick stopped or changed; reconcile its outcome')
+        await runner._run_in_executor_with_context(partial(manager.complete_tick, '', _authorize_write=write_guard))

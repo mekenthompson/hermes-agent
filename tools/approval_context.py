@@ -65,7 +65,11 @@ class ApprovalTaskLease:
     def live(self) -> bool:
         with self._lock:
             active = not self._revoked and (self._parent_open or self._children > 0)
-        return active and self._owner_current()
+        if not active or not self._owner_current():
+            return False
+        # Ownership validation can wait. A Stop or parent close during that wait wins.
+        with self._lock:
+            return not self._revoked and (self._parent_open or self._children > 0)
 
     def _owner_current(self) -> bool:
         try:

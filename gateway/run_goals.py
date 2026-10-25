@@ -494,6 +494,7 @@ class GatewayGoalsMixin:
         # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
         # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog
         # fired. The context-preserving executor keeps the profile HERMES_HOME override under multiplex.
+        arrival_epoch = self._route_stop_epoch(session_key) if session_key else None
         wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
         if not wakeup:
             return
@@ -511,17 +512,19 @@ class GatewayGoalsMixin:
             from gateway.session_automation import admit_route_wake
             # Under a session authority the tick commits to the FIFO (never a classic turn beside an
             # admitted one); a slash-command loop is a command and keeps the command path.
-            if wakeup.lstrip().startswith("/") or not await admit_route_wake(self, adapter, source, wakeup, "loop-tick",
+            if wakeup.lstrip().startswith("/"):
+                from gateway.session_periodic_approval import dispatch_loop_command
+                await dispatch_loop_command(self, adapter, source, sid, mgr, arrival_epoch)
+            elif not await admit_route_wake(self, adapter, source, wakeup, "loop-tick",
                     _native_periodic=('loop-tick', sid, mgr.state.to_json())):
                 await adapter.handle_message(self._synthetic_prompt_event(source, wakeup, internal=True))
-            # Slash-command loops dispatch through the command path and never hit the post-turn
-            # completion hook — complete the tick immediately (caps + scheduling).
-            if wakeup.lstrip().startswith("/"):
-                await self._run_in_executor_with_context(mgr.complete_tick, "")
         except Exception as exc:
-            logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
-            with suppress(Exception):
-                mgr.abandon_tick()
+            logger.warning("loop wakeup injection failed for %s: %s", sid, exc, exc_info=True)
+            # A command may have changed external state before its response was lost.
+            # Retain its claimed tick for reconciliation instead of scheduling a replay.
+            if not wakeup.lstrip().startswith("/"):
+                with suppress(Exception):
+                    mgr.abandon_tick()
         # Viewers swap the countdown for "running now" (or re-anchor it after a slash tick settled).
         self._publish_local_control(source)
 

@@ -3915,18 +3915,8 @@ class BasePlatformAdapter(ABC):
         return True
 
     def _track_session_task(self, session_key: str, task: Any) -> bool:
-        """Record ``task`` as the session owner and track it for shutdown; False when
-        ``create_task`` was stubbed with an unhashable sentinel (tests) — the owner entry is left
-        for the caller."""
-        self._session_tasks[session_key] = task
-        try:
-            self._background_tasks.add(task)
-        except TypeError:
-            return False
-        if hasattr(task, "add_done_callback"):
-            task.add_done_callback(self._background_tasks.discard)
-            task.add_done_callback(self._expected_cancelled_tasks.discard)
-        return True
+        from gateway.platforms.base_session_tasks import _track_session_task
+        return _track_session_task(self, session_key, task)
 
     async def cancel_session_processing(self, session_key: str, *, release_guard: bool = True,
                                         discard_pending: bool = True) -> None:
@@ -3989,9 +3979,11 @@ class BasePlatformAdapter(ABC):
             raise
         await self._drain_pending_after_session_command(session_key, command_guard)
 
-    async def handle_message(self, event: MessageEvent) -> None:
+    async def handle_message(self, event: MessageEvent, *, _wait_for_processing: bool = False,
+                             _require_idle: bool = False) -> None:
         """Process an incoming message; returns quickly by spawning a background
-        task so new messages (and interrupts) can arrive while an agent runs."""
+        task so new messages (and interrupts) can arrive while an agent runs. Native producers
+        may await that existing task and decline occupied slots without queuing work."""
         event._gateway_accepted = False
         if not self._message_handler:
             # No handler = every inbound silently discarded on an adapter that still polls and sends;
@@ -4028,10 +4020,14 @@ class BasePlatformAdapter(ABC):
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
         if session_key in self._active_sessions or behind_burst:
+            if _require_idle:
+                return  # a native recurring producer leaves healthy work alone
             await self._handle_message_while_active(event, session_key)
             return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         event._gateway_accepted = self._start_session_processing(event, session_key)
+        if _wait_for_processing and event._gateway_accepted:
+            await asyncio.shield(self._session_tasks[session_key])
 
     def _shared_runtime_owns_input(self, event: MessageEvent) -> bool:
         """True when a non-command input belongs to the shared runtime's session authority."""

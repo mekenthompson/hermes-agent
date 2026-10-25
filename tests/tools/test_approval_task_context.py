@@ -2,6 +2,9 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from types import SimpleNamespace
+from threading import Event
+
+import pytest
 from unittest.mock import patch
 
 from tools.approval_context import (approval_task_context, background_approval_task,
@@ -195,3 +198,25 @@ def test_stale_task_cannot_reuse_off_mode_or_session_approval(monkeypatch):
         assert A.check_all_command_guards("python -c 'print(1)'", "local")["approved"] is False
         assert A.check_execute_code_guard("print(1)", "local")["approved"] is False
         assert A.request_tool_approval("write", "change file")["approved"] is False
+
+
+@pytest.mark.parametrize('transition', ['stop', 'parent_close'])
+def test_task_liveness_does_not_outlive_a_waiting_owner_check(transition):
+    from tools.approval_context import ApprovalTaskLease
+
+    entered, release = Event(), Event()
+
+    def current():
+        entered.set()
+        assert release.wait(10)
+        return True
+
+    lease = ApprovalTaskLease(current)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(lease.live)
+        try:
+            assert entered.wait(10)
+            {'stop': lease.revoke, 'parent_close': lease.close_parent}[transition]()
+        finally:
+            release.set()
+        assert pending.result(timeout=10) is False

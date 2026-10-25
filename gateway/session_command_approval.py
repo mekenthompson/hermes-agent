@@ -5,28 +5,36 @@ import uuid
 from weakref import WeakSet
 
 
-def command_task_scope(authority, ref, identity, text, arrival_epoch):
-    from gateway.session_authorities import require_serving
-    from hermes_state_runtime import RuntimeStoreError, _epoch
-    from tools.approval_context import (approval_task_context, approval_task_failure_scope,
-                                        approval_task_revoked, current_approval_task_context)
-
+def command_task_scope(authority, ref, identity, text, arrival_epoch, *, producer_current=None):
+    from tools.approval_context import (approval_task_failure_scope, approval_task_revoked,
+                                        current_approval_task_context)
     if approval_task_revoked() or current_approval_task_context() is not None:
         return approval_task_failure_scope(nullcontext())  # never replace or broaden inherited authority
+    return _native_command_task_scope(authority, ref, identity, text, arrival_epoch,
+                                       producer_current=producer_current)
+
+
+def _native_command_task_scope(authority, ref, identity, text, arrival_epoch, *, producer_current=None):
+    """Construct a lease only after a private native producer validated its own unit of work."""
+    from gateway.session_authorities import require_serving
+    from hermes_state_runtime import RuntimeStoreError, _epoch
+    from tools.approval_context import approval_task_context, approval_task_failure_scope
     live = authority.sessions[ref.session_id]
 
     def current():
+        if producer_current is not None and not producer_current():
+            return False
+        entry = authority.runner.session_store.lookup_by_session_key(live.route)
+        owner = authority.logical_owner(entry.session_id) if entry is not None else None
         try:
             require_serving(authority)
             with authority.db._read_ctx() as conn:
                 _epoch(conn, authority.epoch)
         except RuntimeStoreError:
             return False
-        entry = authority.runner.session_store.lookup_by_session_key(live.route)
         return (authority.sessions.get(ref.session_id) is live and not live.superseded
                 and authority.route_epoch(live.route) == arrival_epoch
-                and entry is not None and not entry.suspended
-                and authority.logical_owner(entry.session_id) == ref.session_id)
+                and entry is not None and not entry.suspended and owner == ref.session_id)
 
     def own(lease):
         with live.event_stream.lock:

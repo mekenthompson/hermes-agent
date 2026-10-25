@@ -30,6 +30,13 @@ def hermes_home(tmp_path, monkeypatch):
     goals._DB_CACHE.clear()
 
 
+def _make_due(manager):
+    """Author the due native record, rather than only changing a detached snapshot."""
+    from hermes_cli.loops import save_loop
+    manager.state.next_due_at = time.time() - 1
+    save_loop(manager.session_id, manager.state)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Interval / argument parsing
 # ──────────────────────────────────────────────────────────────────────
@@ -332,8 +339,8 @@ class TestTickLifecycle:
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="t3")
-        state = mgr.set("poll the build", interval_seconds=300)
-        state.next_due_at = time.time() - 1
+        mgr.set("poll the build", interval_seconds=300)
+        _make_due(mgr)
         wakeup = mgr.fire_tick()
         assert wakeup is not None
         assert "[/loop wakeup #1" in wakeup
@@ -347,16 +354,16 @@ class TestTickLifecycle:
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="t4")
-        state = mgr.set("/recap", interval_seconds=300)
-        state.next_due_at = time.time() - 1
+        mgr.set("/recap", interval_seconds=300)
+        _make_due(mgr)
         assert mgr.fire_tick() == "/recap"
 
     def test_abandon_tick_rolls_back(self, hermes_home):
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="t5")
-        state = mgr.set("poll", interval_seconds=300)
-        state.next_due_at = time.time() - 1
+        mgr.set("poll", interval_seconds=300)
+        _make_due(mgr)
         mgr.fire_tick()
         mgr.abandon_tick()
         assert mgr.state.awaiting_response is False
@@ -366,8 +373,8 @@ class TestTickLifecycle:
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="t6")
-        state = mgr.set("poll", interval_seconds=300)
-        state.next_due_at = time.time() - 1
+        mgr.set("poll", interval_seconds=300)
+        _make_due(mgr)
         mgr.fire_tick()
         decision = mgr.complete_tick("The deploy is live.\nLOOP_COMPLETE")
         assert decision["stopped"] is True
@@ -377,8 +384,8 @@ class TestTickLifecycle:
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="t7")
-        state = mgr.set("poll", interval_seconds=300, times=1)
-        state.next_due_at = time.time() - 1
+        mgr.set("poll", interval_seconds=300, times=1)
+        _make_due(mgr)
         mgr.fire_tick()
         decision = mgr.complete_tick("still building")
         assert decision["stopped"] is True
@@ -389,8 +396,8 @@ class TestTickLifecycle:
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="t8")
-        state = mgr.set("poll", interval_seconds=300)
-        state.next_due_at = time.time() - 1
+        mgr.set("poll", interval_seconds=300)
+        _make_due(mgr)
         mgr.fire_tick()
         decision = mgr.complete_tick("still building")
         assert decision["stopped"] is False
@@ -404,7 +411,7 @@ class TestTickLifecycle:
         mgr = LoopManager(session_id="t9")
         state = mgr.set("poll", interval_seconds=300)
         state.max_ticks = 1
-        state.next_due_at = time.time() - 1
+        _make_due(mgr)
         mgr.fire_tick()
         decision = mgr.complete_tick("still building")
         assert decision["stopped"] is True
@@ -414,8 +421,8 @@ class TestTickLifecycle:
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="t10")
-        state = mgr.set("poll", interval_seconds=300, until="the suite is green")
-        state.next_due_at = time.time() - 1
+        mgr.set("poll", interval_seconds=300, until="the suite is green")
+        _make_due(mgr)
         mgr.fire_tick()
         with patch("hermes_cli.goals.judge_goal", return_value=("done", "suite green", False, None, False)):
             decision = mgr.complete_tick("All 500 tests passed.")
@@ -426,8 +433,8 @@ class TestTickLifecycle:
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="t11")
-        state = mgr.set("poll", interval_seconds=300, until="the suite is green")
-        state.next_due_at = time.time() - 1
+        mgr.set("poll", interval_seconds=300, until="the suite is green")
+        _make_due(mgr)
         mgr.fire_tick()
         with patch("hermes_cli.goals.judge_goal", return_value=("continue", "3 failures", False, None, False)):
             decision = mgr.complete_tick("3 tests still failing")
@@ -438,8 +445,8 @@ class TestTickLifecycle:
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="t11b")
-        state = mgr.set("poll", interval_seconds=300, until="the deleted repo's CI is green")
-        state.next_due_at = time.time() - 1
+        mgr.set("poll", interval_seconds=300, until="the deleted repo's CI is green")
+        _make_due(mgr)
         mgr.fire_tick()
         with patch("hermes_cli.goals.judge_goal", return_value=("blocked", "repo no longer exists", False, None, False)):
             decision = mgr.complete_tick("The repository was deleted; there is no CI to watch.")
@@ -451,8 +458,8 @@ class TestTickLifecycle:
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="t12")
-        state = mgr.set("poll", interval_seconds=300, until="green")
-        state.next_due_at = time.time() - 1
+        mgr.set("poll", interval_seconds=300, until="green")
+        _make_due(mgr)
         mgr.fire_tick()
         with patch("hermes_cli.goals.judge_goal", side_effect=RuntimeError("api down")):
             decision = mgr.complete_tick("some output")
@@ -469,25 +476,25 @@ class TestSelfPacedBackoff:
         assert state.mode == "self_paced"
 
         # Tick 1: response A → delay stays at floor (change from empty digest).
-        state.next_due_at = time.time() - 1
+        _make_due(mgr)
         mgr.fire_tick()
         mgr.complete_tick("queue depth is 5")
         assert mgr.state.current_delay == floor
 
         # Tick 2: same response → backoff doubles.
-        mgr.state.next_due_at = time.time() - 1
+        _make_due(mgr)
         mgr.fire_tick()
         mgr.complete_tick("queue depth is 5")
         assert mgr.state.current_delay == floor * 2
 
         # Tick 3: same again → doubles again.
-        mgr.state.next_due_at = time.time() - 1
+        _make_due(mgr)
         mgr.fire_tick()
         mgr.complete_tick("queue depth is 5")
         assert mgr.state.current_delay == floor * 4
 
         # Tick 4: changed response → snaps back to floor.
-        mgr.state.next_due_at = time.time() - 1
+        _make_due(mgr)
         mgr.fire_tick()
         mgr.complete_tick("queue depth is 2 — draining")
         assert mgr.state.current_delay == floor
@@ -498,10 +505,10 @@ class TestSelfPacedBackoff:
         mgr = LoopManager(session_id="sp2")
         state = mgr.set("watch")
         floor = state.current_delay
-        state.next_due_at = time.time() - 1
+        _make_due(mgr)
         mgr.fire_tick()
         mgr.complete_tick("Still building. Checked at 14:02:33")
-        mgr.state.next_due_at = time.time() - 1
+        _make_due(mgr)
         mgr.fire_tick()
         mgr.complete_tick("Still building. Checked at 14:07:33")
         assert mgr.state.current_delay == floor * 2  # digest ignored the clock
@@ -536,8 +543,8 @@ class TestControls:
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="c3")
-        state = mgr.set("poll", interval_seconds=300)
-        state.next_due_at = time.time() - 1
+        mgr.set("poll", interval_seconds=300)
+        _make_due(mgr)
         mgr.fire_tick()
         mgr.pause(reason="user-interrupted")
         assert mgr.state.awaiting_response is False
