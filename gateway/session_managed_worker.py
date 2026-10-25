@@ -89,10 +89,13 @@ def _bootstrap(authority, ref, row, policy, scope, text=None):
 
 def _managed_approval_origin(authority, ref, row):
     """Only the owner's admitted local viewer row can supply worker request evidence."""
+    from gateway.session_native_approval import native_owner_current
     from gateway.session_operator import check_local_input, is_viewer_input
     if not is_viewer_input(row) or not isinstance(row['payload'].get('text'), str):
         return None
     check_local_input(authority, ref, row)
+    if not native_owner_current(authority):
+        return None
     return {'text': row['payload']['text'], 'identity': row['principal_id'],
             'profile': str(authority.profile_id), 'session': authority.sessions[ref.session_id].route,
             'admission': row['admission_id'], 'generation': row['generation']}

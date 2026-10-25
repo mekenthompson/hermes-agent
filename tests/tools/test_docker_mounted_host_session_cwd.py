@@ -19,8 +19,10 @@ When the registered cwd is the mounted host directory, both must land on
 import pytest
 
 import tools.terminal_tool as tt
+from tools.approval_context import approval_task_context
 from tools.environments.base import BaseEnvironment
 from tools.environments.base_session_env import _wrap_command_script
+from tools.process_registry import ProcessSession
 
 
 MNT = "/mnt/d/projects/app"
@@ -138,17 +140,17 @@ class TestMountedHostSessionCwd:
         def fake_spawn(process_registry, *, env, env_type, command, cwd, **kwargs):
             captured["cwd"] = cwd
 
-            class _Session:
-                id = "bg-1"
-                pid = 1
-
-            return _Session()
+            session = ProcessSession(id="bg-1", pid=1, command=command)
+            kwargs['prepare_session'](session)
+            return session
 
         monkeypatch.setattr("tools.terminal_tool_background._spawn", fake_spawn)
         task_id = "desktop-sess"
         tt.register_task_env_overrides(task_id, {"cwd": host, "cwd_source": "session"})
         try:
-            tt.terminal_tool(command="pwd", task_id=task_id, background=True)
+            with approval_task_context("Check the mounted background cwd", identity="fixture-owner", profile="fixture",
+                                       session=task_id, task_id=task_id, is_current=lambda: True):
+                tt.terminal_tool(command="pwd", task_id=task_id, background=True)
         finally:
             tt.clear_task_env_overrides(task_id)
         assert captured["cwd"] == "/workspace"

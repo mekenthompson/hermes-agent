@@ -13,6 +13,7 @@ import os
 import time
 import pytest
 from unittest.mock import patch
+from tools.approval_context import approval_task_context, current_approval_task_context
 
 from tools.process_registry import (
     ProcessRegistry,
@@ -306,8 +307,10 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     dummy_env = SimpleNamespace(env={})
 
     def fake_spawn_local(**kwargs):
-        return SimpleNamespace(
+        assert current_approval_task_context() is not None
+        session = ProcessSession(
             id="proc_silent_test",
+            command=kwargs["command"],
             pid=4242,
             notify_on_complete=False,
             watcher_platform="",
@@ -318,6 +321,8 @@ def _silent_bg_harness(monkeypatch, tmp_path):
             watcher_message_id="",
             watcher_interval=0,
         )
+        kwargs["_prepare_session"](session)
+        return session
 
     monkeypatch.setattr(terminal_tool_module, "_get_env_config", lambda: config)
     monkeypatch.setattr(terminal_tool_module, "_start_cleanup_thread", lambda: None)
@@ -333,12 +338,14 @@ def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_pa
     and the agent has no signal it finished. Tool must nudge."""
     tt = _silent_bg_harness(monkeypatch, tmp_path)
     try:
-        result = json.loads(
-            tt.terminal_tool(
-                command="while true; do gh pr checks 999; sleep 30; done",
-                background=True,
+        with approval_task_context("Run the silent watcher", identity="fixture-owner", profile=str(tmp_path),
+                                   session="silent-hint", task_id="silent-watcher", is_current=lambda: True):
+            result = json.loads(
+                tt.terminal_tool(
+                    command="while true; do gh pr checks 999; sleep 30; done",
+                    background=True,
+                )
             )
-        )
     finally:
         tt._active_environments.pop("default", None)
         tt._last_activity.pop("default", None)
@@ -355,13 +362,15 @@ def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):
     """The correct shape — bg+notify together — must not nag."""
     tt = _silent_bg_harness(monkeypatch, tmp_path)
     try:
-        result = json.loads(
-            tt.terminal_tool(
-                command="pytest tests/",
-                background=True,
-                notify_on_complete=True,
+        with approval_task_context("Run the tests and notify on completion", identity="fixture-owner", profile=str(tmp_path),
+                                   session="notify-hint", task_id="test-suite", is_current=lambda: True):
+            result = json.loads(
+                tt.terminal_tool(
+                    command="pytest tests/",
+                    background=True,
+                    notify_on_complete=True,
+                )
             )
-        )
     finally:
         tt._active_environments.pop("default", None)
         tt._last_activity.pop("default", None)
@@ -423,17 +432,20 @@ def test_non_ci_background_command_does_not_emit_homebrew_hint(monkeypatch, tmp_
     combination of `gh pr ...` AND a stdout parser."""
     tt = _silent_bg_harness(monkeypatch, tmp_path)
     try:
-        result = json.loads(
-            tt.terminal_tool(
-                command="cat /var/log/syslog | awk '/error/ {print}' > /tmp/errs.log",
-                background=True,
-                notify_on_complete=True,
+        with approval_task_context("Collect matching log entries", identity="fixture-owner", profile=str(tmp_path),
+                                   session="non-ci-hint", task_id="collect-logs", is_current=lambda: True):
+            result = json.loads(
+                tt.terminal_tool(
+                    command="cat /var/log/syslog | awk '/error/ {print}' > /tmp/errs.log",
+                    background=True,
+                    notify_on_complete=True,
+                )
             )
-        )
     finally:
         tt._active_environments.pop("default", None)
         tt._last_activity.pop("default", None)
 
+    assert result["error"] is None
     assert "hint" not in result, (
         f"Non-CI command using awk must not be flagged as homebrew CI poller, got: {result.get('hint')!r}"
     )

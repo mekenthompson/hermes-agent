@@ -185,6 +185,13 @@ async def operation(authority, name, params, actor=None):
             # The claim commits before execute() registers its event; latching the
             # cancellation on the admission here means that window cannot lose it.
             _cancellations(authority).setdefault(row['admission_id'], threading.Event()).set()
+        # Each cron session is one immutable fire. Its children may outlive the completed
+        # parent; cancel still revokes those existing Stop leases on this exact session.
+        live = authority.sessions.get(ref.session_id)
+        if live is not None:
+            with live.event_stream.lock:
+                for lease in list(getattr(live, 'approval_task_leases', ())):
+                    lease.revoke()
         return {'ok': True}
     result, flags = None, {}
     if row['status'] == 'terminal':
@@ -231,6 +238,67 @@ def _run_identified(run_job, job, execution_id, **kwargs):
         exit_cron_execution(token)
 
 
+def _approval_task_scope(authority, ref, row, policy, data, cancel):
+    """Only the scheduler's committed frozen fire may lend authority to native children."""
+    from weakref import WeakSet
+    from gateway.session_local_recovery import owned_receipt
+    from gateway.session_native_approval import native_claim_current, native_owner_current, native_task_context
+    from gateway.session_policy import restore_policy
+    from tools.approval_context import approval_task_context
+
+    # A drain inherits its submitter's ContextVars, but this separately admitted fire owns
+    # its own lifetime. Only the canonical receipt and current claim below can bind it.
+    unverified = approval_task_context('', identity='unverified', profile='', session='', is_current=lambda: False)
+    if getattr(policy, 'source', None) != 'cron' or getattr(policy, 'platform', None) != 'cron':
+        return unverified
+    if (row.get('status') != 'started' or type(row.get('generation')) is not int
+            or row.get('owner_epoch') != authority.epoch
+            or authority.executing.get(ref.session_id) != row['generation']):
+        return unverified
+    live = authority.sessions[ref.session_id]
+    receipt, source, route, _entry = owned_receipt(authority, ref.session_id)
+    if (ref.profile_id != authority.profile_id or receipt['principal_id'] != CRON_PRINCIPAL_ID
+            or row['principal_id'] != CRON_PRINCIPAL_ID or source.to_dict() != live.source.to_dict()
+            or route != live.route or receipt['request_id'] != row['request_id']
+            or restore_policy(receipt['policy']) != policy or policy.source != 'cron'
+            or policy.platform != 'cron'):
+        return unverified
+    arrival_epoch = authority.route_epoch(route)
+    fields = ('owner_epoch', 'generation', 'target_session_id', 'principal_id', 'request_id', 'payload')
+
+    def current(parent_returned=False):
+        if (cancel.is_set() or not native_owner_current(authority)
+                or authority.sessions.get(ref.session_id) is not live or live.superseded
+                or authority.route_epoch(route) != arrival_epoch):
+            return False
+        committed = get_session_admission(authority.db, admission_id=row['admission_id'])
+        if (committed is None or committed['owner_epoch'] != authority.epoch
+                or committed['target_session_id'] != ref.session_id
+                or any(committed[key] != row[key] for key in fields)):
+            return False
+        if committed['status'] == 'started':
+            return (native_claim_current(authority, live, row, parent_returned=parent_returned)
+                    and authority.pending_stops.get(ref.session_id) != row['generation']
+                    and authority.delivered_stops.get(ref.session_id) != row['generation'])
+        entry = authority.runner.session_store.lookup_by_session_key(route)
+        return (committed['status'] == 'terminal' and committed['outcome'] == 'completed'
+                and entry is not None and not entry.suspended
+                and authority.logical_owner(entry.session_id) == ref.session_id)
+
+    def own(lease):
+        with live.event_stream.lock:
+            leases = getattr(live, 'approval_task_leases', None)
+            if leases is None:
+                leases = live.approval_task_leases = WeakSet()
+            leases.add(lease)
+            if not current():
+                lease.revoke()
+
+    text = '\n\n'.join(value for value in (data['cron_job'].get('prompt'), data['extra_prompt']) if value)
+    return native_task_context(text, identity=CRON_PRINCIPAL_ID, profile=str(authority.profile_id),
+        session=route, task_id=row['admission_id'], run_id=str(row['generation']), is_current=current, owner=own)
+
+
 async def execute(authority, ref, row, policy):
     from cron.scheduler import run_job
     from gateway.run import _profile_runtime_scope
@@ -255,18 +323,18 @@ async def execute(authority, ref, row, policy):
     token = bind_execution(authority, ref.session_id, job['id'], execution_id)
     try:
         db_path = await asyncio.to_thread(Path(authority.db.db_path).resolve)
-        with _profile_runtime_scope(db_path.parent):
+        with _profile_runtime_scope(db_path.parent), _approval_task_scope(authority, ref, row, policy, data, cancel):
             result = await asyncio.to_thread(_run_identified, run_job, job, execution_id,
                                              extra_prompt=data['extra_prompt'], cancel_event=cancel)
-        # run_job stamps run-side verdicts on ITS job copy (quota hold, unreachable model); the
-        # firing scheduler's bookkeeping reads them off its own dict, so they ride the result.
-        flags = {key: job[key] for key in RUN_JOB_FLAGS if key in job}
-        authority.pending_results[row['admission_id']] = {
-            'result': {'final_response': result[2], 'cron_result': list(result), 'cron_job_flags': flags,
-                       'failed': not result[0], 'completed': result[0]}, 'usage': {}}
-        if not result[0]:
-            raise RuntimeError(result[3] or 'cron execution failed')
-        return result[2]
+            # run_job stamps run-side verdicts on ITS job copy (quota hold, unreachable model); the
+            # firing scheduler's bookkeeping reads them off its own dict, so they ride the result.
+            flags = {key: job[key] for key in RUN_JOB_FLAGS if key in job}
+            authority.pending_results[row['admission_id']] = {
+                'result': {'final_response': result[2], 'cron_result': list(result), 'cron_job_flags': flags,
+                           'failed': not result[0], 'completed': result[0]}, 'usage': {}}
+            if not result[0]:
+                raise RuntimeError(result[3] or 'cron execution failed')
+            return result[2]
     finally:
         from cron.scheduler_liveness import owner_progress
         owner_progress.pop(execution_id, None)

@@ -372,10 +372,12 @@ def _approval_task_scope(authority, ref, row, live, event, *, is_api):
                                 source.thread_id, source.user_id], separators=(',', ':'))
         if row['principal_id'] != 'messaging:' + principal:
             return nullcontext()
-    from tools.approval_context import approval_task_context
+    from gateway.session_native_approval import native_claim_current, native_owner_current, native_task_context
     from hermes_state_runtime import get_session_admission
 
-    def is_current():
+    def is_current(parent_returned=False):
+        if not native_owner_current(authority):
+            return False
         if authority.sessions.get(ref.session_id) is not live:
             return False
         committed = get_session_admission(authority.db, admission_id=row['admission_id'])
@@ -384,7 +386,7 @@ def _approval_task_scope(authority, ref, row, live, event, *, is_api):
                 or committed['target_session_id'] != ref.session_id):
             return False
         if committed['status'] == 'started':
-            if authority.executing.get(ref.session_id) != row['generation']:
+            if not native_claim_current(authority, live, row, parent_returned=parent_returned):
                 return False
             run_generation = getattr(event, '_approval_run_generation', None)
             return (run_generation is not None
@@ -407,7 +409,7 @@ def _approval_task_scope(authority, ref, row, live, event, *, is_api):
                 leases = live.approval_task_leases = WeakSet()
             leases.add(lease)
 
-    return approval_task_context(
+    return native_task_context(
         event.text, identity=row['principal_id'],
         profile=str(authority.profile_id), session=str(live.route),
         task_id=row['admission_id'], run_id=str(row['generation']), is_current=is_current, owner=own,

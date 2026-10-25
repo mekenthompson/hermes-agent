@@ -15,7 +15,7 @@ from gateway.run import (
 from gateway.session_context import set_session_vars
 from gateway.session_state import SessionState
 from model_tools import handle_function_call
-from tools.approval_context import set_current_session_key
+from tools.approval_context import approval_task_context, set_current_session_key
 from tools.process_registry import process_registry
 
 
@@ -444,8 +444,11 @@ def _bind_session(session_key, session_id, platform="telegram"):
 
 
 def _spawn_background(turn_task_id, spawned):
-    out = json.loads(handle_function_call(
-        "terminal", {"command": "sleep 300", "background": True}, task_id=turn_task_id))
+    # These cleanup units call the producer without running the gateway's ingress.
+    with approval_task_context("Start this turn's cleanup process", identity="fixture-owner", profile="fixture",
+                               session=turn_task_id, task_id=turn_task_id, is_current=lambda: True):
+        out = json.loads(handle_function_call(
+            "terminal", {"command": "sleep 300", "background": True}, task_id=turn_task_id))
     spawned.append(process_registry.get(out["session_id"]))
     return spawned[-1]
 

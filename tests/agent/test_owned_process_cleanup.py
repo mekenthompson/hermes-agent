@@ -5,6 +5,7 @@ import sys
 
 from agent.turn_context import _bind_turn_identity
 from run_agent import AIAgent
+from tools.approval_context import approval_task_context
 from tools.process_registry import ProcessRegistry
 from tools.terminal_tool import terminal_tool
 
@@ -18,8 +19,11 @@ def _agent():
 def _spawn(agent, task_id, tmp_path):
     _bind_turn_identity(agent, task_id, None, None, None, None)
     command = shlex.quote(sys.executable) + " -c " + shlex.quote("import time; time.sleep(60)")
-    result = json.loads(terminal_tool(command, background=True, task_id=task_id,
-                                     workdir=str(tmp_path), notify_on_complete=True))
+    # This teardown unit calls the producer directly, outside an admitted turn.
+    with approval_task_context("Start the process owned by this agent", identity="fixture-owner", profile=str(tmp_path),
+                               session=agent.session_id, task_id=task_id, is_current=lambda: True):
+        result = json.loads(terminal_tool(command, background=True, task_id=task_id,
+                                         workdir=str(tmp_path), notify_on_complete=True))
     return result["session_id"]
 
 

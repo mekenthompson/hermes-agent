@@ -160,6 +160,7 @@ def test_authenticated_desktop_process_completion_retains_command_authority(tmp_
     def spawn(_registry, **kwargs):
         proc = processes[len(spawned)]
         proc.session_key = kwargs['session_key']
+        kwargs['prepare_session'](proc)
         with process_registry._lock:
             process_registry._running[proc.id] = proc
         spawned.append(proc)

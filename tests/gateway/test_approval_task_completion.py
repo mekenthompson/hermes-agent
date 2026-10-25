@@ -45,7 +45,11 @@ async def test_process_spawn_completion_reviewer_uses_live_origin(tmp_path, monk
                           parent_session_id=target, started_at=1700000000.0,
                           watcher_platform='local', watcher_chat_id=live.source.chat_id,
                           watcher_user_id=live.source.user_id)
-    monkeypatch.setattr('tools.terminal_tool_background._spawn', lambda *_a, **_k: proc)
+    def spawn(*_args, **kwargs):
+        kwargs['prepare_session'](proc)
+        return proc
+
+    monkeypatch.setattr('tools.terminal_tool_background._spawn', spawn)
     monkeypatch.setattr('tools.terminal_tool_background._register_completion_watcher', lambda *_a: None)
     with process_registry._lock:
         process_registry._running[proc.id] = proc
@@ -94,7 +98,8 @@ async def test_process_spawn_completion_reviewer_uses_live_origin(tmp_path, monk
         evidence, verdict = observed[0]
         assert evidence.text == 'Build only src/cli.py'
         assert evidence.task_id == origin.task_id
-        assert len(evidence.ancestry) == 1 and evidence.ancestry[0].startswith('completion:')
+        assert evidence.ancestry[:-1] == origin.ancestry
+        assert evidence.ancestry[-1].startswith('completion:')
         assert verdict == 'approve'
         await async_wait_until(lambda: proc.approval_task_reservation is None,
                                timeout=10, what='completion reservation settlement')

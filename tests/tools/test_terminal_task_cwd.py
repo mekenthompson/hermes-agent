@@ -1,9 +1,9 @@
 """Regression tests for task/session cwd propagation in terminal_tool."""
 
 import json
-from types import SimpleNamespace
-
 from tools import terminal_tool
+from tools.approval_context import approval_task_context
+from tools.process_registry import ProcessSession
 
 
 def _minimal_terminal_config(cwd="/default"):
@@ -132,7 +132,9 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
 
         def spawn_local(self, **kwargs):
             self.calls.append(kwargs)
-            return SimpleNamespace(id="proc_test", pid=1234)
+            session = ProcessSession(id="proc_test", pid=1234, command=kwargs['command'])
+            kwargs['_prepare_session'](session)
+            return session
 
     import tools.process_registry as process_registry_mod
 
@@ -153,13 +155,15 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
     monkeypatch.setattr(process_registry_mod, "process_registry", registry)
     terminal_tool.record_session_cwd(task_id, "/workspace/live")
 
-    result = json.loads(
-        terminal_tool.terminal_tool(
-            command="sleep 1",
-            task_id=task_id,
-            background=True,
+    with approval_task_context("Check the background cwd", identity="fixture-owner", profile="fixture",
+                               session=task_id, task_id=task_id, is_current=lambda: True):
+        result = json.loads(
+            terminal_tool.terminal_tool(
+                command="sleep 1",
+                task_id=task_id,
+                background=True,
+            )
         )
-    )
 
     assert result["exit_code"] == 0
     # session_key falls back to the raw task_id when no gateway contextvar is set
@@ -183,7 +187,9 @@ def test_host_local_background_command_bypasses_configured_backend(tmp_path, mon
 
         def spawn_local(self, **kwargs):
             calls.append(("local", kwargs))
-            return SimpleNamespace(id="proc_host", pid=1234)
+            session = ProcessSession(id="proc_host", pid=1234, command=kwargs['command'])
+            kwargs['_prepare_session'](session)
+            return session
 
         def spawn_via_env(self, **kwargs):
             calls.append(("configured", kwargs))
@@ -222,15 +228,17 @@ def test_host_local_background_command_bypasses_configured_backend(tmp_path, mon
     monkeypatch.setattr(self_repo_guard, "guard_active", lambda: False)
     monkeypatch.setattr(process_registry_mod, "process_registry", FakeRegistry())
 
-    result = json.loads(
-        terminal_tool.terminal_tool(
-            command="host-runner",
-            task_id=task_id,
-            workdir=str(tmp_path),
-            background=True,
-            _host_local=True,
+    with approval_task_context("Check the host-local background cwd", identity="fixture-owner", profile=str(tmp_path),
+                               session=task_id, task_id=task_id, is_current=lambda: True):
+        result = json.loads(
+            terminal_tool.terminal_tool(
+                command="host-runner",
+                task_id=task_id,
+                workdir=str(tmp_path),
+                background=True,
+                _host_local=True,
+            )
         )
-    )
 
     assert result["session_id"] == "proc_host"
     assert calls[0][0] == "local"

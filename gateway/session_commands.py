@@ -467,8 +467,11 @@ async def execute_command(connection, ref, params, *, dispatch=False):
         await before()  # mid-run the busy dispatcher fires it once it accepts the command (``BUSY_ACCEPTED``)
     if runner_command is not None:
         from gateway.plugin_command_choice import viewer_choices
+        from gateway.session_command_approval import command_task_scope
+        typed = '/' + name + (' ' + arg if arg else '')
         with (_profile_runtime_scope(home), _session_workspace(authority.runner, live.source),
-              viewer_choices(live, ref.session_id)):
+              viewer_choices(live, ref.session_id),
+              command_task_scope(authority, ref, actor.subject, typed, arrival_epoch)):
             output = await _run_runner_command(authority.runner, live, name, arg, *runner_command)
         return {'type': 'exec', 'output': _text(output)}
     if definition is None:
