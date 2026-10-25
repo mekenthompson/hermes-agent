@@ -660,6 +660,9 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_body: dict[str, Any]
     if block_body is not None:
         result = json.dumps(block_body, ensure_ascii=False)
         error_type, error_message = block_error_type, block_body.get("message") or block_body["error"]
+        result = agent._append_guardrail_observation(
+            ref.name, ref.args, result, failed=True, tool_call_id=ref.call_id, refused=True,
+        )
     else:
         result = agent._guardrail_block_result(guardrail_decision)
         error_type = "guardrail_block"
@@ -1099,9 +1102,8 @@ def _commit_tool_result(
 ):
     """Observe (``observed`` results only) and log the outcome; mark the tool done; persist/
     spill, hint, wrap and append the result; flush the session DB; project ``tool.completed``.
-
-    Blocked calls never ran, so they are neither guardrail-observed nor fed to the file-
-    mutation verifier; ``success_log_chars`` (sequential path) also logs the completion line.
+    Blocked calls were already refusal-observed at admission; never count them again
+    or feed them to the mutation verifier. ``success_log_chars`` also logs completion.
     Returns ``(persisted_result, display_result, risk_metadata)`` (``display_result`` =
     pre-persist content for UI previews) or ``None`` when the flush failed (stop the batch).
     """
