@@ -275,6 +275,7 @@ _UPDATE_PIPELINE = (
     "hermes_cli/release_channels.py",
     "hermes_cli/gitlock.py",  # git self-heal + partial-clone fetch
     "hermes_cli/process_identity.py",  # marker owner liveness
+    "hermes_cli/process_custody.py",  # OS subreaper primitives used by update_custody
     "hermes_cli/runtime_state.py",
     "hermes_cli/relaunch.py",
     "hermes_cli/managed_uv.py",

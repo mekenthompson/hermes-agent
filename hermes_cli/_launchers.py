@@ -400,8 +400,10 @@ def _hermes_closure_repair():
                 meta, _, rel = entry.decode('utf-8', 'replace').partition('\\t')
                 if meta.split()[1:2] == ['blob']:
                     ids[rel] = meta.split()[2]
+            selected = tuple(rel for rel in __CLOSURE__ if rel in ids or rel not in __CLOSURE_ADDITIONS__)
+            files = (*selected, __INIT__)
             blobs = {__INIT__: b''}
-            for rel in __CLOSURE__:
+            for rel in selected:
                 blobs[rel] = git_out('cat-file', 'blob', ids[rel])
                 if blob_id(blobs[rel]) != ids[rel]:  # an object that inflates to bytes pre never had
                     raise OSError('%s does not hash to %s' % (rel, ids[rel]))
@@ -457,6 +459,7 @@ def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> s
     from hermes_cli._early_recovery import (
         INTERRUPTED_PULL_MARKER,
         RECOVERY_CLOSURE,
+        RECOVERY_CLOSURE_ADDITIONS,
         RECOVERY_CLOSURE_DIR,
         RECOVERY_CLOSURE_INIT,
         RECOVERY_CLOSURE_MANIFEST,
@@ -467,6 +470,7 @@ def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> s
                       .replace("__MANIFEST__", repr(RECOVERY_CLOSURE_MANIFEST))
                       .replace("__INIT__", repr(RECOVERY_CLOSURE_INIT))
                       .replace("__CLOSURE__", repr(RECOVERY_CLOSURE))
+                      .replace("__CLOSURE_ADDITIONS__", repr(RECOVERY_CLOSURE_ADDITIONS))
                       .replace("__ROOT__", repr(root)))  # last: a path is never re-substituted
     return (
         # The repair's own stdlib, bound before the checkout root goes on sys.path: a stdlib-named
@@ -495,6 +499,9 @@ def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> s
         f"    print_runtime_command(Path({root!r}), sys.argv[2:])\n"
         "    sys.exit(0)\n"
         f"sys.{PIN_DEFAULT_HOME_FLAG} = True\n"
+        f"if not os.path.isfile(os.path.join({root!r}, 'hermes_bootstrap.py')):\n"
+        "    _hermes_closure_repair()\n"
+        "    raise ImportError('The owning checkout is missing hermes_bootstrap.py')\n"
         "try:\n"
         "    import hermes_bootstrap\n"
         "except Exception:\n"

@@ -10,12 +10,13 @@ import pytest
 
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("live_owner", [True, False])
-def test_torn_custody_modules_cannot_authorize_uncontained_repair(tmp_path, live_owner):
+@pytest.mark.parametrize("custody_module", ["update_custody.py", "process_custody.py"])
+def test_torn_custody_modules_cannot_authorize_uncontained_repair(tmp_path, live_owner, custody_module):
     source = Path(__file__).resolve().parents[2]
     root = tmp_path / "checkout"
     package = root / "hermes_cli"
     package.mkdir(parents=True)
-    for name in ("__init__.py", "_early_recovery.py", "update_lock.py", "update_custody.py"):
+    for name in ("__init__.py", "_early_recovery.py", "update_lock.py", "update_custody.py", "process_custody.py"):
         shutil.copy2(source / "hermes_cli" / name, package / name)
     env = {**os.environ, "HOME": str(tmp_path / "home"), "HERMES_HOME": str(tmp_path / "state"),
            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
@@ -56,7 +57,7 @@ def test_torn_custody_modules_cannot_authorize_uncontained_repair(tmp_path, live
                              env=env, stdout=subprocess.PIPE, text=True, encoding="utf-8")
     try:
         assert owner.stdout.readline().strip() == "HELD"
-        damaged = ("update_lock.py", "update_custody.py") if live_owner else ("update_custody.py",)
+        damaged = ("update_lock.py", custody_module) if live_owner else (custody_module,)
         if not live_owner:
             owner.kill()
             owner.wait()

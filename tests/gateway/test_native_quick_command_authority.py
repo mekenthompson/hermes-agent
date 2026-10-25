@@ -418,7 +418,10 @@ async def test_native_stop_reconciles_actual_spawn_before_its_receipt_returns(tm
                 await async_wait_until(pending.done, timeout=10, what='cancelled quick-command observer')
                 assert pending.cancelled() and not stopping.done()
                 assert command_effects(runtime.authority) and uncounted_runtime_work(runtime.authority.runner) > 0
-                assert _alive(shell) and _alive(child), 'the actual receipt must remain owned while it waits'
+                # The independent controller may already have stopped the scope.
+                # Its delayed producer receipt must still belong to this resource.
+                assert registry.get(session.id) is session and session._custody is not None
+                assert not tree.effect.exists()
         receipt.set()
         if stopping is not None:
             await asyncio.wait_for(stopping, 20)

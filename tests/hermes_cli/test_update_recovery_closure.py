@@ -29,7 +29,7 @@ SOURCE = Path(__file__).resolve().parents[2]
 BOOT = ("hermes_bootstrap.py", "hermes_constants.py", "hermes_cli/__init__.py", "hermes_cli/_launchers.py",
         "hermes_cli/_early_recovery.py", "hermes_cli/_parser.py", "hermes_cli/runtime_state.py",
         "hermes_cli/venv_sync.py", "hermes_cli/steward.py", "hermes_cli/stderr_timestamp.py",
-        "hermes_cli/update_lock.py", "hermes_cli/update_custody.py", "pm/environments.py",
+        "hermes_cli/update_lock.py", "hermes_cli/update_custody.py", "hermes_cli/process_custody.py", "pm/environments.py",
         "pm/filesystem.py", "pm/paths.py")
 _HOLDER = ("import sys, time\nfrom pathlib import Path\nsys.path.insert(0, sys.argv[1])\n"
            "from hermes_cli.update_lock import UpdateLock\n"
@@ -110,6 +110,7 @@ def _killed_mid_write(tmp_path: Path, rel: str, committed: dict[str, str] | None
     ("hermes_cli/_early_recovery.py", True, True),
     ("hermes_cli/__init__.py", True, True),
     ("hermes_cli/update_lock.py", True, True),
+    ("hermes_cli/process_custody.py", True, True),
     # An updater that predates publication: the launcher reads the same files from git's objects.
     ("hermes_bootstrap.py", True, False),
 ])
@@ -164,15 +165,22 @@ def test_the_published_repair_leaves_the_tree_to_a_live_writer_holding_the_check
 
 
 @pytest.mark.platforms("posix")
-@pytest.mark.parametrize("damage", ["truncated", "foreign"])
+@pytest.mark.parametrize("damage", ["truncated", "foreign", "missing_helper"])
 def test_a_damaged_published_closure_is_rebuilt_from_git_objects_not_trusted(tmp_path, damage):
     """A power loss can leave the published closure with bytes git never had: they never run, and the
     launch rebuilds the closure from ``pre``'s objects before repairing (M1)."""
     root, env, original, launcher = _killed_mid_write(tmp_path, "hermes_bootstrap.py")
     (closure,) = (root / ".git/hermes-update-recovery").iterdir()
-    module = closure / "hermes_cli/_early_recovery.py"
-    module.write_bytes(b"" if damage == "truncated" else
-                       module.read_bytes() + b"\nprint('NOT_PRE_CODE_RAN', file=__import__('sys').stderr)\n")
+    if damage == "missing_helper":
+        # A previous publisher omitted the dependency but otherwise wrote a self-consistent manifest.
+        (closure / "hermes_cli/process_custody.py").unlink()
+        manifest = closure / "MANIFEST"
+        manifest.write_text("".join(line for line in manifest.read_text().splitlines(keepends=True)
+                                    if not line.endswith(" hermes_cli/process_custody.py\n")))
+    else:
+        module = closure / "hermes_cli/_early_recovery.py"
+        module.write_bytes(b"" if damage == "truncated" else
+                           module.read_bytes() + b"\nprint('NOT_PRE_CODE_RAN', file=__import__('sys').stderr)\n")
     launch = subprocess.run([str(launcher)], cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8",
                             errors="replace", timeout=60, check=False)
     assert launch.returncode == 0 and "APP_REACHED" in launch.stdout, launch.stderr
@@ -222,14 +230,16 @@ def test_a_stdlib_named_file_in_the_tree_never_runs_before_the_repair(tmp_path, 
     assert not (root / ".git/hermes-update-pull").exists()
 
 
-def test_the_closure_is_pres_committed_bytes_read_in_one_cat_file_spawn(tmp_path, monkeypatch):
+@pytest.mark.parametrize("helper_present", [False, True])
+def test_the_closure_is_pres_committed_bytes_read_in_one_cat_file_spawn(tmp_path, monkeypatch, helper_present):
     """The published repair is ``pre``'s committed bytes, not the working tree's, read with one
     ``git cat-file --batch`` (the preflight's batched reader), not a ``cat-file`` per file."""
     from hermes_cli import update_cmd_commit as commit
     from hermes_cli._early_recovery import RECOVERY_CLOSURE
 
     root = tmp_path / "checkout"
-    for rel in RECOVERY_CLOSURE:
+    selected = tuple(rel for rel in RECOVERY_CLOSURE if helper_present or rel != "hermes_cli/process_custody.py")
+    for rel in selected:
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
         (root / rel).write_bytes(f"# {rel} at pre\n".encode())
     env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
@@ -244,6 +254,11 @@ def test_the_closure_is_pres_committed_bytes_read_in_one_cat_file_spawn(tmp_path
 
     closure = commit.publish_recovery_closure(["git"], root, pre)
 
-    for rel in RECOVERY_CLOSURE:
+    for rel in selected:
         assert (closure / rel).read_bytes() == f"# {rel} at pre\n".encode()
+    assert (closure / "hermes_cli/process_custody.py").exists() is helper_present
     assert spawns == ["ls-tree", "cat-file"]
+    assert commit.recovery_closure_verified(closure, pre, selected)
+    spawns.clear()
+    assert commit.publish_recovery_closure(["git"], root, pre) == closure
+    assert spawns == ["ls-tree"], "a cached closure must be checked against this PRE's actual dependency set"

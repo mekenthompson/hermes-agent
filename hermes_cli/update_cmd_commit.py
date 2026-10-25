@@ -25,6 +25,7 @@ from typing import Optional
 
 from hermes_cli._early_recovery import (
     RECOVERY_CLOSURE,
+    RECOVERY_CLOSURE_ADDITIONS,
     RECOVERY_CLOSURE_INIT,
     RECOVERY_CLOSURE_MANIFEST,
     blob_id,
@@ -242,8 +243,6 @@ def publish_recovery_closure(git_cmd, root: Path, pre: str) -> Path:
     if not is_object_id(pre):
         raise OSError(f"not a commit id: {pre!r}")
     dest = recovery_closure_dir(Path(root), pre)
-    if recovery_closure_verified(dest, pre):
-        return dest
     git_cmd = [*([git_cmd] if isinstance(git_cmd, str) else git_cmd), "--no-replace-objects"]
     listed = run_git(git_cmd, ["ls-tree", "-z", "--full-tree", pre, "--", *RECOVERY_CLOSURE], cwd=str(root),
                      capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
@@ -252,9 +251,12 @@ def publish_recovery_closure(git_cmd, root: Path, pre: str) -> Path:
         meta, _, rel = entry.decode("utf-8", "replace").partition("\t")
         if meta.split()[1:2] == ["blob"]:
             ids[rel] = meta.split()[2]
+    files = tuple(rel for rel in RECOVERY_CLOSURE if rel in ids or rel not in RECOVERY_CLOSURE_ADDITIONS)
+    if recovery_closure_verified(dest, pre, files):
+        return dest
     blobs = {RECOVERY_CLOSURE_INIT: b""}
-    shown = read_target_files(git_cmd, root, pre, RECOVERY_CLOSURE)  # one spawn, not a cat-file per file
-    for rel in RECOVERY_CLOSURE:
+    shown = read_target_files(git_cmd, root, pre, files)  # one spawn, not a cat-file per file
+    for rel in files:
         if rel not in ids or shown[rel] is None or blob_id(shown[rel], pre) != ids[rel]:
             raise OSError(f"{rel} is not in {pre[:10]}")
         blobs[rel] = shown[rel]

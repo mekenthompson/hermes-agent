@@ -187,7 +187,8 @@ def test_the_critical_inventory_covers_every_module_the_entry_paths_import_first
     assert entry <= set(update_cmd._UPDATE_CRITICAL_FILES), sorted(entry - set(update_cmd._UPDATE_CRITICAL_FILES))
 
 
-def test_a_malformed_bootstrap_is_refused_before_the_move(tmp_path):
+@pytest.mark.parametrize("relative", ["hermes_bootstrap.py", "hermes_cli/process_custody.py"])
+def test_a_malformed_bootstrap_is_refused_before_the_move(tmp_path, relative):
     """The preflight reads the real inventory from the target commit: a broken bootstrap refuses."""
     from hermes_cli import update_cmd_commit as commit
 
@@ -197,12 +198,14 @@ def test_a_malformed_bootstrap_is_refused_before_the_move(tmp_path):
     git("init", "-b", "main")
     git("config", "user.email", "test@example.invalid")
     git("config", "user.name", "Test")
-    (tmp_path / "hermes_bootstrap.py").write_text("def broken(:\n", encoding="utf-8")
+    malformed = tmp_path / relative
+    malformed.parent.mkdir(parents=True, exist_ok=True)
+    malformed.write_text("def broken(:\n", encoding="utf-8")
     (tmp_path / "hermes_constants.py").write_text("ok = 1\n", encoding="utf-8")
     git("add", ".")
     git("commit", "-m", "broken bootstrap")
     refused = commit.target_syntax_error(["git"], tmp_path, "HEAD", update_cmd._UPDATE_CRITICAL_FILES)
-    assert refused is not None and refused[0] == "hermes_bootstrap.py"
+    assert refused is not None and refused[0] == relative
 
 
 def test_the_preflight_reads_every_critical_file_in_one_git_spawn(tmp_path, monkeypatch):

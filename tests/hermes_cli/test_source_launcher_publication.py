@@ -590,7 +590,7 @@ def _torn_by_a_killed_merge(tmp_path, monkeypatch):
     interrupted-pull marker of a dead updater, ``.git/index.lock`` and no ``hermes_constants.py``.
     """
     repo, home, interpreter = fixture_tree(tmp_path, monkeypatch)
-    for relative in ("hermes_cli/update_lock.py", "hermes_cli/update_custody.py"):
+    for relative in ("hermes_cli/update_lock.py", "hermes_cli/update_custody.py", "hermes_cli/process_custody.py"):
         shutil.copy2(ROOT / relative, repo / relative)
 
     def git(*args):

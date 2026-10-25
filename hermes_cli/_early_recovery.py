@@ -257,7 +257,10 @@ def interrupted_pull_marker(root: Path) -> Path:
 # objects first when no updater published them (``_launchers._CLOSURE_REPAIR``).
 # The modules import only the stdlib and each other; the package initializer is published empty.
 RECOVERY_CLOSURE_DIR = "hermes-update-recovery"
-RECOVERY_CLOSURE = ("hermes_cli/_early_recovery.py", "hermes_cli/update_lock.py", "hermes_cli/update_custody.py")
+# Additions are absent only in older PRE revisions; the committed tree selects the closure.
+RECOVERY_CLOSURE_ADDITIONS = ("hermes_cli/process_custody.py",)
+RECOVERY_CLOSURE = ("hermes_cli/_early_recovery.py", "hermes_cli/update_lock.py", "hermes_cli/update_custody.py",
+                    *RECOVERY_CLOSURE_ADDITIONS)
 
 
 # ``<blob id> <path>`` per published file (``RECOVERY_CLOSURE`` + the empty package initializer):
@@ -284,12 +287,12 @@ def blob_id(data: bytes, like: str) -> str:
     return hashlib.new("sha1" if len(like) == 40 else "sha256", b"blob %d\0" % len(data) + data).hexdigest()
 
 
-def recovery_closure_verified(closure: Path, pre: str) -> bool:
+def recovery_closure_verified(closure: Path, pre: str, files=RECOVERY_CLOSURE) -> bool:
     """Every closure file present with exactly the bytes its manifest names, and nothing missing."""
     try:
         listed = dict(line.split(" ", 1)[::-1] for line in
                       (closure / RECOVERY_CLOSURE_MANIFEST).read_text(encoding="utf-8-sig").splitlines())
-        return (set(listed) == {*RECOVERY_CLOSURE, RECOVERY_CLOSURE_INIT}
+        return (set(listed) == {*files, RECOVERY_CLOSURE_INIT}
                 and listed[RECOVERY_CLOSURE_INIT] == blob_id(b"", pre)
                 and all(blob_id((closure / rel).read_bytes(), pre) == oid for rel, oid in listed.items()))
     except (OSError, ValueError):
