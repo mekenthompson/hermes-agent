@@ -9,15 +9,18 @@ _LOCAL_PENDING = 'Local process launch receipt is pending; reconcile this sessio
 
 
 def spawn_local(registry, command, cwd, task_id, session_key, env_vars, use_pty,
-                owner_task_id, persist_on_release, prepare_session):
+                owner_task_id, persist_on_release, prepare_session, reserved_session=None):
     from tools import process_registry as facade
     from tools.approval_context import current_approval_task_context, require_live_task_setup
     from tools.terminal_tool_sudo import _rewrite_compound_background
     from tools.process_registry_chat_execution import reserve_local_process, spawn_local_pipe
 
     require_live_task_setup()
-    session = registry._new_session(command, task_id, owner_task_id, session_key,
+    session = reserved_session or registry._new_session(command, task_id, owner_task_id, session_key,
         facade._resolve_safe_cwd(cwd or facade.os.getcwd()), persist_on_release=persist_on_release)
+    if reserved_session is not None:
+        session.command, session.cwd, session.task_id = command, facade._resolve_safe_cwd(cwd or facade.os.getcwd()), task_id
+        session.owner_task_id, session.persist_on_release = owner_task_id, persist_on_release
     if prepare_session:
         prepare_session(session)
     session._native_local_launch = current_approval_task_context() is not None
@@ -155,7 +158,7 @@ def spawn_pty(registry, session, safe_command, env_vars):
     return session
 
 
-def spawn_via_env(registry, env, command, cwd, task_id, session_key, timeout, owner_task_id, persist_on_release, prepare_session):
+def spawn_via_env(registry, env, command, cwd, task_id, session_key, timeout, owner_task_id, persist_on_release, prepare_session, reserved_session=None):
     from tools.approval_context import (
         release_background_approval_task, require_live_task_setup, reserve_background_approval_task,
     )
@@ -164,8 +167,16 @@ def spawn_via_env(registry, env, command, cwd, task_id, session_key, timeout, ow
     reader_reservation = reserve_background_approval_task()
     reader_started = False
     try:
-        session = registry._new_session(command, task_id, owner_task_id, session_key, cwd,
+        session = reserved_session or registry._new_session(command, task_id, owner_task_id, session_key, cwd,
             env_ref=env, pid_scope="sandbox", persist_on_release=persist_on_release)
+        if reserved_session is not None:
+            with session._lock:
+                require_live_task_setup()
+                if session.exited or session.termination_source:
+                    raise ValueError('Native remote launch was cancelled before backend setup.')
+                session.command, session.cwd, session.env_ref, session.pid_scope = command, cwd, env, 'sandbox'
+                session.task_id, session.owner_task_id, session.persist_on_release = task_id, owner_task_id, persist_on_release
+                session._local_launch_pending = session._native_local_launch = False
         if prepare_session:
             prepare_session(session)
         temp_dir = registry._env_temp_dir(env)
@@ -184,6 +195,9 @@ def spawn_via_env(registry, env, command, cwd, task_id, session_key, timeout, ow
             if reader_reservation is not None and persisted is False:
                 raise OSError('Native remote launch checkpoint could not be written; target was not started.')
             require_live_task_setup()  # writing the checkpoint can wait across Stop or owner replacement
+            with session._lock:
+                if session.exited or session.termination_source:
+                    raise ValueError('Native remote launch was cancelled before backend entry.')
         except Exception:
             fail_unstarted_remote(registry, session)
             raise

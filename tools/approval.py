@@ -253,6 +253,10 @@ def submit_pending(session_key: str, approval: dict):
 def approve_session(session_key: str, pattern_key: str):
     """Approve a pattern for this session only."""
     with _lock:
+        from agent.safe_worker_policy import managed_tool_policy as current_policy
+        if policy := current_policy():
+            policy.session_approved.add(pattern_key)
+            return
         _session_approved.setdefault(session_key, set()).add(pattern_key)
 
 
@@ -327,7 +331,9 @@ def is_current_session_yolo_enabled() -> bool:
 def _yolo_active() -> bool:
     """CLI ``--yolo`` (process-scoped, frozen at import) or gateway ``/yolo``
     (session-scoped). Hardline / deny-rule floors run BEFORE this everywhere."""
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    from agent.safe_worker_policy import managed_tool_policy as current_policy
+    policy = current_policy()
+    if policy.yolo if policy is not None else (_YOLO_MODE_FROZEN or is_current_session_yolo_enabled()):
         return True
     from gateway.session_finite import unattended_turn
     return unattended_turn()
@@ -340,6 +346,9 @@ def _permanent_set() -> set:
     launch profile's "always" approvals must not pre-approve commands for a secondary, nor may a
     secondary's "always" choice be written back into the launch profile's config. Callers hold ``_lock``.
     """
+    from agent.safe_worker_policy import managed_tool_policy as current_policy
+    if policy := current_policy():
+        return policy.permanent
     from hermes_constants import get_hermes_home_override, hermes_home_key
     if get_hermes_home_override() is None:
         approved, key = _permanent_approved, ""
@@ -373,7 +382,9 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
     regex-derived key so existing command_allowlist entries survive key migrations."""
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
-        approved = _permanent_set() | _session_approved.get(session_key, set())
+        from agent.safe_worker_policy import managed_tool_policy as current_policy
+        policy = current_policy()
+        approved = _permanent_set() | (policy.session_approved if policy is not None else _session_approved.get(session_key, set()))
     return any(alias in approved for alias in aliases)
 
 
@@ -410,7 +421,10 @@ def _persist_choice(session_key: str, choice: str, keys: list[str]) -> None:
             # check that syncs a hand removal before the save runs advances the baseline, so a
             # removed entry left in a full snapshot would pass for a new grant and be written back.
             with _lock:
-                grants = _permanent_set() - _permanent_baseline_by_home.get(_baseline_key(), set())
+                from agent.safe_worker_policy import managed_tool_policy as current_policy
+                policy = current_policy()
+                baseline = policy.permanent_baseline if policy is not None else _permanent_baseline_by_home.get(_baseline_key(), set())
+                grants = _permanent_set() - baseline
             save_permanent_allowlist(grants)
 
 
@@ -418,8 +432,7 @@ def _persist_choice(session_key: str, choice: str, keys: list[str]) -> None:
 
 def _read_permanent_allowlist() -> set:
     """``command_allowlist`` of the active profile's config as a set (empty on malformed input)."""
-    from hermes_cli.config import load_config_readonly
-    config = load_config_readonly()
+    config = approval_context._approval_policy_config()
     raw = config.get("command_allowlist")
     legacy = isinstance(raw, str)
     if legacy:
@@ -493,6 +506,9 @@ def save_permanent_allowlist(patterns: set):
             merged = on_disk | (set(patterns) - baseline)
             config["command_allowlist"] = sorted(merged)
             save_config(config)
+            from agent.safe_worker_policy import managed_tool_policy as current_policy
+            if current_policy() is not None:
+                return  # Live profile persistence never enlarges the worker's frozen in-memory grant.
             _permanent_baseline_by_home[key] = set(merged)
             governing = _permanent_set()
             governing.clear()
@@ -507,7 +523,10 @@ def is_approval_bypass_active_for_session(session_key: str) -> bool:
     """Canonical three-source bypass check: process ``--yolo`` (frozen at import), the
     session-scoped gateway ``/yolo`` toggle, ``approvals.mode: off``. Pure bypass
     sub-expression only — hardline blocklist / permanent allowlist are the caller's job."""
-    return (_YOLO_MODE_FROZEN or is_session_yolo_enabled(session_key) or approval_context._get_approval_mode() == "off")
+    from agent.safe_worker_policy import managed_tool_policy as current_policy
+    policy = current_policy()
+    yolo = policy.yolo if policy is not None else (_YOLO_MODE_FROZEN or is_session_yolo_enabled(session_key))
+    return yolo or approval_context._get_approval_mode() == "off"
 
 
 def is_approval_bypass_active() -> bool:
@@ -954,6 +973,9 @@ def _presence(approval_callback=None) -> tuple:
     approval_callback = _resolve_cli_approval_callback(approval_callback)
     is_cli, is_gateway = _is_interactive_cli(), _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
+    from agent.safe_worker_policy import managed_tool_policy as current_policy
+    if policy := current_policy():
+        is_ask = policy.ask
     if _is_single_query_approval_context() or _is_cron_approval_context():
         is_cli = is_gateway = is_ask = False
     elif is_ask and _is_unattended_platform_approval_context() \

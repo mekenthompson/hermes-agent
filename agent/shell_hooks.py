@@ -536,8 +536,9 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[dict[str, Any]
 
     def _callback(**kwargs: Any) -> Optional[dict[str, Any]]:
         from agent.safe_worker_policy import safe_worker_enabled
+        from agent.safe_worker_policy import managed_tool_policy as current_policy
 
-        if safe_worker_enabled():
+        if safe_worker_enabled() or ((policy := current_policy()) is not None and (policy.safe or policy.ignore)):
             return None
         if spec.event in _TOOL_EVENTS and not spec.matches_tool(kwargs.get("tool_name")):
             return None

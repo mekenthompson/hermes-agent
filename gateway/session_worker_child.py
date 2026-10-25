@@ -81,6 +81,28 @@ async def worker_child_request(connection, ref, params):
     _verify(connection, ref, params, claim)
     authority = connection.authority
 
+    if params['operation'] == 'child.account':
+        from tools.managed_process_child import owner_child_account
+        def account():
+            result = owner_child_account(authority, params)
+            return apply_worker_receipt(authority.db,
+                **{key: params[key] for key in ('epoch', 'execution_id', 'session_id', 'generation',
+                                               'sequence', 'operation', 'payload')},
+                handlers={'child.account': lambda _db, _conn, _sid, _payload: result})
+        return await asyncio.to_thread(account)
+
+    if params['operation'] in {'child.bind', 'child.cancel'}:
+        from tools.managed_process_child import bind_owner_child, cancel_owner_child
+        if params['operation'] == 'child.cancel':
+            return await asyncio.to_thread(cancel_owner_child, authority, params)
+        # The native journal records this exact binding; authority still comes
+        # from its separately verified reserved child and frozen parent policy.
+        commit = partial(apply_worker_receipt, authority.db,
+            **{key: params[key] for key in ('epoch', 'execution_id', 'session_id', 'generation',
+                                           'sequence', 'operation', 'payload')},
+            handlers={'child.bind': lambda _db, _conn, _sid, _payload: {'bound': True}})
+        return await asyncio.to_thread(bind_owner_child, authority, params, commit)
+
     def reserve():
         refused, limits = None, (0, 0)
         try:

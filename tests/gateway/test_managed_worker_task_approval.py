@@ -5,7 +5,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import shlex
 import sqlite3
+import sys
 import threading
 import time
 
@@ -34,7 +36,7 @@ class Model(BaseHTTPRequestHandler):
             text = str(messages[-1].get('content') or '')
             target = (self.server.review_target if 'Review only' in text else
                       self.server.late_target if 'late.txt' in text else self.server.edit_target)
-            command = f'python -c "from pathlib import Path; Path({str(target)!r}).write_text(\'done\')"'
+            command = f'{shlex.quote(sys.executable)} -c "from pathlib import Path; Path({str(target)!r}).write_text(\'done\')"'
             message = {'role': 'assistant', 'content': None, 'tool_calls': [{
                 'id': 'task-tool', 'type': 'function', 'function': {'name': 'terminal',
                 'arguments': json.dumps({'command': command, 'timeout': 10})}}]}
@@ -96,6 +98,8 @@ def test_managed_worker_task_review_and_advice_boundary(tmp_path):
             assert 'result' in submitted, submitted
             await async_wait_until(lambda: terminal('edit') == [('terminal',)], timeout=45, interval=.05,
                                    what='managed edit settlement')
+            assert peer.edit_target.exists(), '\n'.join(str(message.get('content')) for message in
+                (await rpc(ws, 'session.resume', session_id=sid))['result']['messages'] if message['role'] == 'tool')
             assert peer.edit_target.read_text() == 'done'
             assert not (await rpc(ws, 'session.resume', session_id=sid))['result']['prompts']
             submitted = await rpc(ws, 'prompt.submit', session_id=sid, input_id='advice',

@@ -6,16 +6,17 @@ from types import SimpleNamespace
 import pytest
 
 from tests.gateway.test_managed_turn_contract import assignment
+from tests.gateway.fixtures.managed_worker_execution import managed_worker_owner
 
 
 def _execute(tmp_path, monkeypatch, events, *, start_error=None, close_error=None):
     from agent import managed_worker as worker
+    from agent.runtime_session_store import RuntimeSessionStore, WorkerRPC
 
-    class RPC:
-        def __init__(self, home): pass
-        def __call__(self, method, **params): return {'owner_epoch': 1}
+    class RPC(WorkerRPC):
         def close(self):
             events.append('rpc.close')
+            super().close()
             if close_error is not None:
                 raise close_error
 
@@ -27,12 +28,13 @@ def _execute(tmp_path, monkeypatch, events, *, start_error=None, close_error=Non
         def run_conversation(self, text, **kwargs):
             return {'final_response': 'ok', 'completed': True}
 
-    class Store:
-        def __init__(self, *args): pass
-        def get_messages_as_conversation(self, sid): return []
-        def flush_token_counts(self): pass
-        def finish(self): events.append('store.finish')
-        def close(self): events.append('store.close')
+    class Store(RuntimeSessionStore):
+        def finish(self):
+            events.append('store.finish')
+            return super().finish()
+        def close(self):
+            events.append('store.close')
+            return super().close()
 
     class Controls:
         def __init__(self, *args):
@@ -48,10 +50,10 @@ def _execute(tmp_path, monkeypatch, events, *, start_error=None, close_error=Non
     monkeypatch.setattr(worker, 'WorkerControls', Controls)
     monkeypatch.setattr('agent.runtime_session_store.WorkerRPC', RPC)
     monkeypatch.setattr('agent.runtime_session_store.RuntimeSessionStore', Store)
-    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda: None)
     monkeypatch.setattr('run_agent.AIAgent', Agent)
     monkeypatch.setattr('agent.title_generator.wait_for_title_upgrades', lambda: None)
-    worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: events.append(kind)))
+    with managed_worker_owner(frame, monkeypatch):
+        worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: events.append(kind)))
 
 
 def test_execute_closes_the_rpc_after_the_store_on_success(tmp_path, monkeypatch):

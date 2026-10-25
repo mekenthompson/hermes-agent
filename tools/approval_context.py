@@ -401,6 +401,9 @@ def reset_hermes_interactive_context(token: contextvars.Token) -> None:
 
 def _is_interactive_cli() -> bool:
     """True for an interactive CLI/ACP session (contextvar first, env fallback)."""
+    from agent.safe_worker_policy import managed_tool_policy as current_policy
+    if policy := current_policy():
+        return policy.interactive
     ctx_val = _hermes_interactive_ctx.get()
     return is_truthy_value(ctx_val) if ctx_val is not None else env_var_enabled("HERMES_INTERACTIVE")
 
@@ -638,8 +641,7 @@ def _get_approval_config() -> dict:
     """Read the approvals config block: the LIVE config-cache sub-dict
     (load_config_readonly contract) — callers must not mutate it or any nested structure."""
     try:
-        from hermes_cli.config import load_config_readonly
-        return load_config_readonly().get("approvals", {}) or {}
+        return _approval_policy_config().get("approvals", {}) or {}
     except Exception as e:
         logger.warning("Failed to load approval config: %s", e)
         return {}
@@ -647,6 +649,9 @@ def _get_approval_config() -> dict:
 
 def _get_approval_mode() -> str:
     """Return 'manual', 'smart', or 'off' (a hosted-room policy overrides config)."""
+    from agent.safe_worker_policy import managed_tool_policy as current_policy
+    if current_policy() is not None:
+        return _normalize_approval_mode(_get_approval_config().get("mode", "manual"))
     try:
         from gateway.hosted_room_execution_policy import current_room_execution_policy
         if (room_policy := current_room_execution_policy()) is not None:
@@ -701,8 +706,7 @@ def approval_timeout_notice_kwargs() -> dict:
 def _binary_approval_mode(key: str) -> str:
     """Read ``approvals.<key>`` as 'approve' or 'deny' (default deny)."""
     try:
-        from hermes_cli.config import load_config_readonly
-        mode = str(cfg_get(load_config_readonly(), "approvals", key, default="deny")).lower().strip()
+        mode = str(cfg_get(_approval_policy_config(), "approvals", key, default="deny")).lower().strip()
         return "approve" if mode in {"approve", "off", "allow", "yes"} else "deny"
     except Exception:
         return "deny"
@@ -728,8 +732,7 @@ def _get_unattended_approval_mode() -> str:
 def _get_approval_transport_config() -> tuple[str, str | None]:
     """Return explicitly selected transport and fail-closed fallback mode."""
     try:
-        from hermes_cli.config import load_config_readonly
-        cfg = ((load_config_readonly() or {}).get("security") or {}).get("approval") or {}
+        cfg = ((_approval_policy_config() or {}).get("security") or {}).get("approval") or {}
         selected = str(cfg.get("transport") or "builtin").strip().lower()
         fallback = str(cfg.get("transport_fallback") or "").strip().lower()
     except Exception:
@@ -737,3 +740,13 @@ def _get_approval_transport_config() -> tuple[str, str | None]:
         # prompt on a built-in surface the operator may not be watching.
         return "config-error", None
     return selected or "builtin", "builtin" if fallback == "builtin" else None
+
+
+def _approval_policy_config():
+    """A managed tool consumes its owner's frozen snapshot, never a request-selected policy."""
+    from agent.safe_worker_policy import managed_tool_policy as current_policy
+    policy = current_policy()
+    if policy is not None:
+        return policy.config
+    from hermes_cli.config import load_config_readonly
+    return load_config_readonly()

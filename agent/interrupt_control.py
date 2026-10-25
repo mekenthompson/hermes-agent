@@ -234,6 +234,12 @@ class InterruptControlMixin:
             )
             self._pending_redirect = None
 
+        if hard_cancel:
+            # Native child cancellation uses another owner RPC connection. Never
+            # hold the redirect/interrupt lock while that owner applies its fence.
+            from tools.managed_process_child import cancel_child_agent
+            cancel_child_agent(self)
+
         # Codex watches a private interrupt event rather than Hermes' per-thread flag.
         _request_interrupt = _ic_codex_method(self, "request_interrupt")
         if _request_interrupt is not None:

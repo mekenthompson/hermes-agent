@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.gateway.fixtures.managed_worker_execution import managed_worker_owner
 from tests.gateway.test_managed_turn_contract import assignment
 
 BASE_URL = 'https://api.minimax.io/anthropic'
@@ -41,13 +42,6 @@ def _execute(frame, monkeypatch, base=object, built=None, result=None, sent=None
         def run_conversation(self, text, **kwargs):
             return dict(result or {'final_response': 'ok', 'completed': True})
 
-    class Store:
-        def __init__(self, *args): pass
-        def get_messages_as_conversation(self, sid): return []
-        def flush_token_counts(self): pass
-        def finish(self): pass
-        def close(self): pass
-
     class Controls:
         def __init__(self, *args):
             self.stopped, self.finish = threading.Event(), threading.Event()
@@ -59,13 +53,11 @@ def _execute(frame, monkeypatch, base=object, built=None, result=None, sent=None
     monkeypatch.setattr(worker, 'discover_profile_mcp', lambda policy: None)
     monkeypatch.setattr(worker, 'retire_agent', lambda agent: None)
     monkeypatch.setattr(worker, 'WorkerControls', Controls)
-    monkeypatch.setattr('agent.runtime_session_store.WorkerRPC', lambda home: lambda *a, **k: {'owner_epoch': 1})
-    monkeypatch.setattr('agent.runtime_session_store.RuntimeSessionStore', Store)
-    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda: None)
     monkeypatch.setattr('run_agent.AIAgent', Agent)
     monkeypatch.setattr('agent.title_generator.wait_for_title_upgrades', lambda: None)
     sent = [] if sent is None else sent
-    worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: sent.append((kind, payload))))
+    with managed_worker_owner(frame, monkeypatch):
+        worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: sent.append((kind, payload))))
     return built
 
 

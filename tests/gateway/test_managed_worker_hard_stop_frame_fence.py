@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.session_contract import Principal, SessionRef
+from tests.gateway.fixtures.managed_worker_execution import managed_worker_owner
 from tests.gateway.test_managed_turn_contract import assignment
 
 
@@ -20,14 +21,17 @@ class _Agent:
 
     def __init__(self, **kwargs):
         self.session_prompt_tokens = self.session_completion_tokens = 0
+        self.stopped = False
 
     def interrupt(self, message=None, **kwargs):
         self.calls.append('soft')
 
     def hard_interrupt(self, message=None, **kwargs):
         self.calls.append('hard')
+        self.stopped = True
 
     def run_conversation(self, text, **kwargs):
+        assert self.stopped, 'a construction-time Stop must reach the agent before it runs'
         return {'final_response': '', 'interrupted': True}
 
 
@@ -39,13 +43,6 @@ def test_worker_stop_hard_cancels_the_agent_before_and_after_construction(tmp_pa
     controls.task_checks = {}
     controls.stop()
     frame, _ = assignment(tmp_path, monkeypatch)
-
-    class Store:
-        def __init__(self, *args): pass
-        def get_messages_as_conversation(self, sid): return []
-        def flush_token_counts(self): pass
-        def finish(self): pass
-        def close(self): pass
 
     class Latched:  # a Stop that arrived while the agent was being constructed
         def __init__(self, *args):
@@ -59,13 +56,16 @@ def test_worker_stop_hard_cancels_the_agent_before_and_after_construction(tmp_pa
     monkeypatch.setattr(worker, 'discover_profile_mcp', lambda policy: None)
     monkeypatch.setattr(worker, 'retire_agent', lambda agent: None)
     monkeypatch.setattr(worker, 'WorkerControls', Latched)
-    monkeypatch.setattr('agent.runtime_session_store.WorkerRPC', lambda home: lambda *a, **k: {'owner_epoch': 1})
-    monkeypatch.setattr('agent.runtime_session_store.RuntimeSessionStore', Store)
-    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda: None)
     monkeypatch.setattr('run_agent.AIAgent', _Agent)
     monkeypatch.setattr('agent.title_generator.wait_for_title_upgrades', lambda: None)
-    worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: None))
+    frames = []
+    with managed_worker_owner(frame, monkeypatch) as calls:
+        worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: frames.append((kind, payload))))
     assert _Agent.calls == ['hard', 'hard'], 'a managed worker Stop must hard-cancel like the canonical Stop'
+    assert [params['operation'] for method, params in calls if method == 'worker.persist'] == [
+        'compression.history', 'execution.finish']
+    assert [kind for kind, _ in frames] == ['ready', 'result', 'finished']
+    assert frames[1][1]['result']['interrupted'] is True
 
 
 CHILD = """import json, os, sys, psutil

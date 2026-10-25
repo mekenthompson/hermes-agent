@@ -431,6 +431,15 @@ def _owner_objects(authority, ref, *, include_fallback_evicted=False):
     answered with an empty success."""
     from gateway.session_managed_worker import managed_policy
     if managed_policy(authority, ref) is not None:
+        module = sys.modules.get('tools.process_registry')
+        keys, owners = _ownership(authority, ref, None, [])
+        if module is not None:
+            registry = module.process_registry
+            with registry._lock:
+                hosted = any(getattr(p, '_managed_gateway_hosted', False) or p.reconciliation_required
+                    for p in _owned_locked(registry, keys, owners, authority, authority.sessions[ref.session_id]))
+            if hosted:
+                return None, []
         raise RuntimeStoreError('unsupported_projection')
     agent = authority.agent(ref)
     session_id = physical_target(authority, ref) if include_fallback_evicted else None
@@ -574,6 +583,13 @@ def _ownership(authority, ref, agent, records):
     routing key AND an owner among the session, its agent and its subagents."""
     target = physical_target(authority, ref)
     keys, owners = {authority.sessions[ref.session_id].route, target}, {target}
+    from gateway.session_managed_worker import managed_policy
+    if managed_policy(authority, ref) is not None:
+        from hermes_state_runtime_workers import runtime_lineage
+        from tools.managed_process_child import native_child_sessions
+        with authority.db._read_ctx() as conn:
+            owners.update(runtime_lineage(conn, ref.session_id))
+        owners.update(native_child_sessions(authority, owners))
     if agent is not None:
         owners.add(getattr(agent, 'session_id', None))
     owners.update(r.get('subagent_id') for r in records)

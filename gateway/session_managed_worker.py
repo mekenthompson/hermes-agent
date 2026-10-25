@@ -1,6 +1,6 @@
 """Admission-owned production exec; observers never own the worker lifetime."""
 import asyncio
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from collections import deque
 from dataclasses import asdict, replace
 from functools import partial
@@ -179,6 +179,8 @@ class ManagedWorker:
         # Verified interpreter behind the handle (a launcher trampoline may sit between).
         self.worker = None
         self.write_lock = threading.Lock()
+        self._native_child_process_lock = threading.RLock()
+        self._native_child_process_scopes = {}
         self.commands = queue.Queue(maxsize=16)
         self.closed = threading.Event()
         # Latched the moment Stop is admitted, before any pipe write: the owner's read loop
@@ -601,6 +603,9 @@ async def _spawn_registered_worker(authority, ref, row):
     generation = row.get('generation')
     try:
         env = await asyncio.to_thread(_worker_env, authority)
+        from utils import is_truthy_value
+        launch_flags = tuple(is_truthy_value((env if env is not None else os.environ).get(name, ''))
+                             for name in ('HERMES_YOLO_MODE', 'HERMES_INTERACTIVE', 'HERMES_EXEC_ASK'))
         cwd = (await asyncio.to_thread(Path(__file__).resolve)).parents[1]
         from gateway.session_worker_spawn import acquire_process
         from gateway.session_managed_worker_log import worker_log_path
@@ -617,6 +622,7 @@ async def _spawn_registered_worker(authority, ref, row):
         spawning.pop(ref.session_id, None)
         raise
     worker = ManagedWorker(process)
+    worker.launch_yolo, worker.launch_interactive, worker.launch_ask = launch_flags
     if log_path is not None:
         worker.drain_stderr(log_path)
     workers = getattr(authority, '_managed_workers', None)
@@ -668,6 +674,7 @@ async def execute_managed(authority, ref, row, policy):
     authority.adopt_agent(ref.session_id, row['generation'], worker)
     accepted = usage = None
     scope = None
+    approval_scope = ExitStack()
     try:
         # The interpreter behind the handle introduces itself first; the owner verifies that
         # identity (alive, same birth, descends from the handle) before reserving for it.
@@ -680,8 +687,13 @@ async def execute_managed(authority, ref, row, policy):
         scope = await tracked_write(authority, partial(reserve_admission_worker, authority,
                     admission_id=row['admission_id'], process=process, principal_id=row['principal_id'], hello=hello))
         worker.worker = (scope['pid'], scope['birth'])
+        worker.scope, worker.admission, worker.native_ref = scope, row, ref
+        from gateway.session_managed_approval import managed_admission_scope, configure_policy, install_approval_notifier
+        approval_scope.enter_context(managed_admission_scope(authority, ref, row, worker))
         # The child reads nothing else until the exact reservation has committed.
         frame = await asyncio.to_thread(_bootstrap, authority, ref, row, policy, scope, text)
+        configure_policy(worker, frame)
+        install_approval_notifier(authority, worker)
         worker.secrets.extend(v for v in (frame['api_key'], scope['secret']) if isinstance(v, str) and v)
         await asyncio.to_thread(worker.send, frame)
         worker.writer.start()
@@ -752,4 +764,7 @@ async def execute_managed(authority, ref, row, policy):
         raise ManagedExecutionUnknown('managed_worker_unknown') from exc
     finally:
         workers.pop(ref.session_id, None)
-        await asyncio.to_thread(worker.close)
+        try:
+            await asyncio.to_thread(worker.close)
+        finally:
+            approval_scope.__exit__(*sys.exc_info())

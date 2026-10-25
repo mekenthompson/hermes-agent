@@ -372,12 +372,12 @@ def execute(frame, channel):
     if adopted['owner_epoch'] != scope['epoch']:
         raise RuntimeError('stale_epoch')
     store = RuntimeSessionStore(rpc, scope, outbox_dir(frame['home'], scope['execution_id']), adopted)
+    from tools.managed_process_proxy import bind_worker_process_store
+    bind_worker_process_store(store, frame)
     from gateway.session_kanban import bind_worker_context
     bind_worker_context(frame)
-    # Background processes a previous admission of this session started outlive that worker
-    # (F24); adopt them so process_manage in this turn can poll and kill them.
-    from tools.process_registry import process_registry
-    process_registry.recover_from_checkpoint()
+    # Background process control stays with the gateway; a new model interpreter
+    # must not cold-adopt or rewrite its live custody descriptors.
     # Store construction binds the delegation ledger before tool discovery.
     from gateway.session_policy import restore_policy, policy_scope, register_worker_hooks
     policy = restore_policy(frame['policy'])

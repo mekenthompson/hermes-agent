@@ -169,7 +169,7 @@ class WorkerRPC:
         with self.lock:
             self._drop()
 
-    def __call__(self, method, **params):
+    def __call__(self, method, *, _timeout=20, **params):
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -194,7 +194,7 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection()
                     link.send(request_id, message)
-                response = link.receive(20)
+                response = link.receive(_timeout)
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()

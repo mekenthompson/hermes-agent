@@ -10,8 +10,9 @@ logger = logging.getLogger(__name__)
 
 def _observe(hook_name: str, **kwargs: Any) -> None:
     from agent.safe_worker_policy import safe_worker_enabled
+    from agent.safe_worker_policy import managed_tool_policy as current_policy
 
-    if safe_worker_enabled():
+    if safe_worker_enabled() or ((policy := current_policy()) is not None and policy.safe):
         return
     try:
         from hermes_cli.observability import observe_lifecycle
@@ -22,6 +23,9 @@ def _observe(hook_name: str, **kwargs: Any) -> None:
 
 
 def _plugin_hooks(hook_name: str, **kwargs: Any) -> list[Any]:
+    from agent.safe_worker_policy import managed_tool_policy as current_policy
+    if (policy := current_policy()) is not None and (policy.safe or policy.ignore):
+        return []
     from hermes_cli import plugins
 
     return plugins.invoke_hook(hook_name, **kwargs)
@@ -41,6 +45,9 @@ async def ainvoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
     """:func:`invoke_hook` for callers on an event loop: same observers-then-plugins
     composition, with ``async def`` plugin callbacks awaited on that loop."""
     _observe(hook_name, **kwargs)
+    from agent.safe_worker_policy import managed_tool_policy as current_policy
+    if (policy := current_policy()) is not None and (policy.safe or policy.ignore):
+        return []
     from hermes_cli import plugins
 
     return await plugins.ainvoke_hook(hook_name, **kwargs)
@@ -49,8 +56,9 @@ async def ainvoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
 def has_hook(hook_name: str) -> bool:
     """Return whether a first-party observer or plugin consumes a hook."""
     from agent.safe_worker_policy import safe_worker_enabled
+    from agent.safe_worker_policy import managed_tool_policy as current_policy
 
-    if safe_worker_enabled():
+    if safe_worker_enabled() or ((policy := current_policy()) is not None and policy.safe):
         return False
     try:
         from hermes_cli.observability import handles_hook
@@ -60,6 +68,8 @@ def has_hook(hook_name: str) -> bool:
     except Exception:
         logger.warning("Unable to inspect built-in observability hooks", exc_info=True)
 
+    if policy is not None and policy.ignore:
+        return False
     from hermes_cli import plugins
 
     return plugins.has_hook(hook_name)

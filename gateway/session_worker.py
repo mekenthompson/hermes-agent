@@ -65,10 +65,13 @@ def _verify(connection, ref, params, claim):
 async def worker_request(connection, ref, params, *, operation):
     from gateway.session_authorities import require_serving
     require_serving(connection.authority)  # adopt/persist would write with the released epoch
+    if operation == 'persist' and isinstance(params.get('operation'), str) and params['operation'].startswith('process.'):
+        from gateway.session_worker_process import process_request
+        return await process_request(connection, ref, params)
     if operation == "persist" and isinstance(params.get("operation"), str) and params["operation"].startswith("delegation."):
         from gateway.session_worker_delegation import worker_delegation_request
         return await worker_delegation_request(connection, ref, params)
-    if operation == "persist" and params.get("operation") == "child.reserve":
+    if operation == "persist" and params.get("operation") in {"child.reserve", "child.bind", "child.cancel", "child.account"}:
         from gateway.session_worker_child import worker_child_request
         return await worker_child_request(connection, ref, params)
     extra = {'register': {'kind'}, 'adopt': set(), 'persist': {'epoch', 'sequence', 'operation', 'payload'}}[operation]
@@ -93,8 +96,19 @@ async def worker_request(connection, ref, params, *, operation):
     if operation == 'adopt':
         return await asyncio.to_thread(adopt_worker_execution, authority.db, epoch=authority.epoch,
                                        **scope, adoption_secret=claim)
-    result = await asyncio.to_thread(mutate_worker_execution, authority.db, epoch=params['epoch'],
-        **scope, sequence=params['sequence'], operation=params['operation'], payload=params['payload'])
+    async def persist():
+        result = await asyncio.to_thread(mutate_worker_execution, authority.db, epoch=params['epoch'],
+            **scope, sequence=params['sequence'], operation=params['operation'], payload=params['payload'])
+        if params['operation'] == 'execution.finish' and '/child:' in params['execution_id']:
+            from tools.managed_process_child import owner_child_finished
+            await asyncio.to_thread(owner_child_finished, authority, params)
+        return result
+
+    if params['operation'] == 'execution.finish' and '/child:' in params['execution_id']:
+        from gateway.session_runtime_workers import track_mutation
+        result = await asyncio.shield(track_mutation(authority, persist()))
+    else:
+        result = await persist()
     if params['operation'] == 'execution.finish':
         # Queued input parked behind this worker; nothing else would restart its FIFO.
         authority.wake_after_worker(params['session_id'])

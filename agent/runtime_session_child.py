@@ -20,6 +20,39 @@ _REFUSALS = {
 class ChildSessionStore(RuntimeSessionStore):
     binds_delegation_ledger = False
 
+    def account_processes(self):
+        if self._process_scope_facts is None or self._process_cancelled:
+            return {}
+        return call_off_event_loop(self._apply, 'child.account', {})
+
+    def bind_process_scope(self, facts):
+        from agent.runtime_session_store import call_off_event_loop
+        with self._process_control_lock:
+            if self._process_cancelled:
+                raise ValueError('The native child was stopped before process setup.')
+            if self._process_scope_facts is not None:
+                if self._process_scope_facts != facts:
+                    raise ValueError('The original native child process scope cannot change.')
+                return
+        call_off_event_loop(self._apply, 'child.bind', facts)
+        with self._process_control_lock:
+            if self._process_cancelled:
+                raise ValueError('The native child was stopped during process setup.')
+            self._process_scope_facts = facts
+
+    def cancel_process_scope(self):
+        from agent.runtime_session_store import call_off_event_loop
+        with self._process_control_lock:
+            if self._process_cancel_acked:
+                return
+            self._process_cancelled = True
+        # A separate existing WorkerRPC connection avoids an in-flight process.call
+        # monopolizing the data connection or the receipt journal's lock.
+        call_off_event_loop(self._process_control_rpc, 'worker.persist', **dict(self.scope),
+            sequence=max(0, self.journal['next_sequence'] - 1), operation='child.cancel', payload={})
+        with self._process_control_lock:
+            self._process_cancel_acked = True
+
     @property
     def reserved_session_id(self):
         return self.scope['session_id']
@@ -38,7 +71,10 @@ class ChildSessionStore(RuntimeSessionStore):
             if not self._outbox_owner.closed and not self.failure:
                 self.finish()
         finally:
-            super().close()
+            try:
+                super().close()
+            finally:
+                self._process_control_rpc.close()
 
 
 def reserve_child_store(parent):
@@ -54,4 +90,14 @@ def reserve_child_store(parent):
     # Every child RPC hops off a running loop, not only this reservation: the child is built, run
     # and closed inside delegate_task's callback, and its constructor already reads the store
     # (ContextCompressor.bind_session_state), which WorkerRPC refuses on Relay's loop.
-    return ChildSessionStore(partial(call_off_event_loop, parent.rpc), scope, outbox)
+    store = ChildSessionStore(partial(call_off_event_loop, parent.rpc), scope, outbox)
+    from agent.runtime_session_store import WorkerRPC
+    import threading
+    store._process_control_rpc = WorkerRPC(scope['profile_id'])
+    store._process_control_lock = threading.RLock()
+    store._process_cancelled = False
+    store._process_cancel_acked = False
+    store._process_scope_facts = None
+    from tools.managed_process_proxy import _STORE
+    store.process_frame = _STORE[1] if _STORE is not None else None
+    return store

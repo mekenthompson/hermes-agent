@@ -945,7 +945,7 @@ def mutate_worker_execution(db, *, epoch, execution_id, session_id, generation,
 
 
 def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, sequence,
-                         operation, payload, handlers):
+                         operation, payload, handlers, _with_fresh=False):
     """The one worker receipt transaction every ``worker.persist`` family shares.
 
     An exact (execution, sequence, digest) retry returns the stored result; otherwise the
@@ -974,7 +974,8 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
             from hermes_state_runtime_workers import retired_receipt
             if retired_receipt(old['result_json']):
                 raise RuntimeStoreError('stale_generation')  # a terminal execution's read copy
-            return json.loads(old['result_json'])
+            cached = json.loads(old['result_json'])
+            return (cached, False) if _with_fresh else cached
         if row['status'] not in ('registered', 'running'):
             raise RuntimeStoreError('stale_generation')
         if sequence != row['last_sequence'] + 1:
@@ -995,5 +996,5 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
         if operation == 'execution.finish':
             from hermes_state_runtime_workers import compact_terminal_receipts
             compact_terminal_receipts(conn, execution_id)
-        return result
+        return (result, True) if _with_fresh else result
     return db._execute_write(write, patience_s=db._TRANSCRIPT_WRITE_PATIENCE_S)

@@ -554,7 +554,14 @@ def _validate_child_output_schema(
         # unmarked turn is misread as the dispatcher-owned worker by every HERMES_KANBAN_* gate.
         from agent.delegation_context import delegated_child_context
         from tools.delegate_tool_routes import child_profile_scope
-        with child_profile_scope(child), delegated_child_context(str(getattr(child, "session_id", "") or "")):
+        from tools.approval_context import delegated_approval_task
+        from tools.managed_process_child import managed_child_scope
+        store = getattr(child, '_session_db', None)
+        facts = getattr(store, '_process_scope_facts', None) or {}
+        with (child_profile_scope(child),
+              delegated_approval_task(child_task_id, stop_event=getattr(child, '_hard_interrupt_requested', None)),
+              delegated_child_context(str(getattr(child, "session_id", "") or "")),
+              managed_child_scope(child, child_task_id, writer_lease_id=facts.get('writer_lease_id'))):
             _retry_result = child.run_conversation(
                 user_message=build_retry_message(_schema_errors), task_id=child_task_id,
                 stream_callback=relay_child_text,
@@ -929,14 +936,17 @@ class _ChildRun:
             from agent.delegation_context import delegated_child_context
             from tools.approval_context import delegated_approval_task, require_live_task_setup
             from tools.delegate_tool_routes import child_profile_scope
+            from tools.managed_process_child import managed_child_scope
             # A profile-routed child converses as that profile (config, secrets, skills, terminal policy).
             with child_profile_scope(child), delegated_approval_task(
                 self.child_task_id, stop_event=getattr(child, "_hard_interrupt_requested", None),
             ), delegated_child_context(str(getattr(child, "session_id", "") or "")):
                 require_live_task_setup()
-                return child.run_conversation(
-                    user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
-                )
+                with managed_child_scope(child, self.child_task_id,
+                        writer_lease_id=getattr(self.heartbeat, 'admission_lease_id', None)):
+                    return child.run_conversation(
+                        user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
+                    )
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
         # One wait covers both ways out: the worker finishing, or the heartbeat's stale verdict.
@@ -1069,6 +1079,12 @@ class _ChildRun:
         """Name the child's background processes on the result BEFORE ``cleanup`` kills them: handed-off ones now
         belong to the parent (their completion lands in the parent's chat); anything else still running is about to be
         terminated, and the parent must hear that from the runtime rather than trust a child's "watcher running"."""
+        from agent.runtime_session_child import ChildSessionStore
+        store = getattr(self.child, '_session_db', None)
+        if isinstance(store, ChildSessionStore):
+            with _quiet(None):
+                entry.update(store.account_processes())
+            return
         handed = list(getattr(self.child, "_handed_off_processes", None) or [])
         if handed:
             entry["handed_off_processes"] = handed

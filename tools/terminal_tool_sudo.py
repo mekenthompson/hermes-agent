@@ -38,6 +38,9 @@ def get_sudo_prompt_command() -> str:
 
 def _get_sudo_password_cache_scope() -> str:
     """Return the cache scope for interactive sudo passwords."""
+    from agent.safe_worker_policy import managed_tool_policy as current_policy
+    if policy := current_policy():
+        return 'managed:' + policy.cache_key
     from tools.terminal_tool import _current_session_key, _get_sudo_password_callback
     session_key = _current_session_key()
     if session_key:

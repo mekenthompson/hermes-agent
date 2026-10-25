@@ -78,3 +78,9 @@ def worker_config_snapshot() -> dict | None:
     """Return detached explicit config; None means the ordinary loader owns it."""
     policy = _current_policy()
     return json.loads(policy.config_json) if policy is not None else None
+
+
+def managed_tool_policy():
+    """Read an already-bound owner tool scope without importing the optional gateway."""
+    module = sys.modules.get('gateway.session_managed_approval')
+    return module.current_policy() if module is not None else None

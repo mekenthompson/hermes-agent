@@ -644,6 +644,9 @@ def resolve_task_overrides(task_id: Optional[str]) -> dict[str, Any]:
     session's override is silently dropped. Single source of that lookup so
     the terminal and file layers can't drift apart.
     """
+    from agent.safe_worker_policy import managed_tool_policy as current_policy
+    if policy := current_policy():
+        return {'cwd': policy.workspace, 'cwd_source': 'session'}
     raw = task_id or "default"
     return (
         _task_env_overrides.get(_qualify_task_key(raw))
@@ -1311,6 +1314,10 @@ def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
     Raises :class:`_Rejected` with the ``"disabled"`` envelope when creation
     raises ImportError.
     """
+    from agent.safe_worker_policy import managed_tool_policy as current_policy
+    if current_policy() is not None:
+        from gateway.session_managed_approval import cached_environment
+        return cached_environment(plan)
     _start_cleanup_thread()
     env_type, eff = plan.env_type, plan.effective_task_id
 
@@ -1704,6 +1711,9 @@ TERMINAL_SCHEMA = {
 def _handle_terminal(args, **kw):
     from agent.terminal_approval_batch import validate_prepared_terminal
     validate_prepared_terminal(args)
+    from tools.managed_process_proxy import terminal_proxy
+    if (proxied := terminal_proxy(args, kw.get('task_id'))) is not None:
+        return proxied
     # Models sometimes send execute_code's ``code`` here; name the stray
     # argument and the right tool instead of failing on command=None.
     if "command" not in args and "code" in args:

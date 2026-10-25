@@ -98,6 +98,9 @@ def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, 
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
                   owner_task_id=task_id or effective_task_id, session_key=session_key,
                   persist_on_release=persist_on_release, _prepare_session=prepare_session)
+    from tools.managed_process_proxy import reserved_background
+    if reserved := reserved_background():
+        common['_reserved_session'] = reserved
     if env_type == "local":
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty, **common)

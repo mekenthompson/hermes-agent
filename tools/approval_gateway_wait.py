@@ -64,7 +64,8 @@ def _poll_event(event: threading.Event, session_key: str, *, interrupt_log: str)
             # The poll loop below is verifiably blocked on a human answer (the user tapping approve/deny on
             # the gateway surface), bounded by the approval timeout. Record it as human-wait time so the
             # concurrent batch deadline excludes it (#79719).
-            if is_interrupted():
+            from tools.approval_context import approval_task_revoked
+            if is_interrupted() or approval_task_revoked():
                 logger.info(interrupt_log, session_key)
                 return "interrupted"
             remaining = deadline - time.monotonic()

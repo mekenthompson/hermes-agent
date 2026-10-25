@@ -406,6 +406,9 @@ def _native_task_scope(authority, ref, row, live, event, text, *, producer_curre
         if committed['status'] == 'started':
             if not native_claim_current(authority, live, row, parent_returned=parent_returned):
                 return False
+            managed_current = getattr(event, '_managed_worker_current', None)
+            if managed_current is not None:
+                return managed_current()
             run_generation = getattr(event, '_approval_run_generation', None)
             return (run_generation is not None
                     and authority.runner._is_session_run_current(live.route, run_generation))

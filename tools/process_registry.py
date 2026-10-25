@@ -1158,14 +1158,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
     def spawn_local(
         self, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
         env_vars: dict | None = None, use_pty: bool = False, owner_task_id: str = "",
-        persist_on_release: bool = False, _prepare_session=None) -> ProcessSession:
-        """Spawn a background process locally (TERMINAL_ENV=local; other backends use
-        spawn_via_env()). ``use_pty`` requests a pseudo-terminal via ptyprocess/pywinpty
+        persist_on_release: bool = False, _prepare_session=None, _reserved_session=None) -> ProcessSession:
+        """Spawn locally. ``use_pty`` requests a pseudo-terminal via ptyprocess/pywinpty
         for interactive CLIs, falling back to a plain pipe when the backend is unavailable.
         ``persist_on_release`` keeps the process out of agent-lifecycle kill sweeps (#41225)."""
         from tools.process_registry_spawn import spawn_local
         return spawn_local(self, command, cwd, task_id, session_key, env_vars, use_pty,
-                           owner_task_id, persist_on_release, _prepare_session)
+                           owner_task_id, persist_on_release, _prepare_session, _reserved_session)
 
     def adopt_local(
         self, proc: subprocess.Popen, *, command: str, cwd: Optional[str], task_id: str = "",
@@ -1196,14 +1195,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
 
     def spawn_via_env(
         self, env: Any, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
-        timeout: int = 10, owner_task_id: str = "", persist_on_release: bool = False, _prepare_session=None) -> ProcessSession:
+        timeout: int = 10, owner_task_id: str = "", persist_on_release: bool = False, _prepare_session=None, _reserved_session=None) -> ProcessSession:
         """Spawn a background process inside a non-local backend's sandbox.
-        The command is wrapped to capture its in-sandbox PID and redirect output to a
-        log file that later execute() calls poll. No live pipe or stdin, but it runs in
+        The wrapper captures its sandbox PID and redirects output to a polled log. No live pipe or stdin, but it runs in
         the correct sandbox context. ``persist_on_release`` keeps the process out of
         agent-lifecycle kill sweeps (#41225)."""
         from tools.process_registry_spawn import spawn_via_env
-        return spawn_via_env(self, env, command, cwd, task_id, session_key, timeout, owner_task_id, persist_on_release, _prepare_session)
+        return spawn_via_env(self, env, command, cwd, task_id, session_key, timeout, owner_task_id, persist_on_release, _prepare_session, _reserved_session)
 
     # ----- Reader / Poller Threads -----
 
@@ -2633,8 +2631,10 @@ _SESSION_ACTIONS = {
 
 
 def _handle_process(args, **kw):
+    from tools.managed_process_proxy import worker_call
+    if (proxied := worker_call('process_manage', args)) is not None:
+        return proxied
     action = args.get("action", "")
-    # Coerce to string — some models send session_id as an integer
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
     if action == "list":
         return json.dumps(_list_processes(kw.get("task_id")), ensure_ascii=False)
