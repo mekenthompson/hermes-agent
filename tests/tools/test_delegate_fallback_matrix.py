@@ -182,7 +182,10 @@ def test_pinned_review_does_not_borrow_general_worker_chain(tmp_path, monkeypatc
 
     token = set_hermes_home_override(tmp_path)
     try:
-        with patch("run_agent.AIAgent", side_effect=capture):
+        from tools.approval_context import approval_task_context
+        with (patch("run_agent.AIAgent", side_effect=capture),
+              approval_task_context("Review", identity="owner", profile="default", session=parent.session_id,
+                                    is_current=lambda: True)):
             with pytest.raises(ReachedConstructor):
                 start_review(
                     parent,

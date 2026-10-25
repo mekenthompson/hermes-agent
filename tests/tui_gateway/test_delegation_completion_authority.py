@@ -128,6 +128,12 @@ def test_authenticated_desktop_delegation_completion_authority(
         submitted = server.handle_request({'id': 'prompt', 'method': 'prompt.submit',
                                            'params': {'session_id': sid, 'text': 'Inspect the build'}})
         assert submitted['result']['status'] == 'streaming', submitted
+        if not human_identity:
+            assert len(handles) == 1 and handles[0]["code"] == "missing_task_authority", handles
+            assert not started.is_set(), "Unscoped transport must refuse before child execution"
+            assert process_registry.completion_queue.empty()
+            assert not delegation._records
+            return
         assert handles == [{'status': 'dispatched', 'delegation_id': 'deleg_desktop_authority'}]
         assert started.wait(10)
         with delegation._records_lock:

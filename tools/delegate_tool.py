@@ -11,6 +11,7 @@ the delegation call and the summary result, never the child's intermediate
 tool calls or reasoning.
 """
 
+import json
 import logging
 import time
 import weakref
@@ -721,6 +722,9 @@ def delegate_task(
     # background applies to single tasks AND batches: a batch is ONE async unit
     # that joins on every child and re-enters as a single consolidated message.
     background = is_truthy_value(background, default=False) if background is not None else False
+    from tools.approval_context import background_task_refusal
+    if refusal := background_task_refusal(background):
+        return json.dumps(refusal)
 
     depth = getattr(parent_agent, "_delegate_depth", 0)
     max_spawn = _get_max_spawn_depth()
@@ -863,7 +867,7 @@ _DESCRIPTION_HEAD = (
     "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
     "- A single tool call -> call the tool directly\n"
     "- Tasks needing user interaction -> subagents cannot ask questions\n"
-    "- Durable work that must survive this session -> cronjob or terminal(background=True, notify=True); /stop, /new, "
+    "- Durable work that must survive this process -> an existing native durable task; /stop, /new, "
     "or process exit halts running subagents (whole tree); each returns an 'interrupted' completion with partial output.\n\n"
     "RULES:\n"
     "- Children know nothing of this conversation: pass everything needed via 'context', including any required "

@@ -191,3 +191,55 @@ def test_skips_own_authored_comments_without_env_profile(worker_home, monkeypatc
     _unthrottle()
     assert kt.inject_new_comments_from_env(agent) is False
     assert agent.steers == []
+
+
+def test_same_profile_chat_followups_reach_existing_worker_once(worker_home, monkeypatch):
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+    from tools.registry import registry
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="one continuing work unit", assignee="worker-bot")
+    monkeypatch.setenv("HERMES_PROFILE", "worker-bot")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    worker = FakeAgent()
+    assert not kt.inject_new_comments_from_env(worker)
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+
+    def followup(index):
+        return json.loads(registry.dispatch("kanban_comment", {"task_id": tid,
+            "body": f"follow-up {index}", "idempotency_key": f"request-{index}"}))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        receipts = list(pool.map(followup, [1, 2]))
+    assert all(receipt["ok"] for receipt in receipts)
+    assert followup(1)["comment_id"] == receipts[0]["comment_id"]
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(worker)
+    assert len(worker.steers) == 1
+    assert all(worker.steers[0].count(f"follow-up {index}") == 1 for index in (1, 2))
+    _unthrottle()
+    assert not kt.inject_new_comments_from_env(worker)
+    with kbc.connect() as conn:
+        assert len(kb.list_comments(conn, tid)) == 2
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_refused_native_steer_does_not_consume_followup(worker_home, monkeypatch):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="continuation delivery")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    worker = FakeAgent()
+    assert not kt.inject_new_comments_from_env(worker)
+    with kbc.connect() as conn:
+        kb.add_comment(conn, tid, "desktop", "preserve this instruction", idempotency_key="request")
+    original = worker.steer
+    worker.steer = lambda text: False
+    _unthrottle()
+    assert not kt.inject_new_comments_from_env(worker)
+    worker.steer = original
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(worker)
+    assert len(worker.steers) == 1
+    assert "preserve this instruction" in worker.steers[0]

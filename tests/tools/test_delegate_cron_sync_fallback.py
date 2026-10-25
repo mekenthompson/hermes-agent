@@ -130,7 +130,10 @@ def test_cron_sync_fallback_returns_and_spawns_no_review_fork(monkeypatch):
         # Cron declares the channel stateless (#66617): async delivery is
         # unsupported and there is no bound origin session id to wake, so
         # delegate_task must run the batch synchronously.
+        from tools.approval_context import approval_task_context
         with (
+            approval_task_context("configured job", identity="cron-owner", profile="default", session=parent.session_id,
+                                  is_current=lambda: True),
             patch(
                 "gateway.session_context.async_delivery_supported",
                 return_value=False,

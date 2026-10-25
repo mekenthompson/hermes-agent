@@ -145,6 +145,8 @@ def test_authority_refusal_never_falls_back_to_inline_execution(monkeypatch):
         "status": "rejected", "code": "missing_task_authority", "error": "No origin authority"})
     monkeypatch.setattr(dispatch, "_run_sync_with_note", lambda *args: pytest.fail("unscoped fallback"))
     monkeypatch.setattr(dispatch, "_execute_and_aggregate", lambda *args, **kwargs: pytest.fail("inline work"))
-    result = json.loads(dispatch._dispatch_background(batch))
+    from tools.approval_context import approval_task_context
+    with approval_task_context("work", identity="owner", profile="default", session="route", is_current=lambda: True):
+        result = json.loads(dispatch._dispatch_background(batch))
     assert result["status"] == "rejected"
     assert result["code"] == "missing_task_authority"

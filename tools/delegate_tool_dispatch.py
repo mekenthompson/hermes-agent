@@ -468,6 +468,9 @@ def _dispatch_background(batch: _Batch) -> str:
     of one call shares ONE pool slot (``slot_key``), so grouping never changes capacity accounting. Falls back to
     running synchronously (with an explanatory ``note``) when the session cannot receive detached completions or the
     async pool is at capacity."""
+    from tools.approval_context import background_task_refusal
+    if refusal := background_task_refusal():
+        return json.dumps(refusal)
     from tools.delegate_tool import _get_max_async_children
     wake_sid = _resolve_async_wake_sid(batch.origin_wake_sid, batch.origin_session_history_delivery)
     if wake_sid is None:

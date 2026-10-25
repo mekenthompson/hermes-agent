@@ -220,6 +220,19 @@ def approval_task_revoked() -> bool:
                                       else not bound[2].active()))
 
 
+def background_task_refusal(required=True):
+    """Validate native provenance before any background producer setup or fallback."""
+    if not required:
+        return None
+    if approval_task_revoked():
+        return {"status": "rejected", "code": "task_authority_revoked",
+                "error": "The originating native task was stopped or superseded."}
+    if current_approval_task_context() is None:
+        return {"status": "rejected", "code": "missing_task_authority",
+                "error": "Background work requires live native task-scoped authority."}
+    return None
+
+
 def revoked_task_tool_error():
     """Fence every model tool before hooks, bridge expansion or handler side effects."""
     if not approval_task_revoked():

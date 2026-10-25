@@ -162,10 +162,13 @@ def test_apiserver_session_without_id_stays_synchronous(monkeypatch):
         async_delivery=False,
     )
 
-    out = dt.delegate_task(
-        goal="one-shot", context="ctx",
-        background=True, parent_agent=_fake_parent(),
-    )
+    from tools.approval_context import approval_task_context
+    with approval_task_context("one-shot", identity="owner", profile="default", session="request",
+                               is_current=lambda: True):
+        out = dt.delegate_task(
+            goal="one-shot", context="ctx",
+            background=True, parent_agent=_fake_parent(),
+        )
     parsed = json.loads(out)
     assert parsed.get("status") != "dispatched", parsed
     assert "SYNCHRONOUSLY" in parsed.get("note", "")
