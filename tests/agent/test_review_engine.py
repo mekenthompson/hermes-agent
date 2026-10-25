@@ -20,6 +20,7 @@ from agent.review_engine import (
     start_review,
 )
 from tools import async_delegation as ad
+from tools.approval_context import approval_task_context
 from tools.process_registry import process_registry
 
 @pytest.fixture(autouse=True)
@@ -175,12 +176,15 @@ def test_delegate_task_credentials_cfg_overrides_delegation_config(monkeypatch):
     )
 
     override = {"provider": "openrouter", "model": "review-model-x"}
-    out = dt.delegate_task(
-        goal="review this",
-        background=True,
-        parent_agent=_fake_parent(),
-        credentials_cfg=override,
-    )
+    parent = _fake_parent()
+    with approval_task_context("review this", identity="fixture-owner", profile="default",
+                               session=parent.session_id, task_id="review", is_current=lambda: True):
+        out = dt.delegate_task(
+            goal="review this",
+            background=True,
+            parent_agent=parent,
+            credentials_cfg=override,
+        )
     parsed = json.loads(out)
     assert parsed["status"] == "dispatched"
     assert seen["cfg"] == override
@@ -223,7 +227,10 @@ def test_start_review_dispatches_background_and_completes(monkeypatch):
         {"role": "user", "content": "open a PR for the fix"},
         {"role": "assistant", "content": "PR #77 opened: https://x/pull/77"},
     ]
-    result = start_review(_fake_parent(), msgs, "check the tests")
+    parent = _fake_parent()
+    with approval_task_context("check the tests", identity="fixture-owner", profile="default",
+                               session=parent.session_id, task_id="review", is_current=lambda: True):
+        result = start_review(parent, msgs, "check the tests")
     assert result["status"] == "dispatched"
 
     # The reviewer briefing carries the conversation excerpt + user prompt.
@@ -352,7 +359,9 @@ def test_start_review_threads_loaded_skills_into_context(monkeypatch):
         {"role": "user", "content": "open a PR"},
         {"role": "assistant", "content": "PR #9 opened"},
     ]
-    result = start_review(parent, msgs, "")
+    with approval_task_context("review the PR", identity="fixture-owner", profile="default",
+                               session=parent.session_id, task_id="review", is_current=lambda: True):
+        result = start_review(parent, msgs, "")
     assert result["status"] == "dispatched"
     assert "hermes-agent-dev" in built["context"]
     assert "skill_view" in built["context"]

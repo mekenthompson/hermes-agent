@@ -17,6 +17,7 @@ import time
 import pytest
 
 from tools import async_delegation as ad
+from tools.approval_context import approval_task_context
 from tools.process_registry import process_registry
 from tools.process_registry_notifications import format_process_notification
 
@@ -753,10 +754,12 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_run_single_child", slow_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
-    out = dt.delegate_task(
-        goal="the real task", context="ctx",
-        background=True, parent_agent=parent,
-    )
+    with approval_task_context("the real task", identity="fixture-owner", profile="default",
+                               session=parent.session_id, task_id="work", is_current=lambda: True):
+        out = dt.delegate_task(
+            goal="the real task", context="ctx",
+            background=True, parent_agent=parent,
+        )
 
     import json
     parsed = json.loads(out)
@@ -830,7 +833,9 @@ def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
         ui_session_id="origin-tab",
     )
     try:
-        out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
+        with approval_task_context("bg task", identity="fixture-owner", profile="default",
+                                   session="pre-compress-parent", task_id="work", is_current=lambda: True):
+            out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
         assert json.loads(out)["status"] == "dispatched"
         evt = _drain_one()
     finally:
@@ -1113,7 +1118,9 @@ def _grouped_fanout(monkeypatch, tasks, gates):
     monkeypatch.setattr(dt, "_build_child_agent", build)
     monkeypatch.setattr(dt, "_run_single_child", child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
-    return json.loads(dt.delegate_task(tasks=tasks, background=True, parent_agent=parent))
+    with approval_task_context("review grouped tasks", identity="fixture-owner", profile="default",
+                               session=parent.session_id, task_id="work", is_current=lambda: True):
+        return json.loads(dt.delegate_task(tasks=tasks, background=True, parent_agent=parent))
 
 
 def test_ungrouped_task_completes_alone_and_group_completes_together(monkeypatch):
@@ -1238,8 +1245,11 @@ def build(**kw):
     c = MagicMock(); c._delegate_role = "leaf"; c._subagent_id = f"s{kw['task_index']}"; return c
 creds = {"model": "m", "provider": None, "base_url": None, "api_key": None, "api_mode": None, "command": None, "args": None}
 dt._build_child_agent = build; dt._run_single_child = child; dt._resolve_delegation_credentials = lambda *a, **k: creds
-dt.delegate_task(tasks=[{"goal": "fast member of the group task", "group": "g"},
-                        {"goal": "slow member of the group task", "group": "g"}], background=True, parent_agent=parent)
+from tools.approval_context import approval_task_context
+with approval_task_context("run group crash probe", identity="fixture-owner", profile="default",
+                           session=parent.session_id, task_id="crash-probe", is_current=lambda: True):
+    dt.delegate_task(tasks=[{"goal": "fast member of the group task", "group": "g"},
+                            {"goal": "slow member of the group task", "group": "g"}], background=True, parent_agent=parent)
 time.sleep(2.0)
 sys.stdout.flush(); os._exit(1)
 '''
@@ -1290,7 +1300,10 @@ def held_finalize(*a, **k):
     open(os.environ["REPRO_MARKER"], "w").write("child-returned")
     time.sleep(600)
 dtd._finalize_child_results = held_finalize
-dt.delegate_task(tasks=[{"goal": "single background subagent"}], background=True, parent_agent=parent)
+from tools.approval_context import approval_task_context
+with approval_task_context("run single-child crash probe", identity="fixture-owner", profile="default",
+                           session=parent.session_id, task_id="crash-probe", is_current=lambda: True):
+    dt.delegate_task(tasks=[{"goal": "single background subagent"}], background=True, parent_agent=parent)
 time.sleep(600)
 '''
     proc = subprocess.Popen([sys.executable, "-u", "-c", producer], cwd=repo, env=env,

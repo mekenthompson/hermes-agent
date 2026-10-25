@@ -134,9 +134,12 @@ class TestStatelessChannelForcesSyncDelegation:
         reset_session_vars()
         try:
             declare_stateless_channel()
-            out = dt.delegate_task(
-                goal="review the spec", background=True, parent_agent=_Parent()
-            )
+            from tools.approval_context import approval_task_context
+            with approval_task_context("review the spec", identity="fixture-owner", profile="default",
+                                       session="stateless-request", task_id="review", is_current=lambda: True):
+                out = dt.delegate_task(
+                    goal="review the spec", background=True, parent_agent=_Parent()
+                )
         finally:
             reset_session_vars()
 

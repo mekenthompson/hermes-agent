@@ -7,7 +7,7 @@ from weakref import WeakSet
 
 def command_task_scope(authority, ref, identity, text, arrival_epoch):
     from gateway.session_authorities import require_serving
-    from hermes_state_runtime import RuntimeStoreError
+    from hermes_state_runtime import RuntimeStoreError, _epoch
     from tools.approval_context import approval_task_context, approval_task_revoked, current_approval_task_context
 
     if approval_task_revoked() or current_approval_task_context() is not None:
@@ -17,6 +17,8 @@ def command_task_scope(authority, ref, identity, text, arrival_epoch):
     def current():
         try:
             require_serving(authority)
+            with authority.db._read_ctx() as conn:
+                _epoch(conn, authority.epoch)
         except RuntimeStoreError:
             return False
         entry = authority.runner.session_store.lookup_by_session_key(live.route)

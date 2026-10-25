@@ -97,3 +97,32 @@ async def test_stop_during_command_hooks_refuses_late_review(monkeypatch, tmp_pa
     release.set()
     reply = await asyncio.wait_for(pending, 10)
     assert "task_authority_revoked" in reply["output"]
+
+
+@pytest.mark.asyncio
+async def test_replaced_native_runtime_revokes_command_effects(monkeypatch, tmp_path):
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_command_approval import command_task_scope
+    from gateway.session_contract import Principal
+    from gateway.session_local import create_local_session
+    from hermes_state_runtime import begin_runtime_epoch
+    from tools.approval_context import current_approval_task_context
+    from tools.registry import registry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner")
+    actor = Principal("owner", "default", frozenset({"session:create", "session:read", "session:control"}), "viewer")
+    ref = create_local_session(authority, actor, dict(request_id="command", source="cli", model="fixture", toolsets=[]))
+    await authority.attach(actor, ref)
+    route = authority.sessions[ref.session_id].route
+    with command_task_scope(authority, ref, actor.subject, "/review", authority.route_epoch(route)):
+        assert current_approval_task_context() is not None
+        begin_runtime_epoch(authority.db, instance_id="replacement")
+        assert current_approval_task_context() is None
+        effect = tmp_path / "stale-worker.txt"
+        result = registry.dispatch("write_file", {"path": str(effect), "content": "stale"})
+        assert "task_authority_revoked" in result
+        assert not effect.exists()
