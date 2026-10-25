@@ -1281,8 +1281,7 @@ class TestCheckpoint:
         stop_unit.assert_called_once_with(entry["systemd_unit"])
         assert json.loads(checkpoint.read_text()) == []
 
-
-    def test_recovery_skips_explicit_sandbox_backed_entries(self, registry, tmp_path):
+    def test_recovery_retains_explicit_sandbox_backed_entries_as_unknown(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
         original = [{
             "session_id": "proc_remote",
@@ -1292,14 +1291,15 @@ class TestCheckpoint:
             "pid_scope": "sandbox",
         }]
         checkpoint.write_text(json.dumps(original))
-
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
-            assert recovered == 0
-            assert registry.get("proc_remote") is None
-
+            assert recovered == 1
+            session = registry.get("proc_remote")
+            assert session.detached and not session.exited and session.pid_scope == "sandbox"
+            assert session.reconciliation_required
             data = json.loads(checkpoint.read_text())
-            assert data == []
+            assert data[0]["session_id"] == "proc_remote" and data[0]["pid"] == original[0]["pid"]
+            assert data[0]["reconciliation_required"] == session.reconciliation_required
 
     def test_checkpoint_redacts_command_with_inline_secret(self, registry, tmp_path):
         """Issue #77484: the checkpoint file persists raw commands; inline

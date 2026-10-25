@@ -191,10 +191,13 @@ class TestTerminalNotifyGate:
 
     def _run_bg(self, command):
         from tools.terminal_tool import terminal_tool
+        from tools.approval_context import approval_task_context
 
-        return json.loads(
-            terminal_tool(command=command, background=True, notify_on_complete=True)
-        )
+        with approval_task_context(command, identity="fixture-owner", profile="default",
+                                   session="s1", task_id="terminal-notify", is_current=lambda: True):
+            return json.loads(
+                terminal_tool(command=command, background=True, notify_on_complete=True)
+            )
 
     def test_api_server_skips_watcher_and_notes(self):
         from tools.process_registry import process_registry

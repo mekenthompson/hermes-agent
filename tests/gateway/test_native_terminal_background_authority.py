@@ -583,6 +583,68 @@ async def test_remote_inspection_failure_preserves_unknown_even_with_live_author
 
 
 @pytest.mark.asyncio
+@pytest.mark.platforms("posix")
+async def test_healthy_remote_process_survives_abrupt_owner_restart_as_unknown(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    from pathlib import Path
+    from tests.waiting import async_wait_until
+    from tools.process_registry import ProcessRegistry
+
+    source = r'''
+import asyncio, json, os, sys, threading
+from pathlib import Path
+from pytest import MonkeyPatch
+from tests.gateway.test_native_terminal_background_authority import _runtime, _hold_background_boundary, _set_event
+from gateway.session_command_approval import command_task_scope
+from model_tools import handle_function_call
+
+async def launch():
+    home = Path(sys.argv[1])
+    patch = MonkeyPatch()
+    _, authority, actor, ref, registry = await _runtime(home, patch)
+    route = authority.sessions[ref.session_id].route
+    _hold_background_boundary(patch, "remote", registry, threading.Event(), _set_event())
+    started, finish, completed = home / "started", home / "finish", home / "completed"
+    with command_task_scope(authority, ref, actor.subject, "authorized remote work", authority.route_epoch(route)):
+        receipt = json.loads(await asyncio.to_thread(handle_function_call, "terminal",
+            {"command": f"printf started > {started}; while [ ! -e {finish} ]; do sleep 0.05; done; printf done > {completed}",
+             "background": True, "notify": True}, task_id="terminal-restart"))
+        assert not receipt.get("error"), receipt
+        session = registry.get(receipt["session_id"])
+        assert session.pid and not session.reconciliation_required
+        assert session.approval_task_reservation is not None
+        (home / "receipt.json").write_text(json.dumps(receipt))
+        os._exit(19)
+
+asyncio.run(launch())
+'''
+    finish, completed = tmp_path / "finish", tmp_path / "completed"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    try:
+        child = await asyncio.to_thread(subprocess.run, [sys.executable, "-c", source, str(tmp_path)],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            capture_output=True, timeout=30, check=False)
+        assert child.returncode == 19, child.stderr.decode()
+        receipt = json.loads((tmp_path / "receipt.json").read_text())
+        await async_wait_until((tmp_path / "started").exists, timeout=10, what="surviving remote process")
+        recovered = ProcessRegistry()
+        assert recovered.recover_from_checkpoint() == 1
+        session = recovered.get(receipt["session_id"])
+        assert session.pid == receipt["pid"]
+        assert session.pid_scope == "sandbox"
+        assert session.detached and not session.exited
+        assert session.env_ref is None
+        assert getattr(session, "approval_task_reservation", None) is None
+        assert recovered.poll(session.id)["status"] == "unknown"
+        assert recovered.kill_process(session.id)["status"] == "error"
+        assert not session.exited
+    finally:
+        finish.touch()
+        await async_wait_until(completed.exists, timeout=10, what="surviving test process to finish")
+
+
+@pytest.mark.asyncio
 async def test_native_timeout_promotion_and_foreground_control(tmp_path, monkeypatch):
     from gateway.session_command_approval import command_task_scope
     from model_tools import handle_function_call
