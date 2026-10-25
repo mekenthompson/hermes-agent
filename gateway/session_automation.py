@@ -462,12 +462,16 @@ def restore_local_automation(authority, ref, row):
     return event
 
 
-async def admit_automation(authority, adapter, event, identity, replaces=None):
+async def admit_automation(authority, adapter, event, identity, replaces=None, *, _native_periodic=None):
     """``replaces``: a queued automation row of the same session this input supersedes (a liveness
     tick carrying the output of the one still waiting). Its cancellation commits in this admission's
     own transaction, so neither lands without the other."""
     authority._require_admission_open()
     payload, entry = snapshot_automation(authority, adapter, event, identity)
+    if _native_periodic is not None:
+        from gateway.session_periodic_approval import snapshot_policy
+        descriptor = payload.get('local_automation_v1') or payload['native_text_v1']['automation']
+        descriptor['native_periodic_v1'] = snapshot_policy(authority, event, identity, _native_periodic)
     from gateway.session_authority import LiveSession
     sid = (payload.get('local_automation_v1') or payload['native_text_v1']['automation'])['owner']
     ref = SessionRef(authority.profile_id, sid)
@@ -652,7 +656,7 @@ async def reset_and_rehome_messages(runner, session_key, old_session_id):
     return entry, release
 
 
-async def admit_route_wake(runner, adapter, source, text, producer, metadata=None):
+async def admit_route_wake(runner, adapter, source, text, producer, metadata=None, *, _native_periodic=None):
     """Commit a producer wake (Kanban push wake, /loop tick) for ``source``'s route into the
     authority FIFO, like heartbeats and process completions, instead of a classic turn that
     interrupts or races the admitted one. ``False`` when no authority serves the scope or the
@@ -676,7 +680,7 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
                              message_id=identity, metadata={'gateway_session_key': key,
                                                             'gateway_session_id': entry.session_id,
                                                             **(metadata or {})})
-        await authority.admit_automation(adapter, event, identity)
+        await admit_automation(authority, adapter, event, identity, _native_periodic=_native_periodic)
         return True
     from gateway.session_envelope import restore_native
     envelope = committed_route_envelope(authority, entry)
@@ -689,5 +693,5 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
                          message_id=identity, metadata={'gateway_session_key': key,
                                                         'gateway_session_id': entry.session_id,
                                                         **(metadata or {})})
-    await authority.admit_automation(adapter, event, identity)
+    await admit_automation(authority, adapter, event, identity, _native_periodic=_native_periodic)
     return True

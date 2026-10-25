@@ -332,12 +332,13 @@ class GatewayGoalsMixin:
         prompt = decision.get("continuation_prompt") or ""
         if not decision.get("should_continue") or not prompt or source is None:
             return
-        if getattr(source, "platform", None) == Platform.LOCAL:
-            # A local session's adapter FIFO has no reader: its turns are authority admissions.
-            # Commit the continuation there, as main's TUI chained it after the turn.
+        from gateway.session_authorities import active_authority
+        if active_authority(self) is not None:
+            # The saved goal, not a synthetic human message, owns its next admitted turn.
             from gateway.session_automation import admit_route_wake
             try:
-                await admit_route_wake(self, self._delivery_adapter_for(source), source, prompt, "goal-continuation")
+                await admit_route_wake(self, self._delivery_adapter_for(source), source, prompt, "goal-continuation",
+                    _native_periodic=('goal-continuation', mgr.session_id, mgr.state.to_json()))
             except Exception:  # health: allow BLE001 -- best-effort like the FIFO enqueue below; traceback logged
                 logger.debug("goal continuation: local admission failed", exc_info=True)
             return
@@ -510,7 +511,8 @@ class GatewayGoalsMixin:
             from gateway.session_automation import admit_route_wake
             # Under a session authority the tick commits to the FIFO (never a classic turn beside an
             # admitted one); a slash-command loop is a command and keeps the command path.
-            if wakeup.lstrip().startswith("/") or not await admit_route_wake(self, adapter, source, wakeup, "loop-tick"):
+            if wakeup.lstrip().startswith("/") or not await admit_route_wake(self, adapter, source, wakeup, "loop-tick",
+                    _native_periodic=('loop-tick', sid, mgr.state.to_json())):
                 await adapter.handle_message(self._synthetic_prompt_event(source, wakeup, internal=True))
             # Slash-command loops dispatch through the command path and never hit the post-turn
             # completion hook — complete the tick immediately (caps + scheduling).

@@ -44,6 +44,7 @@ from agent.inline_tool_executors import (
     tool_hook_ids,
 )
 from agent.message_metadata import stamp_data_use
+from agent.tool_invocation import pre_tool_block as _pre_tool_block, refuse_revoked_tool
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
     _is_destructive_command,
@@ -655,23 +656,6 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_body: dict[str, Any]
     return result
 
 
-def _pre_tool_block(agent, ref: _ToolCallRef):
-    """Run ``pre_tool_call`` plugin hooks; returns ``(block_message, final_args)`` with any
-    hook-modified args applied. Hook failures never block."""
-    try:
-        from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
-
-        block_msg, modified_args = _dispatch_pre_tool_call_hooks(
-            ref.name,
-            ref.args,
-            **tool_hook_ids(agent, ref.task_id, ref.call_id),
-            middleware_trace=list(ref.trace),
-        )
-        return block_msg, (ref.args if modified_args is None else modified_args)
-    except Exception:
-        return None, ref.args
-
-
 def _dispatch_authorized_once(
     agent,
     state: _ManagedToolResult,
@@ -689,6 +673,8 @@ def _dispatch_authorized_once(
     ``begin_execution`` (concurrent start-order gate) is advanced exactly once on every
     path so later-ordered workers keep moving; blocked calls advance it without a callback.
     """
+    if (denied := refuse_revoked_tool(state, begin_execution)) is not None:
+        return denied
     def _advance_start_order(callback=None) -> None:
         if begin_execution is not None:
             begin_execution(callback)
@@ -698,9 +684,17 @@ def _dispatch_authorized_once(
     block_message, block_error_type = scope_block, "tool_scope_block"
     if block_message is None:
         block_error_type = "plugin_block"
-        resolve = lambda: _pre_tool_block(agent, ref)
+        def resolve():
+            if refuse_revoked_tool(state) is not None:
+                return None, ref.args
+            return _pre_tool_block(agent, ref)
         block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
         state.args = ref.args
+        if state.blocked:
+            _advance_start_order()
+            return state.result
+        if refuse_revoked_tool(state, _advance_start_order) is not None:
+            return state.result
     block_body = None if block_message is None else {"error": block_message}
 
     # Checked once, after plugin modify hooks (which may replace arguments) and
@@ -731,6 +725,8 @@ def _dispatch_authorized_once(
             block_body=block_body, block_error_type=block_error_type, guardrail_decision=guardrail_decision,
         )
 
+    if (denied := refuse_revoked_tool(state, _advance_start_order)) is not None:
+        return denied
     if ref.name == "memory":
         agent._turns_since_memory = 0
     elif ref.name == "skill_manage":
@@ -771,6 +767,8 @@ def _run_agent_tool_execution_middleware(
 
     trace = middleware_trace if middleware_trace is not None else []
     state = _ManagedToolResult(result=None, args=function_args, middleware_trace=trace, blocked=False, dispatched=False)
+    if refuse_revoked_tool(state, begin_execution) is not None:
+        return state
     dispatch_lock = threading.Lock()
 
     def _authorized_dispatch(final_args: dict[str, Any]) -> Any:
@@ -797,6 +795,8 @@ def _run_agent_tool_execution_middleware(
     _authorized_dispatch = bind_tool_continuation(_authorized_dispatch)
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
+        if (denied := refuse_revoked_tool(state, begin_execution)) is not None:
+            return denied
         request_result = apply_tool_request_middleware(
             function_name,
             relay_args,
@@ -806,6 +806,8 @@ def _run_agent_tool_execution_middleware(
         request_args = request_result.payload if isinstance(request_result.payload, dict) else relay_args
         trace.clear()
         trace.extend(request_result.trace)
+        if (denied := refuse_revoked_tool(state, begin_execution)) is not None:
+            return denied
         return run_tool_execution_middleware(
             function_name,
             request_args,

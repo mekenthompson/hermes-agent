@@ -55,6 +55,7 @@ async def test_viewer_request_reaches_reviewer_but_internal_notice_does_not(tmp_
             gate = (A.check_all_command_guards("python -c 'print(1)'", "local")
                     if evidence is not None else None)
             def child_conversation(**_kwargs):
+                assert evidence is not None, "an unverified notice must not start its child"
                 return {"evidence": current_approval_task_context(),
                         "verdict": _smart_approve("python -c 'print(1)'", "script execution")}
 
@@ -63,6 +64,9 @@ async def test_viewer_request_reaches_reviewer_but_internal_notice_does_not(tmp_
                 parent_agent=SimpleNamespace(), task_index=0, goal="Edit src/cli.py",
                 subagent_id=None, child_progress_cb=None, child_task_id="child-1")
             child_result, child_error, _deferred = child_run.await_child()
+            if evidence is None:
+                assert child_result is None and child_error is not None
+                return evidence, None, verdict, gate
             assert child_error is None
             child = child_result["evidence"]
             assert child_result["verdict"] == verdict
@@ -96,9 +100,8 @@ async def test_viewer_request_reaches_reviewer_but_internal_notice_does_not(tmp_
     assert child.ancestry == ("child-1",)
     assert verdict == "approve"
     assert gate["approved"] is True and gate["smart_approved"] is True
-    assert results["synthetic notice"] == (None, None, "escalate", None)
+    assert results["synthetic notice"] == (None, None, "deny", None)
     assert "Edit only src/cli.py" in seen[0]
-    assert "Edit only src/cli.py" not in seen[-1]
 
 
 @pytest.mark.asyncio
@@ -154,11 +157,10 @@ async def test_stop_during_smart_review_rejects_late_approve(tmp_path, monkeypat
 
 
 def test_foreign_and_synthetic_rows_cannot_supply_human_request():
-    from contextlib import nullcontext
     from gateway.config import Platform
     from gateway.session_ingress import _approval_task_scope
     from hermes_state_runtime import RuntimeStoreError
-    from tools.approval_context import current_approval_task_context
+    from tools.approval_context import current_approval_task_context, approval_task_revoked
 
     source = SimpleNamespace(user_id="owner", platform=Platform.LOCAL, profile=None,
                              chat_id="room", thread_id=None)
@@ -175,7 +177,8 @@ def test_foreign_and_synthetic_rows_cannot_supply_human_request():
         assert current_approval_task_context() is None
     event.internal = False
     row["payload"] = {"text": event.text, "native_text_v1": {}}
-    assert isinstance(_approval_task_scope(authority, ref, row, live, event, is_api=False), type(nullcontext()))
+    with _approval_task_scope(authority, ref, row, live, event, is_api=False):
+        assert current_approval_task_context() is None and approval_task_revoked()
 
 
 @pytest.mark.parametrize("platform", ["telegram", "slack"])
@@ -259,8 +262,8 @@ async def test_native_messaging_fifo_binds_authenticated_request_to_smart_review
     evidence, verdict = reviewed[0]
     if foreign_principal:
         assert evidence is None
-        assert verdict == "escalate"
-        assert text not in prompts[0]
+        assert verdict == "deny"
+        assert not any(text in prompt for prompt in prompts)
     else:
         assert evidence.text == text
         assert evidence.identity == row["principal_id"]

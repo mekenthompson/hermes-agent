@@ -99,7 +99,8 @@ async def test_background_admission_and_completion_authority(tmp_path, monkeypat
         await async_wait_until(lambda: bool(dispatched), timeout=10, what="background admission")
         if origin == "plugin":
             assert dispatched[0]["status"] == "rejected"
-            assert dispatched[0]["code"] == "missing_task_authority"
+            assert dispatched[0]["code"] == "task_authority_revoked"
+            assert dispatched[0]["error"]
             assert not executed
             assert delegation.approval_reservation_for_completion(delegation_id) is None
             return

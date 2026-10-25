@@ -71,7 +71,9 @@ async def admit_heartbeat(runner, adapter, source, session_id, route):
         metadata={'gateway_session_key': route, 'gateway_session_id': session_id})
     event._heartbeat_session_id = session_id
     try:
-        await authority.admit_automation(adapter, event, identity)
+        from gateway.session_automation import admit_automation
+        await admit_automation(authority, adapter, event, identity,
+                               _native_periodic=('heartbeat', session_id, state.to_json()))
     except BaseException:
         # Readiness is not a delivery attempt, and cancellation before commit is not ACK.
         if getattr(event, '_gateway_accepted', False) is not True:

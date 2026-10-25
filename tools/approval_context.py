@@ -257,8 +257,7 @@ def approval_task_revoked() -> bool:
 
 def require_live_task_setup():
     """Recheck Stop immediately before producer setup that can call hooks or write state."""
-    from tools.interrupt import is_interrupted
-    if approval_task_revoked() or is_interrupted() or _api_execution_revoked():
+    if approval_task_revoked() or _api_execution_revoked():
         raise ValueError("The originating native task was stopped or superseded.")
 
 

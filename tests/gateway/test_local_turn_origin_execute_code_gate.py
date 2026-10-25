@@ -97,8 +97,8 @@ async def test_only_the_viewers_own_turn_skips_the_whole_script_gate(tmp_path, m
         db.close()
 
     assert gates == {"typed by the viewer": (True, []),
-                     "plugin injection": (False, ["execute_code"]),
-                     "loop tick": (False, ["execute_code"]),
+                     "plugin injection": (False, []),
+                     "loop tick": (False, []),
                      "typed, then detached": (False, ["execute_code"])}
 
 

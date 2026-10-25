@@ -77,6 +77,10 @@ def _bootstrap(authority, ref, row, policy, scope, text=None):
     hydrated = replace(policy, config_json=json.dumps(config), request_json=json.dumps(request),
                        terminal_json=json.dumps(terminal), credential_ref=None, config_secret_ref=None)
     approval_origin = _managed_approval_origin(authority, ref, row)
+    if approval_origin is None and 'local_automation_v1' in row['payload']:
+        # An unverified notification is a denied worker scope, never legacy unscoped work.
+        approval_origin = {'text': '', 'identity': 'unverified', 'profile': str(authority.profile_id),
+                           'session': live.route, 'admission': row['admission_id'], 'generation': row['generation']}
     return {'version': 1, 'home': authority.profile_id, 'scope': scope,
             'policy': asdict(hydrated), 'api_key': route_launch_key(authority, policy, config),
             'text': row['payload']['text'] if text is None else text, 'route': live.route,
@@ -88,8 +92,17 @@ def _bootstrap(authority, ref, row, policy, scope, text=None):
 
 
 def _managed_approval_origin(authority, ref, row):
-    """Only the owner's admitted local viewer row can supply worker request evidence."""
+    """Native viewer, hosted task, periodic job, or reserved completion evidence."""
     from gateway.session_native_approval import native_owner_current
+    from gateway.session_hosted_approval import hosted_origin
+    if hosted := hosted_origin(authority, ref, row):
+        return hosted
+    if 'local_automation_v1' in row['payload']:
+        if not native_owner_current(authority):
+            return None
+        from gateway.session_periodic_approval import periodic_origin
+        from gateway.session_approval_completion import completion_approval_origin
+        return periodic_origin(authority, ref, row) or completion_approval_origin(authority, row, authority.sessions[ref.session_id])
     from gateway.session_operator import check_local_input, is_viewer_input
     if not is_viewer_input(row) or not isinstance(row['payload'].get('text'), str):
         return None
@@ -619,12 +632,14 @@ async def admit_managed(authority, ref, row, policy):
     """The ingress route into a managed worker. A removed folder is refused before a worker exists,
     like the in-process runner: a worker failing in its policy scope reads as a LOST execution
     (``unknown``) and parks every follower behind it."""
-    from gateway.session_policy import workspace_ready, workspace_unavailable_result
-    if not workspace_ready(policy):
-        result = workspace_unavailable_result(policy)
-        authority.pending_results[row['admission_id']] = {'result': result, 'usage': {}}
-        return result['final_response']
-    return await execute_managed(authority, ref, row, policy)
+    from gateway.session_approval_completion import managed_completion_scope
+    with managed_completion_scope(authority, row, authority.sessions[ref.session_id]):
+        from gateway.session_policy import workspace_ready, workspace_unavailable_result
+        if not workspace_ready(policy):
+            result = workspace_unavailable_result(policy)
+            authority.pending_results[row['admission_id']] = {'result': result, 'usage': {}}
+            return result['final_response']
+        return await execute_managed(authority, ref, row, policy)
 
 
 async def execute_managed(authority, ref, row, policy):

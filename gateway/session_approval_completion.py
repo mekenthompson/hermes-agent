@@ -76,8 +76,7 @@ def release_admitted_completion(row):
             release_completion_reservation(identity)
 
 
-@contextmanager
-def completion_task_scope(authority, row, live):
+def _completion_identities(row):
     payload = row['payload']
     descriptor = payload.get('local_automation_v1') or (payload.get('native_text_v1') or {}).get('automation') or {}
     raw = descriptor.get('identities') or [descriptor.get('identity')]
@@ -88,6 +87,12 @@ def completion_task_scope(authority, row, live):
         except (TypeError, ValueError):
             identity = None
         identities.append(identity)
+    return identities
+
+
+@contextmanager
+def completion_task_scope(authority, row, live):
+    identities = _completion_identities(row)
     completion_kinds = ('completion', 'async_delegation')
     if not any(isinstance(identity, list) and identity and identity[0] in completion_kinds
                for identity in identities):
@@ -107,6 +112,18 @@ def completion_task_scope(authority, row, live):
                     release_completion_reservation(identity)
         return
     from tools.approval_context import completion_approval_task, release_background_approval_task
+    reservations, releases = _completion_reservations(authority, identities, live)
+    try:
+        with completion_approval_task(reservations, 'completion:' + row['admission_id']):
+            yield
+    finally:
+        for release in releases:
+            release()
+        for reservation in reservations:
+            release_background_approval_task(reservation)
+
+
+def _completion_reservations(authority, identities, live):
     reservations = []
     releases = []
     for kind, producer_id, incarnation in identities:
@@ -130,11 +147,28 @@ def completion_task_scope(authority, row, live):
                 or reservation.evidence.session != live.route or not reservation.evidence.task_id)):
             reservation = None
         reservations.append(reservation)
-    try:
-        with completion_approval_task(reservations, 'completion:' + row['admission_id']):
-            yield
-    finally:
-        for release in releases:
-            release()
-        for reservation in reservations:
-            release_background_approval_task(reservation)
+    return reservations, releases
+
+
+def completion_approval_origin(authority, row, live):
+    """Managed workers read the same private reservations as the in-process consumer."""
+    from tools.approval_context import completion_approval_task, current_approval_task_context
+    identities = _completion_identities(row)
+    if (not identities or any(not isinstance(identity, list) or len(identity) != 3
+            or identity[0] not in ('completion', 'async_delegation') for identity in identities)):
+        return None
+    reservations, _releases = _completion_reservations(authority, identities, live)
+    with completion_approval_task(reservations, 'completion:' + row['admission_id']):
+        origin = current_approval_task_context()
+    if origin is None:
+        return None
+    return {'text': origin.text, 'identity': origin.identity, 'profile': origin.profile,
+            'session': origin.session, 'admission': origin.task_id, 'generation': row['generation']}
+
+
+def managed_completion_scope(authority, row, live):
+    from contextlib import nullcontext
+    if any(isinstance(identity, list) and identity and identity[0] in ('completion', 'async_delegation')
+           for identity in _completion_identities(row)):
+        return completion_task_scope(authority, row, live)
+    return nullcontext()

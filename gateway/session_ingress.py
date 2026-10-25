@@ -350,10 +350,18 @@ def _approval_task_scope(authority, ref, row, live, event, *, is_api):
     """Bind consent evidence to this exact authenticated admission and live owner."""
     from tools.approval_context import unverified_approval_task
     if event.internal:
+        from gateway.session_periodic_approval import periodic_task_scope
+        periodic = periodic_task_scope(authority, ref, row, live, event)
+        if periodic is not None:
+            return periodic
         from gateway.session_approval_completion import completion_task_scope
         return completion_task_scope(authority, row, live)
     if is_api:
         return _api_approval_scope(authority, ref, row, live)
+    from gateway.session_hosted_approval import hosted_task_scope
+    hosted = hosted_task_scope(authority, ref, row, live, event)
+    if hosted is not None:
+        return hosted
     if (not isinstance(event.text, str)
             or not event.text.strip() or not isinstance(row.get('generation'), int)):
         return unverified_approval_task()
@@ -373,10 +381,18 @@ def _approval_task_scope(authority, ref, row, live, event, *, is_api):
                                 source.thread_id, source.user_id], separators=(',', ':'))
         if row['principal_id'] != 'messaging:' + principal:
             return unverified_approval_task()
+    return _native_task_scope(authority, ref, row, live, event, event.text)
+
+
+def _native_task_scope(authority, ref, row, live, event, text, *, producer_current=None):
     from gateway.session_native_approval import native_claim_current, native_owner_current, native_task_context
     from hermes_state_runtime import get_session_admission
+    owned_lease = None
 
     def is_current(parent_returned=False):
+        if producer_current is not None and not producer_current():
+            owned_lease.revoke()
+            return False
         if not native_owner_current(authority):
             return False
         if authority.sessions.get(ref.session_id) is not live:
@@ -403,6 +419,8 @@ def _approval_task_scope(authority, ref, row, live, event, *, is_api):
                      or authority.db.get_compression_tip(ref.session_id) == entry.session_id))
 
     def own(lease):
+        nonlocal owned_lease
+        owned_lease = lease
         from weakref import WeakSet
         with live.event_stream.lock:
             leases = getattr(live, 'approval_task_leases', None)
@@ -411,7 +429,7 @@ def _approval_task_scope(authority, ref, row, live, event, *, is_api):
             leases.add(lease)
 
     return native_task_context(
-        event.text, identity=row['principal_id'],
+        text, identity=row['principal_id'],
         profile=str(authority.profile_id), session=str(live.route),
         task_id=row['admission_id'], run_id=str(row['generation']), is_current=is_current, owner=own,
     )

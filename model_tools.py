@@ -824,6 +824,9 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
         return registry.dispatch(function_name, next_args, **dispatch_kwargs)
 
     with _approval_observability(ids):
+        from tools.approval_context import revoked_task_tool_error
+        if refusal := revoked_task_tool_error():
+            return refusal
         if skip_tool_execution_middleware:
             return _dispatch(function_args)
         from hermes_cli.middleware import run_tool_execution_middleware
@@ -921,12 +924,16 @@ def handle_function_call(
     original_args = dict(function_args)
     if not skip_tool_request_middleware:
         function_args, original_args, trace = _apply_request_middleware(function_name, function_args, ids, trace)
+    if refusal := revoked_task_tool_error():
+        return refusal
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
 
         function_args, blocked = _pre_dispatch_guards(function_name, function_args, skip_pre_tool_call_hook, ids, trace)
+        if refusal := revoked_task_tool_error():
+            return refusal
         if blocked is not None:
             result, error_type, error_message = blocked
             return _emit(result, status="blocked", error_type=error_type, error_message=error_message)

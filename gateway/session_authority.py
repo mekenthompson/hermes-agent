@@ -1012,6 +1012,7 @@ class SessionAuthority:
     async def _claim_next(self, ref, live):
         # False asks the pump to re-read after a queued head changed during preflight.
         async with live.claim_gate, live.mutation_lock:
+            hosted_checked = False
             pending = list_session_admissions(self.db, session_id=ref.session_id)
             if any(row['status'] == 'unknown' for row in pending):
                 raise RuntimeStoreError('unknown_execution')
@@ -1039,6 +1040,7 @@ class SessionAuthority:
                     current = get_session_admission(self.db, admission_id=first['admission_id'])
                     if current is None or current['status'] != 'queued':
                         return False, first
+                    hosted_checked = True
                 if 'local_automation_v1' in first['payload']:
                     from gateway.session_automation import check_local_automation
                     check_local_automation(self, ref, first)
@@ -1083,6 +1085,8 @@ class SessionAuthority:
                                                     session_id=ref.session_id, _guard=self._admission_gate(),
                                                     head=first['admission_id'] if first is not None else None),
                                       then=partial(self._stamp_claim, ref, live))
+            if row and hosted_checked:
+                row['_hosted_authorized'] = (self.epoch, row['admission_id'])
             # Input scheduled while this claim's transaction ran may postdate its read: re-read
             # instead of letting the drain exit idle over a committed admission.
             return (False if row is None and live.rescan else row), first
