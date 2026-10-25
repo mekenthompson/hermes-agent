@@ -65,11 +65,18 @@ async def messaging_command_scope(runner, event, route, arrival_epoch):
     frozen = _adapter_event(event)
     fresh_roles = await reauthorize_roles(runner, frozen.source, provenance)
     _validate_native(runner, frozen, provenance, fresh_roles, allow_command=True)
-    entry = runner.session_store.lookup_by_session_key(route)
-    if entry is None:
-        return nullcontext()
-    ref = SessionRef(authority.profile_id, authority.logical_owner(entry.session_id))
     source = frozen.source
+    entry = runner.session_store.lookup_by_session_key(route)
+    owner = authority.logical_owner(entry.session_id) if entry is not None else None
+    if owner not in authority.sessions:
+        from functools import partial
+        from gateway.session_runtime_workers import tracked_write
+        ref = await tracked_write(authority, partial(authority._reserve_route, source),
+                                  then=lambda reserved: authority._publish_route(source, *reserved))
+        fresh_roles = await reauthorize_roles(runner, source, provenance)
+        _validate_native(runner, frozen, provenance, fresh_roles, allow_command=True)
+    else:
+        ref = SessionRef(authority.profile_id, owner)
     identity = "messaging:" + json.dumps([source.profile, source.platform.value, source.chat_id,
                                           source.thread_id, source.user_id], separators=(",", ":"))
     actor = Principal(identity, authority.profile_id, frozenset({"session:control"}), "native-command")
