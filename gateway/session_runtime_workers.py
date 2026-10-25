@@ -20,7 +20,27 @@ def uncounted_runtime_work(runner):
                   for worker in getattr(authority, '_managed_workers', {}).values())
     return (managed + sum(live.route not in running and sid not in getattr(authority, '_managed_workers', {})
                 for authority in authorities for sid, live, _ in executing_sessions(authority))
-            + sum(len(mutation_tasks(authority)) + len(side_agents(authority)) for authority in authorities))
+            + sum(len(mutation_tasks(authority)) + len(side_agents(authority))
+                  + len(command_effects(authority)) + len(command_unknowns(authority))
+                  for authority in authorities))
+
+
+def command_effects(authority):
+    """Physical quick commands remain profile work after their RPC observer disconnects."""
+    return {task for live in getattr(authority, 'sessions', {}).values()
+            for lease in list(getattr(live, 'approval_task_leases', ()))
+            for task in lease.effect_tasks() if not task.done()}
+
+
+def command_unknowns(authority, route=None):
+    """Unknown command effects live in the existing durable process registry, beyond task exit."""
+    from tools.process_registry import process_registry
+    routes = {route} if route is not None else {live.route for live in getattr(authority, 'sessions', {}).values()
+                                              if getattr(live, 'route', None)}
+    with process_registry._lock:
+        return [session for session in process_registry._running.values()
+                if session.session_key in routes and session.owner_task_id.startswith('command:')
+                and session.reconciliation_required and not session.exited]
 
 
 def side_agents(authority):
@@ -152,6 +172,12 @@ def stop_authority_work(authority):
     from gateway.run_runtime import stop_authority_turns
     from agent.interrupt_compat import request_hard_interrupt
     stop_authority_turns(authority, in_process=True)
+    for live in getattr(authority, 'sessions', {}).values():
+        for lease in list(getattr(live, 'approval_task_leases', ())):
+            lease.revoke()
+    for effect in command_effects(authority):
+        if not effect.cancelling():
+            effect.cancel()
     for _, holder in [*physical_workers(authority), *side_agents(authority)]:
         if holder and holder[0] is not None:
             request_hard_interrupt(holder[0], 'Profile runtime is stopping')
@@ -164,8 +190,62 @@ async def join_authority_work(authority, timeout):
     while True:
         stop_authority_work(authority)
         if (not list(physical_workers(authority)) and not list(executing_sessions(authority))
-                and not mutation_tasks(authority) and not side_agents(authority)):
+                and not mutation_tasks(authority) and not side_agents(authority) and not command_effects(authority)):
+            require_command_cleanup(authority)
             return
         if asyncio.get_running_loop().time() >= deadline:
             raise TimeoutError('Profile workers did not stop; ownership retained')
         await asyncio.sleep(.05)
+
+
+def require_command_cleanup(authority, route=None):
+    from hermes_state_runtime import RuntimeStoreError
+    if command_unknowns(authority, route):
+        raise RuntimeStoreError('unknown_execution', detail='Native command cleanup is unconfirmed; reconcile its process and effects before retrying.')
+
+
+async def interrupt_session(authority, actor, ref, generation):
+    from hermes_state_runtime import RuntimeStoreError
+    authority.authorize(actor, ref, 'session:control')
+    handle = authority._handle(ref)
+    if handle.execution_generation != generation:
+        raise RuntimeStoreError('stale_generation')
+    live, agent = authority.sessions[ref.session_id], None
+    # A later admission can finish while an earlier detached child is still
+    # running. Stop revokes every task owned by this live conversation.
+    effects = set()
+    with live.event_stream.lock:
+        authority.fence_route(live.route)
+        for lease in list(getattr(live, 'approval_task_leases', ())):
+            lease.revoke()
+            effects.update(lease.effect_tasks())
+    if handle.execution_state == 'running':
+        # Latches are written under the lock adopt_agent takes on the executor thread, BEFORE the
+        # agent is called: an adoption racing the call consumes them. The agent is called outside it.
+        with live.event_stream.lock:
+            adopted_generation, agent = authority.adopted.get(ref.session_id, (None, None))
+            if adopted_generation != generation:
+                agent = authority.agent(ref)
+                if not authority._runs_own_agent(ref):
+                    # Accepted for this exact claim before its turn adopted an agent: whatever agent
+                    # the turn adopts for this generation must not run the work as if no Stop arrived.
+                    authority.pending_stops[ref.session_id] = generation
+            if agent is not None:
+                authority.delivered_stops[ref.session_id] = generation
+    # Main's Stop: hard-cancel (aborts compression too) and end the session's own background
+    # delegations (spawned by this session only: a viewer must not kill other gateway work).
+    from agent.interrupt_compat import request_hard_interrupt
+    from tools.async_delegation import interrupt_for_session
+    if agent is not None:
+        request_hard_interrupt(agent)
+    for parent in dict.fromkeys((ref.session_id, authority.physical_target(ref))):
+        interrupt_for_session(session_key=live.route, parent_session_id=parent, reason='user_stop')
+    if effects:
+        for effect in effects:
+            if not effect.cancelling():
+                effect.cancel()
+        done, pending = await asyncio.wait(effects, timeout=15)
+        if pending or any(not effect.cancelled() and effect.exception() is not None for effect in done):
+            raise RuntimeStoreError('unknown_execution', detail='Native command cleanup is unconfirmed; reconcile its process and effects before retrying.')
+    require_command_cleanup(authority, live.route)
+    return authority._handle(ref)

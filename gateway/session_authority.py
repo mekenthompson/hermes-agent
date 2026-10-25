@@ -863,39 +863,8 @@ class SessionAuthority:
         return self._receipt(row)
 
     async def interrupt(self, actor, ref, generation):
-        self.authorize(actor, ref, 'session:control')
-        handle = self._handle(ref)
-        if handle.execution_generation != generation:
-            raise RuntimeStoreError('stale_generation')
-        live, agent = self.sessions[ref.session_id], None
-        # A later admission can finish while an earlier detached child is still
-        # running. Stop revokes every task owned by this live conversation.
-        with live.event_stream.lock:
-            self.fence_route(live.route)
-            for lease in list(getattr(live, 'approval_task_leases', ())):
-                lease.revoke()
-        if handle.execution_state == 'running':
-            # Latches are written under the lock adopt_agent takes on the executor thread, BEFORE the
-            # agent is called: an adoption racing the call consumes them. The agent is called outside it.
-            with live.event_stream.lock:
-                adopted_generation, agent = self.adopted.get(ref.session_id, (None, None))
-                if adopted_generation != generation:
-                    agent = self.agent(ref)
-                    if not self._runs_own_agent(ref):
-                        # Accepted for this exact claim before its turn adopted an agent: whatever agent
-                        # the turn adopts for this generation must not run the work as if no Stop arrived.
-                        self.pending_stops[ref.session_id] = generation
-                if agent is not None:
-                    self.delivered_stops[ref.session_id] = generation
-        # Main's Stop: hard-cancel (aborts compression too) and end the session's own background
-        # delegations (spawned by this session only: a viewer must not kill other gateway work).
-        from agent.interrupt_compat import request_hard_interrupt
-        from tools.async_delegation import interrupt_for_session
-        if agent is not None:
-            request_hard_interrupt(agent)
-        for parent in dict.fromkeys((ref.session_id, self.physical_target(ref))):
-            interrupt_for_session(session_key=live.route, parent_session_id=parent, reason='user_stop')
-        return self._handle(ref)
+        from gateway.session_runtime_workers import interrupt_session
+        return await interrupt_session(self, actor, ref, generation)
 
     def _classic_turn_holds(self, route):
         """The route's running slot is held by a turn this FIFO did not claim (the drain is serial:

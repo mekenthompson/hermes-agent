@@ -15,6 +15,22 @@ class ProcessCheckpointMixin:
         """Subclass supplies the live PID decision. See ProcessRegistry."""
         raise NotImplementedError
 
+    def _refresh_detached_session(self, session):
+        """Re-attach, close, or prune a recovered host-PID session.
+
+        A completion is not queued here: recovery has no waitable handle, so it
+        never collected an exit status.
+        """
+        if session is None or session.exited or not session.detached or session.pid_scope != "host" or session.output_log or session.reconciliation_required:
+            return session  # a log-backed adoption's reader collects the recorded exit itself
+        fate = self._detached_host_fate(session.pid, session.host_start_time)
+        if fate == "running":
+            return session
+        if fate == "gone":
+            return self._prune_uncollected_detached(session)
+        self._close_reused_detached(session)
+        return session
+
     # ----- Checkpoint (crash recovery) -----
 
     def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None):
@@ -29,7 +45,7 @@ class ProcessCheckpointMixin:
                         continue
                     # Backfill the start time so recovery can detect PID recycling
                     # even for sessions spawned before this field existed.
-                    if s.host_start_time is None and s.pid_scope == "host" and s.pid:
+                    if s.host_start_time is None and s.pid_scope == "host" and s.pid and not s.reconciliation_required:
                         s.host_start_time = self._safe_host_start_time(s.pid)
                     entry = {"session_id": s.id, **{f: getattr(s, f) for f in _CHECKPOINT_FIELDS}}
                     # Redact inline credentials before persisting (~/.hermes/processes.json).
@@ -56,7 +72,7 @@ class ProcessCheckpointMixin:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
     def _foreign_handoffs(self, path, known) -> list[dict[str, Any]]:
-        """Keep foreign remote effects and host logs with a live or unread outcome."""
+        """Keep uncertain effects and foreign logs with a live or unread outcome."""
         from pathlib import Path
         from tools.process_registry_output_log import _exit_path, adoptable_log
         try:
@@ -64,7 +80,7 @@ class ProcessCheckpointMixin:
         except (OSError, ValueError):
             return []
         def retained(entry):
-            if entry.get("pid_scope", "host") != "host":
+            if entry.get("reconciliation_required") or entry.get("pid_scope", "host") != "host":
                 # A sandbox PID is never a host liveness probe. Both acknowledged
                 # launches and missing receipts need native external reconciliation.
                 return True
@@ -96,7 +112,7 @@ class ProcessCheckpointMixin:
         unresolved_scope_entries: list[dict[str, Any]] = []
         for entry in entries:
             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
-            if not pid and pid_scope == "host":
+            if not pid and pid_scope == "host" and not entry.get("reconciliation_required"):
                 continue
             # The registry is process-global, so every profile's checkpoint carries every live
             # process; a multiplexer recovering several homes must adopt each session once.
@@ -104,7 +120,8 @@ class ProcessCheckpointMixin:
                 already_tracked = entry.get("session_id") in self._running
             if already_tracked:
                 continue
-            if pid_scope != "host":  # in-sandbox PIDs mean nothing once the env handle is gone
+            # A PID's death/reuse cannot settle uncertain descendants or external effects.
+            if pid_scope != "host" or entry.get("reconciliation_required"):
                 fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
                 fields["reconciliation_required"] = entry.get("reconciliation_required") or (
                     "The runtime restarted; remote process state is unknown. Reconcile with current native "

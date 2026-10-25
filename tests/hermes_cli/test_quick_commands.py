@@ -144,9 +144,9 @@ class TestGatewayQuickCommands:
 
 
     @pytest.mark.asyncio
-    async def test_timeout_returns_error(self):
+    async def test_timeout_returns_error(self, monkeypatch):
         from gateway.run import GatewayRunner
-        import asyncio
+        monkeypatch.setattr('gateway.run_inbound_hooks._EXEC_QUICK_COMMAND_TIMEOUT', 2)
         runner = GatewayRunner.__new__(GatewayRunner)
         runner.config = {"quick_commands": {"slow": {"type": "exec", "command": "sleep 100"}}}
         runner._running_agents = {}
@@ -154,8 +154,7 @@ class TestGatewayQuickCommands:
         runner._is_user_authorized = MagicMock(return_value=True)
 
         event = self._make_event("slow")
-        with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
-            result = await runner._handle_message(event)
+        result = await runner._handle_message(event)
         assert result is not None
         assert "timed out" in result.lower()
 

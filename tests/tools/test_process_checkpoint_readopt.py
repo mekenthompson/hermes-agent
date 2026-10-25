@@ -4,9 +4,11 @@ A still-live host PID is re-attached and stays running. A confirmed start-time
 mismatch means the PID was reused: the old entry is closed and that PID is not
 signalled. A gone PID is pruned. A completion is queued only when a real exit
 status was collected.
+An explicitly uncertain effect stays visible until reconciliation, regardless of PID fate.
 """
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -52,6 +54,59 @@ def _completions(registry) -> list:
 
 
 class TestCheckpointReadopt:
+    @pytest.mark.platforms('linux')
+    @pytest.mark.parametrize('identity', ['matching', 'mismatched', 'missing_birth', 'gone'])
+    def test_unknown_host_effect_survives_foreign_writer_and_cold_reload(self, identity):
+        """A lost shell receipt remains uncertain even after its PID disappears or changes."""
+        from tools.process_registry import _checkpoint_path
+        registry = ProcessRegistry()
+        proc = _sleep_proc()
+        try:
+            birth = registry._safe_host_start_time(proc.pid)
+            assert birth is not None
+            session = _detach(registry, proc, sid='proc_unknown_effect', start=birth)
+            session.owner_task_id = 'command:uncertain-shell'
+            session.session_key = 'agent:main:cli:uncertain-shell'
+            session.reconciliation_required = 'Inspect the actual process and external effects before retrying.'
+            if identity == 'mismatched':
+                session.host_start_time += 1
+            elif identity == 'missing_birth':
+                session.host_start_time = None
+            elif identity == 'gone':
+                proc.kill()
+                proc.wait(timeout=10)
+            registry._write_checkpoint()
+
+            # A second interpreter's empty process table proves nothing about our effect.
+            subprocess.run([sys.executable, '-c',
+                'from tools.process_registry import ProcessRegistry; ProcessRegistry()._write_checkpoint()'],
+                env=dict(os.environ), check=True, capture_output=True, timeout=30)
+            assert any(row['session_id'] == session.id for row in json.loads(_checkpoint_path().read_text()))
+            code = '''
+import json
+from tools.process_registry import ProcessRegistry
+registry = ProcessRegistry()
+assert registry.recover_from_checkpoint() == 1
+status = registry.poll('proc_unknown_effect')
+assert status['status'] == 'unknown', status
+assert registry.list_sessions()[0]['status'] == 'unknown'
+assert registry.kill_process('proc_unknown_effect')['status'] == 'unknown'
+assert registry.poll('proc_unknown_effect')['status'] == 'unknown'
+registry._write_checkpoint()
+print(json.dumps(status))
+'''
+            result = subprocess.run([sys.executable, '-c', code], env=dict(os.environ),
+                                    check=True, capture_output=True, text=True, timeout=30)
+            assert json.loads(result.stdout)['reconciliation_required'] == session.reconciliation_required
+            assert identity == 'gone' or proc.poll() is None, 'a mismatched live PID must never be signalled'
+            saved = json.loads(_checkpoint_path().read_text())[0]
+            assert saved['reconciliation_required']
+            assert saved['host_start_time'] == session.host_start_time
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
     def test_live_matching_pid_stays_running_when_later_start_probe_fails(
         self, registry, monkeypatch
     ):

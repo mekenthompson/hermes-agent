@@ -998,22 +998,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             return "running"
         return "reused"
 
-    def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
-        """Re-attach, close, or prune a recovered host-PID session.
-
-        A completion is not queued here: recovery has no waitable handle, so it
-        never collected an exit status.
-        """
-        if session is None or session.exited or not session.detached or session.pid_scope != "host" or session.output_log:
-            return session  # a log-backed adoption's reader collects the recorded exit itself
-        fate = self._detached_host_fate(session.pid, session.host_start_time)
-        if fate == "running":
-            return session
-        if fate == "gone":
-            return self._prune_uncollected_detached(session)
-        self._close_reused_detached(session)
-        return session
-
     def _close_reused_detached(self, session: ProcessSession) -> None:
         """Close an entry whose PID was recycled onto another process.
 
@@ -2210,6 +2194,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             # If this recovered session also carries an owned systemd scope, stop that scope before
             # returning: a daemonized descendant may still be alive there even though the wrapper PID exited
             # or was recycled across the gateway restart (#70716, teknium1 review).
+            if session.reconciliation_required:
+                return {"status": "unknown", "session_id": session.id,
+                        "reconciliation_required": session.reconciliation_required}
             if self._detached_host_fate(session.pid, session.host_start_time) != "running":
                 scope_stopped = self._stop_scope(session)
                 with session._lock:

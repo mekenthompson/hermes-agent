@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Event, RLock
 from typing import Callable
+from weakref import WeakSet
 import logging
 import os
 from agent.i18n import t
@@ -61,6 +62,21 @@ class ApprovalTaskLease:
         self._parent_open = True
         self._children = 0
         self._revoked = False
+        self._effects = WeakSet()
+
+    def effect_tasks(self):
+        """Actual in-process async effects owned by this native lease, never subscribers."""
+        with self._lock:
+            return tuple(self._effects)
+
+    def track_effect(self, task):
+        if not self._owner_current():
+            return False
+        with self._lock:
+            if self._revoked or not (self._parent_open or self._children):
+                return False
+            self._effects.add(task)
+            return True
 
     def live(self) -> bool:
         with self._lock:
@@ -215,6 +231,14 @@ def current_approval_task_context() -> ApprovalTaskContext | None:
     bound = _approval_task_context.get()
     return (bound[1] if bound is not None and bound[0].live()
             and (bound[0].parent_open() if bound[2] is None else bound[2].active()) else None)
+
+
+def track_approval_task_effect(task):
+    """Join a concrete async consumer to its existing native Stop lease before it runs."""
+    bound = _approval_task_context.get()
+    if bound is not None and (approval_task_revoked() or not bound[0].track_effect(task)):
+        task.cancel()
+        raise ValueError("The originating native task was stopped or superseded.")
 
 
 def unverified_approval_task():
