@@ -173,14 +173,6 @@ def completion_approval_task(reservations, unit_id: str):
              and all(r is not None and r.active() and r.lease is first.lease
                      and r.evidence == first.evidence for r in reservations))
     if not valid:
-        logger.warning(
-            "Completion approval provenance refused: count=%d present=%s active=%s lease_live=%s "
-            "owner_current=%s stop_set=%s",
-            len(reservations), first is not None, first.active() if first is not None else False,
-            first.lease.live() if first is not None else False,
-            first.lease._owner_current() if first is not None else False,
-            any(event.is_set() for event in first.stop_events) if first is not None else False,
-        )
         with approval_task_context('', identity='unverified', profile='', session='',
                                    is_current=lambda: False):
             yield
@@ -224,17 +216,9 @@ def current_approval_task_context() -> ApprovalTaskContext | None:
 
 def approval_task_revoked() -> bool:
     bound = _approval_task_context.get()
-    revoked = bound is not None and (not bound[0].live()
-                                     or (not bound[0].parent_open() if bound[2] is None
-                                         else not bound[2].active()))
-    if revoked and isinstance(bound[2], _ReservationBundle):
-        logger.warning(
-            "Completion approval task became stale: lease_live=%s owner_current=%s "
-            "reservations_active=%s stop_set=%s",
-            bound[0].live(), bound[0]._owner_current(), bound[2].active(),
-            any(event.is_set() for event in bound[2].stop_events),
-        )
-    return revoked
+    return bound is not None and (not bound[0].live()
+                                  or (not bound[0].parent_open() if bound[2] is None
+                                      else not bound[2].active()))
 
 
 @contextmanager

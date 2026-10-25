@@ -33,7 +33,8 @@ def handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dict
     session = process_registry.transfer_ownership(
         session_id, from_owner=str(task_id or ""), to_owner=parent_owner,
         to_task_id=_resolve_container_task_id(parent_owner),
-        to_session_key=str(getattr(parent, "session_id", "") or ""), note=note,
+        to_session_key=str(getattr(parent, "_gateway_session_key", "") or getattr(parent, "session_id", "") or ""),
+        note=note,
         child_stop_event=getattr(child, "_hard_interrupt_requested", None))
     if session is None:
         return {"error": f"cannot hand off {session_id}: process exited, ownership changed, or its approval task "
