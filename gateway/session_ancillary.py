@@ -6,12 +6,14 @@ reconciles only the requesting profile's MCP servers; ``file.attach`` stages for
 """
 import asyncio
 from functools import partial
+import logging
 from pathlib import Path
 import sys
 
 from gateway.session_busy_controls import authorize
 from hermes_state_runtime import RuntimeStoreError
 
+logger = logging.getLogger(__name__)
 
 _SUBAGENT_FIELDS = (
     'subagent_id', 'parent_id', 'depth', 'goal', 'delegation_id', 'model',
@@ -220,10 +222,15 @@ async def read(connection, ref, params, *, kind):
 def _owned_targets(connection, ref, params, *, select):
     """``(registry, ids)``: the session's own processes (what ``process.list`` shows) that
     ``select(process)`` keeps; ``(None, [])`` when no process was ever registered here."""
-    authority = connection.authority
+    authorize(connection, ref, params, 'session:control')
+    return owned_process_targets(connection.authority, connection.actor, ref, select=select)
+
+
+def owned_process_targets(authority, actor, ref, *, select):
+    """Snapshot the native owner's existing process projection before asynchronous cleanup."""
     if ref.session_id not in authority.sessions:
         raise RuntimeStoreError('not_found')
-    authorize(connection, ref, params, 'session:control')
+    authority.authorize(actor, ref, 'session:control')
     live = authority.sessions[ref.session_id]
     with live.event_stream.lock:
         _require_current_route(authority, ref)
@@ -234,7 +241,39 @@ def _owned_targets(connection, ref, params, *, select):
         registry = module.process_registry
         keys, owners = _ownership(authority, ref, agent, records)
         with registry._lock:
-            return registry, [p.id for p in _owned_locked(registry, keys, owners) if select(p)]
+            return registry, [p.id for p in _owned_locked(registry, keys, owners, authority, live) if select(p)]
+
+
+def start_owned_process_stop(authority, actor, ref, *, source):
+    """The selected cleanup is owner work even if its Stop RPC disconnects."""
+    from gateway.session_runtime_workers import track_mutation
+    registry, targets = owned_process_targets(authority, actor, ref,
+                                               select=lambda p: not p.exited or p._scope_stop_pending)
+    return track_mutation(authority, asyncio.to_thread(_stop_process_targets, registry, targets, source))
+
+
+def _stop_process_targets(registry, targets, source):
+    from tools.process_registry_spawn import retain_remote_unknown
+    killed, unconfirmed = 0, []
+    for process_id in targets:
+        with registry._lock:
+            session = registry._running.get(process_id) or registry._finished.get(process_id)
+        try:
+            result = registry.kill_process(process_id, source=source, consume_output=False)
+            confirmed = (result.get('status') in {'killed', 'already_exited'}
+                         and 'scope_stop_failed' not in result
+                         and (session is None or not registry._probe_survivors(session)))
+        except Exception:
+            logger.exception('Native session process cleanup is unconfirmed for %s', process_id)
+            confirmed = False
+        if confirmed:
+            killed += 1
+        else:
+            unconfirmed.append(process_id)
+            if session is not None:
+                retain_remote_unknown(registry, session, session.reconciliation_required or
+                    'Native Stop could not confirm process exit. Reconcile the actual process and external effects before retrying.')
+    return {'killed': killed, **({'unconfirmed': unconfirmed} if unconfirmed else {})}
 
 
 async def kill_process(connection, ref, params):
@@ -360,15 +399,9 @@ async def stop_processes(connection, ref, params):
     ``persist_on_release`` job of THIS session is still reached (#41225)."""
     if set(params) - {'session_id', 'profile'} or not isinstance(ref.session_id, str) or not ref.session_id:
         raise RuntimeStoreError('invalid_params')
-    registry, targets = _owned_targets(connection, ref, params,
-                                       select=lambda p: not p.exited or p._scope_stop_pending)
-
-    def kill():
-        results = [registry.kill_process(pid, source='process.stop', consume_output=False) for pid in targets]
-        return sum(r.get('status') in {'killed', 'already_exited'} and 'scope_stop_failed' not in r
-                   for r in results)
-    killed = await asyncio.to_thread(kill) if targets else 0
-    return {'killed': killed, 'delegations': await asyncio.to_thread(_interrupt_delegations, connection.authority, ref)}
+    authorize(connection, ref, params, 'session:control')
+    result = await asyncio.shield(start_owned_process_stop(connection.authority, connection.actor, ref, source='process.stop'))
+    return {**result, 'delegations': await asyncio.to_thread(_interrupt_delegations, connection.authority, ref)}
 
 
 def _interrupt_delegations(authority, ref):
@@ -549,11 +582,15 @@ def _ownership(authority, ref, agent, records):
     return keys, owners
 
 
-def _owned_locked(registry, keys, owners):
+def _owned_locked(registry, keys, owners, authority, live):
     """Matching process objects; the caller holds ``registry._lock``. Read directly:
     ``list_sessions`` refreshes recovered processes and writes checkpoints."""
-    return [p for p in (*registry._running.values(), *registry._finished.values())
-            if p.session_key in keys and (p.owner_task_id or p.task_id) in owners]
+    leases = tuple(getattr(live, 'approval_task_leases', ()))
+    return [p for p in (*registry._running.values(), *registry._finished.values()) if p.session_key in keys
+            and ((p.owner_task_id or p.task_id) in owners or p.parent_session_id in owners
+                 or ((reservation := getattr(p, 'approval_task_reservation', None)) is not None
+                     and reservation.lease in leases and reservation.evidence.session == live.route
+                     and reservation.evidence.profile == str(authority.profile_id)))]
 
 
 def process_snapshot(authority, ref, agent, records):
@@ -565,8 +602,11 @@ def process_snapshot(authority, ref, agent, records):
     # Keep ownership and output together.
     with registry._lock:
         return [{'session_id': p.id, 'command': p.command[:200],
-                 'status': 'exited' if p.exited else 'running', 'exit_code': p.exit_code,
+                 'status': 'unknown' if p.reconciliation_required and not p.exited else ('exited' if p.exited else 'running'),
+                 'exit_code': p.exit_code,
+                 **({'reconciliation_required': p.reconciliation_required} if p.reconciliation_required else {}),
                  # The classic CLI dock's elapsed / exit-age / verdict and its 32k tail view.
                  'started_epoch': p.started_at, 'exited_at': p.exited_at or None,
                  'completion_reason': p.completion_reason if p.exited else None,
-                 'output_tail': p.output_buffer[-_PROCESS_TAIL_CHARS:]} for p in _owned_locked(registry, keys, owners)]
+                 'output_tail': p.output_buffer[-_PROCESS_TAIL_CHARS:]} for p in _owned_locked(
+                     registry, keys, owners, authority, authority.sessions[ref.session_id])]

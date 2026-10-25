@@ -38,9 +38,29 @@ def command_unknowns(authority, route=None):
     routes = {route} if route is not None else {live.route for live in getattr(authority, 'sessions', {}).values()
                                               if getattr(live, 'route', None)}
     with process_registry._lock:
-        return [session for session in process_registry._running.values()
-                if session.session_key in routes and session.owner_task_id.startswith('command:')
-                and session.reconciliation_required and not session.exited]
+        uncertain = [session for session in process_registry._running.values()
+                     if session.session_key in routes and session.reconciliation_required and not session.exited]
+    found = {session.id: session for session in uncertain if session.owner_task_id.startswith('command:')}
+    if len(found) == len(uncertain):
+        return list(found.values())
+    from gateway.session_ancillary import _owner_objects, _ownership, _owned_locked
+    from gateway.session_contract import SessionRef
+    from hermes_state_runtime import RuntimeStoreError
+    for sid, live in authority.sessions.items():
+        if live.route not in routes:
+            continue
+        ref = SessionRef(authority.profile_id, sid)
+        try:
+            agent, records = _owner_objects(authority, ref)
+        except RuntimeStoreError as exc:
+            if exc.reason != 'unsupported_projection':
+                raise
+            continue
+        keys, owners = _ownership(authority, ref, agent, records)
+        with process_registry._lock:
+            found.update((session.id, session) for session in _owned_locked(process_registry, keys, owners, authority, live)
+                         if session.reconciliation_required and not session.exited)
+    return list(found.values())
 
 
 def side_agents(authority):
@@ -240,6 +260,17 @@ async def interrupt_session(authority, actor, ref, generation):
         request_hard_interrupt(agent)
     for parent in dict.fromkeys((ref.session_id, authority.physical_target(ref))):
         interrupt_for_session(session_key=live.route, parent_session_id=parent, reason='user_stop')
+    from gateway.session_ancillary import start_owned_process_stop
+    from tools.process_registry import process_registry
+    with process_registry._lock:
+        process_work = bool(process_registry._running) or any(p._scope_stop_pending for p in process_registry._finished.values())
+    processes = None
+    if process_work:
+        try:
+            processes = start_owned_process_stop(authority, actor, ref, source='session.interrupt')
+        except RuntimeStoreError as exc:
+            if exc.reason != 'unsupported_projection':  # managed workers own their process-local registry
+                raise
     if effects:
         for effect in effects:
             if not effect.cancelling():
@@ -247,5 +278,7 @@ async def interrupt_session(authority, actor, ref, generation):
         done, pending = await asyncio.wait(effects, timeout=15)
         if pending or any(not effect.cancelled() and effect.exception() is not None for effect in done):
             raise RuntimeStoreError('unknown_execution', detail='Native command cleanup is unconfirmed; reconcile its process and effects before retrying.')
+    if processes is not None and (await asyncio.shield(processes)).get('unconfirmed'):
+        raise RuntimeStoreError('unknown_execution', detail='Native Stop could not confirm process exit; reconcile its process and effects before retrying.')
     require_command_cleanup(authority, live.route)
     return authority._handle(ref)
