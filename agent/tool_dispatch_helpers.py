@@ -99,6 +99,22 @@ def _context_pruned_argument_paths(tool_name: str, args: Any) -> list[str]:
     return found
 
 
+def record_persisted_path_for_stub(agent, tool_call_id: str, function_result) -> None:
+    """Record the spillover file path so a later result-reference stub can't dangle (best-effort)."""
+    from tools.tool_result_storage import extract_persisted_path
+
+    try:
+        candidates = [function_result] if isinstance(function_result, str) else [
+            function_result.get("text_summary"),
+            *(p.get("text") for p in function_result.get("content") or [] if isinstance(p, dict)),
+        ] if _is_multimodal_tool_result(function_result) else []
+        path = next((p for p in map(extract_persisted_path, candidates) if p), None)
+        if path:
+            agent._tool_guardrails.record_persisted_result(tool_call_id, path)
+    except Exception as exc:
+        logger.debug("persisted-path record for result stub failed: %s", exc, exc_info=True)
+
+
 def _is_destructive_command(cmd: str) -> bool:
     """Heuristic: does this terminal command look like it modifies/deletes files?"""
     return bool(cmd) and bool(_DESTRUCTIVE_PATTERNS.search(cmd) or _REDIRECT_OVERWRITE.search(cmd))
