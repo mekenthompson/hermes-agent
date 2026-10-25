@@ -141,17 +141,16 @@ class ApprovalTaskReservation:
         every ancestor stop fence. A child stop must not revoke work the live
         parent explicitly accepted ownership of.
         """
-        if child_stop_event is None:
-            return self.active()
         with self._lock:
             if self._released:
                 return False
-            # A stop observed before ownership moves is permanent. Do not let
-            # detaching its event revive a reservation that has not yet been read.
-            if any(event.is_set() for event in self.stop_events):
+            # Stale ownership or a stop observed before handoff is permanent.
+            # Detaching the child's event must not revive either reservation.
+            if any(event.is_set() for event in self.stop_events) or not self.lease.live():
                 self.release()
                 return False
-            self.stop_events = tuple(event for event in self.stop_events if event is not child_stop_event)
+            if child_stop_event is not None:
+                self.stop_events = tuple(event for event in self.stop_events if event is not child_stop_event)
             return True
 
 
