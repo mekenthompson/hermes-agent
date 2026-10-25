@@ -7,6 +7,71 @@ import time
 import psutil
 
 
+def owner_stop_confirmed(conn, task_id, run_id, binding):
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+        "AND kind='native_owner_stop' AND json_extract(payload,'$.status')='confirmed' "
+        "ORDER BY id DESC LIMIT 1", (task_id, run_id)).fetchone()
+    proof = json.loads(row['payload']) if row else {}
+    return (isinstance(proof, dict) and proof.get('status') == 'confirmed'
+            and proof.get('confirmation') == 'effect_scope_cleaned' and type(proof.get('generation')) is int
+            and proof.get('session_id') == binding['session_id']
+            and proof.get('request_id') == binding['request_id'])
+
+
+def owner_stop_unresolved(conn, task_id):
+    """An original native Stop or aborted attempt must settle before reuse/cleanup.
+
+    The blocked event is the fence before the post-commit RPC starts. A failed
+    or lost reply retains it, including after a task's current_run_id clears.
+    Existing exact-run halt can re-inspect/interrupt the original admission;
+    only its confirmed canonical Stop releases this fence. Old ambiguous blocks
+    remain fenced; new worker self-blocks explicitly retain ordinary semantics.
+    """
+    markers = conn.execute(
+        "SELECT e.run_id,e.payload,r.outcome FROM task_events e JOIN task_runs r ON r.id=e.run_id "
+        "AND r.task_id=e.task_id WHERE e.task_id=? AND e.kind='owner_admitted' "
+        "AND (r.outcome IN ('blocked','reclaimed','stale','timed_out','crashed','gave_up','spawn_failed') "
+        "OR EXISTS (SELECT 1 FROM task_events s WHERE s.task_id=e.task_id AND s.run_id=e.run_id "
+        "AND s.kind='native_owner_stop')) ORDER BY e.id DESC", (task_id,)).fetchall()
+    for marker in markers:
+        run_id = marker['run_id']
+        block = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+            "AND kind IN ('blocked','block_loop_detected','dependency_wait') ORDER BY id DESC LIMIT 1",
+            (task_id, run_id)).fetchone()
+        try:
+            blocked = json.loads(block['payload']) if block else {}
+            if not isinstance(blocked, dict):
+                return True
+            if marker['outcome'] == 'blocked' and blocked.get('supervisor_stop') is False:
+                continue
+            binding = json.loads(marker['payload'])
+            if owner_stop_confirmed(conn, task_id, run_id, binding):
+                continue
+        except (ValueError, TypeError, KeyError):
+            return True  # unreadable authority is not permission to repeat or remove its work
+        return True
+    return False
+
+
+def owner_delete_unresolved(conn, task_id):
+    """Keep the original evidence while any native worker or Stop is unresolved."""
+    if owner_stop_unresolved(conn, task_id):
+        return True
+    rows = conn.execute(
+        "SELECT e.run_id,e.payload FROM task_events e JOIN task_runs r ON r.id=e.run_id "
+        "AND r.task_id=e.task_id WHERE e.task_id=? AND e.kind='owner_admitted' "
+        "AND (r.ended_at IS NULL OR r.worker_pid IS NOT NULL)", (task_id,)).fetchall()
+    for row in rows:
+        try:
+            if not owner_stop_confirmed(conn, task_id, row['run_id'], json.loads(row['payload'])):
+                return True
+        except (ValueError, TypeError, KeyError):
+            return True
+    return False
+
+
 def owner_reclaim_paused(conn, task_id):
     """Missing/ambiguous owner receipts never authorize another attempt."""
     marker = conn.execute(
@@ -117,6 +182,10 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
       * every worker pid recorded for the run (``tasks.worker_pid``, its ``spawned`` and
         ``worker_bound`` events) is dead or recycled.
 
+    This proves only the recorded interpreter/submitting processes exited. The
+    termination path must additionally confirm the native owner's hosted scope
+    through canonical Stop; these PIDs cannot speak for separate background bodies.
+
     Missing evidence is never proof: no recorded worker pid, a live pid whose identity
     cannot be compared, or an unreadable clock all return False and the pause holds.
     """
@@ -154,7 +223,13 @@ def owner_reclaim_blocked(conn, task_id, *, crash_sweep=False) -> bool:
     run that never bound one is released by any path once ``owner_attempt_provably_over``:
     the shape that used to be unreclaimable forever, because ``bound_interpreter_gone`` was the
     only override and it needs the ``worker_bound`` event that run never wrote.
+    Native termination also calls ``owner_termination_ready`` outside its writer.
+    Its separate hosted resources are never proved gone by this process-only gate.
     """
+    binding = _latest_run_event(conn, task_id, 'owner_admitted')
+    current = conn.execute('SELECT current_run_id FROM tasks WHERE id=?', (task_id,)).fetchone()
+    if binding and current and owner_stop_confirmed(conn, task_id, current['current_run_id'], binding):
+        return False
     if not owner_reclaim_paused(conn, task_id):
         return False
     if crash_sweep and bound_interpreter_gone(conn, task_id):

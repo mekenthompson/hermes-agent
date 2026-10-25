@@ -830,9 +830,6 @@ class AuthorityConnection:
             self.actor, ref, params['admission_id'], params['execution_generation']))
 
     async def interrupt(self, ref, params):
-        from gateway.session_managed_worker import interrupt_managed
-        if interrupt_managed(self.authority, self.actor, ref, params.get('execution_generation')):
-            return asdict(self.authority._handle(ref))
         return asdict(await self.authority.interrupt(self.actor, ref, params.get('execution_generation')))
 
     def _resolve_response(self, frame):

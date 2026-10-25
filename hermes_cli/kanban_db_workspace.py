@@ -369,6 +369,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     only when provably free of work (clean tree, every commit reachable from a
     remote-tracking ref); ``dir`` is intentionally preserved."""
     try:
+        from hermes_cli.kanban_owner_recovery import owner_stop_unresolved
+        if owner_stop_unresolved(conn, task_id):
+            return
         if conn.execute(
             "SELECT 1 FROM task_runs WHERE task_id=? AND worker_pid IS NOT NULL LIMIT 1",
             (task_id,),

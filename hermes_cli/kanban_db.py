@@ -2108,53 +2108,6 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
     return [(row["id"], row["status"]) for row in rows]
 
 
-def _claim_and_open_run(
-    conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
-    *, event_extra: Optional[dict] = None,
-) -> Optional[int]:
-    """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
-    when the CAS lost. Caller holds the txn."""
-    cur = conn.execute(
-        f"""
-        UPDATE tasks
-           SET status        = 'running',
-               claim_lock    = ?,
-               claim_expires = ?,
-               started_at    = COALESCE(started_at, ?)
-         WHERE id = ?
-           AND status = '{source_status}'
-           AND claim_lock IS NULL
-        """,
-        (lock, expires, now, task_id),
-    )
-    if cur.rowcount != 1:
-        return None
-    trow = conn.execute(
-        "SELECT assignee, max_runtime_seconds, current_step_key "
-        "FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    run_cur = conn.execute(
-        """
-        INSERT INTO task_runs (
-            task_id, profile, step_key, status,
-            claim_lock, claim_expires, max_runtime_seconds,
-            started_at
-        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
-        """,
-        (
-            task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
-            lock, expires, trow["max_runtime_seconds"] if trow else None, now,
-        ),
-    )
-    run_id = run_cur.lastrowid
-    conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
-    _append_event(
-        conn, task_id, "claimed",
-        {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
-    )
-    return run_id
-
-
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
@@ -2326,7 +2279,7 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = _host_prefix()
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
+        "SELECT id, current_run_id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
         "       assignee "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
@@ -2347,6 +2300,8 @@ def release_stale_claims(
             _extend_live_stale_claim(conn, row, now)
             continue
 
+        if not owner_termination_ready(conn, row["current_run_id"]):
+            continue
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
         )
@@ -2369,8 +2324,8 @@ def release_stale_claims(
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ? "
                 # A worker that registered its own pid since the SELECT keeps its claim.
-                "AND worker_pid IS ?",
-                (retry_status, row["id"], row["claim_lock"], now, row["worker_pid"]),
+                "AND worker_pid IS ? AND current_run_id IS ?",
+                (retry_status, row["id"], row["claim_lock"], now, row["worker_pid"], row["current_run_id"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -2392,7 +2347,7 @@ def release_stale_claims(
         # Own txn, after the reclaim commit (same shape as ``enforce_max_runtime``):
         # the run ended without a verdict, so it counts toward the breaker and a
         # trip flips the task to ``blocked`` + ``gave_up`` on top of ``reclaimed``.
-        _release_kanban_admission(row["id"], run_id)
+        _release_kanban_admission(row["id"], run_id, conn=conn)
         _record_task_failure(
             conn, row["id"], f"stale_lock={row['claim_lock']}",
             outcome="reclaimed", failure_limit=failure_limit,
@@ -2458,7 +2413,7 @@ def reclaim_task(
     """Operator reclaim regardless of TTL: release the claim, restore the source
     phase, reset the failure counter. False when not running."""
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
+        "SELECT status, current_run_id, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     if not row:
         return False
@@ -2466,6 +2421,8 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
+    if not owner_termination_ready(conn, row["current_run_id"]):
+        return False
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
     run_id = None
@@ -2475,7 +2432,8 @@ def reclaim_task(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?", (retry_status, task_id, prev_lock),
+            "AND claim_lock IS ? AND current_run_id IS ?",
+            (retry_status, task_id, prev_lock, row["current_run_id"]),
         )
         if cur.rowcount != 1:
             return False
@@ -2485,7 +2443,7 @@ def reclaim_task(
             payload={"manual": True, "reason": reason, "prev_lock": prev_lock, "retry_status": retry_status},
         )
     # Operator intervention = fresh retry budget (own txn, runs after commit).
-    _release_kanban_admission(task_id, run_id)
+    _release_kanban_admission(task_id, run_id, conn=conn)
     _clear_failure_counter(conn, task_id)
     return True
 
@@ -2716,7 +2674,7 @@ def complete_task(
             run_id=run_id,
         )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
-    _release_kanban_admission(task_id, run_id)
+    _release_kanban_admission(task_id, run_id, conn=conn)
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
     recompute_ready(conn)  # separate txn so children see ``done``
@@ -2727,9 +2685,11 @@ def complete_task(
     return True
 
 
-def _release_kanban_admission(task_id: str, run_id: Optional[int]) -> None:
+def _release_kanban_admission(task_id: str, run_id: Optional[int], *, conn=None) -> None:
     """Best-effort post-commit release bound to this completed worker run."""
     try:
+        if conn is not None:
+            finish_aborted_owner_run(conn, task_id, run_id)
         from hermes_cli.admission_runtime import release_kanban_admission
         release_kanban_admission(task_id, run_id)
     except Exception:
@@ -3274,7 +3234,7 @@ def request_review(
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
         raise
-    _release_kanban_admission(task_id, run_id)
+    _release_kanban_admission(task_id, run_id, conn=conn)
     return _ret(True)
 
 
@@ -3365,7 +3325,7 @@ def request_changes(
             },
             run_id=run_id,
         )
-    _release_kanban_admission(task_id, run_id)
+    _release_kanban_admission(task_id, run_id, conn=conn)
     return True, implementer
 
 
@@ -3603,7 +3563,7 @@ def invalidate_descendants_for_parent_reopen(
     if not caller_owns_txn:
         # Standalone: committed above, audit trail durable, safe to clean up now.
         for released_task_id, run_id in admission_releases:
-            _release_kanban_admission(released_task_id, run_id)
+            _release_kanban_admission(released_task_id, run_id, conn=conn)
         for pid, claim_lock, started_at in terminations:
             _terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
     return {
@@ -3707,7 +3667,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     if was_running:
-        _release_kanban_admission(task_id, run_id)
+        _release_kanban_admission(task_id, run_id, conn=conn)
         termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
         with write_txn(conn):
             _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
@@ -3720,6 +3680,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+    from hermes_cli.kanban_owner_recovery import owner_delete_unresolved
+    if owner_delete_unresolved(conn, task_id):
+        raise ValueError("Native task Stop is unresolved; stop/reconcile the original owner before deleting")
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
@@ -3784,7 +3747,7 @@ def schedule_task(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
         _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
-    _release_kanban_admission(task_id, run_id)
+    _release_kanban_admission(task_id, run_id, conn=conn)
     return True
 
 
@@ -4058,6 +4021,8 @@ def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
 from hermes_cli.kanban_db_run_queries import current_run_started_ats, latest_summaries
 from hermes_cli.kanban_db_block import _route_block, halt_blocked_worker
+from hermes_cli.kanban_db_claim import _claim_and_open_run
+from hermes_cli.kanban_owner_control import owner_termination_ready, finish_aborted_owner_run
 from hermes_cli.kanban_db_boards import (
     _default_board_display_name,
     _dir_holds_board,

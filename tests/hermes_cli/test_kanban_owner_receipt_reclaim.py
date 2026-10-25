@@ -1,19 +1,9 @@
-"""A dead attempt behind an unresolved owner receipt must not hold its claim forever.
+"""Dead submitters and interpreters do not prove a native owner's effects ended.
 
-Regression for #140858. Card t_5ea03658 sat ``running`` for 16 hours: claimed 07:48, worker
-killed by a restart at 08:59, claim expired 08:03, no heartbeat, and no ``worker_bound``
-event. ``owner_reclaim_paused`` was true — a killed owner leaves a ``terminal/interrupted``
-admission, or a pid that is gone — and every reclaim path read that as "leave it alone", so
-``release_stale_claims``, ``detect_crashed_workers`` and ``reconcile_orphaned_running`` all
-declined. ``bound_interpreter_gone``, the one override, needs the ``worker_bound`` event that
-run never wrote. The card held its profile's ``max_in_progress_per_profile`` slot while every
-card queued behind it was deferred, and no diagnostics rule could see a ``running`` card at
-all, so the alarms named the victims and never the cause.
-
-The pause is about effects that may still be in flight. These tests pin both sides of that
-line: a live worker, a fresh heartbeat, a live claim, a foreign host's lock or an identity
-that cannot be read all keep the card; a provably dead attempt is reclaimed by the platform's
-own path.
+The board's existing process evidence still diagnoses an expired attempt and fences
+late-bound workers. A legacy ambiguous owner receipt cannot confirm hosted background
+scope cleanup, even after its submitting process or owner becomes a zombie. The
+canonical Stop bridge must retain that uncertainty instead of replaying the card.
 """
 
 from __future__ import annotations
@@ -109,7 +99,7 @@ class _Board:
             spawned = {}
         self.event(tid, run, "spawned", spawned, started)
         payload = {"db": str(self.ledger), "session_id": "sess-1", "pid": owner_pid,
-                   "request_id": f'kanban:["default","{tid}",1]'}
+                   "request_id": f'kanban:["default","{tid}",{run}]'}
         if owner_birth is not None:
             payload["birth"] = owner_birth
         self.event(tid, run, "owner_admitted", payload, started + 30)
@@ -149,6 +139,13 @@ class _Board:
             self.state(tid), self.events(tid), [], now=NOW, config=config or {})
 
 
+def _assert_stop_unknown(board, task_id):
+    events = [json.loads(row["payload"]) for row in board.events(task_id)
+              if row["kind"] == "native_owner_stop"]
+    assert events[-1]["status"] == "unknown"
+    assert events[-1]["reason"] == "missing_or_stale_admission"
+
+
 @pytest.fixture
 def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
@@ -159,8 +156,8 @@ def board(tmp_path, monkeypatch):
 
 # --- the incident shape is named by diagnostics and reclaimed by the platform's own paths --
 
-def test_dead_attempt_behind_an_unresolved_receipt_is_named_and_reclaimed(board):
-    """Every reclaim path declined this card and no diagnostic could see it; both must now act."""
+def test_dead_attempt_behind_an_unresolved_receipt_is_named_and_fenced(board):
+    """Diagnosis remains actionable, but an ambiguous receipt cannot prove effect cleanup."""
     board.dead_attempt("t_ghost")
     board.dead_attempt("t_ghost2")
     board.dead_attempt("t_live", worker_pid=os.getpid(), worker_fingerprint=kbd._process_fingerprint(os.getpid()))
@@ -173,11 +170,13 @@ def test_dead_attempt_behind_an_unresolved_receipt_is_named_and_reclaimed(board)
     assert [a.kind for a in hits[0].actions] == ["reclaim", "cli_hint"]
     assert not [d for d in board.diagnostics("t_live") if d.kind == "stale_running"]
 
-    assert kb.release_stale_claims(board.conn) == 2
+    assert kb.release_stale_claims(board.conn) == 0
     row = board.state("t_ghost")
-    assert (row["status"], row["claim_lock"], row["worker_pid"], row["current_run_id"]) == ("ready", None, None, None)
+    assert row["status"] == "running" and row["current_run_id"] is not None
     run = board.conn.execute("SELECT status, outcome FROM task_runs WHERE task_id = 't_ghost'").fetchone()
-    assert tuple(run) == ("reclaimed", "reclaimed")
+    assert tuple(run) == ("running", None)
+    _assert_stop_unknown(board, "t_ghost")
+    _assert_stop_unknown(board, "t_ghost2")
     assert board.state("t_live")["status"] == "running"
 
 
@@ -229,7 +228,11 @@ def test_an_interpreter_bound_after_the_gate_keeps_its_claim(board, monkeypatch,
 
     monkeypatch.setattr(kanban_owner_recovery, "owner_reclaim_blocked", gate_then_bind)
     assert not _RECLAIM_PATHS[path](board.conn)
-    assert calls[0] is False and calls[-1] is True
+    assert calls[0] is False
+    # The late binding is retained, and the native Stop refuses even earlier
+    # than the under-lock release check because its canonical scope is unknown.
+    assert bound_interpreter_gone(board.conn, "t_ghost") is False
+    _assert_stop_unknown(board, "t_ghost")
     row = board.state("t_ghost")
     assert (row["status"], row["current_run_id"]) == ("running", run)
 
@@ -258,11 +261,8 @@ def test_a_foreign_host_interpreter_bound_after_the_gate_keeps_its_claim(board, 
     assert (row["status"], row["current_run_id"]) == ("running", run)
 
 @pytest.mark.platforms("linux", "macos")
-def test_a_timed_out_managed_run_is_booked_timed_out_not_left_for_the_crash_sweep(board):
-    """Killing a managed run's worker takes its bound interpreter down with it, and the owner
-    settles the admission ``unknown``. The under-lock re-check must not read that pause, which
-    the timeout itself caused, as an owner still in flight: the run is ``timed_out``, never left
-    running for the crash sweep to book ``crashed`` on the next tick."""
+def test_timeout_retains_the_claim_when_native_scope_cleanup_cannot_be_confirmed(board):
+    """A submitter signal cannot settle separately hosted effects or authorize replay."""
     worker, interpreter = (subprocess.Popen([sys.executable, "-c", "input()"], stdin=subprocess.PIPE)
                            for _ in range(2))
     try:
@@ -281,9 +281,11 @@ def test_a_timed_out_managed_run_is_booked_timed_out_not_left_for_the_crash_swee
             with sqlite3.connect(board.ledger) as store:  # the owner settles the lost turn
                 store.execute("UPDATE session_admissions SET status = 'unknown'")
 
-        assert kbd.enforce_max_runtime(board.conn, signal_fn=sigterm_ends_the_attempt) == ["t_slow"]
+        assert kbd.enforce_max_runtime(board.conn, signal_fn=sigterm_ends_the_attempt) == []
         outcome = board.conn.execute("SELECT outcome FROM task_runs WHERE id = ?", (run,)).fetchone()[0]
-        assert (board.state("t_slow")["status"], outcome) == ("ready", "timed_out")
+        assert (board.state("t_slow")["status"], outcome) == ("running", None)
+        assert worker.poll() is None and interpreter.poll() is None
+        _assert_stop_unknown(board, "t_slow")
         assert kbd.detect_crashed_workers(board.conn) == []
     finally:
         for child in (worker, interpreter):
@@ -292,8 +294,8 @@ def test_a_timed_out_managed_run_is_booked_timed_out_not_left_for_the_crash_swee
 
 
 @pytest.mark.platforms("linux", "macos")
-def test_an_exited_unreaped_owner_no_longer_holds_the_slot(board):
-    """A zombie keeps its birth until reaped, but it has exited: it cannot be executing anything."""
+def test_an_exited_unreaped_owner_does_not_prove_hosted_effects_are_over(board):
+    """An exited owner cannot report whether separately hosted processes are still live."""
     child = subprocess.Popen([sys.executable, "-c", "input()"], stdin=subprocess.PIPE)
     try:
         birth = process_birth(psutil.Process(child.pid))
@@ -303,8 +305,9 @@ def test_an_exited_unreaped_owner_no_longer_holds_the_slot(board):
             assert time.time() < deadline, "child never exited"
             time.sleep(0.02)
         board.dead_attempt("t_ghost", owner_pid=child.pid, owner_birth=birth)
-        assert kb.release_stale_claims(board.conn) == 1
-        assert board.state("t_ghost")["status"] == "ready"
+        assert kb.release_stale_claims(board.conn) == 0
+        assert board.state("t_ghost")["status"] == "running"
+        _assert_stop_unknown(board, "t_ghost")
     finally:
         child.wait()
 

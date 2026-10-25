@@ -346,7 +346,7 @@ async def execute_admission(authority, ref, row):
         viewer_turn.reset(viewer_token)
 
 
-def _approval_task_scope(authority, ref, row, live, event, *, is_api):
+def _approval_task_scope(authority, ref, row, live, event, *, is_api, producer_current=None):
     """Bind consent evidence to this exact authenticated admission and live owner."""
     from tools.approval_context import unverified_approval_task
     if event.internal:
@@ -382,7 +382,7 @@ def _approval_task_scope(authority, ref, row, live, event, *, is_api):
                                 source.thread_id, source.user_id], separators=(',', ':'))
         if row['principal_id'] != 'messaging:' + principal:
             return unverified_approval_task()
-    return _native_task_scope(authority, ref, row, live, event, event.text)
+    return _native_task_scope(authority, ref, row, live, event, event.text, producer_current=producer_current)
 
 
 def _native_task_scope(authority, ref, row, live, event, text, *, producer_current=None):

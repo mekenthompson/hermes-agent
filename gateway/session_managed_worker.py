@@ -95,6 +95,10 @@ def _managed_approval_origin(authority, ref, row):
     """Native viewer, hosted task, periodic job, or reserved completion evidence."""
     from gateway.session_native_approval import native_owner_current
     from gateway.session_hosted_approval import hosted_origin
+    from gateway.session_kanban_approval import original_claim_check
+    claim_current = original_claim_check(authority, ref)
+    if claim_current is not None and not claim_current():
+        return None
     if hosted := hosted_origin(authority, ref, row):
         return hosted
     if 'local_automation_v1' in row['payload']:

@@ -56,8 +56,9 @@ def halt_blocked_worker(conn: sqlite3.Connection, run_id: Optional[int]) -> bool
     PID are never signalled; a worker that survives keeps its evidence for the
     reaper's next tick. Call after the block's txn has committed and its hook has
     fired: the reap polls for up to ~5 s and opens its own write txn. Never
-    raises, so no halt failure can touch the committed block. True when a live
-    worker was ended.
+    raises, so no halt failure can touch the committed block. Native runs first
+    join their owner's effect resources; unknown cleanup keeps its fence. True
+    confirms that effect scope or a legacy worker's exit, not model-interpreter exit.
     """
     if run_id is None:
         return False
@@ -65,6 +66,10 @@ def halt_blocked_worker(conn: sqlite3.Connection, run_id: Optional[int]) -> bool
 
     reaped: list[str] = []
     try:
+        from hermes_cli.kanban_owner_control import interrupt_owner_run
+        native_stopped = interrupt_owner_run(conn, int(run_id))
+        if native_stopped is False:
+            return False  # the submitter is not the owner of its background effects
         row = conn.execute(
             "SELECT id, task_id, worker_pid, worker_started_at, claim_lock FROM task_runs "
             "WHERE id = ? AND ended_at IS NOT NULL "
@@ -77,7 +82,7 @@ def halt_blocked_worker(conn: sqlite3.Connection, run_id: Optional[int]) -> bool
         # The block has committed; a failed halt leaves the reaper's grace path in charge.
         logger.exception("kanban: halting blocked worker failed for run %s", run_id)
         return False
-    return bool(reaped)
+    return native_stopped is True or bool(reaped)
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this

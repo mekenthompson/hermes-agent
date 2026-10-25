@@ -7,6 +7,8 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 
 from __future__ import annotations
 
+from hermes_cli.kanban_db_claim import _worker_survived_termination
+
 import contextlib
 import os
 import re
@@ -500,6 +502,8 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
         return
     if fingerprint == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
         return  # unproven identity: never signalled; its evidence is cleared once the pid is gone
+    if not _kb.owner_termination_ready(conn, row["id"]):
+        return
     alive = _worker_alive(pid, fingerprint)
     termination = None
     if alive:
@@ -523,21 +527,6 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
     from hermes_cli.kanban_db_workspace import _cleanup_workspace, _is_terminal_task
     if _is_terminal_task(conn, row["task_id"]):
         _cleanup_workspace(conn, row["task_id"])
-
-
-def _worker_survived_termination(termination: dict) -> bool:
-    """True when we tried to kill our own host-local worker and it is still alive.
-
-    Reclaiming then would release the claim and spawn a second worker while the
-    first still runs — the duplication loop. Only host-local workers we actually
-    signalled count; a non-local lock or no-op attempt (no ``os.kill``) must fall
-    through to the normal release path since we cannot manage that worker anyway.
-    """
-    return bool(
-        termination.get("host_local")
-        and (termination.get("termination_attempted") or termination.get("signal_refused"))
-        and not termination.get("terminated")
-    )
 
 
 def _defer_reclaim_for_live_worker(
@@ -628,7 +617,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     host_prefix = _kb._host_prefix()
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.worker_started_at, "
+        "SELECT t.id, t.current_run_id, t.worker_pid, t.worker_started_at, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -663,6 +652,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
         # shutdown install their own SIGTERM handler. A recycled PID (fingerprint
         # mismatch) is never signalled: the worker is already gone.
+        if not _kb.owner_termination_ready(conn, row["current_run_id"]):
+            continue
         killed = False
         kill = _kill_fn(signal_fn)
         if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
@@ -686,8 +677,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, tid, pid, row["claim_lock"]),
+                "  AND worker_pid = ? AND claim_lock IS ? AND current_run_id IS ?",
+                (retry_status, tid, pid, row["claim_lock"], row["current_run_id"]),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -709,7 +700,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         if cur.rowcount == 1:
             # The durable task transition has committed.  Drop only this
             # attempt's reservation before retry accounting can requeue it.
-            _kb._release_kanban_admission(tid, run_id)
+            _kb._release_kanban_admission(tid, run_id, conn=conn)
             _record_task_failure(
                 conn, tid,
                 error=error,
@@ -749,7 +740,7 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.current_run_id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -775,6 +766,8 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
+        if not _kb.owner_termination_ready(conn, row["current_run_id"]):
+            continue
         termination = _kb._terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"))
 
@@ -798,8 +791,8 @@ def detect_stale_running(
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
-                (retry_status, tid, row["claim_lock"]),
+                "  AND claim_lock IS ? AND current_run_id IS ?",
+                (retry_status, tid, row["claim_lock"], row["current_run_id"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -828,7 +821,7 @@ def detect_stale_running(
             reclaimed.append(tid)
         # Release after the task/run transition commits, never while a live
         # worker is being deferred above.
-        _kb._release_kanban_admission(tid, run_id)
+        _kb._release_kanban_admission(tid, run_id, conn=conn)
 
     return reclaimed
 
@@ -900,7 +893,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             )
             _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
             reconciled.append(tid)
-        _kb._release_kanban_admission(tid, run_id)
+        _kb._release_kanban_admission(tid, run_id, conn=conn)
         _kb._log.info(
             "kanban reconcile: requeued orphaned running task %s "
             "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
@@ -1225,7 +1218,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
     for task_id, run_id in released_admissions:
-        _kb._release_kanban_admission(task_id, run_id)
+        _kb._release_kanban_admission(task_id, run_id, conn=conn)
     return sweep
 
 

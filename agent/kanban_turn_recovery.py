@@ -212,6 +212,9 @@ def worker_claim_is_live(
     the reconciler processes the row; a NULL expiry is not a provable live
     lease either and fails closed.
 
+    A native supervisor Stop on this exact run also denies retry, including
+    while unknown physical cleanup retains the claim to fence replacement.
+
     FAIL-CLOSED: any missing coordinate, missing/unreadable DB, mismatched
     run/lock/pid, closed run, or expired lease returns False and the caller
     does not re-enter the model — an honest non-zero exit is always available,
@@ -266,9 +269,13 @@ def worker_claim_is_live(
                 return False
             if row["claim_expires"] is None or int(row["claim_expires"]) < now:
                 return False
+            # A supervisor's Stop is a deny even while unconfirmed cleanup
+            # deliberately retains this claim to prevent a replacement worker.
             run = conn.execute(
-                "SELECT ended_at, worker_pid, claim_expires FROM task_runs WHERE id = ?",
-                (int(current_run_id),),
+                "SELECT ended_at, worker_pid, claim_expires FROM task_runs WHERE id = ? "
+                "AND NOT EXISTS (SELECT 1 FROM task_events WHERE task_id=? AND run_id=? "
+                "AND kind='native_owner_stop')",
+                (int(current_run_id), task_id, int(current_run_id)),
             ).fetchone()
             if run is None:
                 return False

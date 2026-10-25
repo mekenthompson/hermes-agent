@@ -788,7 +788,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             terminations.extend(result["terminations"])
             admission_releases.extend(result["admission_releases"])
     for released_task_id, run_id in admission_releases:
-        kanban_db._release_kanban_admission(released_task_id, run_id)
+        kanban_db._release_kanban_admission(released_task_id, run_id, conn=conn)
     for pid, claim_lock, started_at in terminations:
         kanban_db._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
     # Re-opening something may have made children stale.

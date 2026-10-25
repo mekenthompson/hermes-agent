@@ -1,8 +1,11 @@
 """Managed turns carry finite approval policy, accounting, and live tool details."""
 import asyncio
+from contextlib import ExitStack
 from dataclasses import replace
 import json
 import os
+import subprocess
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -10,7 +13,9 @@ import pytest
 
 
 def assignment(tmp_path, monkeypatch, *, finite=True, unattended=False, yolo=False):
-    from gateway.session_local import _bypass_policy
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+    from gateway.session_local import LocalSessionAdapter, _bypass_policy
     from gateway.session_managed_worker import _bootstrap
     from tools.approval import clear_session
     clear_session('managed-contract')
@@ -18,8 +23,13 @@ def assignment(tmp_path, monkeypatch, *, finite=True, unattended=False, yolo=Fal
                             'base_url': 'http://127.0.0.1:9/v1', 'ignore_user_config': True}, private_secrets={})
     policy = replace(policy, request_json=json.dumps({**json.loads(policy.request_json), 'yolo': yolo}))
     monkeypatch.setattr('gateway.session_policy.launch_key', lambda *args: None)
-    live = SimpleNamespace(source=SimpleNamespace(user_id='u', chat_id='c'), route='managed-contract')
-    authority = SimpleNamespace(sessions={'sid': live}, runner=None, profile_id=str(tmp_path))
+    source = SessionSource(platform=Platform.LOCAL, user_id='u', chat_id='c')
+    live = SimpleNamespace(source=source, route='managed-contract')
+    authority = SimpleNamespace(sessions={'sid': live}, profile_id=str(tmp_path))
+    adapter = LocalSessionAdapter(authority)
+    adapter.register_source(source)
+    adapter.policies[source.chat_id] = policy
+    authority.runner = SimpleNamespace(_adapter_for_source=lambda candidate: adapter if candidate is source else None)
     ref = SimpleNamespace(session_id='sid')
     row = {'request_id': 'hosted:fixture', 'admission_id': 'adm', 'generation': 1, 'principal_id': 'u',
            'payload': {'text': 'hello', 'finite': finite, 'unattended': unattended}}
@@ -30,11 +40,23 @@ def assignment(tmp_path, monkeypatch, *, finite=True, unattended=False, yolo=Fal
 
 @pytest.mark.parametrize('unattended', [False, True])
 def test_child_executes_under_finite_policy_and_preserves_receipt(tmp_path, monkeypatch, unattended):
-    from agent import managed_worker as worker
-    from gateway.session_finite import finite_turn_required, unattended_turn
-    from tools.approval import _yolo_active, clear_session
     frame, _ = assignment(tmp_path, monkeypatch, unattended=unattended)
+    result = subprocess.run(
+        [sys.executable, '-c', 'import json, sys; from tests.gateway.test_managed_turn_contract import '
+         '_execute_finite_child; _execute_finite_child(json.load(sys.stdin))'],
+        input=json.dumps(frame), capture_output=True, text=True, timeout=60, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _execute_finite_child(frame):
+    # Worker policy binds before runtime imports in a fresh interpreter, just as in production.
+    from agent import managed_worker as worker
+    from agent.runtime_session_store import WorkerRPC
+    from tests.gateway.fixtures.managed_worker_execution import managed_worker_owner
+    identity = worker.hello()
+    frame['scope'].update(pid=identity['pid'], birth=identity['birth'])
     observed, frames = [], []
+    unattended = json.loads(frame['policy']['request_json'])['turn_v1']['unattended']
 
     class Agent:
         def __init__(self, **kwargs):
@@ -42,6 +64,8 @@ def test_child_executes_under_finite_policy_and_preserves_receipt(tmp_path, monk
             self.session_prompt_tokens = 100
             self.session_completion_tokens = 20
         def run_conversation(self, text, **kwargs):
+            from gateway.session_finite import finite_turn_required, unattended_turn
+            from tools.approval import _yolo_active
             observed.append((finite_turn_required(), unattended_turn(), _yolo_active()))
             self.kwargs['tool_start_callback']('call-1', 'read_file', {'path': 'report.txt'})
             self.kwargs['tool_complete_callback']('call-1', 'read_file', {'path': 'report.txt'},
@@ -53,13 +77,6 @@ def test_child_executes_under_finite_policy_and_preserves_receipt(tmp_path, monk
                     'completion_tokens': 23, 'estimated_cost_usd': .02, 'model': 'fixture', 'provider': 'custom',
                     'messages': [{'role': 'assistant', 'content': 'large history'}]}
 
-    class Store:
-        def __init__(self, *args): pass
-        def get_messages_as_conversation(self, sid): return []
-        def flush_token_counts(self): pass
-        def finish(self): pass
-        def close(self): pass
-
     class Controls:
         def __init__(self, *args):
             self.stopped = threading.Event()
@@ -68,17 +85,17 @@ def test_child_executes_under_finite_policy_and_preserves_receipt(tmp_path, monk
         def approval(self, data): pytest.fail('unexpected approval')
         def clarify(self, questions): pytest.fail('unexpected question')
 
-    monkeypatch.setattr(worker, 'bind_worker_policy', lambda frame: None)
-    monkeypatch.setattr(worker, 'discover_profile_mcp', lambda policy: None)
-    monkeypatch.setattr(worker, 'retire_agent', lambda agent: None)
-    monkeypatch.setattr(worker, 'WorkerControls', Controls)
-    monkeypatch.setattr('agent.runtime_session_store.WorkerRPC', lambda home: lambda *a, **k: {'owner_epoch': 1})
-    monkeypatch.setattr('agent.runtime_session_store.RuntimeSessionStore', Store)
-    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda: None)
-    monkeypatch.setattr('run_agent.AIAgent', Agent)
-    monkeypatch.setattr('agent.title_generator.wait_for_title_upgrades', lambda: None)
-    clear_session('managed-contract')  # the child owns a fresh approval registry
-    worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: frames.append({'type': kind, **payload})))
+    with pytest.MonkeyPatch.context() as patches, ExitStack() as owner:
+        def connect(rpc):
+            # execute has now frozen policy; the native owner transport may import runtime code.
+            owner.enter_context(managed_worker_owner(frame, patches))
+            return rpc._connection()
+        patches.setattr(WorkerRPC, '_connection', connect)
+        patches.setattr(worker, 'discover_profile_mcp', lambda policy: None)
+        patches.setattr(worker, 'retire_agent', lambda agent: None)
+        patches.setattr(worker, 'WorkerControls', Controls)
+        patches.setattr(worker, '_construct_agent', lambda frame, factory, policy, **kwargs: Agent(**kwargs))
+        worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: frames.append({'type': kind, **payload})))
     assert observed == [(True, unattended, unattended)]
     receipt = next(f for f in frames if f['type'] == 'result')
     assert receipt['result']['completed'] is False

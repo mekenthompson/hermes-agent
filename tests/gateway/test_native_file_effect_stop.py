@@ -7,6 +7,8 @@ from contextlib import contextmanager
 
 import pytest
 
+from tests.waiting import async_wait_until
+
 
 async def _native(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
@@ -122,7 +124,10 @@ async def test_native_stop_during_file_mutation_preflight(tmp_path, monkeypatch,
     try:
         with command_task_scope(authority, ref, actor.subject, "/file-test", authority.route_epoch(route)):
             pending = asyncio.create_task(asyncio.to_thread(handle_function_call, tool, arguments, task_id="file-stop"))
-            assert await asyncio.to_thread(waiting.wait, 10)
+            # Shell moves validate both paths through multiple real backend probes first.
+            await async_wait_until(lambda: waiting.is_set() or pending.done(), timeout=40,
+                                   what="file mutation preflight or tool result")
+            assert waiting.is_set(), await pending
             if stop:
                 await authority.interrupt(actor, ref, authority._handle(ref).execution_generation)
             release.set()

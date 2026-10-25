@@ -165,8 +165,9 @@ def test_a_child_store_closed_before_any_turn_finishes_its_execution_and_ends_it
     from agent.runtime_session_child import reserve_child_store
     from agent.runtime_session_store import RuntimeSessionStore
     db, epoch = ledger
+    identity = {'profile_id': 'home', 'pid': os.getpid(), 'birth': psutil.Process().create_time()}
     reserve = partial(reserve_child_execution, epoch=epoch, execution_id='worker',
-                      identity={'profile_id': 'home', 'pid': os.getpid(), 'birth': psutil.Process().create_time()},
+                      identity=identity,
                       principal='local', limits=(2, 1), refused=None)
 
     def rpc(method, **params):
@@ -174,7 +175,8 @@ def test_a_child_store_closed_before_any_turn_finishes_its_execution_and_ends_it
         if params['operation'] == 'child.reserve':
             return rt.apply_worker_receipt(db, **params, handlers={'child.reserve': reserve})
         return rt.mutate_worker_execution(db, **params)
-    parent = RuntimeSessionStore(rpc, dict(epoch=epoch, execution_id='worker', session_id='parent', generation=0),
+    parent = RuntimeSessionStore(rpc, dict(identity, epoch=epoch, execution_id='worker',
+                                         session_id='parent', generation=0, secret='private-fixture'),
                                  tmp_path / 'outbox')
     try:
         child = reserve_child_store(parent)

@@ -89,6 +89,7 @@ def managed_admission_scope(authority, ref, row, worker):
     from gateway.session_ingress import _approval_task_scope, restore_native
     from gateway.platforms.event import MessageEvent
     from tools.approval_context import release_background_approval_task, reserve_background_approval_task
+    from gateway.session_kanban_approval import original_claim_check
 
     live = authority.sessions[ref.session_id]
     if 'native_text_v1' in row['payload']:
@@ -99,7 +100,8 @@ def managed_admission_scope(authority, ref, row, worker):
             from gateway.session_automation import restore_local_automation
             event = restore_local_automation(authority, ref, row)
     event._managed_worker_current = lambda: _managed_current(authority, ref, row, worker)
-    with _approval_task_scope(authority, ref, row, live, event, is_api=live.source.platform == Platform.API_SERVER):
+    with _approval_task_scope(authority, ref, row, live, event, is_api=live.source.platform == Platform.API_SERVER,
+                              producer_current=original_claim_check(authority, ref)):
         worker.original_reservation = reserve_background_approval_task()
         try:
             yield

@@ -56,7 +56,11 @@ def prune_events(conn, cutoff):
     """Keep request receipts and each task's latest control fence until deletion."""
     placeholders = ",".join("?" for _ in _AUTHORITY_EVENTS)
     cur = conn.execute(
-        "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' "
+        "DELETE FROM task_events WHERE created_at < ? AND kind NOT IN "
+        "('decomposed','owner_admitted','native_owner_stop') "
+        "AND id NOT IN (SELECT b.id FROM task_events b JOIN task_events o "
+        "ON b.task_id=o.task_id AND b.run_id=o.run_id AND o.kind='owner_admitted' "
+        "WHERE b.kind IN ('blocked','block_loop_detected','dependency_wait')) "
         "AND json_extract(payload, '$.idempotency_key') IS NULL "
         "AND task_id IN (SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
         "AND id NOT IN (SELECT MAX(id) FROM task_events "
@@ -215,6 +219,7 @@ def block_task(
             kind, reason, source_status, prev_kind=_kb._row_get(cur_row, "block_kind"),
             prev_recurrences=int(_kb._row_get(cur_row, "block_recurrences") or 0),
         )
+        payload['supervisor_stop'] = expected_run_id is None
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason
@@ -267,6 +272,9 @@ def unblock_task(
             return replay
         if _kb._task_status(conn, task_id) is None:
             return False
+        from hermes_cli.kanban_owner_recovery import owner_stop_unresolved
+        if owner_stop_unresolved(conn, task_id):
+            return request.finish(False, refusal='native_stop_unknown')
         refusal = request.stale()
         if refusal:
             return request.finish(False, refusal=refusal)

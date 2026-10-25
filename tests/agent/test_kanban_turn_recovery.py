@@ -188,6 +188,8 @@ def _make_board(tmp_path, *, status="running", task_pid=None, run_id=1, lock="lk
         " current_run_id INTEGER, claim_lock TEXT, claim_expires INTEGER);"
         "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, ended_at INTEGER,"
         " worker_pid INTEGER, claim_expires INTEGER);"
+        "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER,"
+        " kind TEXT, payload TEXT);"
     )
     conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)",
                  ("t_live", status, task_pid, run_id, lock, task_expires))
@@ -205,6 +207,17 @@ def _pin_carrier(monkeypatch, db, *, task="t_live", run_id="1", lock="lk"):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_id)
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", lock)
+
+
+@pytest.mark.parametrize('status', ['pending', 'unknown', 'confirmed'])
+@pytest.mark.parametrize('stop_run', [1, 2])
+def test_native_stop_audit_denies_only_its_original_run(clear_kanban_env, tmp_path, status, stop_run):
+    db = _make_board(tmp_path)
+    _pin_carrier(clear_kanban_env, db)
+    with sqlite3.connect(db) as conn:
+        conn.execute('INSERT INTO task_events(task_id,run_id,kind,payload) VALUES (?,?,?,?)',
+                     ('t_live', stop_run, 'native_owner_stop', json.dumps({'status': status})))
+    assert worker_claim_is_live() is (stop_run != 1)
 
 
 @pytest.mark.parametrize(
