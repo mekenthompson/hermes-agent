@@ -822,6 +822,12 @@ def stop_all_browsers() -> None:
         stop_browser(key)
 
 
+def stop_shared_profile(user_data_dir: str) -> bool:
+    """Stop an existing retained profile; false while a human/other holder still uses it."""
+    from tools.browser_launcher_lifecycle import stop_shared_profile as stop
+    return stop(user_data_dir)
+
+
 # ── Per-profile records + orphan reap ────────────────────────────────────────────────────────────────
 
 def _ephemeral_root(home: str) -> Path:

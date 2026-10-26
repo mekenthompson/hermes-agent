@@ -68,9 +68,82 @@ def client(mode):
     return {'ok': True, 'pid': browser.pid, 'http_url': browser.http_url, **targets}
 
 
+def real_profile_client(action):
+    from hermes_constants import get_hermes_home, hermes_home_key
+    from hermes_cli import browser_connect
+    from tools import browser_launcher, browser_session, browser_session_cloud, browser_use_cli
+    from tools import browser_session_real_profile
+
+    # An empty disposable copy stands in for the user's default profile. No
+    # default-browser discovery or credential snapshot is permitted in this test.
+    profile = str(get_hermes_home() / 'browser-profile/chrome')
+    binary = browser_launcher._resolve_executable()
+    browser_connect.detect_default_chromium = lambda: 'chrome'
+    browser_connect.chromium_executable = lambda name: binary
+    browser_connect.real_profile_copy_dir = lambda name: profile
+    browser_connect.snapshot_real_profile = lambda name: (profile, None)
+    # The Docker fixture has no user namespace sandbox. This empty, offline
+    # test profile uses the packaged browser's container flags, never secrets.
+    browser_session_real_profile._REAL_PROFILE_EXTRA_FLAGS = (
+        *browser_session_real_profile._REAL_PROFILE_EXTRA_FLAGS, '--no-sandbox')
+    browser_session_cloud.use_real_profile = lambda: action != 'real-revoke'
+    browser_use_cli._real_profile_consented = lambda: True
+    if action == 'real-revoke':
+        assert browser_session_real_profile.real_profile_cdp() == (None, None)
+        return {'ok': True}
+    atexit.register(browser_session.detach_shared_browsers, hermes_home_key())
+    result = browser_use_cli.browser_exec(
+        code="import json\nprint(json.dumps(cdp('Target.createTarget',url='about:blank')['targetId']))",
+        session='direct-real-profile', timeout_s=40)
+    result = json.loads(result) if isinstance(result, str) else result
+    assert result.get('success') is True, result
+    assert not browser_session._active_sessions
+    browser = browser_launcher.get_browser(browser_session_real_profile.real_profile_key())
+    return {'pid': browser.pid, 'http_url': browser.http_url, 'target': json.loads(result['output'])}
+
+
+def check_real_profile(root, checks):
+    from tools import browser_launcher
+
+    home = root / 'real-profile'
+    home.mkdir(mode=0o700)
+    (home / 'config.yaml').write_text(json.dumps({
+        'browser': {'cloud_provider': 'local', 'headed': False, 'use_gateway': False},
+        'bot_desktop': {'auto_start': False}}))
+
+    def run(action):
+        result = subprocess.run([sys.executable, __file__, 'client', action],
+                                env={**os.environ, 'HERMES_HOME': str(home)},
+                                capture_output=True, text=True, timeout=100, check=False)
+        assert result.returncode == 0, result.stderr + result.stdout
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    first = None
+    try:
+        first = run('real-open')
+        browser_launcher.reap_orphaned_browsers(homes=[str(home)])
+        with urllib.request.urlopen(first['http_url'] + '/json/list', timeout=5) as response:
+            assert first['target'] in {target['id'] for target in json.load(response)}
+        checks['direct_real_profile_exit'] = True
+        later = run('real-open')
+        assert later['pid'] == first['pid']
+        with urllib.request.urlopen(first['http_url'] + '/json/list', timeout=5) as response:
+            assert {first['target'], later['target']} <= {target['id'] for target in json.load(response)}
+        checks['direct_real_profile_later_client'] = True
+        run('real-revoke')
+        assert not browser_launcher._pid_alive(first['pid'])
+        assert not (home / 'browser-profile').exists()
+        checks['direct_real_profile_consent_off'] = True
+    finally:
+        if first is not None and browser_launcher._pid_alive(first['pid']):
+            run('real-revoke')
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == 'client':
-        print(json.dumps(client(sys.argv[2])), flush=True)
+        action = sys.argv[2]
+        result = real_profile_client(action) if action.startswith('real-') else client(action)
+        print(json.dumps(result), flush=True)
         return 0
     with tempfile.TemporaryDirectory(prefix='native-browser-detach-') as directory:
         root = Path(directory)
@@ -134,6 +207,7 @@ def main():
                 if first is not None and browser_launcher._pid_alive(first['pid']):
                     run('handback')
                     run('explicit-stop')
+        check_real_profile(root, checks)
         print(json.dumps({'ok': all(checks.values()), 'checks': checks}))
         return 0
 

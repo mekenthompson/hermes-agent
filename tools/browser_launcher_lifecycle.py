@@ -84,3 +84,36 @@ def detach_shared_browser(key: str) -> bool:
             with launcher._lock:
                 launcher._forget(key, browser, drop_record=False)
         return True
+
+
+def detach_profile_browsers(home_key):
+    """Include persistent launchers used directly, outside the session cache."""
+    from tools import browser_launcher as launcher
+
+    with launcher._lock:
+        keys = [key for key, browser in launcher._browsers.items()
+                if browser.home_key == home_key and not browser.ephemeral]
+    return sum(detach_shared_browser(key) for key in keys)
+
+
+def stop_shared_profile(user_data_dir):
+    """Stop a retained local profile without launching or copying anything."""
+    import os
+    from hermes_constants import hermes_home_key
+    from tools import browser_launcher as launcher
+    from tools.browser_launcher_holders import records_lock
+
+    directory = os.path.realpath(user_data_dir)
+    key = 'retained-profile-stop:' + directory
+    records = launcher._shared_state_dir(directory)
+    if records is None:
+        return False
+    with launcher._key_lock(key):
+        with records_lock(records):
+            browser = launcher._attach_running(key, directory, hermes_home_key())
+            if browser is not None:
+                with launcher._lock:
+                    launcher._browsers[key] = browser
+        if browser is not None:
+            launcher._stop_locked(key, force=True)
+    return launcher._live_local_holder(directory) is None and launcher._foreign_holder(directory) is None
