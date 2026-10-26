@@ -228,6 +228,32 @@ def test_op_child_env_forwards_config_directory(monkeypatch):
     assert "UNRELATED_PROVIDER_TOKEN" not in env
 
 
+def test_op_child_env_disables_dbus_autolaunch_when_headless(monkeypatch):
+    """Headless Linux children must not let libdbus autolaunch a daemon."""
+    monkeypatch.setattr("agent.secret_sources.onepassword.sys.platform", "linux")
+    for name in ("DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY"):
+        monkeypatch.delenv(name, raising=False)
+
+    env = op._op_child_env("")
+
+    assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/nonexistent"
+    child = subprocess.run(
+        [sys.executable, "-c", "import os; print(os.environ['DBUS_SESSION_BUS_ADDRESS'])"],
+        env=env, check=True, capture_output=True, text=True,
+    )
+    assert child.stdout.strip() == "unix:path=/nonexistent"
+
+
+def test_op_child_env_preserves_explicit_dbus_bus(monkeypatch):
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+
+    env = op._op_child_env("")
+
+    assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1000/bus"
+
+
 # ---------------------------------------------------------------------------
 # apply_onepassword_secrets
 # ---------------------------------------------------------------------------
