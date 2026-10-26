@@ -82,15 +82,12 @@ def test_direct_real_profile_exit_retains_and_consent_off_respects_human(tmp_pat
 def test_concurrent_holder_started_before_consent_cleanup_keeps_its_data(tmp_path, monkeypatch):
     from hermes_cli import browser_connect
     from tools import browser_session_cloud as cloud, browser_session_real_profile as real_profile
-    from tests.tools.browser_launcher_fakes import install_fake_chromium_identity
 
     binary = write_fake_chromium(tmp_path / 'chromium')
     home, profile = tmp_path / 'home', tmp_path / 'home/browser-profile/chrome'
     monkeypatch.setenv('HERMES_HOME', str(home))
     monkeypatch.setattr(browser_connect, 'get_hermes_home', lambda: home)
     monkeypatch.setattr(cloud, 'use_real_profile', lambda: False)
-    monkeypatch.setattr(launcher, '_verified_local_chromium', launcher._verified_local_chromium)
-    install_fake_chromium_identity(binary)
     original = real_profile.terminate_real_profile_browser
     child = None
     pid = None
