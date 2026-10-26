@@ -109,6 +109,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         self.cdp_url = cdp_url
         self.dialog_policy = dialog_policy
         self.dialog_timeout_s = float(dialog_timeout_s)
+        self.browser_session_info: Optional[dict[str, Any]] = None
 
         # State protected by ``_state_lock`` for cross-thread reads.
         self._state_lock = threading.Lock()
@@ -505,6 +506,7 @@ class _SupervisorRegistry:
         self._lock = threading.Lock()
         self._by_task: dict[str, CDPSupervisor] = {}
         self._home_by_task: dict[str, str] = {}  # profile home that started it (``stop_home``)
+        self._browser_by_task: dict[str, dict[str, Any]] = {}
 
     def get(self, task_id: str) -> Optional[CDPSupervisor]:
         with self._lock:
@@ -513,7 +515,20 @@ class _SupervisorRegistry:
     def _pop(self, task_id: str) -> Optional[CDPSupervisor]:
         with self._lock:
             self._home_by_task.pop(task_id, None)
+            self._browser_by_task.pop(task_id, None)
             return self._by_task.pop(task_id, None)
+
+    def browser_session(self, task_id: str) -> Optional[dict[str, Any]]:
+        """The native route bound atomically to this task's current connection."""
+        with self._lock:
+            info = self._browser_by_task.get(task_id)
+            return {**info, 'features': dict(info.get('features') or {})} if info is not None else None
+
+    def _bind_browser(self, task_id, info, home):
+        if info is not None:
+            self._browser_by_task[task_id] = {**info, 'home_key': home}
+            self._by_task[task_id].browser_session_info = self._browser_by_task[task_id]
+            self._home_by_task[task_id] = home
 
     def capture(self, task_id: str, *, timeout: float = 10.0) -> CapturedCDP:
         """Public CDP seam for trusted in-process plugins: a handle pinned to this task's
@@ -523,7 +538,8 @@ class _SupervisorRegistry:
         return capture(self, task_id, timeout=timeout)
 
     def get_or_start(self, task_id: str, cdp_url: str, *, dialog_policy: str = DEFAULT_DIALOG_POLICY,
-                     dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S, start_timeout: float = 15.0) -> CDPSupervisor:
+                     dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S, start_timeout: float = 15.0,
+                     session_info: Optional[dict[str, Any]] = None) -> CDPSupervisor:
         """Idempotently ensure a supervisor runs for ``(task_id, cdp_url)``; one bound to a
         different ``cdp_url`` or unhealthy (dead thread / stopped loop) is stopped and replaced."""
         from hermes_constants import hermes_home_key
@@ -534,8 +550,11 @@ class _SupervisorRegistry:
                 thread, loop = existing._thread, existing._loop
                 healthy = thread is not None and thread.is_alive() and loop is not None and loop.is_running()
                 if existing.cdp_url == cdp_url and healthy:
+                    self._bind_browser(task_id, session_info, home)
                     return existing
                 self._by_task.pop(task_id, None)
+                self._home_by_task.pop(task_id, None)
+                self._browser_by_task.pop(task_id, None)
         if existing is not None:
             existing.stop()
 
@@ -547,9 +566,11 @@ class _SupervisorRegistry:
             already = self._by_task.get(task_id)
             if already is not None and already.cdp_url == cdp_url:
                 supervisor.stop()
+                self._bind_browser(task_id, session_info, home)
                 return already
             self._by_task[task_id] = supervisor
             self._home_by_task[task_id] = home
+            self._bind_browser(task_id, session_info, home)
         return supervisor
 
     def stop(self, task_id: str) -> None:
@@ -564,12 +585,22 @@ class _SupervisorRegistry:
         for task_id in tasks:
             self.stop(task_id)
 
+    def stop_shared_home(self, home_key: str) -> None:
+        """Release this profile's bound persistent-local browser connections."""
+        with self._lock:
+            tasks = [task for task, info in self._browser_by_task.items()
+                     if info.get('home_key') == home_key and info.get('shared_profile')
+                     and (info.get('features') or {}).get('local')]
+        for task in tasks:
+            self.stop(task)
+
     def stop_all(self) -> None:
         """Stop every running supervisor. For shutdown / test teardown."""
         with self._lock:
             items = list(self._by_task.values())
             self._by_task.clear()
             self._home_by_task.clear()
+            self._browser_by_task.clear()
         for supervisor in items:
             supervisor.stop()
 

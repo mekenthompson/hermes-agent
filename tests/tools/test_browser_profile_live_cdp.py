@@ -107,7 +107,7 @@ cat "$latch"
     monkeypatch.setenv("BH_RUNTIME_DIR", str(shared))
     monkeypatch.setattr(bu_cli, "_find_cli", lambda: [str(cli)])
     monkeypatch.setattr(bu_cli, "_driven_daemons", {})
-    monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id: None)
+    monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id, session_info=None: None)
     monkeypatch.setattr(bs_cdp, "resolve_cdp_override", lambda url: url)
 
     def drive(home, url=None):

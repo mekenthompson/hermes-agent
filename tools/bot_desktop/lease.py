@@ -20,6 +20,7 @@ an action admitted under one lease can tell that control changed underneath it.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 import logging
 import os
 import threading
@@ -145,6 +146,18 @@ class _locked:
 
 def get(profile_key: Optional[str] = None) -> Lease:
     return _read(_path(profile_key))
+
+
+@contextmanager
+def cleanup_guard(profile_key: str):
+    """Serialize destructive cleanup with takeover for the owning profile.
+
+    A new takeover waits for cleanup already admitted as agent-owned; cleanup
+    never signals a browser while a human owns that profile's screen.
+    """
+    path = _path(profile_key)
+    with _lock, _locked(path):
+        yield _read(path).holder != HUMAN
 
 
 def on_change(listener: Callable[[str, Lease], None]) -> Callable[[], None]:
