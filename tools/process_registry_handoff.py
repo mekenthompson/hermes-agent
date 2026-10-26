@@ -44,7 +44,10 @@ def transfer_ownership(registry, session_id, *, from_owner, to_owner, to_task_id
         target = (to_owner, to_task_id, to_session_key, to_parent_session_id, note, session.ownership_generation + 1)
         for field, value in zip(OWNERSHIP_FIELDS, target):
             setattr(session, field, value)
-        if not registry._write_checkpoint(_lock_held=True):
+        # A reader may mark exited under its session lock while settlement waits
+        # for this registry lock. Keep this binding until its result can inherit
+        # the committed parent, including when exit races this checkpoint.
+        if not registry._write_checkpoint(retain_ids=(session.id,), _lock_held=True):
             for field, value in zip(OWNERSHIP_FIELDS, previous):
                 setattr(session, field, value)
             return None
@@ -56,7 +59,7 @@ def transfer_ownership(registry, session_id, *, from_owner, to_owner, to_task_id
             for field, value in zip(OWNERSHIP_FIELDS, previous):
                 setattr(session, field, value)
             session.ownership_generation = target[-1] + 1
-            registry._write_checkpoint(_lock_held=True)
+            registry._write_checkpoint(retain_ids=(session.id,), _lock_held=True)
             return None
         return session
 
