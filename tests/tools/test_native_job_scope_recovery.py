@@ -16,7 +16,7 @@ from tools import process_registry_results as results
 from tools.process_registry_job import job_quiescent, job_receipt_path, read_job_receipt
 
 
-pytestmark = pytest.mark.skipif(sys.platform != 'linux', reason='Linux native job custody')
+pytestmark = pytest.mark.platforms('linux')
 
 
 @pytest.mark.parametrize('refuse_result', [False, True], ids=['durable', 'write-refused'])
