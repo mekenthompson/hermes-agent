@@ -22,9 +22,7 @@ CLIENT = textwrap.dedent('''\
     from tools import browser_session_real_profile as real_profile
     from tools.bot_desktop import lease
     from hermes_cli import browser_connect
-    from tests.tools.browser_launcher_fakes import install_fake_chromium_identity
     binary, profile, mode = sys.argv[1:]
-    install_fake_chromium_identity(Path(binary))
     cloud.use_real_profile = lambda: mode != 'revoke'
     lightpanda.using_lightpanda_engine = lambda: False
     browser_connect.detect_default_chromium = lambda: 'chrome'
