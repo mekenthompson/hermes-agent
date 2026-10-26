@@ -89,6 +89,10 @@ parent-first and recorded in a private 0700 dir (a throwaway profile's in
 `<HERMES_HOME>/cache/browser/chromium-records`; a persistent profile's per OS user under the host lock dir,
 one for every home pinning it) so a later process reaps a crashed owner's browser after checking pid + start
 time + its `--user-data-dir` argv token; the reaper walks every served home and every shared profile.
+Short-lived native clients call `browser_session.detach_shared_browsers(profile_home)` before process
+exit to retain their profile's persistent local browser, closing only their own connections. The verified
+launch record keeps intentional retention distinct from a crashed owner; explicit browser stop still works.
+Native teardown and orphan reap serialize with the owning display profile's human-control lease.
 `browser_tool.py` and `browser_tool_install.py` are frozen old-updater stubs only (see their
 docstrings); never grow them.
 

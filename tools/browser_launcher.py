@@ -764,7 +764,14 @@ def stop_browser(key: str) -> None:
         _stop_locked(key)
 
 
+def detach_browser(key: str) -> bool:
+    """Release this client's persistent browser while retaining its process/tabs."""
+    from tools.browser_launcher_lifecycle import detach_shared_browser
+    return detach_shared_browser(key)
+
+
 def _stop_locked(key: str) -> None:
+    from tools.browser_launcher_lifecycle import cleanup_guard, recorded_home
     with _lock:
         browser = _browsers.get(key)
         proc = _procs.get(key)
@@ -772,16 +779,19 @@ def _stop_locked(key: str) -> None:
         return
     record = None if browser.ephemeral else _record_path(browser)
     if record is None:
-        if browser.owned:
-            _terminate(browser.pid, browser.start_time, proc)
+        with cleanup_guard(browser.home_key) as admitted:
+            if browser.owned and admitted:
+                _terminate(browser.pid, browser.start_time, proc)
         with _lock:
-            _forget(key, browser)
+            _forget(key, browser, drop_record=admitted)
         return
     from tools.browser_launcher_holders import records_lock
     with records_lock(record.parent):  # the decision and the forget are one step: another key may be the heir
         if _heir_key(browser) is None and _last_holder_out(record, browser):
-            _terminate(browser.pid, browser.start_time, proc)
-            record.unlink(missing_ok=True)
+            with cleanup_guard(recorded_home(record, browser)) as admitted:
+                if admitted:
+                    _terminate(browser.pid, browser.start_time, proc)
+                    record.unlink(missing_ok=True)
         with _lock:
             _forget(key, browser, drop_record=False)
 
@@ -1028,6 +1038,10 @@ def _reap_record(path: Path, home: Optional[str]) -> bool:
     record = _load_record(path)
     if record is None or not holders.same_namespace(record):  # another namespace's pids name nobody here
         return False
+    if record.get("retained") is True:
+        if not _pid_alive(record.get("pid")):
+            path.unlink(missing_ok=True)
+        return False
     tracked = _tracked_browser(record)
     if tracked is not None:  # in use here, whoever launched it
         _adopt_record(tracked)
@@ -1040,16 +1054,20 @@ def _reap_record(path: Path, home: Optional[str]) -> bool:
         if heir is not None:
             holders.hand_over(path, record, heir)
         return False
-    reaped = _is_recorded_browser(record, home)
-    if reaped:
-        _terminate(record["pid"], record.get("start_time"), None)
-        logger.info("browser: reaped orphaned Chromium pid %s (%s)", record["pid"], record["user_data_dir"])
-    udd = record.get("user_data_dir")
-    if (record.get("ephemeral") and isinstance(udd, str) and _inside_ephemeral_root(udd, home)
-            and (reaped or not _browser_running_on(udd))):
-        shutil.rmtree(udd, ignore_errors=True)  # its owner is gone: no launch reuses a per-process dir
-    path.unlink(missing_ok=True)
-    return reaped
+    from tools.browser_launcher_lifecycle import cleanup_guard
+    with cleanup_guard(home or record.get("home_key")) as admitted:
+        if not admitted:
+            return False
+        reaped = _is_recorded_browser(record, home)
+        if reaped:
+            _terminate(record["pid"], record.get("start_time"), None)
+            logger.info("browser: reaped orphaned Chromium pid %s (%s)", record["pid"], record["user_data_dir"])
+        udd = record.get("user_data_dir")
+        if (record.get("ephemeral") and isinstance(udd, str) and _inside_ephemeral_root(udd, home)
+                and (reaped or not _browser_running_on(udd))):
+            shutil.rmtree(udd, ignore_errors=True)  # its owner is gone: no launch reuses a per-process dir
+        path.unlink(missing_ok=True)
+        return reaped
 
 
 def _reap_home(home: str) -> int:

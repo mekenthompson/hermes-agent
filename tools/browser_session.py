@@ -332,6 +332,12 @@ def _publish(cache_key: str, session_info: dict[str, Any], home_key: str) -> dic
     return session_info
 
 
+def detach_shared_browsers(profile_home: Optional[str] = None) -> int:
+    """Detach a short-lived caller from its profile's persistent local browser."""
+    from tools.browser_session_lifecycle import detach_shared_browsers as detach
+    return detach(profile_home)
+
+
 def get_session_info(cache_key: Optional[str] = None) -> dict[str, Any]:
     """Get or create the session for ``cache_key`` (thread-safe); starts the inactivity janitor and touches
     activity. A ``::local`` key forces a local browser even with a cloud provider configured."""
