@@ -28,8 +28,8 @@ logger = logging.getLogger(__name__)
 ACTIVE_WORK_INTERVAL_SECONDS = 180
 
 ACTIVE_WORK_PROMPT = (
-    "Check active tracked work that originated in this chat: Kanban tasks, "
-    "delegated agents, and background jobs. If something meaningful changed "
+    "Check active tracked work that originated in this chat: delegated agents "
+    "and background jobs. If something meaningful changed "
     "since the last update in this same chat, send one concise update: what "
     "changed, what is next, and any blocker. If nothing meaningful changed, "
     "reply exactly [SILENT]. Do not invent progress. Do not broadcast to other "
@@ -40,7 +40,6 @@ ACTIVE_WORK_PROMPT = (
 # Same live set as tools/async_delegation.py _LIVE_STATES. stalling is still
 # in flight; omitting it clears the originating check while that agent runs.
 _LIVE_DELEGATION_STATES = ("running", "stalling", "finalizing")
-_ACTIVE_KANBAN_STATUS = "running"
 # Child-process completion chatter stays off. This module never enables
 # delegation.surface_child_process_notifications.
 
@@ -118,7 +117,6 @@ def _managed_session_ids() -> list[str]:
 
 def collect_active_session_ids(
     *,
-    kanban_ids: Optional[Iterable[str]] = None,
     delegation_ids: Optional[Iterable[str]] = None,
     background_ids: Optional[Iterable[str]] = None,
 ) -> tuple[set[str], bool]:
@@ -129,48 +127,10 @@ def collect_active_session_ids(
     is false so reconciliation keeps existing checks.
     """
     scans = [
-        ScanResult(set(kanban_ids), True) if kanban_ids is not None else _scan_kanban_sessions(),
         ScanResult(set(delegation_ids), True) if delegation_ids is not None else _scan_delegation_sessions(),
         ScanResult(set(background_ids), True) if background_ids is not None else _scan_background_sessions(),
     ]
     return {sid for scan in scans for sid in scan.ids if sid}, all(scan.ok for scan in scans)
-
-
-def _scan_kanban_sessions() -> ScanResult:
-    try:
-        from hermes_cli import kanban_db as kb
-        from hermes_cli.kanban_db_connect import connect as kanban_connect
-    except Exception:
-        logger.debug("active-work progress: kanban import failed", exc_info=True)
-        return ScanResult(set(), False)
-    found: set[str] = set()
-    ok = True
-    try:
-        boards = kb.list_boards(include_archived=False)
-    except Exception:
-        logger.debug("active-work progress: kanban board list failed", exc_info=True)
-        return ScanResult(set(), False)
-    for board in boards:
-        slug = (board or {}).get("slug") or getattr(kb, "DEFAULT_BOARD", None)
-        try:
-            conn = kanban_connect(board=slug)
-        except Exception:
-            logger.debug("active-work progress: kanban connect %s failed", slug, exc_info=True)
-            ok = False
-            continue
-        try:
-            for task in kb.list_tasks(conn, status=_ACTIVE_KANBAN_STATUS):
-                if task.session_id:
-                    found.add(task.session_id)
-        except Exception:
-            logger.debug("active-work progress: kanban list %s failed", slug, exc_info=True)
-            ok = False
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                logger.debug("active-work progress: kanban close %s failed", slug, exc_info=True)
-    return ScanResult(found, ok)
 
 
 def _scan_delegation_sessions() -> ScanResult:

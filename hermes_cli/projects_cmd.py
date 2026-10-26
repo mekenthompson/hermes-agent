@@ -130,73 +130,11 @@ def _print_project(proj) -> None:
             print(f"   {' *' if f.is_primary else '  '} {f.path}{f' ({f.label})' if f.label else ''}")
 
 
-def _existing_board_slug(board: str | None) -> str | None:
-    """Validate a non-empty board binding before mutating a project."""
-    if not board or not board.strip():
-        return None
-    from hermes_cli import kanban_db as kb
-
-    slug = kb._normalize_board_slug(board)
-    if not slug or not kb.board_exists(slug):
-        raise ValueError(f"no such kanban board: {board}")
-    return slug
-
-
-def _board_project_id(slug: str) -> str | None:
-    from hermes_cli import kanban_db as kb
-
-    try:
-        meta = kb.read_board_metadata(slug)
-    except Exception as exc:
-        raise ValueError(f"failed to read board {slug!r}: {exc}") from exc
-    return (meta.get("project_id") or "").strip() or None
-
-
-def _assert_board_free_or_ours(slug: str, project_id: str | None) -> None:
-    existing = _board_project_id(slug)
-    if existing and existing != project_id:
-        raise ValueError(f"board {slug!r} already bound to project {existing}")
-
-
-def _write_board_project_link(slug: str, proj) -> None:
-    from hermes_cli import kanban_db as kb
-
-    try:
-        if proj.primary_path:
-            kb.write_board_metadata(slug, project_id=proj.id, default_workdir=proj.primary_path)
-        else:
-            kb.write_board_metadata(slug, project_id=proj.id)
-    except Exception as exc:
-        raise ValueError(f"failed to bind board {slug!r}: {exc}") from exc
-
-
-def _clear_board_project_link(proj) -> None:
-    from hermes_cli import kanban_db as kb
-
-    previous = proj.board_slug
-    if not previous:
-        return
-    existing = _board_project_id(previous)
-    if existing not in {None, proj.id}:
-        return
-    try:
-        meta = kb.read_board_metadata(previous)
-        if proj.primary_path and meta.get("default_workdir") == proj.primary_path:
-            kb.write_board_metadata(previous, project_id="", default_workdir="")
-        else:
-            kb.write_board_metadata(previous, project_id="")
-    except Exception as exc:
-        raise ValueError(f"failed to unbind board {previous!r}: {exc}") from exc
-
-
 @_db_command
 def _cmd_create(args, conn) -> int:
-    board_slug = _existing_board_slug(args.board)
-    if board_slug:
-        _assert_board_free_or_ours(board_slug, None)
     pid = pdb.create_project(
         conn, name=args.name, slug=args.slug, folders=args.folders, primary_path=args.primary,
-        description=args.description, icon=args.icon, color=args.color, board_slug=board_slug,
+        description=args.description, icon=args.icon, color=args.color, board_slug=args.board,
     )
     if args.use:
         pdb.set_active(conn, pid)
@@ -204,8 +142,6 @@ def _cmd_create(args, conn) -> int:
     if proj is None:
         print("project: vanished after create", file=sys.stderr)
         return 2
-    if board_slug:
-        _write_board_project_link(board_slug, proj)
     print(f"Created project {proj.slug} ({pid})")
     _print_project(proj)
     return 0
@@ -274,17 +210,20 @@ def _flag_command(op: str, verb: str):
 
 @_with_project
 def _cmd_bind_board(args, conn, proj) -> str:
-    slug = _existing_board_slug(args.board)
-    if slug is None:
-        _clear_board_project_link(proj)
-        pdb.update_project(conn, proj.id, board_slug="")
+    pdb.update_project(conn, proj.id, board_slug=args.board)
+    if not args.board.strip():
         return f"Unbound board from {proj.slug}"
-    if proj.board_slug and proj.board_slug != slug:
-        _clear_board_project_link(proj)
-    _assert_board_free_or_ours(slug, proj.id)
-    _write_board_project_link(slug, proj)
-    pdb.update_project(conn, proj.id, board_slug=slug)
-    return f"Bound {proj.slug} -> board {slug}"
+    if proj.primary_path:  # best-effort: point the bound board's default_workdir at the primary repo
+        try:
+            from hermes_cli import kanban_db as kb
+
+            slug = kb._normalize_board_slug(args.board)
+            if slug and (slug == kb.DEFAULT_BOARD or kb.board_exists(slug)):
+                kb.write_board_metadata(slug, default_workdir=proj.primary_path)
+        # health: allow BLE001, S110 -- Upstream ff294849 treats board defaults as best-effort.
+        except Exception:
+            pass
+    return f"Bound {proj.slug} -> board {args.board}"
 
 
 _HANDLERS = {
