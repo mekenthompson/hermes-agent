@@ -1,5 +1,6 @@
 """Transfer a delegated child's live process and approval reservation to its parent."""
 
+from contextlib import nullcontext
 from typing import Optional
 
 
@@ -35,33 +36,36 @@ def transfer_ownership(registry, session_id, *, from_owner, to_owner, to_task_id
         if session is None or session.exited or session.owner_task_id != from_owner or not to_parent_session_id:
             return None
         reservation = getattr(session, 'approval_task_reservation', None)
-        if reservation is not None and (not reservation.active() or not reservation.lease.live()):
-            reservation.release()
-            return None
-        if any(type(value) is not int or value <= 0 for value in (session.pid, session.host_start_time)):
-            return None
-        previous = tuple(getattr(session, field) for field in OWNERSHIP_FIELDS)
-        target = (to_owner, to_task_id, to_session_key, to_parent_session_id, note, session.ownership_generation + 1)
-        for field, value in zip(OWNERSHIP_FIELDS, target):
-            setattr(session, field, value)
-        # A reader may mark exited under its session lock while settlement waits
-        # for this registry lock. Keep this binding until its result can inherit
-        # the committed parent, including when exit races this checkpoint.
-        if not registry._write_checkpoint(retain_ids=(session.id,), _lock_held=True):
-            for field, value in zip(OWNERSHIP_FIELDS, previous):
+        # Serialize approval observers with the existing native reservation lock.
+        # Detach at the transfer's linearization point, before durable commit;
+        # failed writes restore the exact child fence before any observer resumes.
+        with reservation._lock if reservation is not None else nullcontext():
+            if reservation is not None and (not reservation.active() or not reservation.lease.live()):
+                reservation.release()
+                return None
+            if any(type(value) is not int or value <= 0 for value in (session.pid, session.host_start_time)):
+                return None
+            previous = tuple(getattr(session, field) for field in OWNERSHIP_FIELDS)
+            stop_events = reservation.stop_events if reservation is not None else ()
+            if reservation is not None and not reservation.transfer_to_parent(child_stop_event):
+                return None
+            target = (to_owner, to_task_id, to_session_key, to_parent_session_id, note, session.ownership_generation + 1)
+            for field, value in zip(OWNERSHIP_FIELDS, target):
                 setattr(session, field, value)
-            return None
-        if tuple(getattr(session, field) for field in OWNERSHIP_FIELDS) != target:
-            return None  # A different transfer already committed; retain that native authority.
-        if reservation is not None and not reservation.transfer_to_parent(child_stop_event):
-            # Revocation raced the write. Roll back at a newer generation so an
-            # older writer cannot resurrect the rejected transfer.
-            for field, value in zip(OWNERSHIP_FIELDS, previous):
-                setattr(session, field, value)
-            session.ownership_generation = target[-1] + 1
-            registry._write_checkpoint(retain_ids=(session.id,), _lock_held=True)
-            return None
-        return session
+            # A reader may mark exited while settlement waits for the registry
+            # lock. Preserve this binding until its result inherits the parent.
+            committed = registry._write_checkpoint(retain_ids=(session.id,), _lock_held=True)
+            if not committed:
+                for field, value in zip(OWNERSHIP_FIELDS, previous):
+                    setattr(session, field, value)
+            if not committed or tuple(getattr(session, field) for field in OWNERSHIP_FIELDS) != target:
+                if reservation is not None:
+                    reservation.stop_events = stop_events
+                    if not reservation.active() or not reservation.lease.live():
+                        reservation.release()
+                return None
+            return session
+
 
 
 def handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dict:
