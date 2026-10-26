@@ -170,8 +170,11 @@ def detach_shared_browsers(profile_home: Optional[str] = None) -> int:
 
     bs = _bs()
     home_key = hermes_home_key(profile_home) if profile_home else hermes_home_key()
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    SUPERVISOR_REGISTRY.stop_shared_home(home_key)
     with bs._cleanup_lock:
         sessions = list(bs._active_sessions.items())
+    other_keys = {info.get('launcher_key') for _key, info in sessions if info.get('home_key') != home_key}
     detached_keys = set()
     count = 0
     for key, info in sessions:
@@ -185,7 +188,9 @@ def detach_shared_browsers(profile_home: Optional[str] = None) -> int:
             continue
         stop_cdp_supervisor(key)
         if launcher_key not in detached_keys:
-            if not detach_browser(launcher_key):
+            from tools.browser_launcher_lifecycle import retain_shared_browser
+            release = retain_shared_browser if launcher_key in other_keys else detach_browser
+            if not release(launcher_key):
                 continue
             detached_keys.add(launcher_key)
         with bs._cleanup_lock:
@@ -196,7 +201,7 @@ def detach_shared_browsers(profile_home: Optional[str] = None) -> int:
     # Consented browser_exec resolves its real-profile launcher directly and
     # never publishes an _active_sessions row. It still belongs to this caller.
     from tools.browser_launcher_lifecycle import detach_profile_browsers
-    return count + detach_profile_browsers(home_key)
+    return count + detach_profile_browsers(home_key, keep_keys=other_keys, skip_keys=detached_keys)
 
 
 def cleanup_browser(task_id: Optional[str] = None) -> None:

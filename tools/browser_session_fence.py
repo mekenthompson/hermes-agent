@@ -15,8 +15,8 @@ def remember_session(env, session_info):
         if key in session_info})
 
 
-def take_session(env):
-    return json.loads(env.pop(_SESSION_SENTINEL, '{"features":{"local":true}}'))
+def take_session(env, local_engine):
+    return json.loads(env.pop(_SESSION_SENTINEL, json.dumps({'features': {'local': bool(local_engine)}})))
 
 
 def owner_home(session_info):
@@ -24,7 +24,7 @@ def owner_home(session_info):
     from tools import browser_launcher as launcher
     from tools.browser_launcher_lifecycle import recorded_home
 
-    home = session_info.get("home_key") or hermes_home_key()
+    home = session_info.get("display_home_key") or session_info.get("home_key") or hermes_home_key()
     key = session_info.get("launcher_key")
     browser = launcher.get_browser(key) if key else None
     if browser is not None and browser.cdp_url == session_info.get("cdp_url"):
@@ -33,6 +33,45 @@ def owner_home(session_info):
     if not isinstance(home, str) or not Path(home).is_absolute():
         raise RuntimeError("The native browser's owning profile could not be verified")
     return hermes_home_key(home)
+
+
+def connection_session(session_info, cdp_url):
+    """Capture verified display provenance before publishing a vault connection."""
+    from hermes_constants import hermes_home_key
+    from tools import browser_launcher
+
+    info = {key: session_info[key] for key in ('launcher_key', 'features') if key in session_info}
+    info.update(cdp_url=cdp_url, home_key=hermes_home_key())
+    if (info.get('features') or {}).get('local'):
+        info['display_home_key'] = owner_home(info)
+        key = info.get('launcher_key')
+        browser = browser_launcher.get_browser(key) if key else None
+        info['shared_profile'] = browser is not None and not browser.ephemeral
+    return info
+
+
+def profile_matches(session_info):
+    from hermes_constants import hermes_home_key
+
+    home = session_info.get('home_key')
+    return home is None or hermes_home_key(home) == hermes_home_key()
+
+
+def evaluate_vault(supervisor, task_id, expression):
+    """Fence the captured socket even after the task replaces/stops its connection."""
+    from tools.browser_session import session_for_task
+
+    info = supervisor.browser_session_info
+    if info is None:
+        info = session_for_task(task_id)
+    result = run_fenced(info, lambda: supervisor.evaluate_runtime(expression))
+    if result.get('code'):
+        return {'success': False, 'error_type': result['code'], 'error': result.get('error', '')}
+    if result.get('ok'):
+        return {'success': True, 'result': result.get('result')}
+    error = str(result.get('error') or 'evaluate failed')
+    return {'success': False, 'error_type': 'supervisor_required' if 'supervisor' in error.lower() else 'eval_failed',
+            'error': error}
 
 
 def shares_desktop(session_info, home):
@@ -66,6 +105,9 @@ def human_holds_shared_browser(session_info):
 
 
 def run_fenced(session_info, fn):
+    if not profile_matches(session_info):
+        return {'success': False, 'code': 'browser_profile_mismatch',
+                'error': 'This browser connection belongs to another profile. Open a browser in this profile first.'}
     if not (session_info.get("features") or {}).get("local"):
         return fn()
     from tools.bot_desktop import lease

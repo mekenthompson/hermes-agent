@@ -145,6 +145,34 @@ def test_cleanup_guard_serializes_a_real_cross_process_takeover(tmp_path):
             process.wait(timeout=10)
 
 
+def test_detaching_one_home_preserves_another_homes_live_shared_handle(tmp_path, monkeypatch):
+    from tools import browser_session as session
+    from tools.browser_session_lifecycle import cleanup_browser
+
+    binary = write_fake_chromium(tmp_path / 'chromium')
+    home_a, home_b = tmp_path / 'a', tmp_path / 'b'
+    monkeypatch.setenv('HERMES_HOME', str(home_a))
+    browser, error = launcher.launch_chromium('shared-homes', executable=str(binary),
+                                             user_data_dir=str(tmp_path / 'profile'), ephemeral=False,
+                                             headed=False, env=dict(os.environ), timeout=20)
+    assert browser is not None, error
+    info = {'launcher_key': 'shared-homes', 'cdp_url': browser.cdp_url, 'features': {'local': True}}
+    session._publish('home-a-session', info, str(home_a))
+    session._publish('home-b-session', info, str(home_b))
+    try:
+        assert session.detach_shared_browsers(str(home_a)) == 1
+        assert 'home-b-session' in session._active_sessions
+        assert launcher.get_browser('shared-homes') is browser
+        cleanup_browser('home-b-session')
+        assert launcher._pid_alive(browser.pid), 'later ordinary cleanup discarded requested retention'
+        launcher.reap_orphaned_browsers(homes=[str(home_a), str(home_b)])
+        assert launcher._pid_alive(browser.pid)
+    finally:
+        session._active_sessions.pop('home-a-session', None)
+        session._active_sessions.pop('home-b-session', None)
+        kill_fake(browser.pid, binary)
+
+
 @pytest.mark.parametrize('failure', ['readiness-error', 'interrupted'])
 def test_failed_launch_keeps_human_browser_until_handback(tmp_path, monkeypatch, failure):
     binary = write_fake_chromium(tmp_path / 'chromium')

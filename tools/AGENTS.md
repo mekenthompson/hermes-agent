@@ -95,6 +95,9 @@ launch record keeps intentional retention distinct from a crashed owner; explici
 Detachment also covers direct consented real-profile browser_exec launchers outside the session cache.
 Consent withdrawal stops a retained copy through verified native profile attachment; snapshot deletion
 waits while a human or another live holder still uses the browser.
+Vault connections retain their verified route/display provenance on the CDP supervisor, including
+named and direct real-profile routes without a task-keyed session row. Re-admit reads and writes
+on that captured connection after prompts; a task may have rebound to another connection meanwhile.
 Use `browser_launcher.stop_browser(key, force=True)` to explicitly override retention; ordinary caller
 and gateway cleanup preserves retained browsers. The human-control lease still fences teardown.
 Native teardown and orphan reap serialize with the owning display profile's human-control lease.

@@ -16,6 +16,33 @@ import tempfile
 import urllib.request
 
 
+def vault_binding_checks():
+    from tools import browser_vault_tool as vault
+    from tools.bot_desktop import lease
+
+    task, viewer = 'default', 'vault-acceptance-viewer'
+    lease.acquire(viewer)
+    try:
+        refused = json.loads(vault._fenced_page_op(task, lambda: json.dumps(vault._eval_js_secret(task, '42'))))
+        assert refused.get('code') == 'human_has_control', refused
+        assert vault._eval_js_secret(task, '42').get('error_type') == 'human_has_control'
+    finally:
+        lease.release(viewer)
+
+    def prompt_then_write():
+        lease.acquire(viewer)
+        return json.dumps(vault._eval_js_secret(task, 'window.__vault_acceptance=42'))
+
+    try:
+        refused = json.loads(vault._fenced_page_op(task, prompt_then_write))
+        assert refused.get('error_type') == 'human_has_control' or refused.get('code') == 'human_has_control', refused
+    finally:
+        lease.release(viewer)
+    resumed = json.loads(vault._fenced_page_op(task, lambda: json.dumps(vault._eval_js_secret(task, '42'))))
+    assert resumed.get('success') is True and resumed.get('result') == 42, resumed
+    return {'vault_refusal': True, 'vault_prompt_takeover': True, 'vault_handback': True}
+
+
 def client(mode):
     from hermes_constants import hermes_home_key
     from tools import browser_launcher, browser_session
@@ -65,7 +92,8 @@ def client(mode):
         lease.acquire('acceptance-viewer')
     result = execute(f"close_tab({targets['owned']!r})\nprint('true')")
     assert result.get('code') == 'human_has_control' if mode == 'human' else result.get('success') is True
-    return {'ok': True, 'pid': browser.pid, 'http_url': browser.http_url, **targets}
+    proof = vault_binding_checks() if mode == 'normal' else {}
+    return {'ok': True, 'pid': browser.pid, 'http_url': browser.http_url, **targets, **proof}
 
 
 def real_profile_client(action):
@@ -99,7 +127,8 @@ def real_profile_client(action):
     assert result.get('success') is True, result
     assert not browser_session._active_sessions
     browser = browser_launcher.get_browser(browser_session_real_profile.real_profile_key())
-    return {'pid': browser.pid, 'http_url': browser.http_url, 'target': json.loads(result['output'])}
+    return {'pid': browser.pid, 'http_url': browser.http_url, 'target': json.loads(result['output']),
+            **vault_binding_checks()}
 
 
 def check_real_profile(root, checks):
@@ -121,6 +150,8 @@ def check_real_profile(root, checks):
     first = None
     try:
         first = run('real-open')
+        checks.update({'direct_real_profile_' + key: first[key] for key in
+                       ['vault_refusal', 'vault_prompt_takeover', 'vault_handback']})
         browser_launcher.reap_orphaned_browsers(homes=[str(home)])
         with urllib.request.urlopen(first['http_url'] + '/json/list', timeout=5) as response:
             assert first['target'] in {target['id'] for target in json.load(response)}
@@ -179,6 +210,9 @@ def main():
             first = None
             try:
                 first = run(mode)
+                if mode == 'normal':
+                    checks.update({key: first[key] for key in
+                                   ['vault_refusal', 'vault_prompt_takeover', 'vault_handback']})
                 browser_launcher.reap_orphaned_browsers(homes=[str(home)])
                 ids = target_ids(first['http_url'])
                 assert first['unrelated'] in ids

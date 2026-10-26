@@ -57,10 +57,8 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     if supervisor is None:
         return {"success": False, "error": "no supervised browser session for this task; open the page with "
                                            "browser_exec first"}
-    sup = supervisor.evaluate_runtime(expression)
-    if sup.get("ok"):
-        return {"success": True, "result": sup.get("result")}
-    return {"success": False, "error": str(sup.get("error") or "evaluate failed")}
+    from tools.browser_session_fence import evaluate_vault
+    return evaluate_vault(supervisor, task_id, expression)
 
 
 def _ensure_supervisor(task_id: str):
@@ -71,6 +69,10 @@ def _ensure_supervisor(task_id: str):
 
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
     if supervisor is not None:
+        from tools.browser_session_fence import profile_matches
+        info = supervisor.browser_session_info
+        if info is not None and not profile_matches(info):
+            return None
         return supervisor
     from tools.browser_session import session_for_task
     from tools.browser_session_cdp import get_dialog_policy_config, resolve_cdp_override
@@ -113,29 +115,10 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
             ),
         }
 
-    # Re-admit at the WRITE. The handler-level fence (_fenced_page_op) admitted before a possibly
-    # human-length prompt (enter_code waits for the user's code); a takeover during that wait must
-    # refuse here, before the credential lands in a page the human is now typing into. The outer
-    # epoch check only discards the result, and a fill is a side effect, not a result.
-    if _bot_desktop_browser_session(task_id):
-        from tools.bot_desktop import lease as _bd_lease
-        from tools.browser_session import session_for_task
-        from tools.browser_session_fence import owner_home
-        try:
-            _bd_lease.assert_agent_may_act(owner_home(session_for_task(task_id)))
-        except _bd_lease.HumanHasControl as exc:
-            return {"success": False, "error_type": "human_has_control", "error": str(exc)}
-
-    sup = supervisor.evaluate_runtime(expression)
-    if sup.get("ok"):
-        return {"success": True, "result": sup.get("result")}
-    return {
-        "success": False,
-        "error_type": "supervisor_required"
-        if "supervisor" in str(sup.get("error") or "").lower()
-        else "eval_failed",
-        "error": str(sup.get("error") or "eval failed"),
-    }
+    # Re-admit on the captured socket after a possibly human-length code
+    # prompt: a result check alone cannot undo a credential write.
+    from tools.browser_session_fence import evaluate_vault
+    return evaluate_vault(supervisor, task_id, expression)
 
 
 def _parse_json_result(raw: Any) -> Any:
@@ -583,11 +566,6 @@ BROWSER_VAULT_SCHEMA = {
         "required": ["action"],
     },
 }
-
-
-def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
-    from tools.browser_session import session_for_task, shares_bot_desktop_browser
-    return shares_bot_desktop_browser(session_for_task(task_id))
 
 
 def _fenced_page_op(task_id: Optional[str], fn) -> str:

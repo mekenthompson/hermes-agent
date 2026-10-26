@@ -54,7 +54,7 @@ def abandon_launch(proc, starting):
                 shutil.rmtree(starting.user_data_dir, ignore_errors=True)
 
 
-def detach_shared_browser(key: str) -> bool:
+def _retain_shared_browser(key: str, *, release_holder: bool) -> bool:
     """Release this caller's shared browser without closing its tabs/process.
 
     The verified launch record retains the browser intentionally, so the
@@ -81,19 +81,28 @@ def detach_shared_browser(key: str) -> bool:
                 atomic_json_write(record, {**data, "retained": True}, indent=None)
             elif browser.owned:
                 raise RuntimeError("Owned shared browser has no launch record to retain")
-            with launcher._lock:
-                launcher._forget(key, browser, drop_record=False)
+            if release_holder:
+                with launcher._lock:
+                    launcher._forget(key, browser, drop_record=False)
         return True
 
 
-def detach_profile_browsers(home_key):
+def detach_shared_browser(key: str) -> bool:
+    return _retain_shared_browser(key, release_holder=True)
+
+
+def retain_shared_browser(key: str) -> bool:
+    return _retain_shared_browser(key, release_holder=False)
+
+
+def detach_profile_browsers(home_key, *, keep_keys=(), skip_keys=()):
     """Include persistent launchers used directly, outside the session cache."""
     from tools import browser_launcher as launcher
 
     with launcher._lock:
         keys = [key for key, browser in launcher._browsers.items()
-                if browser.home_key == home_key and not browser.ephemeral]
-    return sum(detach_shared_browser(key) for key in keys)
+                if browser.home_key == home_key and not browser.ephemeral and key not in skip_keys]
+    return sum(_retain_shared_browser(key, release_holder=key not in keep_keys) for key in keys)
 
 
 def _profile_occupied(directory):
