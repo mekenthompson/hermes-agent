@@ -57,14 +57,29 @@ def profile_matches(session_info):
     return home is None or hermes_home_key(home) == hermes_home_key()
 
 
-def evaluate_vault(supervisor, task_id, expression):
-    """Fence the captured socket even after the task replaces/stops its connection."""
+def run_vault_io(supervisor, task_id, operation):
+    """Re-admit page I/O on its captured socket after prompts or connection replacement."""
     from tools.browser_session import session_for_task
 
     info = supervisor.browser_session_info
     if info is None:
         info = session_for_task(task_id)
-    result = run_fenced(info, lambda: supervisor.evaluate_runtime(expression))
+    return run_fenced(info, operation)
+
+
+def connect_vault(task_id, info, endpoint, policy, timeout):
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    def attach():
+        return {'supervisor': SUPERVISOR_REGISTRY.get_or_start(
+            task_id=task_id, cdp_url=endpoint, dialog_policy=policy, dialog_timeout_s=timeout,
+            session_info=connection_session(info, endpoint))}
+
+    return run_fenced(info, attach).get('supervisor')
+
+
+def evaluate_vault(supervisor, task_id, expression):
+    result = run_vault_io(supervisor, task_id, lambda: supervisor.evaluate_runtime(expression))
     if result.get('code'):
         return {'success': False, 'error_type': result['code'], 'error': result.get('error', '')}
     if result.get('ok'):
@@ -113,8 +128,6 @@ def run_fenced(session_info, fn):
     from tools.bot_desktop import lease
 
     home = owner_home(session_info)
-    if not shares_desktop(session_info, home):
-        return fn()
     try:
         admitted = lease.assert_agent_may_act(home)
     except lease.HumanHasControl as exc:
