@@ -37,8 +37,9 @@ def transfer_ownership(registry, session_id, *, from_owner, to_owner, to_task_id
             return None
         reservation = getattr(session, 'approval_task_reservation', None)
         # Serialize approval observers with the existing native reservation lock.
-        # Detach at the transfer's linearization point, before durable commit;
-        # failed writes restore the exact child fence before any observer resumes.
+        # Validate at the transfer's linearization point, before durable commit.
+        # Keep child fences visible to native reservation captures during I/O;
+        # publish their detachment only after the ownership commit succeeds.
         with reservation._lock if reservation is not None else nullcontext():
             if reservation is not None and (not reservation.active() or not reservation.lease.live()):
                 reservation.release()
@@ -47,8 +48,7 @@ def transfer_ownership(registry, session_id, *, from_owner, to_owner, to_task_id
                 return None
             previous = tuple(getattr(session, field) for field in OWNERSHIP_FIELDS)
             stop_events = reservation.stop_events if reservation is not None else ()
-            if reservation is not None and not reservation.transfer_to_parent(child_stop_event):
-                return None
+            parent_events = tuple(event for event in stop_events if event is not child_stop_event)
             target = (to_owner, to_task_id, to_session_key, to_parent_session_id, note, session.ownership_generation + 1)
             for field, value in zip(OWNERSHIP_FIELDS, target):
                 setattr(session, field, value)
@@ -60,10 +60,11 @@ def transfer_ownership(registry, session_id, *, from_owner, to_owner, to_task_id
                     setattr(session, field, value)
             if not committed or tuple(getattr(session, field) for field in OWNERSHIP_FIELDS) != target:
                 if reservation is not None:
-                    reservation.stop_events = stop_events
                     if not reservation.active() or not reservation.lease.live():
                         reservation.release()
                 return None
+            if reservation is not None:
+                reservation.stop_events = parent_events
             return session
 
 
@@ -109,3 +110,63 @@ def handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dict
     return {"status": "handed_off", "session_id": session.id, "command": session.command,
             "note": "Your parent now owns this process and will receive its completion; you will not. Mention the handoff "
                     "in your final answer."}
+
+
+def ownership_identity(session):
+    """Immutable native scope captured by an owner-selected control."""
+    return tuple(getattr(session, field) for field in (*OWNERSHIP_FIELDS, 'pid', 'host_start_time'))
+
+
+def refresh_ownership(registry):
+    """Read committed profile-local identity before a cached owner selects work.
+
+    The file-locked observation is the control's ownership boundary. Release it
+    before registry callbacks or process waits; a concurrent transfer afterward
+    may legitimately follow this control in the native ordering.
+    """
+    import json
+    from hermes_cli.active_sessions import _FileLock
+    from tools.process_registry import _checkpoint_path
+    from tools.process_registry_results import completed_ownership
+    with registry._lock:
+        entries = [dict(session_id=p.id, **dict(zip((*OWNERSHIP_FIELDS, 'pid', 'host_start_time'), ownership_identity(p))))
+                   for p in (*registry._running.values(), *registry._finished.values())]
+    if not entries:
+        return True
+    try:
+        path = _checkpoint_path()
+        with _FileLock(path.with_name(path.name + '.lock')):
+            try:
+                previous = json.loads(path.read_text(encoding='utf-8-sig'))
+            except FileNotFoundError:
+                previous = []
+            if not isinstance(previous, list) or any(not isinstance(entry, dict) for entry in previous):
+                raise ValueError('invalid native process checkpoint')
+            updates = merge_ownership(entries, previous)
+            updates.update(merge_ownership(entries, completed_ownership(entries)))
+        identities = {entry['session_id']: (entry['pid'], entry['host_start_time']) for entry in entries}
+        with registry._lock:
+            for sid, update in updates.items():
+                current = registry._running.get(sid) or registry._finished.get(sid)
+                if current is not None and current.ownership_generation <= update['ownership_generation']:
+                    if (current.pid, current.host_start_time) != identities[sid]:
+                        return False
+                    for field, value in update.items():
+                        setattr(current, field, value)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def check_control_ownership(registry, session, expected, consume_output):
+    """Revalidate a selected native target immediately before signalling it."""
+    if expected is None:
+        return None  # Explicit profile-wide process_manage actions retain their native policy.
+    if not refresh_ownership(registry):
+        return {'status': 'error', 'error': 'process_stop_unknown', 'session_id': session.id}
+    with registry._lock:
+        if ownership_identity(session) != expected:
+            return {'status': 'ownership_changed', 'session_id': session.id}
+        if consume_output:
+            registry._completion_consumed.add(session.id)
+    return None

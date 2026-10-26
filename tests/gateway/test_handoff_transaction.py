@@ -10,6 +10,7 @@ from tests.gateway.test_process_handoff_stop import Parent, _child, _spawn
 from tools.approval_context import (
     ApprovalTaskContext, ApprovalTaskLease, ApprovalTaskReservation,
     approval_task_revoked, background_approval_task, current_approval_task_context,
+    reserve_background_approval_task,
 )
 from tools.process_registry_handoff import OWNERSHIP_FIELDS, handoff_process
 
@@ -108,8 +109,8 @@ def test_approval_observer_sees_only_committed_parent_or_restored_stopped_child(
     write = owner.registry._write_checkpoint
 
     def held_write(*args, **kwargs):
-        # Child Stop after the accepted transfer boundary belongs to the child;
-        # a failed commit must restore that exact boundary before exposing it.
+        # Validation already accepted this transfer, but captures must still see
+        # the original child fence throughout the ownership write.
         owner.child._hard_interrupt_requested.set()
         entered.set()
         assert release.wait(20)
@@ -124,7 +125,7 @@ def test_approval_observer_sees_only_committed_parent_or_restored_stopped_child(
         transfer = pool.submit(_handoff, owner)
         try:
             assert entered.wait(20)
-            assert owner.child._hard_interrupt_requested not in owner.reservation.stop_events
+            assert owner.child._hard_interrupt_requested in owner.reservation.stop_events
             observation = pool.submit(observe)
             assert observing.wait(20)
             acquired = owner.reservation._lock.acquire(blocking=False)
@@ -161,7 +162,7 @@ def test_parent_lease_revocation_during_commit_never_restores_authorization(owne
     write = owner.registry._write_checkpoint
 
     def revoke_during_write(*args, **kwargs):
-        assert owner.child._hard_interrupt_requested not in owner.reservation.stop_events
+        assert owner.child._hard_interrupt_requested in owner.reservation.stop_events
         owner.lease.revoke()
         return write(*args, **kwargs)
 
@@ -185,3 +186,70 @@ def test_parent_lease_revocation_during_commit_never_restores_authorization(owne
     owner.child._hard_interrupt_requested.clear()
     assert not owner.reservation.active() and not owner.lease.live()
     _assert_native_cleanup_owner(owner, commit)
+
+
+def test_preauthorized_capture_during_failed_handoff_keeps_child_stop_fence(owned_process, monkeypatch):
+    owner = owned_process
+    _refuse_checkpoint(owner, monkeypatch, False)
+    authorized, permit_capture, captured_ready = Event(), Event(), Event()
+    write_entered, release_write, finish_capture = Event(), Event(), Event()
+    reserve, write = owner.lease.reserve_child, owner.registry._write_checkpoint
+    captured = []
+
+    def paused_reserve():
+        # The actual producer already passed approval_task_revoked(), including
+        # its source reservation's active() check, before reaching this seam.
+        authorized.set()
+        assert permit_capture.wait(20)
+        return reserve()
+
+    def capture():
+        with background_approval_task(owner.reservation, 'already-authorized-producer'):
+            captured.append(reserve_background_approval_task())
+            captured_ready.set()
+            assert finish_capture.wait(20)
+
+    def held_write(*args, **kwargs):
+        write_entered.set()
+        assert release_write.wait(20)
+        return write(*args, **kwargs)
+
+    monkeypatch.setattr(owner.lease, 'reserve_child', paused_reserve)
+    monkeypatch.setattr(owner.registry, '_write_checkpoint', held_write)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            producer = pool.submit(capture)
+            try:
+                assert authorized.wait(20)
+                transfer = pool.submit(_handoff, owner)
+                assert write_entered.wait(20)
+                permit_capture.set()
+                assert captured_ready.wait(20)
+                reservation = captured[0]
+                assert reservation is not None
+                during_write = reservation.stop_events
+                owner.child._hard_interrupt_requested.set()
+                release_write.set()
+                assert 'error' in transfer.result(timeout=20)
+                assert _identity(owner) == owner.original
+                assert _checkpoint(owner)['ownership_generation'] == owner.original[-1]
+                active = reservation.active()
+                with background_approval_task(reservation, 'captured-background-unit'):
+                    revoked = approval_task_revoked()
+                    evidence = current_approval_task_context()
+                assert revoked and evidence is None, 'failed handoff leaked usable task authorization'
+                assert not active and during_write == owner.events
+                owner.child._hard_interrupt_requested.clear()
+                assert not reservation.active(), 'clearing Stop revived the escaped capture'
+            finally:
+                owner.child._hard_interrupt_requested.set()
+                permit_capture.set()
+                release_write.set()
+                finish_capture.set()
+            producer.result(timeout=20)
+    finally:
+        monkeypatch.setattr(owner.registry, '_write_checkpoint', write)
+        for reservation in captured:
+            if reservation is not None:
+                reservation.release()
+    _assert_native_cleanup_owner(owner, False)
