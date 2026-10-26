@@ -41,6 +41,10 @@ def transfer_ownership(registry, session_id, *, from_owner, to_owner, to_task_id
         # Keep child fences visible to native reservation captures during I/O;
         # publish their detachment only after the ownership commit succeeds.
         with reservation._lock if reservation is not None else nullcontext():
+            if child_stop_event is not None and child_stop_event.is_set():
+                if reservation is not None:
+                    reservation.release()
+                return None
             if reservation is not None and (not reservation.active() or not reservation.lease.live()):
                 reservation.release()
                 return None
@@ -165,8 +169,14 @@ def check_control_ownership(registry, session, expected, consume_output):
     if not refresh_ownership(registry):
         return {'status': 'error', 'error': 'process_stop_unknown', 'session_id': session.id}
     with registry._lock:
-        if ownership_identity(session) != expected:
-            return {'status': 'ownership_changed', 'session_id': session.id}
+        current = ownership_identity(session)
+        if current != expected:
+            generation = OWNERSHIP_FIELDS.index('ownership_generation')
+            # Only a committed ownership transfer makes this job foreign. A
+            # changed/unproved process birth still belongs behind the Stop fence.
+            if current[generation] > expected[generation] and current[:4] != expected[:4]:
+                return {'status': 'ownership_changed', 'session_id': session.id}
+            return {'status': 'error', 'error': 'process_stop_unknown', 'session_id': session.id}
         if consume_output:
             registry._completion_consumed.add(session.id)
     return None
