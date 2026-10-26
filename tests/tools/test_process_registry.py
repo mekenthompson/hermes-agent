@@ -2408,7 +2408,7 @@ class TestSystemdCgroupIsolation:
         assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
     @pytest.mark.platforms("linux")
-    def test_pty_spawn_failure_reaps_scope_before_distinct_pipe_fallback(
+    def test_pty_spawn_failure_reaps_scope_without_replaying_command(
         self, registry, monkeypatch, _gateway_identity
     ):
         """A failed PTY scope must not collide with the pipe fallback scope."""
@@ -2449,19 +2449,13 @@ class TestSystemdCgroupIsolation:
             patch("tools.process_registry._stop_systemd_unit", side_effect=fake_stop), \
             patch("threading.Thread", return_value=MagicMock()), \
             patch.object(registry, "_write_checkpoint"):
-            session = registry.spawn_local("codex", cwd="/tmp", use_pty=True)
+            with pytest.raises(RuntimeError, match="original command was not retried"):
+                registry.spawn_local("codex", cwd="/tmp", use_pty=True)
 
-        assert [event[0] for event in events] == ["pty", "stop", "pipe"]
-        stopped_unit = events[1][1]
-        fallback_argv = events[2][1]
-        assert stopped_unit == f"hermes-worker-{session.id}.scope"
-        unit_idx = fallback_argv.index("--unit")
-        assert fallback_argv[unit_idx + 1] == (
-            f"hermes-worker-{session.id}-pipe-fallback"
-        )
-        assert session.systemd_unit == (
-            f"hermes-worker-{session.id}-pipe-fallback.scope"
-        )
+        assert [event[0] for event in events] == ["pty", "stop"]
+        session = next(iter(registry._running.values()))
+        assert events[1][1] == f"hermes-worker-{session.id}.scope"
+        assert session.systemd_unit == '' and not session._scope_stop_pending
 
     @pytest.mark.platforms("linux")
     def test_pty_spawn_failure_does_not_fallback_when_scope_reap_fails(
@@ -2488,11 +2482,13 @@ class TestSystemdCgroupIsolation:
         ), patch("subprocess.Popen") as pipe_spawn, patch(
             "tools.process_registry._stop_systemd_unit", return_value=False
         ) as stop_unit:
-            with pytest.raises(RuntimeError, match="could not be reaped"):
+            with pytest.raises(RuntimeError, match="original command was not retried"):
                 registry.spawn_local("codex", cwd="/tmp", use_pty=True)
 
         stop_unit.assert_called_once()
         pipe_spawn.assert_not_called()
+        session = next(iter(registry._running.values()))
+        assert session.systemd_unit and session._scope_stop_pending
 
     def test_worker_memory_limit_honors_local_guard_mb_override(self, monkeypatch):
         import tools.process_registry as pr
