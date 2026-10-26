@@ -14,8 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import subprocess
-import sys
+import subprocess  # tests monkeypatch ``op.subprocess.run``; production goes through run_cli
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
