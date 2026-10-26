@@ -45,27 +45,26 @@ def _admit(request_id: str, caller: AdmissionCaller, workspace: Path, *, priorit
         workspace=str(workspace),
         priority=priority,
         writer_id=f"{caller.value}:{request_id}",
-        kanban_cap=2,
-        delegate_cap=3,
+        delegate_cap=2,
         **kwargs,
     )
 
 
-def test_temp_home_shares_one_ledger_for_kanban_and_delegate_capacity_priority_and_writers(tmp_path, monkeypatch):
+def test_temp_home_shares_delegate_capacity_priority_and_writer_reservations(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     _repo, first, second, third, fourth = _worktrees(tmp_path)
 
-    kanban = _admit("kanban-1", AdmissionCaller.KANBAN, first, priority=10)
+    first_delegate = _admit("delegate-first", AdmissionCaller.DELEGATE, first, priority=10)
     delegate = _admit("delegate-1", AdmissionCaller.DELEGATE, second, priority=20)
-    queued_low = _admit("low", AdmissionCaller.KANBAN, third, priority=10)
+    queued_low = _admit("low", AdmissionCaller.DELEGATE, third, priority=10)
     queued_high = _admit("high", AdmissionCaller.DELEGATE, fourth, priority=90)
 
-    assert kanban.state == delegate.state == "running"
+    assert first_delegate.state == delegate.state == "running"
     assert queued_low.state == queued_high.state == "queued"
     assert queued_low.reason == "capacity"
-    assert release_admission(kanban.lease_id) is None
+    assert release_admission(first_delegate.lease_id) is None
 
     connection = sqlite3.connect(ledger_path(), isolation_level=None)
     try:
@@ -77,9 +76,9 @@ def test_temp_home_shares_one_ledger_for_kanban_and_delegate_capacity_priority_a
     finally:
         connection.close()
 
-    # Both callers used the same common directory but distinct branch targets;
+    # Both delegates used the same common directory but distinct branch targets;
     # non-overlapping writers are valid.  An exact branch overlap is rejected.
-    conflict = _admit("same-branch", AdmissionCaller.KANBAN, second)
+    conflict = _admit("same-branch", AdmissionCaller.DELEGATE, second)
     assert conflict.state == "rejected"
     assert conflict.reason == AdmissionErrorCode.CONFLICTING_WRITER.value
 
@@ -90,7 +89,7 @@ def test_idle_ledger_adopts_new_configured_capacity_but_live_work_blocks_migrati
     monkeypatch.setenv("HERMES_HOME", str(home))
     _repo, first, second, third, _fourth = _worktrees(tmp_path)
 
-    old = _admit("old", AdmissionCaller.KANBAN, first)
+    old = _admit("old", AdmissionCaller.DELEGATE, first)
     assert old.state == "running"
     assert release_admission(old.lease_id) is None
     with sqlite3.connect(ledger_path()) as connection:
@@ -98,7 +97,7 @@ def test_idle_ledger_adopts_new_configured_capacity_but_live_work_blocks_migrati
 
     changed = admit_writer(
         request_id="changed", caller=AdmissionCaller.DELEGATE, workspace=str(second), priority=0,
-        writer_id="delegate:changed", kanban_cap=4, delegate_cap=4,
+        writer_id="delegate:changed", delegate_cap=4,
     )
     assert changed.state == "running"
     with sqlite3.connect(ledger_path()) as connection:
@@ -108,23 +107,23 @@ def test_idle_ledger_adopts_new_configured_capacity_but_live_work_blocks_migrati
     # A concurrent worker still owns a lease. Never silently resize its ledger.
     with pytest.raises(ValueError, match="identical limits"):
         admit_writer(
-            request_id="unsafe", caller=AdmissionCaller.KANBAN, workspace=str(third), priority=0,
-            writer_id="kanban:unsafe", kanban_cap=3, delegate_cap=3,
+            request_id="unsafe", caller=AdmissionCaller.DELEGATE, workspace=str(third), priority=0,
+            writer_id="delegate:unsafe", delegate_cap=3,
         )
     assert release_admission(changed.lease_id) is None
 
     # An abandoned lease past its expiry is not live work. Reap it under the
     # same writer lock before deciding whether the changed cap is safe.
     abandoned = admit_writer(
-        request_id="abandoned", caller=AdmissionCaller.KANBAN, workspace=str(third), priority=0,
-        writer_id="kanban:abandoned", kanban_cap=4, delegate_cap=4,
+        request_id="abandoned", caller=AdmissionCaller.DELEGATE, workspace=str(third), priority=0,
+        writer_id="delegate:abandoned", delegate_cap=4,
     )
     assert abandoned.state == "running"
     with sqlite3.connect(ledger_path()) as connection:
         connection.execute("UPDATE admission_requests SET lease_expires_at = 1 WHERE request_id = 'abandoned'")
     recovered = admit_writer(
         request_id="recovered", caller=AdmissionCaller.DELEGATE, workspace=str(second), priority=0,
-        writer_id="delegate:recovered", kanban_cap=3, delegate_cap=3,
+        writer_id="delegate:recovered", delegate_cap=3,
     )
     assert recovered.state == "running"
     with sqlite3.connect(ledger_path()) as connection:
@@ -138,7 +137,7 @@ def test_temp_home_rejects_unisolated_delegate_and_records_durable_reason(tmp_pa
     monkeypatch.setenv("HERMES_HOME", str(home))
     rejected = admit_writer(
         request_id="delegate-no-worktree", caller=AdmissionCaller.DELEGATE, workspace=None,
-        priority=0, writer_id="delegate:delegate-no-worktree", kanban_cap=2, delegate_cap=2,
+        priority=0, writer_id="delegate:delegate-no-worktree", delegate_cap=2,
     )
     assert rejected.state == "rejected"
     assert rejected.reason == AdmissionErrorCode.UNSUPPORTED_PATH.value
@@ -159,7 +158,7 @@ def test_profile_scope_a_b_a_uses_each_runtime_home_ledger(tmp_path, monkeypatch
     home_b.mkdir()
 
     monkeypatch.setenv("HERMES_HOME", str(home_a))
-    a_first = _admit("a-first", AdmissionCaller.KANBAN, first)
+    a_first = _admit("a-first", AdmissionCaller.DELEGATE, first)
     monkeypatch.setenv("HERMES_HOME", str(home_b))
     b_first = _admit("b-first", AdmissionCaller.DELEGATE, second)
     monkeypatch.setenv("HERMES_HOME", str(home_a))
@@ -177,7 +176,7 @@ def test_dependencies_do_not_consume_running_capacity(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     _repo, first, second, _third, _fourth = _worktrees(tmp_path)
     blocked = _admit(
-        "blocked", AdmissionCaller.KANBAN, first,
+        "blocked", AdmissionCaller.DELEGATE, first,
         dependencies=("parent",), unresolved_dependencies=("parent",),
     )
     admitted = _admit("ready", AdmissionCaller.DELEGATE, second)
@@ -195,18 +194,18 @@ def test_capacity_blocked_retries_are_cancelled_without_queued_occupancy(tmp_pat
     _repo, first, second, third, fourth = _worktrees(tmp_path)
 
     running = admit_writer(
-        request_id="kanban-running", caller=AdmissionCaller.KANBAN, workspace=str(first), priority=0,
-        writer_id="kanban:kanban-running", kanban_cap=1, delegate_cap=1,
+        request_id="delegate-running", caller=AdmissionCaller.DELEGATE, workspace=str(first), priority=0,
+        writer_id="delegate:delegate-running", delegate_cap=1,
     )
     assert running.state == "running"
     for request_id, caller, workspace in (
         ("delegate-queued", AdmissionCaller.DELEGATE, second),
-        ("kanban-retry", AdmissionCaller.KANBAN, third),
+        ("delegate-retry-first", AdmissionCaller.DELEGATE, third),
         ("delegate-retry", AdmissionCaller.DELEGATE, fourth),
     ):
         queued = admit_writer(
             request_id=request_id, caller=caller, workspace=str(workspace), priority=0,
-            writer_id=f"{caller.value}:{request_id}", kanban_cap=1, delegate_cap=1,
+            writer_id=f"{caller.value}:{request_id}", delegate_cap=1,
         )
         assert queued.state == "queued"
         assert cancel_admission_request(queued.request_id) is True

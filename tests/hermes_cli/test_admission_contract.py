@@ -1,8 +1,4 @@
-"""RED contracts for aggregate admission evidence across Kanban and delegates.
-
-These tests define the source-side boundary only.  Wiring launch paths and
-applying policy is deliberately owned by follow-on HF-375 work.
-"""
+"""Typed delegate admission keeps capacity, writer and historical-record contracts."""
 from __future__ import annotations
 
 import sqlite3
@@ -25,7 +21,7 @@ from hermes_cli.admission_contract import (
 def _request(
     *,
     request_id: str = "req-1",
-    caller: AdmissionCaller = AdmissionCaller.KANBAN,
+    caller: AdmissionCaller = AdmissionCaller.DELEGATE,
     priority: int = 50,
     dependency_ids: tuple[str, ...] = (),
     unresolved_dependency_ids: tuple[str, ...] = (),
@@ -65,7 +61,7 @@ def _request(
         ),
         writer=writer
         or WriterEvidence(
-            writer_id="kanban:operations:t_123",
+            writer_id="delegate:operations:t_123",
             write_targets=("repo:mekenthompson/hermes-agent:branch:hf375/bounded-admission",),
         ),
     )
@@ -121,7 +117,7 @@ def test_contract_rejects_malformed_worktree_and_ancestry_evidence():
     assert error.value.code is AdmissionErrorCode.MALFORMED_EVIDENCE
 
 
-def test_shared_controller_accepts_a_complete_kanban_request(controller):
+def test_shared_controller_accepts_a_complete_delegate_request(controller):
     result = controller.admit(_request())
 
     assert result.state == "running"
@@ -183,7 +179,7 @@ def test_shared_controller_queues_dependency_blocked_work_and_promotes_the_highe
             dependency_ids=("t_parent",),
             unresolved_dependency_ids=("t_parent",),
             writer=WriterEvidence(
-                writer_id="kanban:operations:t_blocked",
+                writer_id="delegate:operations:t_blocked",
                 write_targets=("repo:mekenthompson/hermes-agent:branch:hf375/blocked",),
             ),
         )
@@ -226,21 +222,48 @@ def test_launch_path_router_rejects_an_unknown_parallel_writer_path():
     assert result.reason == AdmissionErrorCode.UNSUPPORTED_PATH.value
 
 
-@pytest.mark.parametrize(
-    ("path", "caller"),
-    [
-        ("kanban.dispatch_lane", AdmissionCaller.KANBAN),
-        ("kanban.worker_process", AdmissionCaller.KANBAN),
-        ("delegate.batch", AdmissionCaller.DELEGATE),
-        ("delegate.child_process", AdmissionCaller.DELEGATE),
-    ],
-)
-def test_launch_path_router_accepts_only_its_declared_caller(path, caller):
+@pytest.mark.parametrize("path", ["delegate.batch", "delegate.child_process"])
+def test_launch_path_router_accepts_only_its_declared_caller(path):
     from hermes_cli.admission_contract import route_launch_path
 
-    routed = route_launch_path(path, caller, request_id="request_123")
-    wrong_caller = route_launch_path(path, AdmissionCaller.DELEGATE if caller is AdmissionCaller.KANBAN else AdmissionCaller.KANBAN, request_id="request_456")
+    routed = route_launch_path(path, AdmissionCaller.DELEGATE, request_id="request_123")
+    wrong_caller = route_launch_path(path, "kanban", request_id="request_456")
 
     assert routed.state == "routed"
     assert wrong_caller.state == "rejected"
-    assert wrong_caller.reason == AdmissionErrorCode.UNSUPPORTED_PATH.value
+    assert wrong_caller.reason == AdmissionErrorCode.UNSUPPORTED_CALLER.value
+
+
+@pytest.mark.parametrize("path", ["kanban.dispatch_lane", "kanban.worker_process"])
+def test_retired_kanban_routes_do_not_admit_delegate_writers(path):
+    from hermes_cli.admission_contract import route_launch_path
+
+    result = route_launch_path(path, AdmissionCaller.DELEGATE, request_id="retired-route")
+
+    assert result.state == "rejected"
+    assert result.reason == AdmissionErrorCode.UNSUPPORTED_PATH.value
+
+
+def test_retired_kanban_caller_cannot_reserve_capacity(controller):
+    result = controller.admit(_request(caller="kanban"))
+
+    assert result.state == "rejected"
+    assert result.reason == AdmissionErrorCode.UNSUPPORTED_CALLER.value
+    assert controller.usage("running") == {"cpu": 0, "model": 0}
+
+
+def test_historical_kanban_source_remains_readable_without_rewriting_its_record(controller):
+    admitted = controller.admit(_request())
+    connection = controller.connection
+    connection.execute("UPDATE admission_requests SET source = 'kanban:legacy-writer' WHERE request_id = ?",
+                       (admitted.request_id,))
+    before = tuple(connection.execute("SELECT * FROM admission_requests WHERE request_id = ?",
+                                      (admitted.request_id,)).fetchone())
+
+    historical = controller.get(admitted.request_id)
+
+    assert historical.source == "kanban:legacy-writer"
+    assert historical.lease_id == admitted.lease_id
+    assert historical.state == "running"
+    assert tuple(connection.execute("SELECT * FROM admission_requests WHERE request_id = ?",
+                                    (admitted.request_id,)).fetchone()) == before

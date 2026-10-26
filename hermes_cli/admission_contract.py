@@ -16,7 +16,6 @@ from typing import Mapping
 class AdmissionCaller(str, Enum):
     """Launch families that may present an aggregate-admission request."""
 
-    KANBAN = "kanban"
     DELEGATE = "delegate"
 
 
@@ -158,11 +157,8 @@ class AdmissionResult:
 
 
 _SUPPORTED_LAUNCH_PATHS: dict[str, AdmissionCaller] = {
-    # These are the only process-creation chokepoints.  Ingress callers such
-    # as the CLI, dashboard, daemon, gateway, and /review all funnel through
-    # one of them instead of obtaining an independent bypass.
-    "kanban.dispatch_lane": AdmissionCaller.KANBAN,
-    "kanban.worker_process": AdmissionCaller.KANBAN,
+    # Delegation launch adapters use this contract. Native Kanban admission
+    # remains owned by upstream rather than this downstream ledger.
     "delegate.batch": AdmissionCaller.DELEGATE,
     "delegate.child_process": AdmissionCaller.DELEGATE,
 }

@@ -70,11 +70,11 @@ def test_reconcile_preserves_user_heartbeat_and_clears_when_work_settles(heartbe
 def test_failed_scan_does_not_clear_an_existing_check(heartbeat_db, monkeypatch):
     reconcile_active_work_result(["work-session"])
     monkeypatch.setattr(
-        "hermes_cli.active_work_progress._scan_kanban_sessions",
+        "hermes_cli.active_work_progress._scan_delegation_sessions",
         lambda: ScanResult(set(), False),
     )
     ids, complete = collect_active_session_ids(
-        delegation_ids=set(), background_ids=set(),
+        background_ids=set(),
     )
     assert complete is False
     settled = reconcile_active_work_result(ids, scans_complete=complete)
@@ -96,9 +96,9 @@ def test_restart_reloads_managed_check_and_does_not_refire_settled_work(heartbea
 
 def test_collect_skips_child_handoff_and_stopped_delegations():
     ids, complete = collect_active_session_ids(
-        kanban_ids={"kanban-parent"}, delegation_ids=set(), background_ids=set(),
+        delegation_ids={"delegate-parent"}, background_ids={"job-parent"},
     )
-    assert ids == {"kanban-parent"}
+    assert ids == {"delegate-parent", "job-parent"}
     assert complete is True
 
     class _Proc:
@@ -112,6 +112,23 @@ def test_collect_skips_child_handoff_and_stopped_delegations():
     })
     from hermes_cli import active_work_progress as progress
     assert progress._scan_background_sessions(registry).ids == {"human-session"}
+
+
+def test_native_kanban_does_not_arm_a_second_progress_heartbeat():
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+
+    conn = connect()
+    try:
+        task_id = kb.create_task(conn, title="Native work", session_id="native-origin",
+                                 workspace_kind="scratch")
+        assert kb.claim_task(conn, task_id, claimer="native-worker") is not None
+        assert kb.get_task(conn, task_id).status == "running"
+        ids, complete = collect_active_session_ids(delegation_ids=set(), background_ids=set())
+        assert ids == set()
+        assert complete is True
+    finally:
+        conn.close()
 
 
 def test_delegation_scan_ignores_stopped_rows(tmp_path, monkeypatch):

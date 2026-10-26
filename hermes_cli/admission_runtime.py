@@ -1,8 +1,8 @@
 """Live launch adapters for the shared bounded-admission ledger.
 
-The controller is intentionally policy-free.  This module is the only place
-where real Kanban/delegation launch paths derive their existing concurrency
-limits and verify a writer's worktree evidence before it may start.
+The controller is intentionally policy-free. Delegation launch paths derive
+their existing concurrency limits and verify a writer's worktree evidence here
+before it may start. Native Kanban uses its upstream admission path.
 """
 from __future__ import annotations
 
@@ -39,93 +39,19 @@ def ledger_path(home: Path | None = None) -> Path:
     return (home or get_hermes_home()).expanduser() / _LEDGER_NAME
 
 
-def kanban_request_id(task_id: str, run_id: int) -> str:
-    """Stable, attempt-scoped admission identity for one Kanban worker."""
-    return f"kanban:{task_id}:run:{int(run_id)}"
+def configured_gateway_capacity(*, delegate_cap: int | None = None) -> int | None:
+    """Use delegation's existing child cap without coupling native Kanban capacity.
 
-
-def _has_admission_requests_table(connection: sqlite3.Connection) -> bool:
-    """Whether this inherited ledger was initialized by the admission controller.
-
-    Kanban terminal transitions and heartbeats are deliberately best-effort
-    against an inherited ledger.  An empty or legacy sqlite file must not turn
-    a completed/heartbeat board transition into a tool failure.
+    This adapter adds no numeric fallback: without a positive established
+    delegation cap, admission fails closed.
     """
-    return connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'admission_requests'"
-    ).fetchone() is not None
-
-
-def release_kanban_admission(task_id: str, run_id: int | None) -> bool:
-    """Release one terminal worker's reservation exactly once, if it has one."""
-    if run_id is None:
-        return False
-    path = ledger_path()
-    if not path.exists():
-        return False
-    with sqlite3.connect(path, isolation_level=None) as connection:
-        if not _has_admission_requests_table(connection):
-            return False
-        result = connection.execute(
-            "UPDATE admission_requests SET state = 'released', lease_id = NULL, lease_expires_at = NULL "
-            "WHERE request_id = ? AND state = 'running'",
-            (kanban_request_id(task_id, run_id),),
-        )
-    return result.rowcount == 1
-
-
-def renew_kanban_admission(task_id: str, run_id: int | None) -> bool:
-    """Renew a live worker using its original durable lease span, never reviving one."""
-    if run_id is None:
-        return False
-    path = ledger_path()
-    if not path.exists():
-        return False
-    now = int(time.time())
-    with sqlite3.connect(path, isolation_level=None) as connection:
-        if not _has_admission_requests_table(connection):
-            return False
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(admission_requests)")}
-        if "lease_seconds" not in columns:
-            connection.execute("ALTER TABLE admission_requests ADD COLUMN lease_seconds INTEGER NOT NULL DEFAULT 300")
-        row = connection.execute(
-            "SELECT lease_seconds, lease_expires_at FROM admission_requests "
-            "WHERE request_id = ? AND state = 'running'",
-            (kanban_request_id(task_id, run_id),),
-        ).fetchone()
-        if row is None or row[1] is None or int(row[1]) <= now:
-            return False
-        lease_span = max(1, int(row[0]))
-        result = connection.execute(
-            "UPDATE admission_requests SET lease_expires_at = ? "
-            "WHERE request_id = ? AND state = 'running' AND lease_expires_at > ?",
-            (now + lease_span, kanban_request_id(task_id, run_id), now),
-        )
-    return result.rowcount == 1
-
-
-def configured_gateway_capacity(*, kanban_cap: int | None = None, delegate_cap: int | None = None) -> int | None:
-    """Use only already-existing launch caps, conservatively combined.
-
-    Kanban's established memory-derived cap and delegation's established child
-    cap are policy owned by their launchers.  This adapter adds no new numeric
-    fallback: if neither launcher can establish a positive cap, admission
-    fails closed.
-    """
-    if kanban_cap is None:
-        try:
-            from hermes_cli.kanban_db_dispatch import configured_max_in_progress, resolve_max_in_progress
-            kanban_cap = resolve_max_in_progress(configured_max_in_progress())
-        except Exception:
-            kanban_cap = None
     if delegate_cap is None:
         try:
             from tools.delegate_tool_config import _get_max_concurrent_children
             delegate_cap = _get_max_concurrent_children()
         except Exception:
             delegate_cap = None
-    caps = [value for value in (kanban_cap, delegate_cap) if isinstance(value, int) and not isinstance(value, bool) and value > 0]
-    return min(caps) if caps else None
+    return delegate_cap if isinstance(delegate_cap, int) and not isinstance(delegate_cap, bool) and delegate_cap > 0 else None
 
 
 def _connect(home: Path | None = None) -> sqlite3.Connection:
@@ -252,7 +178,7 @@ def _reconcile_idle_limits(connection: sqlite3.Connection, capacity: int) -> Non
 def admit_writer(
     *, request_id: str, caller: AdmissionCaller, workspace: str | None, priority: int,
     writer_id: str, dependencies: Iterable[str] = (), unresolved_dependencies: Iterable[str] = (),
-    kanban_cap: int | None = None, delegate_cap: int | None = None,
+    delegate_cap: int | None = None,
 ) -> Admission:
     """Verify a linked worktree then reserve one shared gateway slot.
 
@@ -262,7 +188,7 @@ def admit_writer(
     """
     if not workspace:
         return _reject(request_id, caller, AdmissionErrorCode.UNSUPPORTED_PATH, "missing isolated workspace")
-    capacity = configured_gateway_capacity(kanban_cap=kanban_cap, delegate_cap=delegate_cap)
+    capacity = configured_gateway_capacity(delegate_cap=delegate_cap)
     if capacity is None:
         return _reject(request_id, caller, AdmissionErrorCode.RESOURCE_CAPACITY, "no existing positive launch cap")
     try:
