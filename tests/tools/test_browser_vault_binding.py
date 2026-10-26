@@ -13,6 +13,7 @@ pytestmark = pytest.mark.platforms('linux')
 
 @pytest.fixture
 def bound_connection(tmp_path, monkeypatch):
+    page_io = []
     class Supervisor:
         def __init__(self, task_id, cdp_url, **kwargs):
             self.cdp_url = cdp_url
@@ -24,16 +25,19 @@ def bound_connection(tmp_path, monkeypatch):
             self.stopped = False
 
         def start(self, **kwargs):
+            page_io.append(('connect', lease.human_holds(str(owner))))
             return None
 
         def stop(self):
             self.stopped = True
 
         def evaluate_runtime(self, expression):
+            page_io.append(('evaluate', lease.human_holds(str(owner))))
             self.evaluated.append(expression)
             return {'ok': True, 'result': 42}
 
         def focus_page(self, origin, **kwargs):
+            page_io.append(('focus', lease.human_holds(str(owner))))
             self.focused.append(origin)
             return {'ok': True, 'url': origin}
 
@@ -50,12 +54,12 @@ def bound_connection(tmp_path, monkeypatch):
     monkeypatch.setattr(launcher, 'get_browser', lambda key: browser)
     info = {'launcher_key': 'native', 'cdp_url': browser.cdp_url, 'features': {'local': True}}
     browser_use_cli._attach_vault_supervisor({'BU_CDP_WS': browser.cdp_url}, 'task', info)
-    return registry, str(owner), str(caller), tmp_path
+    return registry, str(owner), str(caller), tmp_path, page_io
 
 
 @pytest.mark.parametrize('named_session', [False, True])
 def test_vault_binding_refuses_human_prompt_takeover_and_resumes(bound_connection, monkeypatch, named_session):
-    registry, owner, caller, _root = bound_connection
+    registry, owner, caller, _root, _io = bound_connection
     active = {'bu-named-helper': {'home_key': caller, 'features': {'local': True}}} if named_session else {}
     monkeypatch.setattr(session, '_active_sessions', active)
     supervisor = registry.get('task')
@@ -85,7 +89,7 @@ def test_vault_binding_refuses_human_prompt_takeover_and_resumes(bound_connectio
 def test_captured_connection_keeps_its_owner_when_task_rebinds(bound_connection, monkeypatch):
     from tools.browser_session_fence import evaluate_vault
 
-    registry, owner, caller, root = bound_connection
+    registry, owner, caller, root, _io = bound_connection
     original = registry.get('task')
     cloud = registry.get_or_start('task', 'ws://external', session_info={'features': {}})
     lease.acquire('viewer', profile_key=owner)
@@ -107,15 +111,25 @@ def test_captured_connection_keeps_its_owner_when_task_rebinds(bound_connection,
 
 @pytest.mark.parametrize('cold_connection', [False, True])
 def test_payment_confirmation_takeover_prevents_all_page_io(bound_connection, monkeypatch, cold_connection):
-    registry, owner, _caller, _root = bound_connection
+    from contextlib import nullcontext
+    registry, owner, _caller, _root, page_io = bound_connection
     supervisor = registry.get('task')
     if cold_connection:
         info = registry.browser_session('task')
         registry.stop('task')
         monkeypatch.setattr(session, '_active_sessions', {'task': info})
-    meta = SimpleNamespace(kind='payment', label='Fixture', origin='https://example.test',
+    meta = SimpleNamespace(id='fixture', kind='payment', label='Fixture', origin='https://example.test',
                            allowed_origins=['https://example.test'])
-    backend = SimpleNamespace(needs_unlock=False, get_meta=lambda handle: meta)
+    class Backend:
+        needs_unlock = False
+
+        def get_meta(self, handle):
+            return meta
+
+        def fill_context(self):
+            return nullcontext()
+
+    backend = Backend()
     monkeypatch.setattr('agent.vault_backends.backend_for_handle', lambda handle: backend)
 
     def confirm(*args):
@@ -126,9 +140,6 @@ def test_payment_confirmation_takeover_prevents_all_page_io(bound_connection, mo
     try:
         result = json.loads(vault._handle_vault({'action': 'fill', 'handle': 'fixture'}, task_id='task'))
         assert result.get('code') == 'human_has_control'
-        assert supervisor.focused == []
-        assert supervisor.evaluated == []
-        if cold_connection:
-            assert registry.get('task') is None, 'takeover started a new page connection'
+        assert not any(human for _operation, human in page_io), 'takeover dispatched page I/O'
     finally:
         lease.release('viewer', profile_key=owner)

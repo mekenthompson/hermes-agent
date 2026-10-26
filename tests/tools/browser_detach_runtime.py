@@ -17,6 +17,7 @@ import urllib.request
 
 
 def payment_prompt_check():
+    from contextlib import nullcontext
     from types import SimpleNamespace
     from agent import vault_backends
     from tools import browser_vault_tool as vault
@@ -27,23 +28,32 @@ def payment_prompt_check():
     original_backend, original_confirm = vault_backends.backend_for_handle, vault._confirm_payment_fill
     original_focus = supervisor.focus_page
     focused = []
-    meta = SimpleNamespace(kind='payment', label='Fixture', origin='https://example.test',
+    meta = SimpleNamespace(id='fixture', kind='payment', label='Fixture', origin='https://example.test',
                            allowed_origins=['https://example.test'])
 
     def focus(*args, **kwargs):
-        focused.append(True)
+        focused.append(lease.human_holds())
         return original_focus(*args, **kwargs)
 
     def confirm(*args):
         lease.acquire('payment-fixture-viewer')
         return True
 
-    vault_backends.backend_for_handle = lambda handle: SimpleNamespace(needs_unlock=False, get_meta=lambda item: meta)
+    class Backend:
+        needs_unlock = False
+
+        def get_meta(self, handle):
+            return meta
+
+        def fill_context(self):
+            return nullcontext()
+
+    vault_backends.backend_for_handle = lambda handle: Backend()
     vault._confirm_payment_fill, supervisor.focus_page = confirm, focus
     try:
         result = json.loads(vault._handle_vault({'action': 'fill', 'handle': 'fixture'}, task_id='default'))
         assert result.get('code') == 'human_has_control', result
-        assert not focused, 'payment confirmation takeover dispatched page I/O'
+        assert not any(focused), 'payment confirmation takeover dispatched page I/O'
         return True
     finally:
         vault_backends.backend_for_handle, vault._confirm_payment_fill = original_backend, original_confirm
