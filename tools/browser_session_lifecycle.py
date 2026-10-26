@@ -157,6 +157,45 @@ def cleanup_single_session(cache_key: str) -> None:
         logger.debug("Closed browser session %s", cache_key)
 
 
+def detach_shared_browsers(profile_home: Optional[str] = None) -> int:
+    """Disconnect this process's local persistent sessions, retaining their browser.
+
+    Short-lived native clients call this before their normal process exit.
+    Shared tabs, cookies and human control outlive that client's connections.
+    Cloud, sandbox and throwaway browser lifecycles remain unchanged.
+    """
+    from tools.browser_launcher import detach_browser, get_browser
+    from tools.browser_session_cdp import stop_cdp_supervisor
+    from hermes_constants import hermes_home_key
+
+    bs = _bs()
+    home_key = hermes_home_key(profile_home) if profile_home else hermes_home_key()
+    with bs._cleanup_lock:
+        sessions = list(bs._active_sessions.items())
+    detached_keys = set()
+    count = 0
+    for key, info in sessions:
+        if info.get("home_key") != home_key:
+            continue
+        launcher_key = info.get("launcher_key")
+        if not launcher_key or not (info.get("features") or {}).get("local"):
+            continue
+        browser = get_browser(launcher_key)
+        if launcher_key not in detached_keys and (browser is None or browser.ephemeral):
+            continue
+        stop_cdp_supervisor(key)
+        if launcher_key not in detached_keys:
+            if not detach_browser(launcher_key):
+                continue
+            detached_keys.add(launcher_key)
+        with bs._cleanup_lock:
+            if bs._active_sessions.get(key) is info:
+                bs._active_sessions.pop(key)
+        _forget_session_tracking(key)
+        count += 1
+    return count
+
+
 def cleanup_browser(task_id: Optional[str] = None) -> None:
     """Close the sessions serving ``task_id``: its exact key, its hybrid ``::local`` sidecar, and the
     served-profile-tagged keys browser_exec builds for it (``<task>@<home>``). Per-turn cleanup calls this
