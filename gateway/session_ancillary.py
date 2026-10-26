@@ -334,7 +334,7 @@ async def interrupt_processes(authority, ref, agent):
         agent = lookup(authority.sessions[ref.session_id].route) if lookup is not None else None
     registry = getattr(sys.modules.get('tools.process_registry'), 'process_registry', None)
     registry, targets = _process_targets(authority, ref, agent, subagent_records(agent),
-        select=lambda p: not p.exited or p._scope_stop_pending
+        select=lambda p: not p.exited or p._scope_stop_pending or p.systemd_unit
         or (p.notify_on_complete and not registry.is_completion_consumed(p.id)))
     if targets:
         # Stop cancels these autonomous notices even if termination is refused or a reader
