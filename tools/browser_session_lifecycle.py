@@ -193,7 +193,10 @@ def detach_shared_browsers(profile_home: Optional[str] = None) -> int:
                 bs._active_sessions.pop(key)
         _forget_session_tracking(key)
         count += 1
-    return count
+    # Consented browser_exec resolves its real-profile launcher directly and
+    # never publishes an _active_sessions row. It still belongs to this caller.
+    from tools.browser_launcher_lifecycle import detach_profile_browsers
+    return count + detach_profile_browsers(home_key)
 
 
 def cleanup_browser(task_id: Optional[str] = None) -> None:
