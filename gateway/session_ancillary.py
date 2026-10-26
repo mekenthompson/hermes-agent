@@ -5,6 +5,7 @@ and ``process.kill`` stop only processes ``process.list`` projects for the sessi
 reconciles only the requesting profile's MCP servers; ``file.attach`` stages for one owned session.
 """
 import asyncio
+from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 import sys
@@ -356,9 +357,19 @@ async def interrupt_processes(authority, ref, agent):
                   or getattr(authority.runner, '_cached_agent_for', None))
         agent = lookup(authority.sessions[ref.session_id].route) if lookup is not None else None
     registry = getattr(sys.modules.get('tools.process_registry'), 'process_registry', None)
-    registry, targets = _process_targets(authority, ref, agent, subagent_records(agent),
-        select=lambda p: not p.exited or p._scope_stop_pending or p.systemd_unit
-        or (p.notify_on_complete and not p.completion_consumed))
+    registry, owned = _process_targets(authority, ref, agent, subagent_records(agent), select=lambda p: True)
+    from tools.process_registry_handoff import ownership_identity
+    with registry._lock if registry is not None else nullcontext():
+        processes = [p for p in (*registry._running.values(), *registry._finished.values())
+                     if p.id in owned] if registry is not None else []
+        targets = {p.id: owned[p.id] for p in processes if not p.exited or p._scope_stop_pending or p.systemd_unit
+                   or (p.notify_on_complete and not p.completion_consumed)}
+        cancellations = [{'id': p.id, 'started_at': p.started_at, 'session_key': p.session_key}
+                         for p in processes if ownership_identity(p) == owned[p.id]]
+    if cancellations:
+        from gateway.session_automation import cancel_process_completions
+        from gateway.session_runtime_workers import tracked_write
+        await tracked_write(authority, partial(cancel_process_completions, authority, ref, cancellations))
     if targets:
         # Stop cancels these autonomous notices even if termination is refused or a reader
         # is still publishing its exit. Output remains in the native process result.

@@ -1253,7 +1253,6 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         self, synth_text: str, evt: dict, *, sibling_claims=(),
     ) -> Optional[bool]:
         from gateway.wake import WakeNotAccepted
-        from tools.process_registry import process_registry
         from tools.process_registry_notifications import should_surface_notification
         if not should_surface_notification(evt):
             return None  # Suppressed noise is terminal, not a consumed process result.
@@ -1264,7 +1263,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             claim = await self._preflight_completion_delivery(evt)
             if not claim.proceed:
                 return claim.early_result
-            if evt.get('type', 'completion') == 'completion' and process_registry.is_completion_consumed(evt.get('session_id')):
+            from gateway.session_automation import completion_consumed
+            if evt.get('type', 'completion') == 'completion' and completion_consumed(self, evt):
                 return None
             if getattr(self, 'session_authority', None) is not None:
                 from gateway.session_automation import completion_admission
@@ -1370,8 +1370,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 self._completion_notification_batch_tasks.pop(key, None)
             if not entries:
                 return
-            from tools.process_registry import process_registry
-            from gateway.session_automation import completion_admission, producer_identity
+            from gateway.session_automation import completion_admission, completion_consumed, producer_identity
             entries_to_deliver, identities = [], []
             native = getattr(self, 'session_authority', None) is not None
             admitted = False
@@ -1379,7 +1378,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # producer's durable flags before it can enter text or native identity lists.
             for item in entries:
                 async with self._completion_event_scope(item[1]):
-                    if process_registry.is_completion_consumed(item[1].get('session_id')):
+                    if completion_consumed(self, item[1]):
                         continue
                     if native:
                         if completion_admission(self, item[1]) is not None:
@@ -1888,8 +1887,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if session.exited:
                 # Agent-notify: inject a synthetic message unless the agent already consumed the result via
                 # wait/log (poll() is read-only and deliberately does NOT mark consumed).
-                if agent_notify and not process_registry.is_completion_consumed(session_id):
-                    completion_evt = self._build_process_completion_event(watcher, session, session_id)
+                from gateway.session_automation import completion_consumed
+                completion_evt = self._build_process_completion_event(watcher, session, session_id)
+                if agent_notify and not completion_consumed(self, completion_evt):
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break
@@ -1936,7 +1936,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     )
                 # Text-only notification; skip when already consumed via wait/log (the agent_notify branch
                 # FALLS THROUGH here, hence the re-check).
-                if process_registry.is_completion_consumed(session_id):
+                if completion_consumed(self, completion_evt):
                     logger.debug(
                         "Process watcher: completion for %s already consumed "
                         "via wait/log — skipping raw notification (#65379)", session_id,

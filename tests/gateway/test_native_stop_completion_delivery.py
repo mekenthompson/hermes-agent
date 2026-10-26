@@ -53,7 +53,10 @@ async def test_native_stop_filters_actual_completion_batch_before_admission(tmp_
         release.set()
         assert await asyncio.wait_for(task, 10) is None
         rows = list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)
-        assert len(rows) == 1 and rows[0]['request_id'] == 'seed'
+        controls = [row for row in rows if row['principal_id'] == 'native-process-stop']
+        work = [row for row in rows if row['principal_id'] != 'native-process-stop']
+        assert len(controls) == 1 and (controls[0]['status'], controls[0]['outcome']) == ('terminal', 'cancelled')
+        assert len(work) == 1 and work[0]['request_id'] == 'seed'
         assert registry.is_completion_consumed(own.id) and own.exit_code == 0
         assert 'retained stopped output' in own.output_buffer
     finally:
@@ -83,7 +86,9 @@ async def test_stop_during_native_admission_write_refuses_consumed_completion(tm
         assert 'result' in await stop(caller(authority, actor), ref)
         release.set()
         assert await asyncio.wait_for(task, 10) is False
-        assert len(list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)) == 1
+        rows = list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)
+        assert len([row for row in rows if row['principal_id'] != 'native-process-stop']) == 1
+        assert all(row['status'] == 'terminal' for row in rows if row['principal_id'] == 'native-process-stop')
     finally:
         release.set()
         await task

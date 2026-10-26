@@ -45,7 +45,9 @@ async def test_consumed_result_is_removed_from_secondary_profile_batch(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_native_profile_batch_filters_before_fifo_and_preserves_human(tmp_path, monkeypatch, request, private_db_probe_cleanup):
+@pytest.mark.platforms('linux')
+@pytest.mark.parametrize('retention', ['retained', 'cap', 'age'])
+async def test_native_profile_batch_filters_before_fifo_and_preserves_human(tmp_path, monkeypatch, request, private_db_probe_cleanup, retention):
     import shlex
     import sys
     from types import SimpleNamespace
@@ -64,7 +66,9 @@ async def test_native_profile_batch_filters_before_fifo_and_preserves_human(tmp_
     from gateway.session_ingress_context import native_callback
     from tests.gateway.test_native_stop_reconciliation import caller, stop
     from tools import process_registry as module
+    from tools import process_registry_results as process_results
     from tools.process_registry_results import load_completed_results, save_completed_result
+    from tests.gateway.test_process_stop_retention import expire_result
 
     schedule = SessionAuthority._schedule
     monkeypatch.setattr(SessionAuthority, '_schedule', lambda self, ref: None)
@@ -138,6 +142,8 @@ async def test_native_profile_batch_filters_before_fifo_and_preserves_human(tmp_
                 cancelled, cancelled_event = await completed(f'CANCELLED_RESULT_{index}')
                 assert 'result' in await stop(caller(authority, actor), seed.ref)
                 assert registry.is_completion_consumed(cancelled.id)
+                if retention != 'retained':
+                    expire_result(process_results, cancelled, retention)
                 _already, already_event = await completed(f'ALREADY_RESULT_{index}')
                 live, live_event = await completed(f'LIVE_RESULT_{index}')
                 assert await runner._deliver_completion_notification(f'ALREADY_RESULT_{index}', already_event) is True
@@ -168,8 +174,14 @@ async def test_native_profile_batch_filters_before_fifo_and_preserves_human(tmp_
                 descriptor = added[0]['payload'].get('local_automation_v1') or added[0]['payload']['native_text_v1']['automation']
                 assert descriptor.get('identities', [descriptor.get('identity')]) == [producer_identity(runner, live_event)]
                 assert completion_admission(runner, already_event)['admission_id'] == already_row['admission_id']
-                retained = load_completed_results(owns_entry=lambda row: row['id'] == cancelled.id, strict=True)[cancelled.id]
-                assert retained.exit_code == 0 and f'CANCELLED_RESULT_{index}' in retained.output_buffer
+                retained = load_completed_results(owns_entry=lambda row: row['id'] == cancelled.id, strict=True)
+                if retention == 'retained':
+                    assert retained[cancelled.id].exit_code == 0 and f'CANCELLED_RESULT_{index}' in retained[cancelled.id].output_buffer
+                else:
+                    assert cancelled.id not in retained
+                assert cancelled.exit_code == 0 and f'CANCELLED_RESULT_{index}' in cancelled.output_buffer
+                from gateway.session_automation import completion_consumed
+                assert completion_consumed(runner, cancelled_event)
                 follower = await admit_human(authority, MessageEvent(text='human continuation', source=source,
                                                                        message_id=f'follow-{index}'), name)
                 monkeypatch.setattr(SessionAuthority, '_schedule', schedule)
