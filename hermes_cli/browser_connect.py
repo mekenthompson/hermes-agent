@@ -795,11 +795,9 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
 
 
 def cleanup_real_profile_snapshots() -> None:
-    """Delete the whole real-profile snapshot store when consent is OFF (idempotent)."""
-    root = str(get_hermes_home() / "browser-profile")
-    if os.path.isdir(root):
-        shutil.rmtree(root, ignore_errors=True)
-        logger.info("real-profile: removed snapshot store %s (consent off)", root)
+    """Retire inactive copied profiles when consent is OFF (idempotent)."""
+    from tools.browser_session_real_profile import retire_profile_snapshots
+    retire_profile_snapshots(get_hermes_home())
 
 
 def _debug_candidate_paths(system: str):

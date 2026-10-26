@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import textwrap
+import select
 
 import pytest
 
@@ -46,6 +47,8 @@ CLIENT = textwrap.dedent('''\
             lease.acquire('real-profile-viewer')
         atexit.register(session.detach_shared_browsers)
         print(browser.pid, flush=True)
+        if mode == 'holder':
+            sys.stdin.read()
 ''')
 
 
@@ -76,3 +79,78 @@ def test_direct_real_profile_exit_retains_and_consent_off_respects_human(tmp_pat
         assert not profile.parent.exists()
     finally:
         kill_fake(pid, binary)
+
+
+def test_concurrent_holder_started_before_consent_cleanup_keeps_its_data(tmp_path, monkeypatch):
+    from hermes_cli import browser_connect
+    from tools import browser_session_cloud as cloud, browser_session_real_profile as real_profile
+    from tests.tools.browser_launcher_fakes import install_fake_chromium_identity
+
+    binary = write_fake_chromium(tmp_path / 'chromium')
+    home, profile = tmp_path / 'home', tmp_path / 'home/browser-profile/chrome'
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setattr(browser_connect, 'get_hermes_home', lambda: home)
+    monkeypatch.setattr(cloud, 'use_real_profile', lambda: False)
+    monkeypatch.setattr(launcher, '_verified_local_chromium', launcher._verified_local_chromium)
+    install_fake_chromium_identity(binary)
+    original = real_profile.terminate_real_profile_browser
+    child = None
+    pid = None
+
+    def start_after_stop():
+        nonlocal child, pid
+        original()
+        child = subprocess.Popen([sys.executable, '-c', CLIENT, str(binary), str(profile), 'holder'],
+                                 cwd=REPO, env={**os.environ, 'HERMES_HOME': str(home)},
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True)
+        assert select.select([child.stdout], [], [], 30)[0], 'concurrent launcher did not become ready'
+        pid = int(child.stdout.readline().strip())
+        (profile / 'active-work').write_text('fixture')
+
+    monkeypatch.setattr(real_profile, 'terminate_real_profile_browser', start_after_stop)
+    try:
+        assert real_profile.real_profile_cdp() == (None, None)
+        assert launcher._pid_alive(pid)
+        assert (profile / 'active-work').read_text() == 'fixture'
+        child.communicate(input='', timeout=20)
+        assert child.returncode == 0
+        monkeypatch.setattr(real_profile, 'terminate_real_profile_browser', original)
+        assert real_profile.real_profile_cdp() == (None, None)
+        assert not launcher._pid_alive(pid)
+        assert not profile.exists()
+    finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.communicate(timeout=10)
+        if pid is not None:
+            kill_fake(pid, binary)
+
+
+def test_snapshot_deletion_keeps_the_native_cross_process_launch_lock(tmp_path, monkeypatch):
+    import shutil
+    from hermes_cli import browser_connect
+
+    home, profile = tmp_path / 'home', tmp_path / 'home/browser-profile/chrome'
+    profile.mkdir(parents=True)
+    (profile / 'copy').write_text('fixture')
+    monkeypatch.setattr(browser_connect, 'get_hermes_home', lambda: home)
+    original = shutil.rmtree
+    locked = []
+
+    def check_lock_then_remove(path, *args, **kwargs):
+        if Path(path) == profile:
+            state = launcher._shared_state_dir(str(profile))
+            code = "from pathlib import Path; import sys; " \
+                   "from tools.browser_launcher_holders import records_lock; " \
+                   "\nwith records_lock(Path(sys.argv[1]),blocking=False) as held: print(held)"
+            result = subprocess.run([sys.executable, '-c', code, str(state)], cwd=REPO,
+                                    capture_output=True, text=True, timeout=20, check=True)
+            assert result.stdout.strip() == 'False', 'deletion released the launch lock'
+            locked.append(True)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, 'rmtree', check_lock_then_remove)
+    browser_connect.cleanup_real_profile_snapshots()
+    assert locked == [True]
+    assert not profile.parent.exists()
