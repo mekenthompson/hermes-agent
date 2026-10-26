@@ -134,8 +134,12 @@ def real_profile_note(cache_key: Optional[str]) -> Optional[str]:
 
 
 def session_for_task(task_id: Optional[str]) -> dict[str, Any]:
-    """The active session serving ``task_id`` (its exact key, else one whose owner is that task), or {}."""
+    """The task's bound browser connection, else its active backend session, or {}."""
     task = task_id or "default"
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    supervised = SUPERVISOR_REGISTRY.browser_session(task)
+    if supervised is not None:
+        return supervised
     with _cleanup_lock:
         if task in _active_sessions:
             return _active_sessions[task]
