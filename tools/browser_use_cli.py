@@ -356,6 +356,8 @@ def _mark_local_browser(env: dict, session: dict, key: str) -> None:
     """Flags for a LOCAL session browser: it runs on the Bot Desktop display (lease fence), and unless a
     persistent profile / the real-profile browser is shared by every key, it is exclusive to this key (no
     own-tab preamble: nothing to share a tab with)."""
+    from tools.browser_session_fence import remember_session
+    remember_session(env, session)
     features = session.get("features") or {}
     env[_BOT_DESKTOP_BROWSER_SENTINEL] = "lightpanda" if features.get("lightpanda") else "local"
     if not session.get("shared_profile") and not features.get("real_profile"):
@@ -484,6 +486,10 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
         return None
     cdp, err = real_profile_cdp()
     if cdp and not err:
+        from tools.browser_session_fence import remember_session
+        from tools.browser_session_real_profile import real_profile_key
+        remember_session(env, {"features": {"local": True}, "cdp_url": cdp,
+                               "launcher_key": real_profile_key()})
         _set_cdp_env(env, cdp)
         env[_BOT_DESKTOP_BROWSER_SENTINEL] = "local"  # the user's real Chromium, whatever browser.engine says
     return err or None
@@ -711,6 +717,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         env["BU_NAME"] = _sidecar_daemon_name(session)
     _exec_route_is_sidecar[route_key] = local_sidecar
     local_engine = env.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None)
+    from tools.browser_session_fence import take_session
+    local_session = take_session(env)
     bot_desktop_browser = bool(local_engine)
     _exec_local_engine.set(local_engine)  # only local browsers carry the sentinel
 
@@ -750,7 +758,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
 
     if bot_desktop_browser:
         from tools.browser_session import run_fenced
-        dispatched = run_fenced({"features": {"local": True}}, dispatch)
+        dispatched = run_fenced(local_session, dispatch)
     else:
         dispatched = dispatch()
     _reload_if_republished(env, generation)
