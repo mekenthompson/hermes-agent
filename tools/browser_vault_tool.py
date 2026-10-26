@@ -119,8 +119,10 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
     # epoch check only discards the result, and a fill is a side effect, not a result.
     if _bot_desktop_browser_session(task_id):
         from tools.bot_desktop import lease as _bd_lease
+        from tools.browser_session import session_for_task
+        from tools.browser_session_fence import owner_home
         try:
-            _bd_lease.assert_agent_may_act()
+            _bd_lease.assert_agent_may_act(owner_home(session_for_task(task_id)))
         except _bd_lease.HumanHasControl as exc:
             return {"success": False, "error_type": "human_has_control", "error": str(exc)}
 

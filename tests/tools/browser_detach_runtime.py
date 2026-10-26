@@ -34,13 +34,18 @@ def client(mode):
         browser_launcher.stop_browser(info['launcher_key'], force=True)
         return {'ok': True}
     if mode == 'refused':
-        result = execute("print(json.dumps(cdp('Target.getTargets')))")
-        assert result.get('code') == 'human_has_control', result
-        return {'ok': True}
+        for command in ["cdp('Target.getTargets')", "cdp('Target.createTarget',url='about:blank')"]:
+            result = execute(f"print(json.dumps({command}))")
+            assert result.get('code') == 'human_has_control', result
+        info = browser_session.get_session_info('bu-named-detach-acceptance')
+        return {'ok': True, 'pid': browser_launcher.get_browser(info['launcher_key']).pid}
     if mode == 'ordinary':
         result = execute("print(json.dumps(cdp('Target.getTargets')))")
         assert result.get('success') is True, result
-        return {'ok': True}
+        result = execute("print(json.dumps(cdp('Target.createTarget',url='about:blank')))")
+        assert result.get('success') is True, result
+        info = browser_session.get_session_info('bu-named-detach-acceptance')
+        return {'ok': True, 'pid': browser_launcher.get_browser(info['launcher_key']).pid}
 
     # Match the standalone client's LIFO shutdown registration, rather than
     # invoking detachment manually before the interpreter exits.
@@ -86,9 +91,9 @@ def main():
             (home / 'config.yaml').write_text(json.dumps(config))
             env = {**os.environ, 'HERMES_HOME': str(home)}
 
-            def run(action):
+            def run(action, client_home=home):
                 result = subprocess.run([sys.executable, __file__, 'client', action],
-                                        env=env, capture_output=True, text=True,
+                                        env={**env, 'HERMES_HOME': str(client_home)}, capture_output=True, text=True,
                                         timeout=100, check=False)
                 assert result.returncode == 0, result.stderr + result.stdout
                 return json.loads(result.stdout.strip().splitlines()[-1])
@@ -109,7 +114,16 @@ def main():
                 assert first['unrelated'] in target_ids(first['http_url'])
                 checks[mode + '_later_client'] = True
                 if mode == 'human':
+                    attacher = root / 'attacher'
+                    attacher.mkdir(mode=0o700)
+                    (attacher / 'config.yaml').write_text(json.dumps(config))
+                    assert run('refused', attacher)['pid'] == first['pid']
+                    assert target_ids(first['http_url']) == ids
+                    checks['cross_home_human_refusal'] = True
                     run('handback')
+                    assert run('ordinary', attacher)['pid'] == first['pid']
+                    assert target_ids(first['http_url']) > ids
+                    checks['cross_home_handback'] = True
                 run('explicit-stop')
                 assert not browser_launcher._pid_alive(first['pid'])
                 checks[mode + '_explicit_stop'] = True
