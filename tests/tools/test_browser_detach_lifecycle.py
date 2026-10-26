@@ -26,9 +26,7 @@ CLIENT = textwrap.dedent("""\
     from tools import browser_launcher as launcher, browser_session as session
     from tools.bot_desktop import lease
     from hermes_constants import hermes_home_key
-    from tests.tools.browser_launcher_fakes import install_fake_chromium_identity
     binary, profile, mode = sys.argv[1:]
-    install_fake_chromium_identity(Path(binary))
     browser, error = launcher.launch_chromium('client', executable=binary, user_data_dir=profile,
         ephemeral=False, headed=False, env=dict(os.environ), timeout=20)
     if error:
