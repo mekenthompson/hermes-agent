@@ -72,36 +72,48 @@ def real_profile_key() -> str:
     return f"hermes-real-profile@{hermes_home_key()}"
 
 
-def terminate_real_profile_browser() -> bool:
-    """Stop this profile's copy-browsers, including one a detached client retained."""
-    from tools.browser_launcher import stop_browser, stop_shared_profile
-    from hermes_constants import get_hermes_home
-
+def terminate_real_profile_browser() -> None:
+    """Stop this caller's real-profile browser; consent cleanup handles retained copies."""
+    from tools.browser_launcher import stop_browser
     stop_browser(real_profile_key(), force=True)
-    root = get_hermes_home() / 'browser-profile'
-    if root.is_symlink():
-        return False
-    stopped = True
-    if root.is_dir():
-        for directory in root.iterdir():
-            if directory.is_dir() and not directory.is_symlink():
-                stopped = stop_shared_profile(str(directory)) and stopped
-    return stopped
+
+
+def retire_profile_snapshots(home) -> None:
+    """Delete each inactive copy under its launch lock; never sweep a newly active tree."""
+    import errno
+    from tools.browser_launcher import retire_shared_profile
+    from tools.browser_launcher_lifecycle import cleanup_guard
+
+    root = home / 'browser-profile'
+    if root.is_symlink() or not root.is_dir():
+        return
+    for directory in root.iterdir():
+        if directory.is_dir() and not directory.is_symlink():
+            retire_shared_profile(str(directory), profile_home=str(home))
+        else:
+            with cleanup_guard(str(home)) as admitted:
+                if admitted:
+                    directory.unlink(missing_ok=True)
+    with cleanup_guard(str(home)) as admitted:
+        if not admitted:
+            return
+        try:
+            root.rmdir()  # only empty: a concurrent launch may have created another copy
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if exc.errno != errno.ENOTEMPTY:
+                raise
+            logger.info("real-profile: snapshot cleanup deferred while a copy remains in use")
 
 
 def _consent_revoked() -> tuple[None, None]:
     """Consent off: stop the copy-browser and delete the snapshot store (copies of cookies/logins), so
     revoking consent actually removes the credential copies."""
-    if not terminate_real_profile_browser():
-        logger.info("real-profile: snapshot cleanup deferred while its browser remains in use")
-        return None, None
+    terminate_real_profile_browser()
     try:
         from hermes_cli.browser_connect import cleanup_real_profile_snapshots
-        from hermes_constants import hermes_home_key
-        from tools.browser_launcher_lifecycle import cleanup_guard
-        with cleanup_guard(hermes_home_key()) as admitted:
-            if admitted:
-                cleanup_real_profile_snapshots()
+        cleanup_real_profile_snapshots()
     except OSError as exc:
         logger.debug("real-profile cleanup-on-consent-off failed: %s", exc)
     return None, None

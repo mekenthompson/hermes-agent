@@ -96,24 +96,59 @@ def detach_profile_browsers(home_key):
     return sum(detach_shared_browser(key) for key in keys)
 
 
-def stop_shared_profile(user_data_dir):
-    """Stop a retained local profile without launching or copying anything."""
+def _profile_occupied(directory):
+    from tools import browser_launcher as launcher
+    return launcher._live_local_holder(directory) is not None or launcher._foreign_holder(directory) is not None
+
+
+def _retire_profile_locked(directory, key, home_key):
+    """Caller holds the profile records lock through occupancy and deletion."""
+    import shutil
+    from tools import browser_launcher as launcher
+
+    browser = launcher._attach_running(key, directory, home_key)
+    if browser is None:
+        if _profile_occupied(directory):
+            return False
+        with cleanup_guard(home_key) as admitted:
+            if admitted and Path(directory).exists():
+                shutil.rmtree(directory)
+            return admitted
+    with launcher._lock:
+        launcher._browsers[key] = browser
+    record = launcher._record_path(browser)
+    try:
+        if record is None:
+            return False
+        if launcher._heir_key(browser) is not None or not launcher._last_holder_out(record, browser, force=True):
+            return False
+        with cleanup_guard(recorded_home(record, browser)) as admitted:
+            if not admitted:
+                return False
+            launcher._terminate(browser.pid, browser.start_time, None)
+            if _profile_occupied(directory):
+                return False
+            record.unlink(missing_ok=True)
+            if Path(directory).exists():
+                shutil.rmtree(directory)
+            return True
+    finally:
+        with launcher._lock:
+            launcher._forget(key, browser, drop_record=False)
+
+
+def retire_shared_profile(user_data_dir, profile_home):
+    """Retire a copied profile atomically against native launches and takeover."""
     import os
     from hermes_constants import hermes_home_key
     from tools import browser_launcher as launcher
     from tools.browser_launcher_holders import records_lock
 
     directory = os.path.realpath(user_data_dir)
-    key = 'retained-profile-stop:' + directory
+    key = 'retained-profile-retire:' + directory
     records = launcher._shared_state_dir(directory)
     if records is None:
         return False
     with launcher._key_lock(key):
         with records_lock(records):
-            browser = launcher._attach_running(key, directory, hermes_home_key())
-            if browser is not None:
-                with launcher._lock:
-                    launcher._browsers[key] = browser
-        if browser is not None:
-            launcher._stop_locked(key, force=True)
-    return launcher._live_local_holder(directory) is None and launcher._foreign_holder(directory) is None
+            return _retire_profile_locked(directory, key, hermes_home_key(profile_home))

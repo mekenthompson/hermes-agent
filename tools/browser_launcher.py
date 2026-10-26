@@ -822,10 +822,10 @@ def stop_all_browsers() -> None:
         stop_browser(key)
 
 
-def stop_shared_profile(user_data_dir: str) -> bool:
-    """Stop an existing retained profile; false while a human/other holder still uses it."""
-    from tools.browser_launcher_lifecycle import stop_shared_profile as stop
-    return stop(user_data_dir)
+def retire_shared_profile(user_data_dir: str, *, profile_home: str) -> bool:
+    """Stop/delete a copied profile atomically; false while another holder still uses it."""
+    from tools.browser_launcher_lifecycle import retire_shared_profile as retire
+    return retire(user_data_dir, profile_home)
 
 
 # ── Per-profile records + orphan reap ────────────────────────────────────────────────────────────────
