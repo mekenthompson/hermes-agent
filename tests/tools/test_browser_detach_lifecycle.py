@@ -42,6 +42,8 @@ CLIENT = textwrap.dedent("""\
         assert refused.get('code') == 'human_has_control'
     if mode in ('detach', 'detach-human'):
         assert session.detach_shared_browsers() == 1
+    if mode == 'explicit-stop':
+        launcher.stop_browser('client', force=True)
     print(browser.pid, flush=True)
 """)
 
@@ -60,6 +62,17 @@ def test_only_client_exit_and_reaper_preserve_browser(tmp_path, mode):
         launcher.reap_orphaned_browsers(homes=[str(home)])
         assert launcher._pid_alive(pid), "orphan cleanup ignored retained/human ownership"
         assert (profile / "unrelated-tab").read_text() == "human work"
+        if mode == "detach":
+            later = subprocess.run([sys.executable, "-c", CLIENT, str(binary), str(profile), 'ordinary'],
+                                   cwd=REPO, env={**os.environ, 'HERMES_HOME': str(home)},
+                                   capture_output=True, text=True, timeout=45, check=True)
+            assert int(later.stdout.strip()) == pid
+            assert launcher._pid_alive(pid), 'a later ordinary client discarded durable retention'
+            stopped = subprocess.run([sys.executable, "-c", CLIENT, str(binary), str(profile), 'explicit-stop'],
+                                     cwd=REPO, env={**os.environ, 'HERMES_HOME': str(home)},
+                                     capture_output=True, text=True, timeout=45, check=True)
+            assert int(stopped.stdout.strip()) == pid
+            assert not launcher._pid_alive(pid), 'explicit stop did not override retention'
         if mode == "human":
             lease.release("test-viewer", profile_key=str(home))
             launcher.reap_orphaned_browsers(homes=[str(home)])
@@ -95,3 +108,38 @@ def test_shared_holder_handover_keeps_launch_home_human_fence(tmp_path, monkeypa
     monkeypatch.setattr(launcher, "_terminate", lambda *args: stopped.append(args))
     launcher.stop_browser("client")
     assert stopped == [], "holder handover changed the browser display's owning profile"
+
+
+def test_cleanup_guard_serializes_a_real_cross_process_takeover(tmp_path):
+    home = tmp_path / 'home'
+    code = textwrap.dedent("""\
+        import fcntl, os, sys
+        from tools.bot_desktop import lease
+        path = lease._path(sys.argv[1]).with_suffix('.lock')
+        with path.open('r+') as stream:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print('cleanup-admitted-first', flush=True)
+            else:
+                raise AssertionError('cleanup guard did not hold the takeover lock')
+        lease.acquire('viewer', profile_key=sys.argv[1])
+        print('takeover-completed', flush=True)
+    """)
+    process = None
+    try:
+        with lease.cleanup_guard(str(home)) as admitted:
+            assert admitted
+            process = subprocess.Popen([sys.executable, '-c', code, str(home)], cwd=REPO,
+                                       env=dict(os.environ), stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True)
+            assert process.stdout.readline().strip() == 'cleanup-admitted-first'
+            assert lease.get(str(home)).holder == lease.AGENT
+        stdout, stderr = process.communicate(timeout=20)
+        assert process.returncode == 0, stderr
+        assert stdout.strip() == 'takeover-completed'
+        assert lease.get(str(home)).holder == lease.HUMAN
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)

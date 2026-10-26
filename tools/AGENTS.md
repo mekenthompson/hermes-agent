@@ -92,6 +92,8 @@ time + its `--user-data-dir` argv token; the reaper walks every served home and 
 Short-lived native clients call `browser_session.detach_shared_browsers(profile_home)` before process
 exit to retain their profile's persistent local browser, closing only their own connections. The verified
 launch record keeps intentional retention distinct from a crashed owner; explicit browser stop still works.
+Use `browser_launcher.stop_browser(key, force=True)` to explicitly override retention; ordinary caller
+and gateway cleanup preserves retained browsers. The human-control lease still fences teardown.
 Native teardown and orphan reap serialize with the owning display profile's human-control lease.
 `browser_tool.py` and `browser_tool_install.py` are frozen old-updater stubs only (see their
 docstrings); never grow them.
