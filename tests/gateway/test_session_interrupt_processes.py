@@ -9,6 +9,7 @@ import pytest
 from tests.gateway.fixtures.local_recovery_probe import child_env
 
 
+@pytest.mark.platforms('linux')
 @pytest.mark.parametrize('persist', [False, True])
 def test_native_gui_stop_ends_terminal_effects_and_preserves_neighbors(tmp_path, persist):
     root = Path(__file__).resolve().parents[2]
@@ -34,3 +35,8 @@ def test_native_gui_stop_ends_terminal_effects_and_preserves_neighbors(tmp_path,
     assert receipt['completion_consumed'] is True and receipt['request_count'] == 2, receipt
     assert receipt['admissions'] == [{'status': 'terminal', 'outcome': 'interrupted',
                                       'generation': receipt['generation']}], receipt
+
+    identity = json.dumps(['completion', receipt['process']['id'], receipt['process']['started_at']], separators=(',', ':'))
+    assert receipt['stop_controls'] == [{'target_session_id': receipt['session_id'], 'request_id': identity,
+        'status': 'terminal', 'outcome': 'cancelled', 'generation': None,
+        'payload': {'process_completion': identity, 'route': receipt['process']['route']}}], receipt

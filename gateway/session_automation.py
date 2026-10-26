@@ -75,8 +75,11 @@ def cancel_process_completions(authority, ref, processes):
         _epoch(conn, authority.epoch)
         _session(conn, ref.session_id)
         for process in processes:
-            identity = producer_identity(authority.runner, {'type': 'completion',
-                'session_id': process['id'], 'started_at': process['started_at']})
+            if not isinstance(process['id'], str) or not process['id'] or not _process_start_known(process['started_at']):
+                raise RuntimeStoreError('process_stop_unknown')
+            # Canonical process producer identity; native/headless owners do not
+            # depend on the messaging runner's delivery mixin.
+            identity = json.dumps(('completion', process['id'], process['started_at']), separators=(',', ':'))
             payload = {'process_completion': identity, 'route': process['session_key']}
             digest = admission_fingerprint(canonical_target=ref.session_id, payload={'input': payload, 'intent': 'queue'})
             conn.execute("INSERT INTO session_admissions(admission_id,request_id,principal_id,target_session_id,"

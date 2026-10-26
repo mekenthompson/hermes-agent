@@ -125,7 +125,10 @@ def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypat
             (home / 'parent-release-finished').touch()
             await async_wait_until(lambda: query('SELECT status FROM session_admissions WHERE request_id=?',
                 ('first',)) != [('started',)], timeout=30, what='finished-frame reconciliation')
-            states = dict(query('SELECT request_id,status FROM session_admissions'))
+            states = dict(query("SELECT request_id,status FROM session_admissions WHERE principal_id!='native-process-stop'"))
+            controls = query("SELECT request_id,status,outcome,generation FROM session_admissions WHERE principal_id='native-process-stop'")
+            identity = json.dumps(['completion', child['session_id'], child['started_at']], separators=(',', ':'))
+            assert controls == [(identity, 'terminal', 'cancelled', None)], controls
             if refuse:
                 assert states == {'first': 'unknown', 'follower': 'queued'} and alive(child), states
                 assert query('SELECT value FROM state_meta WHERE key=?', marker) and peer.follower_alive == []

@@ -127,7 +127,8 @@ async def probe():
             proc = targets[0]
             receipt['process'] = {'id': proc.id, 'pid': proc.pid,
                 'owner_task_id': proc.owner_task_id, 'route': proc.session_key,
-                'persist_on_release': proc.persist_on_release, 'host_start_time': proc.host_start_time}
+                'persist_on_release': proc.persist_on_release, 'host_start_time': proc.host_start_time,
+                'started_at': proc.started_at}
             identity = psutil.Process(proc.pid)
             birth = identity.create_time()
             foreign = await rpc('session.create', request_id='foreign-neighbor', source='gui',
@@ -148,8 +149,12 @@ async def probe():
                                           execution_generation=snapshot['execution_generation'])
             receipt['alive_at_ack'] = not proc.exited
             await asyncio.wait_for(authority.sessions[sid].task, 20)
+            rows = list_session_admissions(authority.db, session_id=sid, pending_only=False)
             receipt['admissions'] = [{k: r.get(k) for k in ('status', 'outcome', 'generation')}
-                for r in list_session_admissions(authority.db, session_id=sid, pending_only=False)]
+                for r in rows if r['principal_id'] != 'native-process-stop']
+            receipt['stop_controls'] = [{k: r.get(k) for k in
+                ('target_session_id', 'request_id', 'status', 'outcome', 'generation', 'payload')}
+                for r in rows if r['principal_id'] == 'native-process-stop']
             (HOME / 'release').touch()
             for neighbor in neighbors:
                 assert await asyncio.to_thread(neighbor._completion_event.wait, 20)
