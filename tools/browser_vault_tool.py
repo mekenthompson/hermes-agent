@@ -77,13 +77,14 @@ def _ensure_supervisor(task_id: str):
     from tools.browser_session import session_for_task
     from tools.browser_session_cdp import get_dialog_policy_config, resolve_cdp_override
 
-    cdp_url = str(session_for_task(task_id).get("cdp_url") or "")
+    info = session_for_task(task_id)
+    cdp_url = str(info.get("cdp_url") or "")
     if not cdp_url:
         return None
     policy, timeout_s = get_dialog_policy_config()
     try:
-        return SUPERVISOR_REGISTRY.get_or_start(task_id=task_id, cdp_url=resolve_cdp_override(cdp_url),
-                                                dialog_policy=policy, dialog_timeout_s=timeout_s)
+        from tools.browser_session_fence import connect_vault
+        return connect_vault(task_id, info, resolve_cdp_override(cdp_url), policy, timeout_s)
     except Exception as exc:  # health: allow BLE001 -- a failed attach is reported as supervisor_required
         logger.debug("vault fill: supervisor attach to the task's session failed (%s)", exc)
         return None
@@ -163,7 +164,9 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
         supervisor = None
     if supervisor is None:
         return None
-    focused = supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
+    from tools.browser_session_fence import run_vault_io
+    focused = run_vault_io(supervisor, task_id,
+                           lambda: supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind)))
     return (origin or focused.get("url")) if focused.get("ok") else None
 
 

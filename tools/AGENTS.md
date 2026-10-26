@@ -89,18 +89,12 @@ parent-first and recorded in a private 0700 dir (a throwaway profile's in
 `<HERMES_HOME>/cache/browser/chromium-records`; a persistent profile's per OS user under the host lock dir,
 one for every home pinning it) so a later process reaps a crashed owner's browser after checking pid + start
 time + its `--user-data-dir` argv token; the reaper walks every served home and every shared profile.
-Short-lived native clients call `browser_session.detach_shared_browsers(profile_home)` before process
-exit to retain their profile's persistent local browser, closing only their own connections. The verified
-launch record keeps intentional retention distinct from a crashed owner; explicit browser stop still works.
-Detachment also covers direct consented real-profile browser_exec launchers outside the session cache.
-Consent withdrawal stops a retained copy through verified native profile attachment; snapshot deletion
-waits while a human or another live holder still uses the browser.
-Vault connections retain their verified route/display provenance on the CDP supervisor, including
-named and direct real-profile routes without a task-keyed session row. Re-admit reads and writes
-on that captured connection after prompts; a task may have rebound to another connection meanwhile.
-Use `browser_launcher.stop_browser(key, force=True)` to explicitly override retention; ordinary caller
-and gateway cleanup preserves retained browsers. The human-control lease still fences teardown.
-Native teardown and orphan reap serialize with the owning display profile's human-control lease.
+Short-lived clients call `browser_session.detach_shared_browsers(profile_home)` to retain persistent
+local browsers (including direct real-profile routes), closing only their own connections.
+Verified records preserve retention across exit/reaping; `stop_browser(key, force=True)` overrides it.
+Teardown and copied-profile retirement hold the native profile lock and owning display's human lease;
+consent withdrawal defers deletion while another holder uses the copy. Vault page I/O re-admits on its
+captured CDP connection after prompts, including named/direct routes and replaced connections.
 `browser_tool.py` and `browser_tool_install.py` are frozen old-updater stubs only (see their
 docstrings); never grow them.
 

@@ -20,6 +20,7 @@ def bound_connection(tmp_path, monkeypatch):
             self._thread = SimpleNamespace(is_alive=lambda: True)
             self._loop = SimpleNamespace(is_running=lambda: True)
             self.evaluated = []
+            self.focused = []
             self.stopped = False
 
         def start(self, **kwargs):
@@ -31,6 +32,10 @@ def bound_connection(tmp_path, monkeypatch):
         def evaluate_runtime(self, expression):
             self.evaluated.append(expression)
             return {'ok': True, 'result': 42}
+
+        def focus_page(self, origin, **kwargs):
+            self.focused.append(origin)
+            return {'ok': True, 'url': origin}
 
     owner, caller = tmp_path / 'owner', tmp_path / 'caller'
     monkeypatch.setenv('HERMES_HOME', str(caller))
@@ -98,3 +103,32 @@ def test_captured_connection_keeps_its_owner_when_task_rebinds(bound_connection,
     registry.stop_shared_home(caller)
     assert local.stopped and registry.get('local') is None
     assert registry.get('task') is cloud and not cloud.stopped
+
+
+@pytest.mark.parametrize('cold_connection', [False, True])
+def test_payment_confirmation_takeover_prevents_all_page_io(bound_connection, monkeypatch, cold_connection):
+    registry, owner, _caller, _root = bound_connection
+    supervisor = registry.get('task')
+    if cold_connection:
+        info = registry.browser_session('task')
+        registry.stop('task')
+        monkeypatch.setattr(session, '_active_sessions', {'task': info})
+    meta = SimpleNamespace(kind='payment', label='Fixture', origin='https://example.test',
+                           allowed_origins=['https://example.test'])
+    backend = SimpleNamespace(needs_unlock=False, get_meta=lambda handle: meta)
+    monkeypatch.setattr('agent.vault_backends.backend_for_handle', lambda handle: backend)
+
+    def confirm(*args):
+        lease.acquire('viewer', profile_key=owner)
+        return True
+
+    monkeypatch.setattr(vault, '_confirm_payment_fill', confirm)
+    try:
+        result = json.loads(vault._handle_vault({'action': 'fill', 'handle': 'fixture'}, task_id='task'))
+        assert result.get('code') == 'human_has_control'
+        assert supervisor.focused == []
+        assert supervisor.evaluated == []
+        if cold_connection:
+            assert registry.get('task') is None, 'takeover started a new page connection'
+    finally:
+        lease.release('viewer', profile_key=owner)

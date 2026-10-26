@@ -16,6 +16,41 @@ import tempfile
 import urllib.request
 
 
+def payment_prompt_check():
+    from types import SimpleNamespace
+    from agent import vault_backends
+    from tools import browser_vault_tool as vault
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    from tools.bot_desktop import lease
+
+    supervisor = SUPERVISOR_REGISTRY.get('default')
+    original_backend, original_confirm = vault_backends.backend_for_handle, vault._confirm_payment_fill
+    original_focus = supervisor.focus_page
+    focused = []
+    meta = SimpleNamespace(kind='payment', label='Fixture', origin='https://example.test',
+                           allowed_origins=['https://example.test'])
+
+    def focus(*args, **kwargs):
+        focused.append(True)
+        return original_focus(*args, **kwargs)
+
+    def confirm(*args):
+        lease.acquire('payment-fixture-viewer')
+        return True
+
+    vault_backends.backend_for_handle = lambda handle: SimpleNamespace(needs_unlock=False, get_meta=lambda item: meta)
+    vault._confirm_payment_fill, supervisor.focus_page = confirm, focus
+    try:
+        result = json.loads(vault._handle_vault({'action': 'fill', 'handle': 'fixture'}, task_id='default'))
+        assert result.get('code') == 'human_has_control', result
+        assert not focused, 'payment confirmation takeover dispatched page I/O'
+        return True
+    finally:
+        vault_backends.backend_for_handle, vault._confirm_payment_fill = original_backend, original_confirm
+        supervisor.focus_page = original_focus
+        lease.release('payment-fixture-viewer')
+
+
 def vault_binding_checks():
     from tools import browser_vault_tool as vault
     from tools.bot_desktop import lease
@@ -40,7 +75,8 @@ def vault_binding_checks():
         lease.release(viewer)
     resumed = json.loads(vault._fenced_page_op(task, lambda: json.dumps(vault._eval_js_secret(task, '42'))))
     assert resumed.get('success') is True and resumed.get('result') == 42, resumed
-    return {'vault_refusal': True, 'vault_prompt_takeover': True, 'vault_handback': True}
+    return {'vault_refusal': True, 'vault_prompt_takeover': True, 'vault_handback': True,
+            'vault_payment_takeover': payment_prompt_check()}
 
 
 def client(mode):
@@ -151,7 +187,7 @@ def check_real_profile(root, checks):
     try:
         first = run('real-open')
         checks.update({'direct_real_profile_' + key: first[key] for key in
-                       ['vault_refusal', 'vault_prompt_takeover', 'vault_handback']})
+                       ['vault_refusal', 'vault_prompt_takeover', 'vault_handback', 'vault_payment_takeover']})
         browser_launcher.reap_orphaned_browsers(homes=[str(home)])
         with urllib.request.urlopen(first['http_url'] + '/json/list', timeout=5) as response:
             assert first['target'] in {target['id'] for target in json.load(response)}
@@ -212,7 +248,7 @@ def main():
                 first = run(mode)
                 if mode == 'normal':
                     checks.update({key: first[key] for key in
-                                   ['vault_refusal', 'vault_prompt_takeover', 'vault_handback']})
+                                   ['vault_refusal', 'vault_prompt_takeover', 'vault_handback', 'vault_payment_takeover']})
                 browser_launcher.reap_orphaned_browsers(homes=[str(home)])
                 ids = target_ids(first['http_url'])
                 assert first['unrelated'] in ids
