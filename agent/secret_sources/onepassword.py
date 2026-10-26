@@ -15,10 +15,12 @@ import logging
 import os
 import shutil
 import subprocess
-import sys  # tests monkeypatch ``op.subprocess.run``; production goes through run_cli
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from hermes_platform.host.facts import os_family
 
 from agent.secret_sources._cache import CachedFetch, SecretCache, fingerprint as _fingerprint
 from agent.secret_sources.base import (
@@ -135,7 +137,7 @@ def _op_child_env(token_value: str) -> dict[str, str]:
     # libdbus autolaunches a daemon when its address is absent. In headless
     # Linux workers, point it at a deliberately unusable address instead; an
     # explicit bus or graphical session remains untouched.
-    if (sys.platform.startswith("linux") and "DBUS_SESSION_BUS_ADDRESS" not in env
+    if (os_family().startswith("linux") and "DBUS_SESSION_BUS_ADDRESS" not in env
             and not source_env.get("DISPLAY") and not source_env.get("WAYLAND_DISPLAY")):
         env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/nonexistent"
     if token_value:
