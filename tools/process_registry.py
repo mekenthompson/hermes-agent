@@ -582,6 +582,7 @@ class ProcessSession:
     # session was closed at a user boundary (/new) instead of injecting into the NEW one.
     parent_session_id: str = ""
     notify_on_complete: bool = False            # Queue agent notification on exit
+    ownership_generation: int = 0               # Native handoff order across checkpoint/result writers
     completion_consumed: bool = False           # Durable cancellation in the retained completed result
     completion_output_chars: int = 0            # Output chars the completion carries; 0 = COMPLETION_OUTPUT_CHARS
     watch_patterns: list[str] = field(default_factory=list)
@@ -657,7 +658,8 @@ _CHECKPOINT_FIELDS = (
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
-    "heartbeat_seconds", "persist_on_release", "output_log", "_scope_stop_pending")
+    "heartbeat_seconds", "persist_on_release", "output_log", "_scope_stop_pending",
+    "handoff_note", "ownership_generation")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -1569,6 +1571,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 "session_key": session.session_key,
                 "task_id": session.task_id,
                 "owner_task_id": session.owner_task_id,
+                "parent_session_id": session.parent_session_id,
                 "command": session.command,
                 **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
                 **self._exit_fields(session),
@@ -2424,26 +2427,16 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                     and s.id not in self._completion_consumed and s.id not in self._poll_observed]
 
     def transfer_ownership(self, session_id: str, *, from_owner: str, to_owner: str, to_task_id: str,
-                           to_session_key: str, note: str = "",
+                           to_session_key: str, to_parent_session_id: str, note: str = "",
                            child_stop_event: Optional[threading.Event] = None) -> Optional[ProcessSession]:
         """Move a RUNNING process from one owner to another under the registry lock. Ownership is the ``owner_task_id``
-        field: completion notices are stamped from it at exit time and teardown kills by it, so flipping it here is the
-        whole transfer. Returns the session, or None when it is unknown, already exited, or not owned by ``from_owner``
+        field plus its trusted native parent and route. Commit their checkpoint before acknowledging the transfer.
+        Returns the session, or None when it is unknown, already exited, or not owned by ``from_owner``
         (the caller must not report a transfer that did not happen)."""
-        session = self.get(session_id)
-        with self._lock:
-            if session is None or session.exited or session.owner_task_id != from_owner:
-                return None
-            # Completion routing and its approval provenance must change under
-            # the same lock. A stop observed before handoff must stay revoked.
-            reservation = getattr(session, "approval_task_reservation", None)
-            if reservation is not None and not reservation.transfer_to_parent(child_stop_event):
-                return None
-            session.owner_task_id = to_owner
-            session.task_id = to_task_id
-            session.session_key = to_session_key
-            session.handoff_note = note
-            return session
+        from tools.process_registry_handoff import transfer_ownership
+        return transfer_ownership(self, session_id, from_owner=from_owner, to_owner=to_owner,
+            to_task_id=to_task_id, to_session_key=to_session_key, to_parent_session_id=to_parent_session_id,
+            note=note, child_stop_event=child_stop_event)
 
     def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:
         """Active processes for a gateway session key. Processes older than

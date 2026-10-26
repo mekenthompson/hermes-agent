@@ -4,6 +4,61 @@ from typing import Optional
 
 
 _MAX_HANDOFFS_PER_CHILD = 3
+OWNERSHIP_FIELDS = ('owner_task_id', 'task_id', 'session_key', 'parent_session_id', 'handoff_note', 'ownership_generation')
+
+
+def merge_ownership(entries, previous):
+    """A native process's committed handoff survives older checkpoint/result writers."""
+    prior = {entry.get('session_id', entry.get('id')): entry for entry in previous}
+    updates = {}
+    for entry in entries:
+        sid = entry.get('session_id', entry.get('id'))
+        old = prior.get(sid)
+        if not old or old.get('ownership_generation', 0) <= 0:
+            continue
+        if old['ownership_generation'] < entry.get('ownership_generation', 0):
+            continue
+        identity = (entry.get('pid'), entry.get('host_start_time'))
+        if (any(type(value) is not int or value <= 0 for value in identity)
+                or identity != (old.get('pid'), old.get('host_start_time'))):
+            raise ValueError('handed process identity mismatch')
+        update = {field: old.get(field, '' if field != 'ownership_generation' else 0) for field in OWNERSHIP_FIELDS}
+        entry.update(update)
+        updates[sid] = update
+    return updates
+
+
+def transfer_ownership(registry, session_id, *, from_owner, to_owner, to_task_id,
+                       to_session_key, to_parent_session_id, note, child_stop_event):
+    session = registry.get(session_id)
+    with registry._lock:
+        if session is None or session.exited or session.owner_task_id != from_owner or not to_parent_session_id:
+            return None
+        reservation = getattr(session, 'approval_task_reservation', None)
+        if reservation is not None and (not reservation.active() or not reservation.lease.live()):
+            reservation.release()
+            return None
+        if any(type(value) is not int or value <= 0 for value in (session.pid, session.host_start_time)):
+            return None
+        previous = tuple(getattr(session, field) for field in OWNERSHIP_FIELDS)
+        target = (to_owner, to_task_id, to_session_key, to_parent_session_id, note, session.ownership_generation + 1)
+        for field, value in zip(OWNERSHIP_FIELDS, target):
+            setattr(session, field, value)
+        if not registry._write_checkpoint(_lock_held=True):
+            for field, value in zip(OWNERSHIP_FIELDS, previous):
+                setattr(session, field, value)
+            return None
+        if tuple(getattr(session, field) for field in OWNERSHIP_FIELDS) != target:
+            return None  # A different transfer already committed; retain that native authority.
+        if reservation is not None and not reservation.transfer_to_parent(child_stop_event):
+            # Revocation raced the write. Roll back at a newer generation so an
+            # older writer cannot resurrect the rejected transfer.
+            for field, value in zip(OWNERSHIP_FIELDS, previous):
+                setattr(session, field, value)
+            session.ownership_generation = target[-1] + 1
+            registry._write_checkpoint(_lock_held=True)
+            return None
+        return session
 
 
 def handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dict:
@@ -22,6 +77,9 @@ def handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dict
     parent_owner = str(getattr(parent, "_current_task_id", "") or getattr(parent, "session_id", "") or "")
     if not parent_owner:
         return {"error": "parent has no process owner id yet; retry after the parent's turn has started."}
+    parent_session = str(record.get('owner_session_id') or getattr(parent, 'session_id', '') or '')
+    if not parent_session:
+        return {'error': 'parent has no native session identity for this process handoff.'}
     handed = getattr(child, "_handed_off_processes", None)
     if handed is None:
         handed = child._handed_off_processes = []
@@ -34,6 +92,7 @@ def handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dict
         session_id, from_owner=str(task_id or ""), to_owner=parent_owner,
         to_task_id=_resolve_container_task_id(parent_owner),
         to_session_key=str(getattr(parent, "_gateway_session_key", "") or getattr(parent, "session_id", "") or ""),
+        to_parent_session_id=parent_session,
         note=note,
         child_stop_event=getattr(child, "_hard_interrupt_requested", None))
     if session is None:

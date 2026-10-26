@@ -100,6 +100,7 @@ def test_registry_handoff_keeps_stale_approval_and_process_with_child():
     assert registry.transfer_ownership(
         session.id, from_owner="child", to_owner="parent", to_task_id="parent-task",
         to_session_key="parent-route", child_stop_event=child_stopped,
+        to_parent_session_id="parent-session",
     ) is None
     assert (session.owner_task_id, session.task_id, session.session_key) == ("child", "child", "child-route")
     owner_current.set()
@@ -108,5 +109,6 @@ def test_registry_handoff_keeps_stale_approval_and_process_with_child():
     assert registry.transfer_ownership(
         session.id, from_owner="child", to_owner="parent", to_task_id="parent-task",
         to_session_key="parent-route", child_stop_event=child_stopped,
+        to_parent_session_id="parent-session",
     ) is None
     assert session.owner_task_id == "child"
