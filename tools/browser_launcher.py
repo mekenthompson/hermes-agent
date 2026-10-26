@@ -755,13 +755,13 @@ def _terminate(pid: Optional[int], start_time: Optional[int], proc: Optional[sub
             proc.kill()
 
 
-def stop_browser(key: str) -> None:
+def stop_browser(key: str, *, force: bool = False) -> None:
     """Let go of ``key``'s browser. A throwaway one this process launched is stopped. A shared-profile one is
     stopped only by its LAST holder across Hermes processes (:func:`_last_holder_out`); one a human started is
     never stopped. Holds ``key``'s launch lock: a relaunch of ``key`` waits for this stop instead of
     registering a replacement on the dir it is about to delete."""
     with _key_lock(key):
-        _stop_locked(key)
+        _stop_locked(key, force=force)
 
 
 def detach_browser(key: str) -> bool:
@@ -770,7 +770,7 @@ def detach_browser(key: str) -> bool:
     return detach_shared_browser(key)
 
 
-def _stop_locked(key: str) -> None:
+def _stop_locked(key: str, *, force: bool = False) -> None:
     from tools.browser_launcher_lifecycle import cleanup_guard, recorded_home
     with _lock:
         browser = _browsers.get(key)
@@ -787,7 +787,7 @@ def _stop_locked(key: str) -> None:
         return
     from tools.browser_launcher_holders import records_lock
     with records_lock(record.parent):  # the decision and the forget are one step: another key may be the heir
-        if _heir_key(browser) is None and _last_holder_out(record, browser):
+        if _heir_key(browser) is None and _last_holder_out(record, browser, force=force):
             with cleanup_guard(recorded_home(record, browser)) as admitted:
                 if admitted:
                     _terminate(browser.pid, browser.start_time, proc)
@@ -796,7 +796,7 @@ def _stop_locked(key: str) -> None:
             _forget(key, browser, drop_record=False)
 
 
-def _last_holder_out(record: Path, browser: LaunchedBrowser) -> bool:
+def _last_holder_out(record: Path, browser: LaunchedBrowser, *, force: bool = False) -> bool:
     """Drop this process's hold on shared-profile ``browser`` (caller holds the records lock). True when it
     must stop it now: no other live Hermes process holds it, and Hermes launched it (a launch record names
     it). Otherwise a record this process holds, or whose owner is gone, goes to a live holder."""
@@ -813,6 +813,8 @@ def _last_holder_out(record: Path, browser: LaunchedBrowser) -> bool:
     if heir is not None and data is not None and not held_elsewhere:
         holders.hand_over(record, data, heir)
     if others or held_elsewhere:
+        return False
+    if data is not None and data.get("retained") is True and not force:
         return False
     return browser.owned or data is not None
 

@@ -75,7 +75,7 @@ def real_profile_key() -> str:
 def terminate_real_profile_browser() -> None:
     """Stop this profile's real-profile browser if this process launched it (idempotent)."""
     from tools.browser_launcher import stop_browser
-    stop_browser(real_profile_key())
+    stop_browser(real_profile_key(), force=True)
 
 
 def _consent_revoked() -> tuple[None, None]:
