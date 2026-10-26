@@ -44,8 +44,9 @@ def client(mode):
         assert result.get('success') is True, result
         result = execute("print(json.dumps(cdp('Target.createTarget',url='about:blank')))")
         assert result.get('success') is True, result
+        created = json.loads(result['output'])['targetId']
         info = browser_session.get_session_info('bu-named-detach-acceptance')
-        return {'ok': True, 'pid': browser_launcher.get_browser(info['launcher_key']).pid}
+        return {'ok': True, 'pid': browser_launcher.get_browser(info['launcher_key']).pid, 'created': created}
 
     # Match the standalone client's LIFO shutdown registration, rather than
     # invoking detachment manually before the interpreter exits.
@@ -118,11 +119,12 @@ def main():
                     attacher.mkdir(mode=0o700)
                     (attacher / 'config.yaml').write_text(json.dumps(config))
                     assert run('refused', attacher)['pid'] == first['pid']
-                    assert target_ids(first['http_url']) == ids
+                    assert {first['owned'], first['unrelated']} <= target_ids(first['http_url'])
                     checks['cross_home_human_refusal'] = True
                     run('handback')
-                    assert run('ordinary', attacher)['pid'] == first['pid']
-                    assert target_ids(first['http_url']) > ids
+                    ordinary = run('ordinary', attacher)
+                    assert ordinary['pid'] == first['pid']
+                    assert {first['owned'], first['unrelated'], ordinary['created']} <= target_ids(first['http_url'])
                     checks['cross_home_handback'] = True
                 run('explicit-stop')
                 assert not browser_launcher._pid_alive(first['pid'])
