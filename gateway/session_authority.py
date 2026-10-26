@@ -903,11 +903,13 @@ class SessionAuthority:
             request_hard_interrupt(agent)
         for parent in dict.fromkeys((ref.session_id, self.physical_target(ref))):
             interrupt_for_session(session_key=live.route, parent_session_id=parent, reason='user_stop')
-        from gateway.session_ancillary import interrupt_processes, record_process_stop, clear_process_stop
+        from gateway.session_ancillary import interrupt_processes, record_process_stop, retry_process_stop
         from gateway.session_runtime_workers import tracked_write
-        token = await tracked_write(self, partial(record_process_stop, self, ref, generation))
-        if await interrupt_processes(self, ref, agent) and handle.execution_state != 'running':
-            await tracked_write(self, partial(clear_process_stop, self, ref, token))
+        await tracked_write(self, partial(record_process_stop, self, ref, generation))
+        if handle.execution_state == 'running':
+            await interrupt_processes(self, ref, agent)
+        else:
+            await retry_process_stop(self, ref, agent)
         return self._handle(ref)
 
     def _classic_turn_holds(self, route):
