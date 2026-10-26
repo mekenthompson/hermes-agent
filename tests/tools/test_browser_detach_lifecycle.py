@@ -143,3 +143,46 @@ def test_cleanup_guard_serializes_a_real_cross_process_takeover(tmp_path):
         if process is not None and process.poll() is None:
             process.kill()
             process.wait(timeout=10)
+
+
+@pytest.mark.parametrize('failure', ['readiness-error', 'interrupted'])
+def test_failed_launch_keeps_human_browser_until_handback(tmp_path, monkeypatch, failure):
+    binary = write_fake_chromium(tmp_path / 'chromium')
+    home, profile = tmp_path / 'home', tmp_path / 'profile'
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    original_wait = launcher._wait_for_devtools
+    launched = []
+
+    def takeover_during_readiness(process, directory, deadline):
+        found, error = original_wait(process, directory, deadline)
+        assert found is not None, error
+        launched.append((process.pid, launcher._record_path(launcher._launching[process.pid])))
+        lease.acquire('test-viewer', profile_key=str(home))
+        if failure == 'interrupted':
+            raise KeyboardInterrupt()
+        return None, 'readiness failed after takeover'
+
+    monkeypatch.setattr(launcher, '_wait_for_devtools', takeover_during_readiness)
+    try:
+        def launch():
+            return launcher.launch_chromium('client', executable=str(binary), user_data_dir=str(profile),
+                                            ephemeral=False, headed=False, env=dict(os.environ), timeout=20)
+
+        if failure == 'interrupted':
+            with pytest.raises(KeyboardInterrupt):
+                launch()
+        else:
+            browser, error = launch()
+            assert browser is None and error
+        pid, record = launched[0]
+        assert launcher._pid_alive(pid)
+        assert record.exists()
+        assert launcher.reap_orphaned_browsers(homes=[str(home)]) == 0
+        assert launcher._pid_alive(pid)
+        lease.release('test-viewer', profile_key=str(home))
+        assert launcher.reap_orphaned_browsers(homes=[str(home)]) == 1
+        assert not launcher._pid_alive(pid)
+        assert not record.exists()
+    finally:
+        for pid, _ in launched:
+            kill_fake(pid, binary)

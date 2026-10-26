@@ -1,7 +1,7 @@
 """Native shared-browser retention and profile-bound teardown admission."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 
@@ -26,6 +26,32 @@ def recorded_home(record, browser):
     if data is not None and launcher._record_is(data, browser):
         return data.get("home_key")
     return browser.home_key
+
+
+def abandon_launch(proc, starting):
+    """Release a failed/readiness-interrupted launch without evicting its viewer."""
+    import shutil
+    from tools import browser_launcher as launcher
+    from tools.browser_launcher_holders import records_lock
+
+    with launcher._lock:
+        launcher._launching.pop(proc.pid, None)
+    record = launcher._record_path(starting)
+    # _start_shared already holds this lock across the readiness wait.
+    lock = records_lock(record.parent) if record is not None and starting.ephemeral else nullcontext()
+    with lock:
+        if not starting.ephemeral and record is not None:
+            if not launcher._last_holder_out(record, starting):
+                return
+        home = recorded_home(record, starting) if record is not None else starting.home_key
+        with cleanup_guard(home) as admitted:
+            if not admitted:
+                return
+            if proc.poll() is None:
+                launcher._terminate(proc.pid, starting.start_time, proc)
+            launcher._remove_record(starting)
+            if starting.ephemeral:
+                shutil.rmtree(starting.user_data_dir, ignore_errors=True)
 
 
 def detach_shared_browser(key: str) -> bool:

@@ -644,13 +644,8 @@ def _launch_owned(key: str, executable: str, udd: str, *, ephemeral: bool, packa
 
 
 def _abandon_launch(proc: subprocess.Popen, starting: LaunchedBrowser) -> None:
-    with _lock:
-        _launching.pop(proc.pid, None)
-    if proc.poll() is None:  # one that already exited is reaped by poll(); its pid is no longer ours
-        _terminate(proc.pid, starting.start_time, proc)
-    _remove_record(starting)
-    if starting.ephemeral:
-        shutil.rmtree(starting.user_data_dir, ignore_errors=True)
+    from tools.browser_launcher_lifecycle import abandon_launch
+    abandon_launch(proc, starting)
 
 
 # ── Lookup / stop ────────────────────────────────────────────────────────────────────────────────────

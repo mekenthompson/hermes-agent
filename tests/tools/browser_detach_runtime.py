@@ -6,6 +6,7 @@ must require exit 0. All profiles, targets and cookies belong to this test.
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ import urllib.request
 
 
 def client(mode):
+    from hermes_constants import hermes_home_key
     from tools import browser_launcher, browser_session
     from tools.bot_desktop import lease
     from tools.browser_use_cli import browser_exec
@@ -40,6 +42,10 @@ def client(mode):
         assert result.get('success') is True, result
         return {'ok': True}
 
+    # Match the standalone client's LIFO shutdown registration, rather than
+    # invoking detachment manually before the interpreter exits.
+    atexit.register(browser_session.detach_shared_browsers, hermes_home_key())
+
     result = execute(
         "owned=cdp('Target.createTarget',url='about:blank')['targetId']\n"
         "other=cdp('Target.createTarget',url='about:blank')['targetId']\n"
@@ -53,7 +59,6 @@ def client(mode):
         lease.acquire('acceptance-viewer')
     result = execute(f"close_tab({targets['owned']!r})\nprint('true')")
     assert result.get('code') == 'human_has_control' if mode == 'human' else result.get('success') is True
-    assert browser_session.detach_shared_browsers() == 1
     return {'ok': True, 'pid': browser.pid, 'http_url': browser.http_url, **targets}
 
 
