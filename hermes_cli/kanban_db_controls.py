@@ -46,6 +46,23 @@ def block_task(
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
     expected_event_id: Optional[int] = None,
 ) -> bool:
+    """Commit the guarded block, then request native Stop for its owned work.
+
+    A delivery error leaves the block committed and reports unconfirmed cleanup;
+    neither the state change nor a Stop acknowledgement proves physical quiescence.
+    """
+    stops = []
+    changed = _block_task(conn, task_id, reason=reason, kind=kind, expected_run_id=expected_run_id,
+                          expected_event_id=expected_event_id, stops=stops)
+    if changed and stops:
+        from hermes_cli.kanban_process_stop import request_native_stop
+        request_native_stop(conn, task_id, stops[-1])
+    return changed
+
+
+def _block_task(
+    conn: sqlite3.Connection, task_id: str, *, reason, kind, expected_run_id, expected_event_id, stops,
+) -> bool:
     """Block active work; an explicit ``needs_input`` also stops queued work.
 
     ``expected_event_id`` optionally compares the task's latest event under
@@ -70,7 +87,10 @@ def block_task(
         if cur_row is None:
             return False
         if cur_row["status"] == "blocked":
-            return _block_parked(conn, task_id, cur_row, reason, kind, expected_run_id, expected_event_id)
+            changed = _block_parked(conn, task_id, cur_row, reason, kind, expected_run_id, expected_event_id)
+            if changed:
+                stops.append(conn.execute('SELECT MAX(id) FROM task_events WHERE task_id=?', (task_id,)).fetchone()[0])
+            return changed
         if cur_row["status"] in ("todo", "scheduled", "review"):
             # Only an operator Stop can override a dependency/time/review wait;
             # a worker cannot assert a run identity for an unclaimed card.
@@ -113,6 +133,8 @@ def block_task(
             conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
         )
         kb._append_event(conn, task_id, event_kind, payload, run_id=run_id)
+        if event_kind in {'blocked', 'block_loop_detected'}:
+            stops.append(conn.execute('SELECT MAX(id) FROM task_events WHERE task_id=?', (task_id,)).fetchone()[0])
         blocked_task = kb.get_task(conn, task_id)
         if kind == "dependency":
             # Preserve the existing dependency-lane hook ordering.
