@@ -884,8 +884,7 @@ class SessionAuthority:
                         # Accepted for this exact claim before its turn adopted an agent: whatever agent
                         # the turn adopts for this generation must not run the work as if no Stop arrived.
                         self.pending_stops[ref.session_id] = generation
-                if agent is not None:
-                    self.delivered_stops[ref.session_id] = generation
+                self.delivered_stops[ref.session_id] = generation
         # Main's Stop: hard-cancel (aborts compression too) and end the session's own background
         # delegations (spawned by this session only: a viewer must not kill other gateway work).
         from agent.interrupt_compat import request_hard_interrupt
@@ -894,6 +893,8 @@ class SessionAuthority:
             request_hard_interrupt(agent)
         for parent in dict.fromkeys((ref.session_id, self.physical_target(ref))):
             interrupt_for_session(session_key=live.route, parent_session_id=parent, reason='user_stop')
+        from gateway.session_ancillary import interrupt_processes
+        await interrupt_processes(self, ref, agent)
         return self._handle(ref)
 
     def _classic_turn_holds(self, route):
@@ -951,8 +952,10 @@ class SessionAuthority:
         with live.event_stream.lock if live is not None else contextlib.nullcontext():
             self.adopted[session_id] = (generation, agent)
             clear = getattr(agent, 'clear_interrupt', None)
-            if self.delivered_stops.pop(session_id, generation) != generation and clear is not None:
-                clear()
+            if self.delivered_stops.get(session_id, generation) != generation:
+                del self.delivered_stops[session_id]
+                if clear is not None:
+                    clear()
             if self.pending_stops.get(session_id) == generation:
                 del self.pending_stops[session_id]
                 from agent.interrupt_compat import request_hard_interrupt
@@ -1165,6 +1168,14 @@ class SessionAuthority:
             finally:
                 with live.event_stream.lock:
                     self.executing.pop(ref.session_id, None)
+                if self.delivered_stops.get(ref.session_id) == row['generation']:
+                    from gateway.session_ancillary import interrupt_processes
+                    if not await interrupt_processes(self, ref, self.adopted.get(ref.session_id, (None, None))[1]):
+                        from gateway.session_settlement_recovery import recover_failed_settlement
+                        await recover_failed_settlement(self, row)
+                        self.pending_results.pop(row['admission_id'], None)
+                        self._publish_pending(ref)
+                        raise ManagedExecutionUnknown('process_stop_unknown')
         except ManagedExecutionUnknown:
             with live.event_stream.lock:
                 live.event_stream.execution = {}
