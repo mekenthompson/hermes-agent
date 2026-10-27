@@ -591,27 +591,32 @@ class SessionAuthority:
                 if (not self.runner._is_user_authorized_for_source(source)
                         or getattr(self.runner._adapter_for_source(source), 'requires_durable_input_ack', False) is not True):
                     raise RuntimeStoreError('permission_denied')
-        receipt = await tracked_write(self, partial(
-            self._admit_native_write, principal_id=principal, session_id=ref.session_id,
-            request_id=request_id, payload=payload,
-            authorize=session_retry_admission.compose(rewrite, authorized_write),
-            raw=getattr(event, 'raw_message', None)),
-            then=admitted, ordered=True)
-        try:
-            # Commit before transport ACK or busy effects. A duplicate returns its
-            # original receipt and never re-enters approval/steer/interrupt handling.
-            if payload['native_text_v1']['event'].get('structured_control') == 'stop' and receipt.status != 'terminal':
-                from gateway.session_native_control import reconcile
-                await reconcile(self, committed[0])
-                receipt = self._receipt(get_session_admission(self.db, admission_id=receipt.admission_id))
-            elif before_schedule is not None and fresh[0]:
-                await before_schedule(receipt, fence)
-                row = get_session_admission(self.db, admission_id=receipt.admission_id)
-                receipt = self._receipt(row)
-            return receipt
-        finally:
-            if (live := self.sessions.get(committed[0].session_id)) is not None and not live.superseded:
-                self._schedule_admitted(committed[0])
+        async def commit():
+            receipt = await tracked_write(self, partial(
+                self._admit_native_write, principal_id=principal, session_id=ref.session_id,
+                request_id=request_id, payload=payload,
+                authorize=session_retry_admission.compose(rewrite, authorized_write),
+                raw=getattr(event, 'raw_message', None)),
+                then=admitted, ordered=True)
+            try:
+                # Commit before transport ACK or busy effects. A duplicate returns its
+                # original receipt and never re-enters approval/steer/interrupt handling.
+                if payload['native_text_v1']['event'].get('structured_control') == 'stop' and receipt.status != 'terminal':
+                    from gateway.session_native_control import reconcile
+                    await reconcile(self, committed[0])
+                    receipt = self._receipt(get_session_admission(self.db, admission_id=receipt.admission_id))
+                elif before_schedule is not None and fresh[0]:
+                    await before_schedule(receipt, fence)
+                    row = get_session_admission(self.db, admission_id=receipt.admission_id)
+                    receipt = self._receipt(row)
+                return receipt
+            finally:
+                if (live := self.sessions.get(committed[0].session_id)) is not None and not live.superseded:
+                    self._schedule_admitted(committed[0])
+        # Once writing starts, cancellation releases only the observer. Retirement
+        # joins this same native commit, busy/control handling and drain publication.
+        from gateway.session_runtime_workers import track_mutation
+        return await asyncio.shield(track_mutation(self, commit()))
 
     def _admit_native_write(self, *, principal_id, session_id, request_id, payload, authorize, raw=None):
         # Off the loop and in admission order: the redelivery reconcile reads the ledger it decides
