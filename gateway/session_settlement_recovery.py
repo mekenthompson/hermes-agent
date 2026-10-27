@@ -132,7 +132,7 @@ def owner_stop_notice(captured, outcome, row=None):
     # The cause is the one the turn recorded when it was interrupted (stop() interrupts with these
     # reasons), never the runner's flags at publication: a user Stop whose settlement was delayed
     # until after shutdown began is still the user's Stop.
-    from gateway.run import _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+    from gateway.session_state import _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN
     cause = ((captured or {}).get('result') or {}).get('interrupt_message') if outcome == 'interrupted' else None
     notice = {_INTERRUPT_REASON_GATEWAY_RESTART: RESTART_INTERRUPT_NOTICE,
               _INTERRUPT_REASON_GATEWAY_SHUTDOWN: SHUTDOWN_INTERRUPT_NOTICE}.get(cause)

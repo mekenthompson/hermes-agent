@@ -2620,8 +2620,7 @@ _INTERRUPT_REASON_EVICTED = "Session ended while the turn was running"
 _INTERRUPT_TOOL_REASON_EVICTED = "session evicted"
 _INTERRUPT_TOOL_REASON_GATEWAY_SHUTDOWN = "gateway shutdown"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
-_INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
-_INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
+from gateway.session_state import _INTERRUPT_REASON_GATEWAY_SHUTDOWN, _INTERRUPT_REASON_GATEWAY_RESTART
 
 
 def _reap_gateway_turn_processes(
