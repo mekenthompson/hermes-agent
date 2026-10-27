@@ -9,7 +9,7 @@ import pytest
 
 from hermes_state_runtime import RuntimeStoreError, list_session_admissions
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit
-from tests.waiting import wait_until
+from tests.waiting import async_wait_until, wait_until
 
 
 def live(process):
@@ -97,7 +97,8 @@ async def test_native_job_scope_quiesces_detached_children_before_fifo(
         # A truthful bounded refusal is still fenced. The next ordinary input
         # uses the existing native recovery boundary before its turn can start.
         await _submit(authority, 'verified human successor')
-        await asyncio.wait_for(authority.sessions['s'].task, 15)
+        await async_wait_until(lambda: executed == ['verified human successor']
+                              and authority.sessions['s'].task.done(), timeout=15)
         assert process_stop_pending(db, 's') is None
         assert job_quiescent(own) and not live(child)
         assert await asyncio.to_thread(own._completion_event.wait, 10)

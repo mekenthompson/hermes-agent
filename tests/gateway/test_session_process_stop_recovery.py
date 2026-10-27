@@ -161,7 +161,9 @@ async def test_stop_consumes_ready_own_completion_but_delivers_neighbor(tmp_path
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
         except RuntimeStoreError as error:
             state = {p.id: {"receipt": read_job_receipt(p), "exited": p.exited,
-                           "pending": p._scope_stop_pending, "completion": p._completion_event.is_set()}
+                           "pending": p._scope_stop_pending, "completion": p._completion_event.is_set(),
+                           "complete_result": p._result_complete, "persisted_generation": p._result_persisted_generation,
+                           "ownership_generation": p.ownership_generation}
                      for p in (own, neighbor)}
             pytest.fail(f"Ready native Stop failed: {error.reason}; {state}")
         assert process_stop_pending(db, 's') is None

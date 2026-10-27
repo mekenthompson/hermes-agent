@@ -1,6 +1,7 @@
 """Follow-up yielding preserves the original native job across Stop, reload and FIFO."""
 import asyncio
 import json
+import os
 from pathlib import Path
 import shlex
 import sys
@@ -14,6 +15,19 @@ from tests.gateway.test_native_job_scope_stop import live, spawn
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit
 from tests.tools.test_foreground_job_scope import capture_foreground_output
 from tests.waiting import async_wait_until, wait_until
+from utils import atomic_json_write
+
+
+def _restore_missing_receipt(receipt, saved):
+    """Publish old readiness only if the actual producer has not already advanced it."""
+    staged = receipt.with_name(receipt.name + '.restore')
+    atomic_json_write(staged, json.loads(saved), mode=0o600)
+    try:
+        os.link(staged, receipt)
+    except FileExistsError:
+        pass  # The real producer's current receipt wins, including final quiescence.
+    finally:
+        staged.unlink(missing_ok=True)
 
 pytestmark = pytest.mark.platforms('linux')
 
@@ -30,7 +44,6 @@ async def test_foreground_followup_then_stop_quiesces_before_human_fifo(tmp_path
     from tools.interrupt import request_yield, consume_yield
     from tools.process_registry_job import job_quiescent, job_receipt_path, read_job_receipt, request_job_stop
     from tools.terminal_tool_background import yield_to_background_handler
-    from utils import atomic_json_write
     db, authority = _authority(tmp_path, monkeypatch)
     original = module.ProcessRegistry()
     monkeypatch.setattr(module, 'process_registry', original)
@@ -100,8 +113,8 @@ if p.exists(): Path({str(effect)!r}).touch()
             await asyncio.wait_for(authority.sessions['s'].task, 10)
             assert executed == []
             assert any(row['status'] == 'queued' for row in list_session_admissions(db, session_id='s'))
-            atomic_json_write(receipt, json.loads(saved), mode=0o600)
-            assert read_job_receipt(own) == json.loads(saved), 'Authentic native evidence must be fully published'
+            _restore_missing_receipt(receipt, saved)
+            assert read_job_receipt(own) is not None, 'Authentic native evidence must be fully published'
             # A new ordinary human message drives native recovery; the first
             # queued human request remains ahead of it, with no manual Stop retry.
             await _submit(authority, 'follow-up human continuation')
@@ -119,7 +132,17 @@ if p.exists(): Path({str(effect)!r}).touch()
             expected = ['human continuation']
         # An uncertain drain may finish paused before the real resource does.
         # Its native completion wakes a later drain, without another message.
-        await async_wait_until(lambda: executed == expected and authority.sessions['s'].task.done(), timeout=15)
+        try:
+            await async_wait_until(lambda: executed == expected and authority.sessions['s'].task.done(), timeout=15)
+        except AssertionError:
+            current_process = current.get(own.id)
+            print({'native_phase_at_failure': {'receipt': read_job_receipt(own),
+                'pending_stop': process_stop_pending(db, 's'), 'executed': executed,
+                'completion': current_process._completion_event.is_set(),
+                'complete_result': current_process._result_complete,
+                'persisted_generation': current_process._result_persisted_generation,
+                'ownership_generation': current_process.ownership_generation}})
+            raise
         assert job_quiescent(own) and not live(child), {
             'receipt': read_job_receipt(own), 'pending': process_stop_pending(db, 's'),
             'native': own.native_job_scope, 'pid': own.pid, 'birth': own.host_start_time,
@@ -131,7 +154,7 @@ if p.exists(): Path({str(effect)!r}).touch()
     finally:
         consume_yield(thread.ident)
         if receipt is not None and saved is not None and not receipt.exists():
-            atomic_json_write(receipt, json.loads(saved), mode=0o600)
+            _restore_missing_receipt(receipt, saved)
         for session in [own, *neighbors]:
             if session is not None:
                 await asyncio.to_thread(request_job_stop, original, session)
@@ -139,3 +162,33 @@ if p.exists(): Path({str(effect)!r}).touch()
         await asyncio.to_thread(thread.join, 10)
         env.cleanup()
         db.close()
+
+
+@pytest.mark.parametrize('producer_finished', [False, True], ids=['missing-active', 'newer-final'])
+def test_fixture_receipt_restoration_never_regresses_actual_producer_proof(tmp_path, producer_finished):
+    from tools.process_registry import ProcessRegistry
+    from tools.process_registry_job import job_receipt_path, read_job_receipt
+    gate = tmp_path / 'finish'
+    code = f'from pathlib import Path; import time\np=Path({str(gate)!r}); end=time.monotonic()+10\nwhile not p.exists() and time.monotonic()<end: time.sleep(.01)\nprint("original receipt producer",flush=True)'
+    registry = ProcessRegistry()
+    own = registry.spawn_local('exec ' + shlex.join([sys.executable, '-c', code]), cwd=str(tmp_path))
+    try:
+        wait_until(lambda: read_job_receipt(own) is not None, timeout=5)
+        receipt = job_receipt_path(own.id)
+        saved = receipt.read_bytes()
+        assert json.loads(saved)['quiescent'] is False
+        receipt.unlink()
+        if producer_finished:
+            gate.touch()
+            assert own._completion_event.wait(5)
+            current = read_job_receipt(own)
+            assert current['quiescent'] is True
+        else:
+            current = json.loads(saved)
+        _restore_missing_receipt(receipt, saved)
+        assert read_job_receipt(own) == current
+        result = registry.kill_process(own.id)
+        assert result['status'] in {'killed', 'already_exited'}
+    finally:
+        gate.touch()
+        registry.kill_process(own.id)
