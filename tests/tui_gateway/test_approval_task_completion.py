@@ -127,6 +127,7 @@ def test_queued_submit_generation_and_stop_fence_reviewer(monkeypatch):
 def test_authenticated_desktop_process_completion_retains_command_authority(tmp_path, monkeypatch, origins, stopped):
     """The registry's process completion must carry the direct submit past turn exit."""
     import json
+    import time
 
     from hermes_state import SessionDB
     from queue import Empty
@@ -153,8 +154,9 @@ def test_authenticated_desktop_process_completion_retains_command_authority(tmp_
     monkeypatch.setattr(server, '_wait_agent_for_prompt', lambda *_a: None)
     monkeypatch.setattr(server, '_start_session_services', lambda *_a: None)
     monkeypatch.setattr(approval_context, '_get_approval_mode', lambda: 'off')
+    started_at = time.time()
     processes = [ProcessSession(id=f'proc_desktop_completion_{index}', command='printf done',
-                                started_at=1700000000.0 + index) for index in range(origins)]
+                                started_at=started_at + index) for index in range(origins)]
     spawned = []
 
     def spawn(_registry, **kwargs):

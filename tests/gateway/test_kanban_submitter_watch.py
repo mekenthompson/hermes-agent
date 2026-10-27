@@ -115,3 +115,41 @@ def test_cleared_handle_does_not_end_work_beside_a_live_original_submitter(owned
         if observer is not None:
             _cleanup(observer)
         _cleanup(submitter)
+
+
+@pytest.mark.platforms("linux", "macos")
+@pytest.mark.parametrize("completed", [False, True], ids=['cancelled', 'completed'])
+def test_owner_stop_callback_distinguishes_cancel_from_normal_completion(owned_run, tmp_path, completed):
+    conn, task_id, run_id = owned_run
+    submitter = subprocess.Popen([sys.executable, '-c', 'import threading; threading.Event().wait(30)'],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    observer = None
+    marker = tmp_path / 'owner-stop'
+    script = '''
+import sys, threading
+from pathlib import Path
+from gateway.session_kanban import _watch_submitter
+notified = threading.Event()
+def stop():
+    Path(sys.argv[3]).touch()
+    notified.set()
+_watch_submitter(Path(sys.argv[1]), int(sys.argv[2]), stop=stop)
+assert notified.wait(10), 'native cancellation did not reach its owner'
+'''
+    try:
+        dispatch._set_worker_pid(conn, task_id, submitter.pid, run_id=run_id)
+        if completed:
+            assert kb.complete_task(conn, task_id, summary='ordinary completed launch', expected_run_id=run_id)
+            submitter.terminate()
+            submitter.wait(timeout=5)
+        else:
+            assert kb.block_task(conn, task_id, reason='operator Stop', kind='needs_input')
+        observer = subprocess.Popen([sys.executable, '-c', script, str(kb.kanban_db_path()), str(run_id), str(marker)],
+                                    env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = observer.communicate(timeout=15)
+        assert observer.returncode == (1 if completed else 0), stdout + stderr
+        assert marker.exists() is (not completed)
+    finally:
+        if observer is not None:
+            _cleanup(observer)
+        _cleanup(submitter)

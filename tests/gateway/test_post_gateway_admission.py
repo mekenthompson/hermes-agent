@@ -137,7 +137,8 @@ async def test_under_an_authority_the_hook_fires_once_at_ingress_never_at_execut
     runner = _runner()
     admitted = []
 
-    async def _admit(_authority, event):
+    async def _admit(_authority, event, *, busy=False):
+        assert busy is False  # this adapter retains its ordinary ingress-hook behavior
         admitted.append(event.text)
         return "admitted"
 

@@ -13,7 +13,8 @@ async def test_messaging_overflow_is_answered_with_a_queue_full_notice(tmp_path,
     db, authority = _authority(tmp_path, monkeypatch)
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)  # the running turn never drains
 
-    async def admit_native(event):
+    async def admit_native(event, *, before_schedule=None):
+        assert before_schedule is None  # This fixture exercises ordinary, non-busy admission.
         return await authority.submit(ACTOR, Submission(event.text, REF, {'text': event.text}, 'queue'))
     monkeypatch.setattr(authority, 'admit_native', admit_native)
     with db:

@@ -1263,6 +1263,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             claim = await self._preflight_completion_delivery(evt)
             if not claim.proceed:
                 return claim.early_result
+            from gateway.session_automation import completion_consumed
+            if evt.get('type', 'completion') == 'completion' and completion_consumed(self, evt):
+                return None
             if getattr(self, 'session_authority', None) is not None:
                 from gateway.session_automation import completion_admission
                 if completion_admission(self, evt) is not None:
@@ -1367,26 +1370,37 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 self._completion_notification_batch_tasks.pop(key, None)
             if not entries:
                 return
-            if getattr(self, 'session_authority', None) is not None:
-                from gateway.session_automation import completion_admission, producer_identity
-                entries_to_deliver = [item for item in entries if completion_admission(self, item[1]) is None]
-                if not entries_to_deliver:
-                    delivered = True
-                    return
-            else:
-                entries_to_deliver = entries
-            synth_text = (entries_to_deliver[0][0] if len(entries_to_deliver) == 1
-                          else self._format_coalesced_process_completions(entries_to_deliver))
-            from tools.process_registry_notifications import process_completion_display_text
-            display_text = process_completion_display_text([evt for _text, evt, _future in entries_to_deliver])
+            from gateway.session_automation import completion_admission, completion_consumed, producer_identity
+            entries_to_deliver, identities = [], []
+            native = getattr(self, 'session_authority', None) is not None
+            admitted = False
+            # A recovered queue is drained in the launch scope. Resolve each
+            # producer's durable flags before it can enter text or native identity lists.
+            for item in entries:
+                async with self._completion_event_scope(item[1]):
+                    if completion_consumed(self, item[1]):
+                        continue
+                    if native:
+                        if completion_admission(self, item[1]) is not None:
+                            admitted = True
+                            continue
+                        identities.append(producer_identity(self, item[1]))
+                    entries_to_deliver.append(item)
+            if not entries_to_deliver:
+                delivered = True if admitted else None
+                return
+            async with self._completion_event_scope(entries_to_deliver[0][1]):
+                synth_text = (entries_to_deliver[0][0] if len(entries_to_deliver) == 1
+                              else self._format_coalesced_process_completions(entries_to_deliver))
+                from tools.process_registry_notifications import process_completion_display_text
+                display_text = process_completion_display_text([evt for _text, evt, _future in entries_to_deliver])
             # A duplicate primary returns None from the dedupe seam; try the next identity so a fresh
             # sibling is never discarded with it.
             delivered = None
             for _text, candidate_evt, _future in entries_to_deliver:
                 candidate_evt = dict(candidate_evt, _display_text=display_text)
-                if getattr(self, 'session_authority', None) is not None:
-                    candidate_evt = dict(candidate_evt, _automation_identities=[
-                        producer_identity(self, evt) for _text, evt, _future in entries_to_deliver])
+                if native:
+                    candidate_evt = dict(candidate_evt, _automation_identities=identities)
                 delivered = await self._deliver_completion_notification(synth_text, candidate_evt)
                 if delivered is not None:
                     break
@@ -1753,6 +1767,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
         else:
             _out = _raw
+        if getattr(session, 'ownership_generation', 0) > 0:
+            # The watcher can predate an authenticated native handoff. Its
+            # original child identity cannot override the committed parent.
+            watcher = {**watcher, 'parent_session_id': session.parent_session_id,
+                       'session_key': session.session_key}
         return {
             "type": "completion",
             "session_id": session_id,
@@ -1868,8 +1887,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if session.exited:
                 # Agent-notify: inject a synthetic message unless the agent already consumed the result via
                 # wait/log (poll() is read-only and deliberately does NOT mark consumed).
-                if agent_notify and not process_registry.is_completion_consumed(session_id):
-                    completion_evt = self._build_process_completion_event(watcher, session, session_id)
+                from gateway.session_automation import completion_consumed
+                completion_evt = self._build_process_completion_event(watcher, session, session_id)
+                if agent_notify and not completion_consumed(self, completion_evt):
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break
@@ -1916,7 +1936,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     )
                 # Text-only notification; skip when already consumed via wait/log (the agent_notify branch
                 # FALLS THROUGH here, hence the re-check).
-                if process_registry.is_completion_consumed(session_id):
+                if completion_consumed(self, completion_evt):
                     logger.debug(
                         "Process watcher: completion for %s already consumed "
                         "via wait/log — skipping raw notification (#65379)", session_id,

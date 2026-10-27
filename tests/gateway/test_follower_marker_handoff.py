@@ -44,7 +44,8 @@ async def test_follower_is_claimed_only_after_the_settled_turn_released_its_adop
     actor = Principal('human', 'p', frozenset({'session:submit'}), 't')
     ref = SessionRef('p', 's')
 
-    async def admit_native(event):
+    async def admit_native(event, *, before_schedule=None):
+        assert before_schedule is None  # This fixture exercises ordinary, non-busy admission.
         return await authority.submit(actor, Submission(event.text, ref, {'text': event.text}, 'queue'))
     monkeypatch.setattr(authority, 'admit_native', admit_native)
 

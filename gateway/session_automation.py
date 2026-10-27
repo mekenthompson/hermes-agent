@@ -7,6 +7,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 import json
 import logging
+import math
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
@@ -18,9 +19,85 @@ logger = logging.getLogger(__name__)
 
 def producer_identity(runner, event):
     identity = runner._completion_delivery_identity(event)
-    if identity is None:
+    if identity is None or (identity[0] == 'completion' and not _process_start_known(identity[2])):
         raise RuntimeStoreError('invalid_params')
     return json.dumps(identity, separators=(',', ':'))
+
+
+_PROCESS_STOP_PRINCIPAL = 'native-process-stop'
+
+
+def _process_start_known(value):
+    return (type(value) is int and value > 0) or (type(value) is float and math.isfinite(value) and value > 0)
+
+
+def _completion_cancelled(conn, owner, identity, process_id=None):
+    if identity is None:
+        # Legacy/malformed events cannot claim a new incarnation of a producer
+        # whose native owner already cancelled it. No result-cache fallback.
+        return conn.execute("SELECT 1 FROM session_admissions WHERE target_session_id=? AND principal_id=? "
+            "AND status='terminal' AND outcome='cancelled' AND "
+            "json_extract(CASE WHEN json_valid(request_id) THEN request_id ELSE '[]' END,'$[1]')=?",
+            (owner, _PROCESS_STOP_PRINCIPAL, process_id)).fetchone() is not None
+    return conn.execute("SELECT 1 FROM session_admissions WHERE target_session_id=? "
+        "AND principal_id=? AND request_id=? AND status='terminal' AND outcome='cancelled'",
+        (owner, _PROCESS_STOP_PRINCIPAL, identity)).fetchone() is not None
+
+
+def completion_consumed(runner, event):
+    """Native Stop authority survives expiry of the bounded process-output cache."""
+    from tools.process_registry import process_registry
+    if process_registry.is_completion_consumed(event.get('session_id')):
+        return True
+    from gateway.session_authorities import active_authority
+    authority = active_authority(runner)
+    entry = runner.session_store.lookup_by_session_key(str(event.get('session_key') or '')) if authority else None
+    if entry is None:
+        return False
+    identity = (runner._completion_delivery_identity({**event, 'type': 'completion'})
+                if _process_start_known(event.get('started_at')) else None)
+    with authority.db._read_ctx() as conn:
+        return _completion_cancelled(conn, _route_owner(authority, entry),
+            json.dumps(identity, separators=(',', ':')) if identity is not None else None, str(event.get('session_id') or ''))
+
+
+def cancel_process_completions(authority, ref, processes):
+    """Commit terminal producer cancellations, never queued input or output history.
+
+    Called only with the native owner's captured process identities. Existing
+    admission retirement handles their lifetime with the owning conversation.
+    No scheduler/observer is notified: these records cannot execute or add a prompt.
+    """
+    import sqlite3
+    import uuid
+    from hermes_state_runtime import _epoch, _json, _session, admission_fingerprint
+    def write(conn):
+        _epoch(conn, authority.epoch)
+        _session(conn, ref.session_id)
+        for process in processes:
+            if not isinstance(process['id'], str) or not process['id'] or not _process_start_known(process['started_at']):
+                raise RuntimeStoreError('process_stop_unknown')
+            # Canonical process producer identity; native/headless owners do not
+            # depend on the messaging runner's delivery mixin.
+            identity = json.dumps(('completion', process['id'], process['started_at']), separators=(',', ':'))
+            payload = {'process_completion': identity, 'route': process['session_key']}
+            digest = admission_fingerprint(canonical_target=ref.session_id, payload={'input': payload, 'intent': 'queue'})
+            conn.execute("INSERT INTO session_admissions(admission_id,request_id,principal_id,target_session_id,"
+                "lineage_json,payload_json,payload_digest,intent,status,outcome,owner_epoch) "
+                "VALUES(?,?,?,?,?,?,?,'queue','terminal','cancelled',?) "
+                "ON CONFLICT(principal_id,target_session_id,request_id) DO NOTHING",
+                (uuid.uuid4().hex, identity, _PROCESS_STOP_PRINCIPAL, ref.session_id,
+                 json.dumps([ref.session_id]), _json(payload), digest, authority.epoch))
+            if not _completion_cancelled(conn, ref.session_id, identity):
+                raise RuntimeStoreError('process_stop_unknown')
+    try:
+        authority.db._execute_write(write)
+    except (OSError, sqlite3.Error) as exc:
+        raise RuntimeStoreError('process_stop_unknown') from exc
+    except RuntimeStoreError as exc:
+        if exc.reason == 'invalid_params':
+            raise RuntimeStoreError('process_stop_unknown') from exc
+        raise
 
 
 def completion_admission(runner, event):
@@ -252,6 +329,27 @@ async def _withdraw(authority, row):
     return receipt.outcome == 'cancelled'
 
 
+async def withdraw_consumed_process_notices(authority, ref):
+    """Withdraw queued completion inputs whose native results Stop has consumed."""
+    from tools.process_registry import process_registry
+    from gateway.session_ancillary import process_stop_pending
+    stopping = process_stop_pending(authority.db, ref.session_id) is not None
+    for row in list_session_admissions(authority.db, session_id=ref.session_id):
+        if row['status'] != 'queued' or not row['principal_id'].startswith('automation:'):
+            continue
+        descriptor = _descriptor(row['payload'])
+        identities = descriptor.get('identities', [descriptor.get('identity')])
+        with authority.db._read_ctx() as conn:
+            consumed = any(len(identity) > 1 and identity[0] == 'completion'
+                and (stopping or process_registry.is_completion_consumed(identity[1])
+                     or _completion_cancelled(conn, ref.session_id, json.dumps(identity, separators=(',', ':'))))
+                for identity in _identities(identities))
+        if consumed:
+            if not await _withdraw(authority, row):
+                return False
+    return True
+
+
 def _route_owner(authority, entry):
     # Compression moves the route's transcript to a child; admissions stay on the logical root.
     return (entry.origin.chat_id if entry.origin.platform == Platform.LOCAL
@@ -480,10 +578,23 @@ async def admit_automation(authority, adapter, event, identity, replaces=None):
             if replaced:  # the guard ran in the committed write; an exact replay runs no guard
                 authority._settle_cancelled(ref, replaces)
             return admitted(row)
+    def authorize(conn):
+        from tools.process_registry import process_registry
+        descriptor = payload.get('local_automation_v1') or payload['native_text_v1']['automation']
+        for producer in _identities(descriptor.get('identities', [identity])):
+            if producer[0] == 'completion' and (len(producer) != 3 or not _process_start_known(producer[2])):
+                raise RuntimeStoreError('invalid_params')
+            if len(producer) > 1 and producer[0] == 'completion' and (
+                    process_registry.is_completion_consumed(producer[1])
+                    or _completion_cancelled(conn, sid, json.dumps(producer, separators=(',', ':')))
+                    or conn.execute('SELECT 1 FROM state_meta WHERE key=?', ('gateway.process_stop.v1:' + sid,)).fetchone()):
+                raise RuntimeStoreError('process_result_consumed')
+        if replaces is not None:
+            _replace_queued(replaces, ref.session_id, replaced)(conn)
     return await tracked_write(authority, partial(
         admit_session_input, authority.db, epoch=authority.epoch, principal_id='automation:' + entry.session_key,
         session_id=ref.session_id, request_id=identity, payload=deepcopy(payload),
-        _authorize_write=authority._admission_gate(replaces and _replace_queued(replaces, ref.session_id, replaced))),
+        _authorize_write=authority._admission_gate(authorize)),
         then=admitted, ordered=True, after=partial(authority._schedule_admitted, ref))
 
 

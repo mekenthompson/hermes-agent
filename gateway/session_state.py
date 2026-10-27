@@ -12,6 +12,9 @@ from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tu
 # /fast stores "priority" or None (explicit normal), so key PRESENCE decides, not truthiness.
 _UNSET_TIER = object()
 SERVICE_TIER_UNSET = _UNSET_TIER  # public alias
+AGENT_PENDING_SENTINEL = object()
+_INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
+_INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
 
 
 @dataclass

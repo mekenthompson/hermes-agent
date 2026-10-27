@@ -90,7 +90,11 @@ def steer_transfers(authority, session_id, generation):
     adopted_generation, agent = authority.adopted.get(session_id, (None, None))
     withdraw = getattr(agent, 'withdraw_steer', None) if adopted_generation == generation else None
     for admission_id, delivered in entry[1].items():
-        if delivered and callable(withdraw) and withdraw(admission_id):
+        if callable(delivered):
+            # Native fanout snapshots every recipient accepting the same ticket.
+            # One child's consumption prevents replay of the whole input.
+            entry[1][admission_id] = bool(delivered())
+        elif delivered and callable(withdraw) and withdraw(admission_id):
             entry[1][admission_id] = False
     return dict(entry[1])
 
@@ -131,6 +135,71 @@ def _deliver(authority, session_id, generation, agent, admission_id, text):
         ticketed = callable(getattr(agent, 'withdraw_steer', None))
         entry[1][admission_id] = bool(agent.steer(text, ticket=admission_id) if ticketed else agent.steer(text))
     return entry[1][admission_id]
+
+
+async def transfer_native_input(authority, ref, admission_id, generation, agent, deliver, current):
+    """Internal native-ingress transfer; external queued-control eligibility is unchanged.
+
+    The caller already committed/authenticated the complete native envelope. A
+    fresh transfer is reserved before its synchronous effect, under the same
+    generation lock as ordinary queued steering. ``current`` also checks Stop.
+    """
+    from hermes_state_runtime import cancel_session_input, interrupt_steer_input
+    from gateway.session_runtime_workers import tracked_write
+    live, session_id = authority.sessions[ref.session_id], ref.session_id
+    with live.event_stream.lock:
+        valid = current()
+        same_agent = _receiving_agent(authority, session_id, generation) is agent
+        if valid and same_agent:
+            _register(authority, session_id, generation, admission_id)
+    if not valid:
+        await tracked_write(authority, partial(cancel_session_input, authority.db,
+            epoch=authority.epoch, admission_id=admission_id))
+        return False
+    if not same_agent:
+        return False
+    try:
+        _row, fresh = await tracked_write(authority, partial(steer_session_input, authority.db,
+            epoch=authority.epoch, admission_id=admission_id, generation=generation))
+    except RuntimeStoreError:
+        with live.event_stream.lock:
+            _unregister(authority, session_id, generation, admission_id)
+        raise
+    if not fresh:
+        return True  # a committed delivery is never attempted a second time
+    attempted = False
+    try:
+        with live.event_stream.lock:
+            valid = current()
+            same_agent = _receiving_agent(authority, session_id, generation) is agent
+            if valid and same_agent:
+                # Pessimistic until the synchronous verb returns: an exception
+                # after enqueueing text is not evidence of non-delivery.
+                attempted = True
+                authority.steer_transfers[session_id][1][admission_id] = True
+                delivery = deliver()
+                delivered = bool(delivery)
+                authority.steer_transfers[session_id][1][admission_id] = delivery if callable(delivery) else delivered
+            else:
+                delivered = False
+        if delivered:
+            authority._publish_pending(ref)
+            return True
+        if not valid:
+            await tracked_write(authority, partial(interrupt_steer_input, authority.db,
+                epoch=authority.epoch, admission_id=admission_id, generation=generation))
+        else:
+            await tracked_write(authority, partial(revert_steer_input, authority.db,
+                epoch=authority.epoch, admission_id=admission_id, generation=generation))
+        with live.event_stream.lock:
+            _unregister(authority, session_id, generation, admission_id)
+        authority._publish_pending(ref)
+        return False
+    except BaseException:
+        if attempted:
+            await asyncio.shield(tracked_write(authority, partial(interrupt_steer_input, authority.db,
+                epoch=authority.epoch, admission_id=admission_id, generation=generation)))
+        raise
 
 
 async def steer_queued(connection, ref, params):

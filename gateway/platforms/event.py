@@ -41,6 +41,29 @@ class ProcessingOutcome(Enum):
     CANCELLED = "cancelled"
 
 
+class StructuredControl(str, Enum):
+    """A platform-authenticated control, separate from conversational text."""
+    STOP = "stop"
+
+
+def valid_structured_stop(event, adapter):
+    """Closed carrier validation; never authenticates an actor or grants a capability."""
+    return (event.structured_control is StructuredControl.STOP
+        and getattr(adapter, 'requires_durable_input_ack', False) is True
+        and event.internal is False and event.allow_gateway_control is False
+        and isinstance(event.message_id, str) and bool(event.message_id)
+        and not event.edit_revision and event.message_type is MessageType.TEXT
+        and not event.media_urls and not event.media_types and not event.media_text_inlined
+        and event.prompt_response is None)
+
+
+def require_structured_control(event, adapter):
+    """Refuse malformed typed carriers before they can enter ordinary command paths."""
+    if event.structured_control is not None and not valid_structured_stop(event, adapter):
+        from hermes_state_runtime import RuntimeStoreError
+        raise RuntimeStoreError('invalid_params', field='structured_control')
+
+
 @dataclass
 class MessageEvent:
     """Incoming message from a platform — the normalized shape all adapters produce."""
@@ -111,6 +134,7 @@ class MessageEvent:
     # ``message_id`` with new text, so native admission keys it apart from the original send.
     # Appended for positional compat (see the field-order rule above).
     edit_revision: Optional[str] = None
+    structured_control: Optional[StructuredControl] = None
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)

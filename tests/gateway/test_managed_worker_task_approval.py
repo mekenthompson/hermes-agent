@@ -5,7 +5,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import shlex
 import sqlite3
+import sys
 import threading
 import time
 
@@ -34,7 +36,8 @@ class Model(BaseHTTPRequestHandler):
             text = str(messages[-1].get('content') or '')
             target = (self.server.review_target if 'Review only' in text else
                       self.server.late_target if 'late.txt' in text else self.server.edit_target)
-            command = f'python -c "from pathlib import Path; Path({str(target)!r}).write_text(\'done\')"'
+            code = f"from pathlib import Path; Path({str(target)!r}).write_text('done')"
+            command = shlex.join([sys.executable, '-c', code])
             message = {'role': 'assistant', 'content': None, 'tool_calls': [{
                 'id': 'task-tool', 'type': 'function', 'function': {'name': 'terminal',
                 'arguments': json.dumps({'command': command, 'timeout': 10})}}]}

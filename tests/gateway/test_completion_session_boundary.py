@@ -306,34 +306,31 @@ def test_async_delegation_gate_unchanged():
 # The stamp survives checkpoint/restore
 # ---------------------------------------------------------------------------
 
+@pytest.mark.platforms('linux')
 def test_parent_session_id_survives_checkpoint_recovery(tmp_path, monkeypatch):
+    import shlex
+    import sys
     import tools.process_registry as pr_module
+    from gateway.session_context import clear_session_vars, set_session_vars
 
-    checkpoint = tmp_path / "processes.json"
-    checkpoint.write_text(json.dumps([{
-        "session_id": "proc_recovered",
-        "command": "sleep 999",
-        "pid": 4242,
-        "pid_scope": "host",
-        "host_start_time": 111.0,
-        "started_at": 1234.5,
-        "task_id": "task",
-        "session_key": "agent:main:telegram:dm:123",
-        "watcher_platform": "telegram",
-        "watcher_chat_id": "123",
-        "watcher_interval": 5,
-        "notify_on_complete": True,
-        "parent_session_id": "sess-spawner",
-    }]), encoding="utf-8")
-    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
-
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setattr(pr_module, '_systemd_run_user_scope_available', lambda: False)
+    producer = ProcessRegistry()
+    tokens = set_session_vars(session_id='sess-spawner', session_key='agent:main:telegram:dm:123')
+    try:
+        session = producer.spawn_local('exec ' + shlex.join([
+            sys.executable, '-c', 'import threading; threading.Event().wait(15)']), task_id='task')
+    finally:
+        clear_session_vars(tokens)
+    session.watcher_platform, session.watcher_chat_id, session.watcher_interval = 'telegram', '123', 5
+    session.notify_on_complete = True
+    assert producer._write_checkpoint()
     registry = ProcessRegistry()
-    monkeypatch.setattr(registry, "_host_pid_is_ours", lambda *_a: True)
-    monkeypatch.setattr(
-        registry, "_write_checkpoint", lambda *_a, **_kw: None,
-    )
-
-    assert registry.recover_from_checkpoint() == 1
-    assert registry.get("proc_recovered").parent_session_id == "sess-spawner"
-    assert len(registry.pending_watchers) == 1
-    assert registry.pending_watchers[0]["parent_session_id"] == "sess-spawner"
+    try:
+        assert registry.recover_from_checkpoint() == 1
+        assert registry.get(session.id).parent_session_id == 'sess-spawner'
+        assert len(registry.pending_watchers) == 1
+        assert registry.pending_watchers[0]['parent_session_id'] == 'sess-spawner'
+    finally:
+        assert producer.kill_process(session.id)['status'] in {'killed', 'already_exited'}
+        assert session._completion_event.wait(5)
