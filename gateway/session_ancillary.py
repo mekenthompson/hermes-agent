@@ -89,7 +89,8 @@ def _observe_process_stop_completion(authority, ref, agent=None):
     try:
         registry, scopes = _process_targets(authority, ref, agent, subagent_records(agent), select=lambda p:
             not p.exited or p._scope_stop_pending or p.systemd_unit
-            or p._result_persisted_generation != p.ownership_generation)
+            or p._result_persisted_generation != p.ownership_generation
+            or (p._reader_thread is not None and not p._completion_event.is_set()))
         generation = authority._handle(ref).execution_generation
     except (RuntimeStoreError, OSError):
         return  # The durable fence remains; a later native control can recover.
@@ -433,7 +434,8 @@ async def interrupt_processes(authority, ref, agent):
         processes = [p for p in (*registry._running.values(), *registry._finished.values())
                      if p.id in owned] if registry is not None else []
         targets = {p.id: owned[p.id] for p in processes if not p.exited or p._scope_stop_pending or p.systemd_unit
-                   or (p.notify_on_complete and not p.completion_consumed)}
+                   or (p.notify_on_complete and not p.completion_consumed)
+                   or (p._reader_thread is not None and not p._completion_event.is_set())}
         cancellations = [{'id': p.id, 'started_at': p.started_at, 'session_key': p.session_key}
                          for p in processes if ownership_identity(p) == owned[p.id]]
     if cancellations:
