@@ -123,7 +123,7 @@ ADMISSION_QUEUE_MAX = 32
 
 def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
                         request_id: str, payload: dict, intent: str = 'queue',
-                        _authorize_write=None, _replay_guard=None) -> dict:
+                        _authorize_write=None, _replay_guard=None, _control_snapshot=None) -> dict:
     """Admit input; the trusted private guard raises to refuse a NEW write.
 
     The guard receives the owning transaction connection, must not commit it or
@@ -136,6 +136,8 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
         _text(value)
     if intent not in ('queue', 'steer', 'redirect'):
         raise RuntimeStoreError('invalid_params')
+    if 'native_stop_v1' in payload:
+        raise RuntimeStoreError('invalid_params')  # owner-produced only, never prompt.submit payload
     encoded = _json(payload)
     from hermes_state_terminal import retry_terminal_admission
     retired = retry_terminal_admission(db, epoch=epoch, principal_id=principal_id, session_id=session_id,
@@ -149,24 +151,40 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
         old = conn.execute('''SELECT * FROM session_admissions
             WHERE principal_id=? AND target_session_id=? AND request_id=?''', (principal_id, session_id, request_id)).fetchone()
         if old is not None:
-            if old['payload_digest'] != digest:
+            compared = digest
+            if _control_snapshot is not None:
+                retained = json.loads(old['payload_json']).get('native_stop_v1')
+                if retained is None:
+                    raise RuntimeStoreError('admission_conflict')
+                compared = admission_fingerprint(canonical_target=session_id,
+                    payload={'input': {**payload, 'native_stop_v1': retained}, 'intent': intent})
+            if old['payload_digest'] != compared:
                 raise RuntimeStoreError('admission_conflict')
             if _replay_guard is not None:
                 _replay_guard(conn)
             return _row(old)
         queued = conn.execute('''SELECT COUNT(*) FROM session_admissions WHERE target_session_id=?
-            AND status='queued' ''', (session_id,)).fetchone()[0]
+            AND status='queued' AND json_type(payload_json, '$.native_stop_v1') IS NULL''', (session_id,)).fetchone()[0]
         # Main's cap holds in both states: a FIFO paused behind an unknown turn runs every accepted
         # input after Discard, so it must not grow without bound while nobody resolves it.
-        if queued >= ADMISSION_QUEUE_MAX:
+        if _control_snapshot is None and queued >= ADMISSION_QUEUE_MAX:
             raise RuntimeStoreError('queue_full')
         if _authorize_write is not None:
             _authorize_write(conn)
+        saved_encoded, saved_digest, control_generation = encoded, digest, None
+        if _control_snapshot is not None:
+            descriptor = _control_snapshot(conn)
+            control_generation = descriptor['generation']
+            control_payload = {**payload, 'native_stop_v1': descriptor}
+            saved_encoded = _json(control_payload)
+            saved_digest = admission_fingerprint(canonical_target=session_id,
+                payload={'input': control_payload, 'intent': intent})
         admission_id = uuid.uuid4().hex
         conn.execute('''INSERT INTO session_admissions(admission_id,request_id,principal_id,
-            target_session_id,lineage_json,payload_json,payload_digest,intent,status,owner_epoch)
-            VALUES(?,?,?,?,?,?,?,?,'queued',?)''',
-            (admission_id, request_id, principal_id, session_id, json.dumps([session_id]), encoded, digest, intent, epoch))
+            target_session_id,lineage_json,payload_json,payload_digest,intent,status,owner_epoch,generation)
+            VALUES(?,?,?,?,?,?,?,?,'queued',?,?)''',
+            (admission_id, request_id, principal_id, session_id, json.dumps([session_id]), saved_encoded, saved_digest,
+             intent, epoch, control_generation))
         return _row(_admission(conn, admission_id))
     return db._execute_write(write)
 
@@ -194,6 +212,32 @@ def list_session_admissions(db, *, session_id: str, pending_only: bool = True) -
         return [_row(row) for row in conn.execute(sql, (session_id,))]
 
 
+def native_stop_watermark(db, session_id, *, cursor=None):
+    """Existing control rows are the persistent fence for in-flight native capture."""
+    if not session_id:
+        return 0
+    def read(conn):
+        return conn.execute("SELECT COALESCE(MAX(seq),0) FROM session_admissions WHERE target_session_id=? "
+                            "AND json_type(payload_json, '$.native_stop_v1')='object'", (session_id,)).fetchone()[0]
+    if cursor is not None:
+        return read(cursor)
+    with db._read_ctx() as conn:
+        return read(conn)
+
+
+def consume_native_stop(db, *, epoch, admission_id):
+    """Consume only a committed typed control; this does not prove physical cleanup."""
+    def write(conn):
+        _epoch(conn, epoch)
+        row = _admission(conn, admission_id)
+        if not isinstance(json.loads(row['payload_json']).get('native_stop_v1'), dict):
+            raise RuntimeStoreError('invalid_params')
+        conn.execute("UPDATE session_admissions SET status='terminal',outcome='cancelled' "
+                     "WHERE admission_id=? AND status='queued'", (admission_id,))
+        return _row(_admission(conn, admission_id))
+    return db._execute_write(write)
+
+
 _ANY_HEAD = object()
 
 
@@ -207,6 +251,9 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
         _epoch(conn, epoch)
         if _guard is not None:
             _guard(conn)
+        if conn.execute("SELECT 1 FROM session_admissions WHERE target_session_id=? AND status='queued' "
+                        "AND json_type(payload_json, '$.native_stop_v1')='object' LIMIT 1", (session_id,)).fetchone():
+            raise RuntimeStoreError('control_pending')
         session = _session(conn, session_id)
         blocked = conn.execute("SELECT status FROM session_admissions WHERE target_session_id=? AND status IN ('started','unknown')", (session_id,)).fetchall()
         if any(row[0] == 'unknown' for row in blocked):
@@ -275,6 +322,8 @@ def cancel_session_input(db, *, epoch: int, admission_id: str) -> dict:
     def write(conn):
         _epoch(conn, epoch)
         row = _admission(conn, admission_id)
+        if row['status'] == 'queued' and 'native_stop_v1' in json.loads(row['payload_json']):
+            raise RuntimeStoreError('unsupported_control')  # a Stop is not queued model work
         if row['status'] == 'unknown':
             raise RuntimeStoreError('unknown_execution')
         # A steer in transfer reads as its running claim and settles with it: as started, not cancellable.

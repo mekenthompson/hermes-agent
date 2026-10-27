@@ -60,7 +60,7 @@ class FiniteAgent:
     def redirect(self, text):
         self.effects.append(('redirect', text))
         return True
-    def interrupt(self, text):
+    def interrupt(self, text=None):
         self.effects.append(('interrupt', text))
 
 

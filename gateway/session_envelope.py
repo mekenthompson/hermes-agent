@@ -11,7 +11,7 @@ from datetime import datetime
 import json
 import logging
 
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType, StructuredControl
 from gateway.session import SessionSource
 from gateway.session_ingress_media import capture_native_media, restore_native_media
 from hermes_state_runtime import RuntimeStoreError
@@ -25,7 +25,7 @@ _EVENT_FIELDS = (
 )
 # ``reply_anchor_override`` = '' is Telegram topic transfer's "do not quote the root DM" (#139136).
 _CONTEXT_FIELDS = ('auto_skill', 'channel_prompt', 'channel_context', 'reply_expected', 'reply_anchor_override',
-                   'edit_revision')
+                   'edit_revision', 'structured_control')
 # Closed metadata contract: only the keys the Baileys adapter stamps on ordinary inbound
 # (``WhatsAppAdapter._build_message_event``) cross native admission; any other key refuses.
 _WHATSAPP_METADATA = frozenset({'whatsapp_native_type', 'whatsapp_native', 'whatsapp_from_owner'})
@@ -105,6 +105,13 @@ def _event_clause(runner, event, provenance, fresh_roles):
         return 'command'
     if event.internal:
         return 'internal'
+    if event.structured_control is not None:
+        adapter = runner._adapter_for_source(source)
+        if (event.structured_control is not StructuredControl.STOP
+                or getattr(adapter, 'requires_durable_input_ack', False) is not True
+                or event.allow_gateway_control or not event.message_id or event.edit_revision
+                or event.message_type is not MessageType.TEXT or event.media_urls or event.media_types):
+            return 'structured_control'
     if _native_metadata(event) is None:
         return 'metadata'
     if event.prompt_response:
@@ -284,10 +291,13 @@ def restore_native(payload, runner=None):
         # Epoch 0 pins the retry fingerprint of producers with no provider time (relay, webhook,
         # automation); the turn records local time, as main's arrival-stamped event did.
         timestamp = datetime.now()
+    fields = deepcopy(envelope['event'])
+    if fields.get('structured_control') is not None:
+        fields['structured_control'] = StructuredControl(fields['structured_control'])
     event = MessageEvent(text=payload['text'], source=source, timestamp=timestamp,
                         message_type=MessageType(envelope.get('message_type', 'text')),
                         media_urls=restore_native_media(envelope.get('media', [])),
-                        **deepcopy(envelope['event']))
+                        **fields)
     if 'automation' in envelope:
         event.internal = True
         if envelope['automation'].get('heartbeat'):

@@ -28,7 +28,7 @@ def process_stop_pending(db, session_id):
     return db.get_meta(_PROCESS_STOP_PREFIX + session_id)
 
 
-def record_process_stop(authority, ref, generation):
+def record_process_stop(authority, ref, generation, *, cursor=None):
     from hermes_state_runtime import _epoch
     token = f'{authority.epoch}:{generation}'
     def write(conn):
@@ -39,7 +39,7 @@ def record_process_stop(authority, ref, generation):
             return pending[0]
         authority.db.set_meta(_PROCESS_STOP_PREFIX + ref.session_id, token, cursor=conn)
         return token
-    return authority.db._execute_write(write)
+    return write(cursor) if cursor is not None else authority.db._execute_write(write)
 
 
 def clear_process_stop(authority, ref, token):

@@ -44,7 +44,7 @@ async def admit_message(authority, event, *, busy=False):
     presentation = [None]
     try:
         before_schedule = None
-        if busy:
+        if busy and event.structured_control is None:
             from gateway.session_native_busy import prepare, apply
             prepared = prepare(authority, event)
             async def before_schedule(receipt, fence):
@@ -68,6 +68,8 @@ async def admit_message(authority, event, *, busy=False):
         return QUEUE_FULL_REPLY
     finally:
         messaging_admission.reset(ingress)
+    if event.structured_control is not None:
+        return None  # a control receipt never owns a model turn or a model waiter
     if presentation[0] is not None:
         # Presentation is outside native admission ordering: a slow ACK cannot
         # prevent a later input/Stop from committing or reaching the live turn.
