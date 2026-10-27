@@ -86,14 +86,10 @@ def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypat
         with closing(sqlite3.connect(home / 'state.db')) as db:
             return db.execute(sql, args).fetchall()
 
-    async def retry(desc, sid, *, stop=True):
+    async def retry(desc, sid):
         async with websocket(home, desc) as ws:
             snapshot = await rpc(ws, 'session.resume', session_id=sid)
             assert 'result' in snapshot, snapshot
-            if stop:
-                response = await rpc(ws, 'session.interrupt', session_id=sid,
-                    execution_generation=snapshot['result']['execution_generation'])
-                assert 'result' in response, response
 
     async def exercise(owner, desc):
         nonlocal child
@@ -151,7 +147,7 @@ def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypat
                     owner.kill()
                     owner.wait(timeout=10)
                     with daemon(ROOT, home, env, barrier=False) as (_reloaded, reloaded_desc):
-                        await retry(reloaded_desc, sid, stop=False)
+                        await retry(reloaded_desc, sid)
                         try:
                             await async_wait_until(lambda: query('SELECT status FROM session_admissions WHERE request_id=?',
                                 ('follower',)) == [('terminal',)], timeout=30, what='cold owner follower completes')

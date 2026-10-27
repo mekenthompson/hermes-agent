@@ -43,6 +43,7 @@ async def test_foreground_followup_then_stop_quiesces_before_human_fifo(tmp_path
     from tools.environments.local import LocalEnvironment
     from tools.interrupt import request_yield, consume_yield
     from tools.process_registry_job import job_quiescent, job_receipt_path, read_job_receipt, request_job_stop
+    from tools import process_registry_job
     from tools.terminal_tool_background import yield_to_background_handler
     db, authority = _authority(tmp_path, monkeypatch)
     original = module.ProcessRegistry()
@@ -74,6 +75,15 @@ if p.exists(): Path({str(effect)!r}).touch()
     neighbors = [await spawn(original, tmp_path, sleeper, parent='foreign-parent'),
                  await spawn(original, tmp_path, sleeper, route='foreign-route')]
     own, child, receipt, saved = None, None, None, None
+    stop_requests = []
+    def observed_stop(registry, process):
+        before = read_job_receipt(process)
+        stopped = request_job_stop(registry, process)
+        stop_requests.append({'pid': process.pid, 'captured_birth': process.host_start_time,
+                              'actual_birth': registry._safe_host_start_time(process.pid),
+                              'before': before, 'after': read_job_receipt(process), 'stopped': stopped})
+        return stopped
+    monkeypatch.setattr(process_registry_job, 'request_job_stop', observed_stop)
     async def execute(owner, ref, row):
         assert job_quiescent(own) and not live(child)
         assert all(not neighbor.exited for neighbor in neighbors)
@@ -136,8 +146,17 @@ if p.exists(): Path({str(effect)!r}).touch()
             await async_wait_until(lambda: executed == expected and authority.sessions['s'].task.done(), timeout=15)
         except AssertionError:
             current_process = current.get(own.id)
+            task = authority.sessions['s'].task
             print({'native_phase_at_failure': {'receipt': read_job_receipt(own),
                 'pending_stop': process_stop_pending(db, 's'), 'executed': executed,
+                'stop_requests': stop_requests, 'helper_pid': current_process.pid,
+                'captured_birth': current_process.host_start_time,
+                'actual_birth': current._safe_host_start_time(current_process.pid),
+                'helper_fate': current._detached_host_fate(current_process.pid, current_process.host_start_time),
+                'owner_done': task.done(), 'owner_error': repr(task.exception()) if task.done() else None,
+                'admissions': [(row['request_id'], row['status'], row['outcome'])
+                               for row in list_session_admissions(db, session_id='s', pending_only=False)],
+                'reader_alive': current_process._reader_thread.is_alive() if current_process._reader_thread else False,
                 'completion': current_process._completion_event.is_set(),
                 'complete_result': current_process._result_complete,
                 'persisted_generation': current_process._result_persisted_generation,
