@@ -500,6 +500,10 @@ class BaseEnvironment(ABC):
         return f"exec 0< {quoted} || exit $?\nrm -f -- {quoted} || exit $?\n{command}"
 
     # --- Process lifecycle ---
+    def _spawn_command(self, command, *, yield_handler=None, **kwargs):
+        """Backend launch boundary for an owned user command, after initialization."""
+        return self._run_bash(command, **kwargs)
+
     def _wait_for_process(
         self, proc: ProcessHandle, timeout: int = 120, *,
         bounded_capture: bool = False, watch_interrupt_tid: int | None = None,
@@ -711,7 +715,9 @@ class BaseEnvironment(ABC):
                 return {"output": "[host is exiting: command not started]", "returncode": 130}
             spawned = None
             try:
-                spawned = self._run_bash(wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin)
+                spawned = self._spawn_command(
+                    wrapped, yield_handler=yield_handler, login=login,
+                    timeout=effective_timeout, stdin_data=effective_stdin)
             finally:
                 fenced = _leave_foreground_spawn(self, spawned)
             proc_holder.append(spawned)

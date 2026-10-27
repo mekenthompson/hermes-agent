@@ -1,6 +1,8 @@
 """Local pipe-process launch evidence, never process-tree settlement proof."""
 from uuid import uuid4
 import os
+import threading
+import time
 from typing import Any
 
 
@@ -109,3 +111,120 @@ def retain_failed_start(registry, session):
     registry._write_checkpoint()
     if session.systemd_unit:
         registry._stop_scope(session)
+
+
+class _ForegroundOutput:
+    """Independent log cursor: foreground capture never owns the job's pipe."""
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.closed = threading.Event()
+
+    def __iter__(self):
+        with open(self.handle._hermes_job_session.output_log, 'rb') as stream:
+            while not self.closed.is_set():
+                chunk = stream.read(65536)
+                if chunk:
+                    yield chunk
+                elif self.handle.poll() is not None:
+                    return
+                else:
+                    # Yield permits the shared drain's stop event to transfer
+                    # this cursor promptly even while the command is silent.
+                    yield b''
+                    self.closed.wait(.02)
+
+    def close(self):
+        self.closed.set()
+
+
+class _ForegroundJob:
+    """The foreground observes primary status; the native registry owns scope fate."""
+
+    _hermes_native_foreground = True
+
+    def __init__(self, registry, session):
+        from tools.process_registry_handoff import ownership_identity
+        self.registry = registry
+        self._hermes_job_session = session
+        self._ownership = ownership_identity(session)
+        self.stdout = _ForegroundOutput(self)
+
+    def __getattr__(self, name):
+        return getattr(self._hermes_job_session.process, name)
+
+    @property
+    def returncode(self):
+        return self.poll()
+
+    def poll(self):
+        from tools.process_registry_job import read_job_receipt
+        session = self._hermes_job_session
+        receipt = read_job_receipt(session)
+        if receipt and type(receipt['exit_code']) is int:
+            return receipt['exit_code']
+        return session.process.poll()
+
+    def wait(self, timeout=None):
+        from subprocess import TimeoutExpired
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while (code := self.poll()) is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutExpired(self._hermes_job_session.command, timeout)
+            self._hermes_job_session._completion_event.wait(.02)
+        return code
+
+    def kill(self):
+        return self.registry.kill_process(self._hermes_job_session.id, source='session.interrupt',
+                                          expected_ownership=self._ownership)
+
+
+def spawn_foreground(session, argv, env, cwd, stdin_data):
+    """Capture native scope before the first user-command instruction can run."""
+    from tools import process_registry as facade
+    from tools.environments.base_output import _pipe_stdin
+    from tools.process_registry_job import job_argv, job_receipt_path
+    registry = facade.process_registry
+    session.cwd = cwd
+    argv = job_argv(session, argv, registry._daemon_term_grace_seconds())
+    log = job_receipt_path(session.id).with_name(session.id + '.log')
+    output = facade.open_output_log(log)
+    resource = reserve_local_process()
+    try:
+        start_local_process(resource)
+        proc = facade.subprocess.Popen(
+            argv, text=True, cwd=cwd, env=env, encoding='utf-8', errors='replace',
+            stdout=output, stderr=facade.subprocess.STDOUT,
+            stdin=facade.subprocess.PIPE if stdin_data is not None else facade.subprocess.DEVNULL,
+            start_new_session=True)
+    finally:
+        os.close(output)
+    session.process, session.output_log = proc, str(log)
+    session.pid = proc.pid
+    session.host_start_time = registry._safe_host_start_time(proc.pid)
+    try:
+        record_local_process(resource, session.id, session.pid, session.host_start_time)
+        registry._track_started(session, registry._log_reader_loop, f'proc-foreground-{session.id}')
+    except BaseException:
+        registry._reap_untracked(session, proc)
+        raise
+    handle = _ForegroundJob(registry, session)
+    if stdin_data is not None:
+        _pipe_stdin(handle, stdin_data)
+    return handle
+
+
+def adopt_foreground(registry, proc, *, command, cwd, task_id, session_key, owner_task_id,
+                     notify_on_complete):
+    """Yield the captured job without inventing new identity from a raw PID."""
+    session = proc._hermes_job_session
+    with registry._lock, session._lock:
+        if (registry._running.get(session.id) is not session or session.exited
+                or (session.command, session.task_id, session.owner_task_id, session.session_key)
+                != (command, task_id, owner_task_id, session_key)):
+            raise RuntimeError('Foreground command already completed or ownership changed')
+        session.persist_on_release = False
+        session.notify_on_complete = notify_on_complete
+    proc.stdout.close()
+    registry._write_checkpoint()
+    return session

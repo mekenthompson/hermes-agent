@@ -270,6 +270,18 @@ def yield_to_background_handler(
     if env_type != "local":
         return None
 
+    def _prepare_local():
+        from tools.process_registry import process_registry
+        from gateway.session_context import get_session_env
+        session = process_registry._new_session(
+            command, effective_task_id, task_id or effective_task_id, session_key, cwd,
+            persist_on_release=True)
+        # Foreground output is delivered inline. Only an actual yield activates
+        # completion delivery; ordinary service launches retain their lifetime.
+        session.notify_on_complete = False
+        _stamp_gateway_routing(session, get_session_env)
+        return session
+
     def _handler(proc, output_so_far: str) -> dict:
         from tools.process_registry import process_registry
         from tools.approval_context import reserve_background_approval_task, release_background_approval_task
@@ -284,6 +296,7 @@ def yield_to_background_handler(
             if not session.notify_on_complete:
                 release_background_approval_task(reservation)
                 session.approval_task_reservation = None
+            process_registry._write_checkpoint()
         except BaseException:
             release_background_approval_task(reservation)
             raise
@@ -291,6 +304,7 @@ def yield_to_background_handler(
         return {
             "output": output_so_far, "returncode": None, "yielded_session_id": session.id, "pid": session.pid,
         }
+    _handler.prepare_local = _prepare_local
     return _handler
 
 

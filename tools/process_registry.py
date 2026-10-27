@@ -1217,6 +1217,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         The caller has stopped its own drain thread; the registry's reader continues from
         the pipe's current position and ``output_so_far`` seeds the buffer so nothing
         already captured is lost."""
+        if isinstance(getattr(proc, '_hermes_job_session', None), ProcessSession):
+            from tools.process_registry_chat_execution import adopt_foreground
+            return adopt_foreground(self, proc, command=command, cwd=cwd, task_id=task_id,
+                                    session_key=session_key, owner_task_id=owner_task_id,
+                                    notify_on_complete=notify_on_complete)
         session = self._new_session(command, task_id, owner_task_id, session_key, cwd)
         session.process = proc
         session.pid = proc.pid

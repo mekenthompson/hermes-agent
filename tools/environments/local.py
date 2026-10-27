@@ -1098,8 +1098,14 @@ class LocalEnvironment(BaseEnvironment):
                 self.cwd, safe_cwd)
         self.cwd = safe_cwd
 
+    def _spawn_command(self, command, *, yield_handler=None, **kwargs):
+        prepare = getattr(yield_handler, 'prepare_local', None)
+        if sys.platform == 'linux' and callable(prepare):
+            return self._run_bash(command, native_session=prepare(), **kwargs)
+        return self._run_bash(command, **kwargs)
+
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
-                  stdin_data: str | None = None) -> subprocess.Popen:
+                  stdin_data: str | None = None, native_session=None) -> subprocess.Popen:
         bash = _find_bash()
         run_env = _make_run_env(self.env)
         # Login invocations (init_session's env snapshot) source the user's rc /
@@ -1113,6 +1119,9 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = shell_init + cmd_string
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
+        if native_session is not None:
+            from tools.process_registry_chat_execution import spawn_foreground
+            return spawn_foreground(native_session, args, run_env, self.cwd, stdin_data)
         proc = subprocess.Popen(
             args, text=True, env=run_env, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1134,6 +1143,8 @@ class LocalEnvironment(BaseEnvironment):
 
     def _kill_process(self, proc):
         """Kill the entire process group (all children)."""
+        if getattr(proc, '_hermes_native_foreground', False) is True:
+            return proc.kill()
         try:
             (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
         except OSError:  # ProcessLookupError / PermissionError included
@@ -1142,6 +1153,8 @@ class LocalEnvironment(BaseEnvironment):
 
     def _force_kill_process(self, proc):
         """SIGKILL the whole group with no TERM grace or wait: the caller os._exit()s next."""
+        if getattr(proc, '_hermes_native_foreground', False) is True:
+            return proc.kill()  # Never kill the native job's only surviving reaper.
         if _IS_WINDOWS:  # already a forced tree kill
             return self._kill_process(proc)
         with contextlib.suppress(OSError):
