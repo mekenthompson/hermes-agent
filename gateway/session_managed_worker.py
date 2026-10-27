@@ -344,7 +344,8 @@ class ManagedWorker:
             self._signal_worker(kill=True)
         if self.writer.ident is not None:
             self.writer.join(timeout=5)
-        self.process.stdin.close()
+        with suppress(BrokenPipeError):
+            self.process.stdin.close()
         if self.reader is None:
             self.process.stdout.close()
         else:

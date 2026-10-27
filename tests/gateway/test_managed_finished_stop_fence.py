@@ -87,9 +87,24 @@ def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypat
             return db.execute(sql, args).fetchall()
 
     async def retry(desc, sid):
+        def retired():
+            assert not query('SELECT value FROM state_meta WHERE key=?', ('gateway.process_stop.v1:' + sid,))
+            states = dict(query("SELECT request_id,status FROM session_admissions WHERE principal_id!='native-process-stop'"))
+            assert states['first'] == 'terminal' and states['follower'] in {'queued', 'started', 'terminal'}, states
+            assert not any(alive(entry) for entry in peer.effect_processes)
+
         async with websocket(home, desc) as ws:
             snapshot = await rpc(ws, 'session.resume', session_id=sid)
             assert 'result' in snapshot, snapshot
+            if not query('SELECT value FROM state_meta WHERE key=?', ('gateway.process_stop.v1:' + sid,)):
+                retired()
+                return
+            response = await rpc(ws, 'session.interrupt', session_id=sid,
+                execution_generation=snapshot['result']['execution_generation'])
+            if response.get('error', {}).get('data', {}).get('reason') == 'stale_generation':
+                retired()  # Never refresh this Stop to target an already admitted successor.
+            else:
+                assert 'result' in response, response
 
     async def exercise(owner, desc):
         nonlocal child
@@ -132,6 +147,8 @@ def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypat
             await async_wait_until(lambda: query('SELECT status FROM session_admissions WHERE request_id=?',
                 ('first',)) != [('started',)], timeout=30, what='finished-frame reconciliation')
             states = dict(query("SELECT request_id,status FROM session_admissions WHERE principal_id!='native-process-stop'"))
+            assert query("SELECT outcome FROM session_admissions WHERE request_id='first'")[0][0] in {
+                'completed', 'interrupted'}
             controls = query("SELECT request_id,status,outcome,generation FROM session_admissions WHERE principal_id='native-process-stop'")
             identity = json.dumps(['completion', child['session_id'], child['started_at']], separators=(',', ':'))
             assert controls == [(identity, 'terminal', 'cancelled', None)], controls
@@ -157,8 +174,16 @@ def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypat
                             raise
                 else:
                     await retry(desc, sid)
-            await async_wait_until(lambda: query('SELECT status FROM session_admissions WHERE request_id=?',
-                ('follower',)) == [('terminal',)], timeout=30, what='queued human completes once cleanup is proved')
+            try:
+                await async_wait_until(lambda: query('SELECT status FROM session_admissions WHERE request_id=?',
+                    ('follower',)) == [('terminal',)], timeout=30, what='queued human completes once cleanup is proved')
+            except AssertionError:
+                print({'admissions': query('SELECT request_id,status,outcome FROM session_admissions'),
+                       'stop': query('SELECT value FROM state_meta WHERE key=?', marker),
+                       'child_alive': alive(child)})
+                print((home / 'native-drain-phases.jsonl').read_text())
+                print((home / 'first.log').read_text()[-5000:])
+                raise
             assert not alive(child), 'native Stop cleared its fence with physical work still alive'
             assert not any(alive(entry) for entry in peer.effect_processes), 'a captured job descendant survived Stop'
             assert not query('SELECT value FROM state_meta WHERE key=?', marker)

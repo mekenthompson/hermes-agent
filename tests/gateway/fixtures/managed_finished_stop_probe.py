@@ -5,11 +5,34 @@ from pathlib import Path
 import runpy
 
 from gateway.session_managed_worker import ManagedWorker
+from gateway.session_authority import SessionAuthority
 from tests.waiting import async_wait_until
 from tools.process_registry import process_registry
 
 home = Path(os.environ['HERMES_HOME'])
 next_frame, kill = ManagedWorker.next_frame, process_registry.kill_process
+drain = SessionAuthority._drain
+
+
+async def observed_drain(self, ref):
+    try:
+        return await drain(self, ref)
+    finally:
+        from gateway.session_ancillary import process_stop_pending
+        from hermes_state_runtime import list_session_admissions
+        from tools.process_registry_job import read_job_receipt
+        with process_registry._lock:
+            processes = list(process_registry._running.values()) + list(process_registry._finished.values())
+        phase = {'refused': (home / 'refuse-cleanup').exists(),
+                 'stop': process_stop_pending(self.db, ref.session_id),
+                 'admissions': [(r['request_id'], r['status'], r['outcome']) for r in
+                                list_session_admissions(self.db, session_id=ref.session_id, pending_only=False)],
+                 'processes': [{'id': p.id, 'exited': p.exited, 'pending': p._scope_stop_pending,
+                                'complete': p._result_complete, 'durable': p._result_persisted_generation,
+                                'generation': p.ownership_generation, 'event': p._completion_event.is_set(),
+                                'receipt': read_job_receipt(p)} for p in processes if p.owner_task_id == ref.session_id]}
+        with (home / 'native-drain-phases.jsonl').open('a') as stream:
+            stream.write(json.dumps(phase) + '\n')
 
 
 async def held_finished(self, *args, **kwargs):
@@ -28,5 +51,6 @@ def refuse_cleanup(session_id, **kwargs):
 
 
 ManagedWorker.next_frame = held_finished
+SessionAuthority._drain = observed_drain
 process_registry.kill_process = refuse_cleanup
 runpy.run_module('gateway.run', run_name='__main__')
