@@ -222,7 +222,7 @@ def _main():
         return code
     receipt(False)
     try:
-        child = subprocess.Popen(argv)
+        child = subprocess.Popen(argv, stdin=None)  # Inherit this job's captured pipe or PTY.
     except OSError:
         code = 126
         receipt(True)

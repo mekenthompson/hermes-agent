@@ -187,7 +187,7 @@ def spawn_foreground(session, argv, env, cwd, stdin_data):
     registry = facade.process_registry
     session.cwd = cwd
     argv = job_argv(session, argv, registry._daemon_term_grace_seconds())
-    log = job_receipt_path(session.id).with_name(session.id + '.log')
+    log = facade.worker_output_log(session.id) or job_receipt_path(session.id).with_name(session.id + '.log')
     output = facade.open_output_log(log)
     resource = reserve_local_process()
     try:
