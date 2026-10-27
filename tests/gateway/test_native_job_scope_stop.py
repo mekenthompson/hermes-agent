@@ -34,7 +34,8 @@ async def spawn(registry, root, command, *, parent='s', route='route', pty=False
 @pytest.mark.parametrize('reload_registry', [False, True], ids=['live-owner', 'registry-reload'])
 @pytest.mark.parametrize('primary_exits', [False, True], ids=['active-primary', 'exited-primary'])
 @pytest.mark.parametrize('pty', [False, True], ids=['file-output', 'pty-output'])
-async def test_native_job_scope_quiesces_detached_children_before_fifo(tmp_path, monkeypatch, reload_registry, primary_exits, pty):
+async def test_native_job_scope_quiesces_detached_children_before_fifo(
+        tmp_path, monkeypatch, reload_registry, primary_exits, pty, record_property):
     from gateway.session_ancillary import process_stop_pending
     from tools import process_registry as module
     from tools.process_registry_job import job_quiescent, read_job_receipt, request_job_stop
@@ -85,7 +86,18 @@ async def test_native_job_scope_quiesces_detached_children_before_fifo(tmp_path,
             assert current.get(own.id).native_job_scope
         else:
             current = original
-        await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
+        try:
+            await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
+            first_stop = 'quiescent'
+        except RuntimeStoreError as error:
+            assert error.reason == 'process_stop_unknown'
+            first_stop = 'unknown_pending'
+            assert process_stop_pending(db, 's') and executed == []
+        record_property('first_stop_outcome', first_stop)
+        # A truthful bounded refusal is still fenced. The next ordinary input
+        # uses the existing native recovery boundary before its turn can start.
+        await _submit(authority, 'verified human successor')
+        await asyncio.wait_for(authority.sessions['s'].task, 15)
         assert process_stop_pending(db, 's') is None
         assert job_quiescent(own) and not live(child)
         assert await asyncio.to_thread(own._completion_event.wait, 10)
@@ -94,8 +106,6 @@ async def test_native_job_scope_quiesces_detached_children_before_fifo(tmp_path,
             assert own.exit_code == 0
         assert all(not neighbor.exited for neighbor in neighbors)
         assert own.id not in {row['session_id'] for row in json.loads(module._checkpoint_path().read_text())}
-        await _submit(authority, 'verified human successor')
-        await asyncio.wait_for(authority.sessions['s'].task, 15)
         assert executed == ['verified human successor'] and not effect.exists()
         assert all(not neighbor.exited for neighbor in neighbors)
     finally:
@@ -157,5 +167,58 @@ async def test_old_unscoped_local_job_remains_unknown(tmp_path, monkeypatch, pri
         if own.process is not None and own.process.poll() is None:
             own.process.terminate()
             await asyncio.to_thread(own.process.wait, 10)
+        await asyncio.to_thread(own._completion_event.wait, 10)
+        db.close()
+
+
+@pytest.mark.platforms('linux')
+@pytest.mark.asyncio
+async def test_default_grace_unknown_reconciles_on_next_human_input_without_replaying_work(
+        tmp_path, monkeypatch, record_property):
+    """A bounded Stop may be unknown while its native reaper finishes deeper adoptees."""
+    from gateway.session_ancillary import process_stop_pending
+    from tools import process_registry as module
+    from tools.process_registry_job import job_quiescent, request_job_stop
+    db, authority = _authority(tmp_path, monkeypatch)
+    registry = module.ProcessRegistry()
+    monkeypatch.setattr(module, 'process_registry', registry)
+    ready = [tmp_path / f'level-{index}' for index in range(3)]
+    child = ''
+    for index in reversed(range(3)):
+        launch = f'subprocess.Popen([sys.executable,"-c",{child!r}]);' if child else ''
+        child = ('import os,signal,subprocess,sys,time; from pathlib import Path; '
+                 'signal.signal(signal.SIGTERM,signal.SIG_IGN); ' + launch
+                 + f'Path({str(ready[index])!r}).write_text(str(os.getpid())); time.sleep(25)')
+    own = await spawn(registry, tmp_path, 'exec ' + shlex.join([sys.executable, '-c', child]))
+    identities, executed = [], []
+    async def execute(owner, ref, row):
+        assert job_quiescent(own)
+        assert not any(live(process) for process in identities)
+        executed.append(row['request_id'])
+        return 'human continued'
+    monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute)
+    try:
+        await asyncio.to_thread(wait_until, lambda: all(path.exists() for path in ready), timeout=15)
+        identities = [psutil.Process(int(path.read_text())) for path in ready]
+        record_property('actual_term_grace_seconds', registry._daemon_term_grace_seconds())
+        try:
+            await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
+            outcome = 'quiescent'
+            assert job_quiescent(own) and process_stop_pending(db, 's') is None
+        except RuntimeStoreError as error:
+            assert error.reason == 'process_stop_unknown'
+            outcome = 'unknown_pending'
+            assert process_stop_pending(db, 's')
+            assert executed == []
+        record_property('first_stop_outcome', outcome)
+        # Ordinary user input drives the existing recovery boundary; there is
+        # no manual process bookkeeping, synthetic acknowledgement or retry loop.
+        await _submit(authority, 'natural human continuation')
+        await asyncio.wait_for(authority.sessions['s'].task, 15)
+        assert executed == ['natural human continuation']
+        assert process_stop_pending(db, 's') is None and job_quiescent(own)
+        assert not any(live(process) for process in identities)
+    finally:
+        await asyncio.to_thread(request_job_stop, registry, own)
         await asyncio.to_thread(own._completion_event.wait, 10)
         db.close()

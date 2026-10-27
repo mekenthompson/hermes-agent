@@ -177,7 +177,18 @@ def test_ordinary_owner_launches_tool_worker_and_detach_does_not_cancel(tmp_path
                     peer.release.set()
                     await async_wait_until(lambda: query('SELECT status FROM session_admissions WHERE request_id=?', (
                         'managed-input',)) != [('started',)], timeout=15, interval=.05, what='stopped turn settled')
-                    assert query('SELECT status FROM session_admissions') == [('terminal',)], (home / 'restart.log').read_text()
+                    assert query("SELECT status FROM session_admissions WHERE principal_id!='native-process-stop'") == [
+                        ('terminal',)], (home / 'restart.log').read_text()
+                    controls = query("SELECT target_session_id,request_id,status,outcome,generation,payload_json "
+                                     "FROM session_admissions WHERE principal_id='native-process-stop'")
+                    assert len(controls) == 1, controls
+                    target_sid, identity, status, outcome, generation, payload = controls[0]
+                    producer = json.loads(identity)
+                    assert target_sid == sid and producer[0] == 'completion' and len(producer) == 3
+                    record = json.loads((home / 'logs' / 'process-results' / f'{producer[1]}.json').read_text())
+                    assert producer == ['completion', record['id'], record['started_at']]
+                    assert (status, outcome, generation) == ('terminal', 'cancelled', None)
+                    assert json.loads(payload) == {'process_completion': identity, 'route': record['session_key']}
                     return
                 answered = await rpc(ws, 'clarify.respond', session_id=sid,
                     execution_generation=clarify['execution_generation'], prompt_id=clarify['prompt_id'], answer='Beta')

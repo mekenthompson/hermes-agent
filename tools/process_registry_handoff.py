@@ -1,4 +1,4 @@
-"""Transfer a delegated child's live process and approval reservation to its parent."""
+"""Native process ownership, controls and in-process completion retention."""
 
 from contextlib import nullcontext
 from typing import Optional
@@ -180,3 +180,52 @@ def check_control_ownership(registry, session, expected, consume_output):
         if consume_output:
             registry._completion_consumed.add(session.id)
     return None
+
+
+def prune_finished(registry, reservation_snapshot=None):
+    """Bound in-memory history without discarding a still-held native delivery grant.
+
+    The caller holds the existing registry lock. Native launch supplies a live
+    owner observation made outside that lock; no owner callback runs here.
+    """
+    import time
+    from tools import process_registry as facade
+    if reservation_snapshot is None:
+        # Legacy private callers already hold the non-reentrant registry
+        # lock. Defer an unobserved live holder rather than call its owner
+        # predicate under that lock or erase its grant during delivery.
+        snapshot = {sid: (s, getattr(s, 'approval_task_reservation', None)) for sid, s in registry._finished.items()}
+        held = {sid for sid, (_, reservation) in snapshot.items()
+                if reservation is not None and reservation.active()}
+    else:
+        snapshot, held = reservation_snapshot
+    from tools.process_registry_awaiting import retained_for_delivery
+    now = time.time()
+    prunable = {sid: s for sid, s in registry._finished.items()
+                if sid in snapshot and snapshot[sid][0] is s
+                and snapshot[sid][1] is getattr(s, 'approval_task_reservation', None) and sid not in held
+                and not s.systemd_unit and not getattr(s, "_scope_stop_pending", False)
+                and not retained_for_delivery(s)}
+    expired = [sid for sid, s in prunable.items() if (now - s.started_at) > facade.FINISHED_TTL_SECONDS]
+    over_cap = len(registry._running) + len(registry._finished) - len(expired) >= facade.MAX_PROCESSES
+    if over_cap and (survivors := [sid for sid in prunable if sid not in expired]):
+        expired.append(min(survivors, key=lambda sid: registry._finished[sid].started_at))
+    for sid in expired:
+        reservation = getattr(registry._finished[sid], 'approval_task_reservation', None)
+        if reservation is not None:
+            from tools.approval_context import release_background_approval_task
+            registry._finished[sid].approval_task_reservation = None
+            release_background_approval_task(reservation)
+        # Belt-and-suspenders handle release: sessions normally arrive in
+        # _finished via _move_to_finished(), which already released their
+        # Popen/PTY handles — but any session inserted into _finished
+        # directly (defensive paths, historical checkpoints) would
+        # otherwise carry its OS handles to the grave unreleased. The
+        # release is idempotent, so double-closing is safe.
+        registry._release_finished_handles(registry._finished[sid])
+        del registry._finished[sid]
+    # Belt-and-suspenders against module-lifetime growth: forget consumed /
+    # poll-observed marks for any session no longer tracked at all.
+    tracked = registry._running.keys() | registry._finished.keys()
+    registry._completion_consumed &= tracked
+    registry._poll_observed &= tracked

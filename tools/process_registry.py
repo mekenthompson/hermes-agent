@@ -1132,7 +1132,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                                   daemon=True, name=reader_name)
         session._reader_thread = reader
         with self._lock:
-            self._prune_if_needed()
+            snapshot = {sid: (s, getattr(s, 'approval_task_reservation', None)) for sid, s in self._finished.items()}
+        # A native owner predicate may call back into the registry. Observe
+        # current grants before taking the existing pruning/registration lock.
+        held = {sid for sid, (s, reservation) in snapshot.items() if s.notify_on_complete
+                and reservation is not None and reservation.active() and reservation.lease.live()}
+        with self._lock:
+            self._prune_if_needed((snapshot, held))
             # Completion takes this lock too. Starting here also leaves no
             # ghost entry if the interpreter cannot start another thread.
             reader.start()
@@ -2112,6 +2118,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 session.native_job_scope or session.systemd_unit or job_quiescent(session)):
             return self._refuse_backend_stop(session, consume_output)
         if session.exited:
+            if (session.native_job_scope and session._reader_thread is not None
+                    and not session._completion_event.is_set()):
+                return self._refuse_backend_stop(session, consume_output)
             # A double-forked descendant may still be alive in the systemd scope even
             # though the main process exited — stop the scope to reap survivors.
             # See #70716.
@@ -2514,30 +2523,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
 
     # ----- Cleanup / Pruning -----
 
-    def _prune_if_needed(self):
-        """Drop expired, then oldest-over-cap finished sessions (hold _lock); keep pending scope stops and unpublished notices."""
-        from tools.process_registry_awaiting import retained_for_delivery
-        now = time.time()
-        prunable = {sid: s for sid, s in self._finished.items()
-                    if not s.systemd_unit and not getattr(s, "_scope_stop_pending", False) and not retained_for_delivery(s)}
-        expired = [sid for sid, s in prunable.items() if (now - s.started_at) > FINISHED_TTL_SECONDS]
-        over_cap = len(self._running) + len(self._finished) - len(expired) >= MAX_PROCESSES
-        if over_cap and (survivors := [sid for sid in prunable if sid not in expired]):
-            expired.append(min(survivors, key=lambda sid: self._finished[sid].started_at))
-        for sid in expired:
-            # Belt-and-suspenders handle release: sessions normally arrive in
-            # _finished via _move_to_finished(), which already released their
-            # Popen/PTY handles — but any session inserted into _finished
-            # directly (defensive paths, historical checkpoints) would
-            # otherwise carry its OS handles to the grave unreleased. The
-            # release is idempotent, so double-closing is safe.
-            self._release_finished_handles(self._finished[sid])
-            del self._finished[sid]
-        # Belt-and-suspenders against module-lifetime growth: forget consumed /
-        # poll-observed marks for any session no longer tracked at all.
-        tracked = self._running.keys() | self._finished.keys()
-        self._completion_consumed &= tracked
-        self._poll_observed &= tracked
+    def _prune_if_needed(self, reservation_snapshot=None):
+        from tools.process_registry_handoff import prune_finished
+        prune_finished(self, reservation_snapshot)
 
 
 

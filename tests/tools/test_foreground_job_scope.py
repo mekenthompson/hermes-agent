@@ -268,9 +268,12 @@ def test_foreground_registration_failure_never_replays_original_command(tmp_path
     monkeypatch.setattr(registry, '_track_started', fail_once)
     env = LocalEnvironment(cwd=str(tmp_path))
     try:
-        with pytest.raises(RuntimeError, match='after native foreground start'):
+        from tools.environments.base import CommandExecutionUnknown
+        with pytest.raises(CommandExecutionUnknown) as refused:
             env.execute(command, timeout=20, yield_handler=handler(command, tmp_path))
         session = captured[0]
+        assert refused.value.session_id == session.id
+        assert 'after native foreground start' in str(refused.value.__cause__)
         assert session._completion_event.wait(10)
         assert job_quiescent(session)
         assert len(starts.read_text().splitlines()) == 1

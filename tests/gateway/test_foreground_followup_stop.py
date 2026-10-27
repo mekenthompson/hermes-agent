@@ -21,7 +21,7 @@ pytestmark = pytest.mark.platforms('linux')
 @pytest.mark.parametrize('reload_registry', [False, True], ids=['live', 'cold'])
 @pytest.mark.parametrize('lose_receipt', [False, True], ids=['physical-stop', 'unknown-retry'])
 async def test_foreground_followup_then_stop_quiesces_before_human_fifo(tmp_path, monkeypatch,
-                                                                      reload_registry, lose_receipt):
+                                                                      reload_registry, lose_receipt, record_property):
     from gateway.session_ancillary import process_stop_pending
     from gateway.session_context import clear_session_vars, set_session_vars
     from tools import process_registry as module
@@ -98,13 +98,25 @@ if p.exists(): Path({str(effect)!r}).touch()
             assert executed == []
             assert any(row['status'] == 'queued' for row in list_session_admissions(db, session_id='s'))
             receipt.write_bytes(saved)
-        await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
+            # A new ordinary human message drives native recovery; the first
+            # queued human request remains ahead of it, with no manual Stop retry.
+            await _submit(authority, 'follow-up human continuation')
+            expected = ['human continuation', 'follow-up human continuation']
+        else:
+            try:
+                await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
+                first_stop = 'quiescent'
+            except RuntimeStoreError as error:
+                assert error.reason == 'process_stop_unknown'
+                first_stop = 'unknown_pending'
+                assert process_stop_pending(db, 's') and executed == []
+            record_property('first_stop_outcome', first_stop)
+            await _submit(authority, 'human continuation')
+            expected = ['human continuation']
+        await asyncio.wait_for(authority.sessions['s'].task, 15)
         assert job_quiescent(own) and not live(child)
         assert process_stop_pending(db, 's') is None
-        if not lose_receipt:
-            await _submit(authority, 'human continuation')
-        await asyncio.wait_for(authority.sessions['s'].task, 15)
-        assert executed == ['human continuation'] and not effect.exists()
+        assert executed == expected and not effect.exists()
         assert own.output_buffer.count('original foreground output') == 1
     finally:
         consume_yield(thread.ident)

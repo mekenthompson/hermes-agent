@@ -1,9 +1,12 @@
 """Local pipe-process launch evidence, never process-tree settlement proof."""
 from uuid import uuid4
+import logging
 import os
 import threading
 import time
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def reserve_local_process():
@@ -78,6 +81,11 @@ def reap_untracked(registry, session, proc):
         from tools.process_registry_job import request_job_stop, job_quiescent
         retain_failed_start(registry, session)
         request_job_stop(registry, session)
+        # An existing reader alone owns the output cursor and finish event.
+        # Starting a second one can duplicate or overwrite the original result.
+        if session._completion_event.is_set() or (session._reader_thread is not None
+                                                   and session._reader_thread.is_alive()):
+            return
         reader = registry._pty_reader_loop if session._pty is not None else registry._log_reader_loop
         if job_quiescent(session):
             reader(session)  # Collect this original job's status/output, never replay its command.
@@ -143,11 +151,10 @@ class _ForegroundJob:
 
     _hermes_native_foreground = True
 
-    def __init__(self, registry, session):
-        from tools.process_registry_handoff import ownership_identity
+    def __init__(self, registry, session, ownership):
         self.registry = registry
         self._hermes_job_session = session
-        self._ownership = ownership_identity(session)
+        self._ownership = ownership
         self.stdout = _ForegroundOutput(self)
 
     def __getattr__(self, name):
@@ -183,6 +190,7 @@ def spawn_foreground(session, argv, env, cwd, stdin_data):
     """Capture native scope before the first user-command instruction can run."""
     from tools import process_registry as facade
     from tools.environments.base_output import _pipe_stdin
+    from tools.process_registry_handoff import ownership_identity, check_control_ownership
     from tools.process_registry_job import job_argv, job_receipt_path
     registry = facade.process_registry
     session.cwd = cwd
@@ -190,28 +198,39 @@ def spawn_foreground(session, argv, env, cwd, stdin_data):
     log = facade.worker_output_log(session.id) or job_receipt_path(session.id).with_name(session.id + '.log')
     output = facade.open_output_log(log)
     resource = reserve_local_process()
+    proc, launch_identity = None, None
+    session.output_log = str(log)
     try:
-        start_local_process(resource)
-        proc = facade.subprocess.Popen(
-            argv, text=True, cwd=cwd, env=env, encoding='utf-8', errors='replace',
-            stdout=output, stderr=facade.subprocess.STDOUT,
-            stdin=facade.subprocess.PIPE if stdin_data is not None else facade.subprocess.DEVNULL,
-            start_new_session=True)
-    finally:
-        os.close(output)
-    session.process, session.output_log = proc, str(log)
-    session.pid = proc.pid
-    session.host_start_time = registry._safe_host_start_time(proc.pid)
-    try:
+        try:
+            start_local_process(resource)
+            proc = facade.subprocess.Popen(
+                argv, text=True, cwd=cwd, env=env, encoding='utf-8', errors='replace',
+                stdout=output, stderr=facade.subprocess.STDOUT,
+                stdin=facade.subprocess.PIPE if stdin_data is not None else facade.subprocess.DEVNULL,
+                start_new_session=True)
+            session.process, session.pid = proc, proc.pid
+            session.host_start_time = registry._safe_host_start_time(proc.pid)
+            launch_identity = ownership_identity(session)
+        finally:
+            os.close(output)
         record_local_process(resource, session.id, session.pid, session.host_start_time)
         registry._track_started(session, registry._log_reader_loop, f'proc-foreground-{session.id}')
-    except BaseException:
-        registry._reap_untracked(session, proc)
+        handle = _ForegroundJob(registry, session, launch_identity)
+        if stdin_data is not None:
+            _pipe_stdin(handle, stdin_data)
+        return handle
+    except BaseException as error:
+        if proc is None:
+            raise
+        try:
+            if check_control_ownership(registry, session, launch_identity, False) is None:
+                registry._reap_untracked(session, proc)
+        except Exception:
+            logger.exception('Native launch cleanup uncertain; retained job %s', session.id)
+        if isinstance(error, Exception):
+            from tools.environments.base import CommandExecutionUnknown
+            raise CommandExecutionUnknown(session.id) from error
         raise
-    handle = _ForegroundJob(registry, session)
-    if stdin_data is not None:
-        _pipe_stdin(handle, stdin_data)
-    return handle
 
 
 def adopt_foreground(registry, proc, *, command, cwd, task_id, session_key, owner_task_id,
