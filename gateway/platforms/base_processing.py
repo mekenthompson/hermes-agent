@@ -54,4 +54,3 @@ class ProcessingLifecycleMixin:
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is not None:
             self._start_session_processing(pending_event, session_key)
-
