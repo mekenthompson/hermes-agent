@@ -182,7 +182,9 @@ def test_foreground_interruption_reaps_scope_and_preserves_unrelated_job(tmp_pat
         env.cleanup()
 
 
-def test_worker_exit_after_foreground_yield_keeps_scope_output_and_cold_cleanup(tmp_path, registry, scope_reaper):
+@pytest.mark.parametrize('hold_reader', [False, True], ids=['ordinary-reader', 'held-original-reader'])
+def test_worker_exit_after_foreground_yield_keeps_scope_output_and_cold_cleanup(
+        tmp_path, registry, scope_reaper, monkeypatch, hold_reader):
     ready = tmp_path / 'ready'
     code = '''import json,os,shlex,sys,threading,time
 from pathlib import Path
@@ -213,11 +215,54 @@ os._exit(0)
     session = registry.get(receipt['yielded_session_id'])
     scope_reaper.append(session.pid)
     assert session.native_job_scope and session.output_log
-    verdict = registry.kill_process(session.id)
+    from tools.process_registry_handoff import ownership_identity
     from tools.process_registry_job import read_job_receipt
-    assert verdict['status'] == 'killed', (verdict, read_job_receipt(session), session)
-    assert job_quiescent(session)
-    assert 'before worker exit' in session.output_buffer
+    identity = ownership_identity(session)
+    release, entered, refused = threading.Event(), threading.Event(), []
+    move, refuse = registry._move_to_finished, registry._refuse_backend_stop
+    def held_move(current):
+        if hold_reader and current is session:
+            entered.set()
+            assert release.wait(10)
+        return move(current)
+    def observe_refusal(current, consume_output):
+        if current is session:
+            refused.append((job_quiescent(current), current._completion_event.is_set(),
+                            current._result_complete, current._result_persisted_generation))
+        return refuse(current, consume_output)
+    monkeypatch.setattr(registry, '_move_to_finished', held_move)
+    monkeypatch.setattr(registry, '_refuse_backend_stop', observe_refusal)
+    neighbor = registry.spawn_local(shlex.join([sys.executable, '-c', 'import time; time.sleep(15)']),
+                                    task_id='foreign', session_key='foreign')
+    try:
+        verdict = registry.kill_process(session.id, expected_ownership=identity)
+        if hold_reader:
+            assert entered.is_set() and verdict['error'] == 'process_stop_unknown'
+        if verdict['status'] == 'error':
+            # Kernel cleanup may precede the original reader's final publication.
+            # A truthful refusal must retain custody until that exact reader finishes.
+            assert verdict['error'] == 'process_stop_unknown' and refused
+            quiescent, published, complete, persisted = refused[-1]
+            assert quiescent and (not published or not complete or persisted != session.ownership_generation)
+            assert job_quiescent(session) and session._scope_stop_pending
+            assert session.id in {row['session_id'] for row in json.loads(module._checkpoint_path().read_text())}
+            assert neighbor.process.poll() is None
+            release.set()
+            assert session._completion_event.wait(5)
+            assert session._result_complete and session._result_persisted_generation == session.ownership_generation
+            assert ownership_identity(session) == identity
+            verdict = registry.kill_process(session.id, expected_ownership=identity)
+            assert verdict['status'] == 'already_exited', (verdict, read_job_receipt(session), session)
+        else:
+            assert verdict['status'] == 'killed', (verdict, read_job_receipt(session), session)
+        assert job_quiescent(session) and not session._scope_stop_pending
+        assert session.output_buffer == 'before worker exit\n' and session.exit_code == -15
+        assert session.id not in {row['session_id'] for row in json.loads(module._checkpoint_path().read_text())}
+        assert neighbor.process.poll() is None
+    finally:
+        release.set()
+        registry.kill_process(neighbor.id)
+        assert neighbor._completion_event.wait(5)
 
 
 def test_old_foreground_handle_cannot_stop_a_handed_off_job(tmp_path, registry, monkeypatch):
