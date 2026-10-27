@@ -1101,7 +1101,6 @@ class SessionAuthority:
                 return 'classic_busy', first
             self._require_admission_open()
             from gateway.session_runtime_workers import tracked_write
-            live.rescan = False  # a _schedule from here on may not be visible to this claim's read
             # The row these checks validated, never whichever is first when the write runs: a
             # cancellation commits from a worker thread and can advance the FIFO at any point.
             row = await tracked_write(self, partial(claim_session_input, self.db, epoch=self.epoch,
@@ -1140,6 +1139,7 @@ class SessionAuthority:
         route; None when the drain must exit (paused, or stopping with committed rows left queued)."""
         backoff = 0.0
         while True:
+            live.rescan = False  # Consume the prior wake; preserve a new one during this attempt.
             try:
                 row, first = await self._claim_next(ref, live)
             except RuntimeStoreError as exc:
@@ -1149,6 +1149,10 @@ class SessionAuthority:
                     from gateway.session_unattended_unknown import settle_unattended_unknown
                     if await settle_unattended_unknown(self, ref):
                         continue
+                if live.rescan:
+                    if self._drain_stopping(ref, live):
+                        return None
+                    continue  # Recheck native gates once per new event, never poll an unchanged refusal.
                 import logging
                 logging.getLogger(__name__).warning('Session %s paused: %s', ref.session_id, exc.reason)
                 self._pause(ref, exc.reason)

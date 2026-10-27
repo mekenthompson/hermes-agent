@@ -65,7 +65,14 @@ async def retry_process_stop(authority, ref, agent=None):
             if not await asyncio.to_thread(_recover_stopped_processes, authority, ref):
                 _observe_process_stop_completion(authority, ref, agent)
                 return False
-        if not await interrupt_processes(authority, ref, agent):
+        try:
+            if not await interrupt_processes(authority, ref, agent):
+                return False
+        except RuntimeStoreError as exc:
+            if exc.reason != 'process_stop_unknown':
+                raise
+            # Unproved process ownership is the same cleanup refusal as False,
+            # independent of an already validated inference result.
             return False
     await tracked_write(authority, partial(clear_process_stop, authority, ref, token))
     return True

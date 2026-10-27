@@ -63,9 +63,12 @@ class Model(BaseHTTPRequestHandler):
 
 
 @pytest.mark.platforms('linux')
-@pytest.mark.parametrize(('refuse', 'restart'), [(False, False), (True, False), (True, True)],
-                         ids=['verified-cleanup', 'refused-cleanup', 'refused-cleanup-cold-owner'])
-def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypatch, refuse, restart):
+@pytest.mark.parametrize(('refuse', 'restart', 'ownership_error'),
+                         [(False, False, False), (True, False, False), (True, True, False),
+                          (True, False, True), (True, True, True)],
+                         ids=['verified-cleanup', 'refused-cleanup', 'refused-cleanup-cold-owner',
+                              'unreadable-ownership', 'unreadable-ownership-cold-owner'])
+def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypatch, refuse, restart, ownership_error):
     home, user = tmp_path / 'state', tmp_path / 'user'
     home.mkdir(mode=0o700)
     user.mkdir()
@@ -143,6 +146,10 @@ def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypat
             assert 'result' in response, response  # Request ACK precedes physical cleanup verification.
             marker = ('gateway.process_stop.v1:' + sid,)
             assert query('SELECT value FROM state_meta WHERE key=?', marker)
+            ownership_path = home / 'logs' / 'process-results' / (child['session_id'] + '.json')
+            original_ownership = ownership_path.read_bytes() if ownership_path.exists() else None
+            if ownership_error:
+                (home / 'unreadable-ownership').touch()
             (home / 'parent-release-finished').touch()
             await async_wait_until(lambda: query('SELECT status FROM session_admissions WHERE request_id=?',
                 ('first',)) != [('started',)], timeout=30, what='finished-frame reconciliation')
@@ -151,7 +158,11 @@ def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypat
                 'completed', 'interrupted'}
             controls = query("SELECT request_id,status,outcome,generation FROM session_admissions WHERE principal_id='native-process-stop'")
             identity = json.dumps(['completion', child['session_id'], child['started_at']], separators=(',', ':'))
-            assert controls == [(identity, 'terminal', 'cancelled', None)], controls
+            if ownership_error:
+                assert (home / 'ownership-read-refused').exists()
+                assert controls in [[], [(identity, 'terminal', 'cancelled', None)]], controls
+            else:
+                assert controls == [(identity, 'terminal', 'cancelled', None)], controls
             if refuse:
                 assert states == {'first': 'terminal', 'follower': 'queued'} and alive(child), states
                 saved = query('SELECT value FROM state_meta WHERE key=?',
@@ -159,6 +170,12 @@ def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypat
                                   "SELECT admission_id FROM session_admissions WHERE request_id='first'")[0][0],))
                 assert saved and json.loads(saved[0][0])['result']['final_response'] == 'FINISH_RESULT', saved
                 assert query('SELECT value FROM state_meta WHERE key=?', marker) and peer.follower_alive == []
+                if ownership_error:
+                    (home / 'unreadable-ownership').unlink()
+                    if original_ownership is None:
+                        ownership_path.unlink(missing_ok=True)
+                    else:
+                        ownership_path.write_bytes(original_ownership)
                 (home / 'refuse-cleanup').unlink()
                 if restart:
                     owner.kill()
@@ -188,6 +205,8 @@ def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypat
             assert not any(alive(entry) for entry in peer.effect_processes), 'a captured job descendant survived Stop'
             assert not query('SELECT value FROM state_meta WHERE key=?', marker)
             assert peer.follower_alive == [False]
+            assert query("SELECT request_id,status,outcome,generation FROM session_admissions WHERE principal_id='native-process-stop'") == [
+                (identity, 'terminal', 'cancelled', None)]
             evidence.update(child_alive=False, follower_saw_live_process=peer.follower_alive)
 
     try:
@@ -198,6 +217,7 @@ def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypat
             finally:
                 (home / 'parent-release-finished').touch()
                 (home / 'refuse-cleanup').unlink(missing_ok=True)
+                (home / 'unreadable-ownership').unlink(missing_ok=True)
                 if child is not None and alive(child):
                     from tools import process_registry as module
                     monkeypatch.setattr(module, 'CHECKPOINT_PATH', home / 'processes.json')

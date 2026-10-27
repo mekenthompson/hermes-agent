@@ -6,12 +6,33 @@ import runpy
 
 from gateway.session_managed_worker import ManagedWorker
 from gateway.session_authority import SessionAuthority
+from gateway import session_ancillary
+from hermes_state_runtime import RuntimeStoreError
 from tests.waiting import async_wait_until
 from tools.process_registry import process_registry
 
 home = Path(os.environ['HERMES_HOME'])
 next_frame, kill = ManagedWorker.next_frame, process_registry.kill_process
 drain = SessionAuthority._drain
+interrupt = session_ancillary.interrupt_processes
+
+
+async def unreadable_ownership(authority, ref, agent):
+    fault = home / 'unreadable-ownership'
+    if fault.exists():
+        with process_registry._lock:
+            owned = [p for p in (*process_registry._running.values(), *process_registry._finished.values())
+                     if p.owner_task_id == ref.session_id]
+        assert len(owned) == 1, owned
+        path = home / 'logs' / 'process-results' / (owned[0].id + '.json')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{unreadable native retained ownership')
+    try:
+        return await interrupt(authority, ref, agent)
+    except RuntimeStoreError as exc:
+        if fault.exists() and exc.reason == 'process_stop_unknown':
+            (home / 'ownership-read-refused').touch()
+        raise
 
 
 async def observed_drain(self, ref):
@@ -52,5 +73,6 @@ def refuse_cleanup(session_id, **kwargs):
 
 ManagedWorker.next_frame = held_finished
 SessionAuthority._drain = observed_drain
+session_ancillary.interrupt_processes = unreadable_ownership
 process_registry.kill_process = refuse_cleanup
 runpy.run_module('gateway.run', run_name='__main__')
