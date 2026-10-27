@@ -157,15 +157,11 @@ def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypat
                             raise
                 else:
                     await retry(desc, sid)
-            else:
-                await async_wait_until(lambda: query('SELECT status FROM session_admissions WHERE request_id=?',
-                    ('follower',)) == [('terminal',)], timeout=30, what='human follower completes')
-                assert peer.follower_alive and not any(peer.follower_alive)
+            await async_wait_until(lambda: query('SELECT status FROM session_admissions WHERE request_id=?',
+                ('follower',)) == [('terminal',)], timeout=30, what='queued human completes once cleanup is proved')
             assert not alive(child), 'native Stop cleared its fence with physical work still alive'
             assert not any(alive(entry) for entry in peer.effect_processes), 'a captured job descendant survived Stop'
             assert not query('SELECT value FROM state_meta WHERE key=?', marker)
-            await async_wait_until(lambda: query('SELECT status FROM session_admissions WHERE request_id=?',
-                ('follower',)) == [('terminal',)], timeout=30, what='queued human completes once cleanup is proved')
             assert peer.follower_alive == [False]
             evidence.update(child_alive=False, follower_saw_live_process=peer.follower_alive)
 
