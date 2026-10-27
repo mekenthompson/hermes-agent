@@ -3971,6 +3971,8 @@ class BasePlatformAdapter(ProcessingLifecycleMixin, ABC):
                 )
             return
 
+        from gateway.platforms.event import require_structured_control
+        require_structured_control(event, self)
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.

@@ -205,6 +205,11 @@ the original target generation, queue cutoff and existing pending Stop fence in
 the native admission transaction. Control admission uses no model-work queue
 slot; pending controls reconcile before any later model claim, including restart.
 An identical redelivery never captures a newer target or cancels later input.
+The closed carrier is checked before ordinary slash/busy/control dispatch:
+internal messages, gateway-command flags, unknown kinds and media refuse. A
+valid authenticated Stop remains available during global pause, including idle
+conversations that still own unfinished cleanup; pause continues to hold ordinary
+new model input.
 
 The optional in-process `receipt.control` property reports `kind`, `request_consumed` and
 `cleanup_pending`. A transport may acknowledge its retained Stop only when

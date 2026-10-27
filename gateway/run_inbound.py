@@ -146,6 +146,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
         (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
         from gateway.run import _is_slack_ignored_channel
+        from gateway.platforms.event import require_structured_control
         source = event.source
         # getattr(self, ...) throughout: bare test runners build GatewayRunner via object.__new__.
         _config = getattr(self, "config", None)
@@ -174,6 +175,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return None
 
         is_internal = bool(getattr(event, "internal", False))  # e.g. background-process notifications
+        if event.structured_control is not None:
+            require_structured_control(event, self._intake_adapter_for(source))
 
         # Ignored-channel guard runs FIRST — before startup-restore queueing, plugin hooks, auth,
         # and session setup — so an ignored channel can never reach pairing/auth/session state.
@@ -238,6 +241,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             else:
                 logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             return None
+        if event.structured_control is not None:
+            require_structured_control(event, self._intake_adapter_for(source))
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
@@ -248,6 +253,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         running work or control traffic — recognized slash commands (incl. /pause off, the in-band
         resume) and replies owned by in-flight work (pending update prompt, running session,
         pending slash-confirm, dangerous-command approval) all pass through."""
+        if event.structured_control is not None:
+            from gateway.platforms.event import valid_structured_stop
+            return valid_structured_stop(event, self._intake_adapter_for(source))
         with suppress(Exception):
             _estop_cmd = event.get_command()
             if _estop_cmd:
@@ -1210,6 +1218,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # The message handler entered the routed profile's scope; its authority owns this turn.
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
+        if event.structured_control is not None:
+            from gateway.platforms.event import require_structured_control
+            require_structured_control(event, self._intake_adapter_for(source))
         if event.structured_control is not None and authority is None:
             from hermes_state_runtime import RuntimeStoreError
             reason = 'profile_mismatch' if getattr(self, 'session_authority', None) is not None else 'not_found'
