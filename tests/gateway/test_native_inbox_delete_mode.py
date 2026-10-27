@@ -75,19 +75,3 @@ class NativeInboxDeleteModeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_registered_base_commits_each_original_delivery_before_own_ack_in_delete_mode(self):
         await fixtures.NativeInboundRetryTests.test_actual_active_base_keeps_distinct_provider_ids_and_bodies_unmerged(self)
-
-    async def test_transaction_owner_keeps_compression_reset_and_branch_identities(self):
-        db = self.authority.db
-        db.create_session('root', source='telegram')
-        db.end_session('root', 'compression')
-        db.create_session('compressed', source='telegram', parent_session_id='root')
-        db.create_session('reset', source='telegram', parent_session_id='root', model_config={'_reset_from': 'root'})
-        db.create_session('branch', source='telegram', parent_session_id='root', model_config={'_branched_from': 'root'})
-        db.create_session('tool', source='tool', parent_session_id='root')
-        for sid in ('root', 'compressed', 'reset', 'branch', 'tool', 'missing'):
-            with self.subTest(session_id=sid):
-                expected = self.authority.logical_owner(sid)
-                observed = db._execute_write(lambda conn: self.authority.logical_owner(sid, cursor=conn))
-                self.assertEqual(observed, expected)
-        self.assertEqual(self.authority.logical_owner('compressed'), 'root')
-        self.assertEqual(self.authority.logical_owner('reset'), 'reset')

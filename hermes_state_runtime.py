@@ -212,13 +212,15 @@ def list_session_admissions(db, *, session_id: str, pending_only: bool = True) -
         return [_row(row) for row in conn.execute(sql, (session_id,))]
 
 
-def native_stop_watermark(db, session_id, *, cursor=None):
+def native_stop_watermark(db, session_id=None, *, cursor=None, route=None):
     """Existing control rows are the persistent fence for in-flight native capture."""
-    if not session_id:
+    if not session_id and route is None:
         return 0
+    selector, value = ('target_session_id', session_id) if route is None else (
+        "json_extract(payload_json, '$.native_text_v1.route')", route)
     def read(conn):
-        return conn.execute("SELECT COALESCE(MAX(seq),0) FROM session_admissions WHERE target_session_id=? "
-                            "AND json_type(payload_json, '$.native_stop_v1')='object'", (session_id,)).fetchone()[0]
+        return conn.execute(f"SELECT COALESCE(MAX(seq),0) FROM session_admissions WHERE {selector}=? "
+                            "AND json_type(payload_json, '$.native_stop_v1')='object'", (value,)).fetchone()[0]
     if cursor is not None:
         return read(cursor)
     with db._read_ctx() as conn:
