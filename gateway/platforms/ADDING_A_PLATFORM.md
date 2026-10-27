@@ -156,6 +156,7 @@ def check_<platform>_requirements() -> bool:
   gateway; the advisory lint (`scripts/check_profile_scope_patterns.py`, pattern P32) flags both
 - Call `self.handle_message(event)` to dispatch inbound messages to the gateway
 - Use `MessageEvent`, `MessageType` from `gateway.platforms.event` and `SendResult` from base
+
 - Use `cache_image_from_bytes`, `cache_audio_from_bytes`, `cache_document_from_bytes` for attachments
 - Filter self-messages (prevent reply loops)
 - Drop redelivered inbound IDs with `MessageDeduplicator` (`gateway/platforms/helpers.py`) held as an adapter
@@ -164,6 +165,24 @@ def check_<platform>_requirements() -> bool:
 - Redact sensitive identifiers (phone numbers, tokens) in all log output
 - Implement reconnection with exponential backoff + jitter for streaming connections
 - Set `MAX_MESSAGE_LENGTH` if the platform has message size limits
+
+**Durable provider inboxes.** An adapter that retains deliveries until the native
+owner accepts them can declare `requires_durable_input_ack = True` and implement
+`async on_message_admitted(event, receipt)`. The owner authenticates and commits
+the complete native input before this hook; identical delivery IDs reconcile to
+the same admission, and changed content conflicts before busy effects. The hook
+runs outside admission ordering and may acknowledge the retained provider row.
+A hook failure leaves the native receipt discoverable by an identical retry.
+Use stable original actor, message ID, timestamp, text and context on redelivery.
+
+This receipt means **accepted**, not completed or published. The normal model,
+native controls and final reply delivery still own those outcomes. A busy input
+can transfer only to its inspected native running generation; unsupported media
+or an unowned legacy generation stays queued. A Stop or uncertain attempted
+transfer never becomes an automatic replay. FIFO capacity still applies to new
+input; structured Stop and targeted approval controls remain available. This
+capability is declared by adapter code, not event metadata or a user permission
+flag. Its default is false, preserving established transports' busy behavior.
 
 ---
 

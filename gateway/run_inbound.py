@@ -1213,16 +1213,15 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if authority is not None and not event.get_command() and not is_internal:
             from gateway.session_ingress import admit_message, executing_admission
             if not executing_admission.get():
-                # The durable FIFO only orders turns; busy_input_mode still decides what a follow-up
-                # does to the RUNNING one (steer into it, redirect it, or end it so the FIFO advances).
-                # Without this, ``interrupt`` degrades to ``queue`` behind a turn that may hang for
-                # its whole request timeout.
-                # A bare "yes"/"no" to a blocking dangerous-command approval answers it (#46866):
-                # never an interrupt (read as deny) nor a queued turn (auto-deny deadlock).
-                # A turn a slash command produced (``/queue yes``) is never live typing.
-                if self._is_session_running(_quick_key) and not getattr(event, "_fifo_only", False) and (
-                        await self._route_plaintext_approval_while_busy(event, _quick_key)
-                        or await self._hm_busy_preempt(event, source, _quick_key)):
+                intake = getattr(self, '_intake_adapter_for', lambda _source: None)(source)
+                durable_inbox = getattr(intake, 'requires_durable_input_ack', False) is True
+                # Existing channels keep their live voice/approval behavior.
+                # Durable-inbox adapters declare the stronger commit-before-
+                # busy contract; event metadata can never opt into it.
+                if (not durable_inbox and self._is_session_running(_quick_key)
+                        and not getattr(event, "_fifo_only", False) and (
+                            await self._route_plaintext_approval_while_busy(event, _quick_key)
+                            or await self._hm_busy_preempt(event, source, _quick_key))):
                     return True, None
                 _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)
                 if _consumed:
@@ -1231,7 +1230,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                     return True, None  # a /stop or /new came after its command, as it clears the slot
                 # A failed admit stays the authority's answer (refusal notice or turn error), never a
                 # pending legacy turn: that would run unadmitted, outside the FIFO's order.
-                return True, await admit_message(authority, event)
+                # Admission/dedupe precedes every busy effect, including a bare
+                # approval answer. An exact retry must never steer a later turn.
+                return True, await admit_message(authority, event,
+                    busy=durable_inbox and not getattr(event, "_fifo_only", False))
         if (authority is None and not is_internal and not event.get_command()
                 and getattr(self, 'session_authority', None) is not None):
             # Scoped to a home this process does not serve: never fall back to the launch ledger.
