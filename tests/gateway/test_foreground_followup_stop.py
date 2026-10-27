@@ -13,7 +13,7 @@ from hermes_state_runtime import RuntimeStoreError, list_session_admissions
 from tests.gateway.test_native_job_scope_stop import live, spawn
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit
 from tests.tools.test_foreground_job_scope import capture_foreground_output
-from tests.waiting import wait_until
+from tests.waiting import async_wait_until, wait_until
 
 pytestmark = pytest.mark.platforms('linux')
 
@@ -117,7 +117,9 @@ if p.exists(): Path({str(effect)!r}).touch()
             record_property('first_stop_outcome', first_stop)
             await _submit(authority, 'human continuation')
             expected = ['human continuation']
-        await asyncio.wait_for(authority.sessions['s'].task, 15)
+        # An uncertain drain may finish paused before the real resource does.
+        # Its native completion wakes a later drain, without another message.
+        await async_wait_until(lambda: executed == expected and authority.sessions['s'].task.done(), timeout=15)
         assert job_quiescent(own) and not live(child), {
             'receipt': read_job_receipt(own), 'pending': process_stop_pending(db, 's'),
             'native': own.native_job_scope, 'pid': own.pid, 'birth': own.host_start_time,
