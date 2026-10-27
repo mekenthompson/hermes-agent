@@ -25,7 +25,9 @@ def expire_result(results, own, mode):
         for index in range(results.MAX_RETAINED_RESULTS + 1):
             # Cache pressure is unrelated output history, not copied launch
             # authority or a new owned process requiring a scope receipt.
-            assert results.save_completed_result(replace(own, id=f'proc_retention{index:03}',
+            # A history-only clone is still stored and counts toward the cap,
+            # but has no original publisher that could certify a complete result.
+            assert not results.save_completed_result(replace(own, id=f'proc_retention{index:03}',
                 owner_task_id='retention-history', task_id='retention-history', parent_session_id='retention-history',
                 session_key='retention-history', pid=None, host_start_time=None, native_job_scope=False,
                 notify_on_complete=False, completion_consumed=False))
