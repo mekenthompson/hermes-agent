@@ -235,12 +235,16 @@ class SessionAuthority:
                 authorize(conn)
         return guard
 
-    def logical_owner(self, session_id):
+    def logical_owner(self, session_id, *, cursor=None):
         """The FIFO/admission identity of a route: the root of its compression lineage.
         Compression advances the physical transcript, never the admission identity. A session this
         store does not hold (another served profile's, under multiplex) keeps its own id."""
         if not session_id:
             return session_id
+        if cursor is not None:
+            # Existing lease identity walks the same compression ancestors on
+            # the writer's transaction; opening a reader here deadlocks DELETE mode.
+            return self.db._session_turn_lease_key_on_conn(cursor, session_id)
         lineage = self.db.get_compression_lineage(session_id)
         return lineage[0] if lineage else session_id
 
@@ -519,7 +523,7 @@ class SessionAuthority:
         from hermes_state_runtime import native_stop_watermark
         def stop_sequence(cursor=None):
             entry = self.runner.session_store.lookup_by_session_key(key)
-            sid = self.logical_owner(entry.session_id) if entry is not None else None
+            sid = self.logical_owner(entry.session_id, cursor=cursor) if entry is not None else None
             return native_stop_watermark(self.db, sid, cursor=cursor)
         seen_stop = stop_sequence() if durable else None
 
