@@ -2118,17 +2118,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 session.native_job_scope or session.systemd_unit or job_quiescent(session)):
             return self._refuse_backend_stop(session, consume_output)
         if session.exited:
-            if (session.native_job_scope and session._reader_thread is not None
-                    and not session._completion_event.is_set()):
+            if session._reader_thread is not None and not session._completion_event.is_set():
                 return self._refuse_backend_stop(session, consume_output)
-            # A double-forked descendant may still be alive in the systemd scope even
-            # though the main process exited — stop the scope to reap survivors.
-            # See #70716.
-            # If the worker was spawned in its own systemd scope (#70716), stop the entire unit to reap any
-            # double-forked descendants that were reparented inside the scope and survived the PID signal
-            # above (reviewer gap #2). ``systemctl --user stop`` sends SIGTERM to every process in the
-            # cgroup and escalates to SIGKILL after TimeoutStopSec. This is additive — the PID-based kill
-            # above already handled the main process; this catches stragglers.
+            # The primary's exit does not prove detached descendants left its native unit.
             scope_stopped = self._stop_scope(session)
             with session._lock:
                 result = self._exit_snapshot(session, "already_exited")
@@ -2182,6 +2174,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                     "error": f"Kill incomplete: systemd scope {session.systemd_unit} did not stop",
                     "session_id": session.id, "scope_stop_failed": session.systemd_unit,
                     "process_running": not root_exited}
+            if session._reader_thread is not None and not session._completion_event.wait(1.0):
+                return self._refuse_backend_stop(session, consume_output)
             # Capture output, mark consumed, THEN expose ``exited`` to watcher tasks —
             # closes the delayed-notification race without losing the transcript.
             with session._lock:

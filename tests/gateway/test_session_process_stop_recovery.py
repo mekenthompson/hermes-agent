@@ -130,6 +130,7 @@ async def test_failed_stop_fences_later_inputs_until_actual_cleanup(tmp_path, mo
 async def test_stop_consumes_ready_own_completion_but_delivers_neighbor(tmp_path, monkeypatch, registry, managed):
     from agent.managed_worker import WorkerControls
     from gateway.session_ancillary import process_stop_pending
+    from tools.process_registry_job import job_quiescent, read_job_receipt
     import threading
     if not managed:
         db, authority = _authority(tmp_path, monkeypatch)
@@ -144,6 +145,9 @@ async def test_stop_consumes_ready_own_completion_but_delivers_neighbor(tmp_path
     gate.touch()
     for process in (own, neighbor):
         assert await asyncio.to_thread(process._completion_event.wait, 10)
+    # This case consumes already-ready work, so establish whole native job fate
+    # as well as reader completion before testing cancellation and isolation.
+    await asyncio.to_thread(wait_until, lambda: all(job_quiescent(p) for p in (own, neighbor)), timeout=10)
     if managed:
         controls = WorkerControls.__new__(WorkerControls)
         controls.route, controls.stopped = 'route', threading.Event()
@@ -152,7 +156,13 @@ async def test_stop_consumes_ready_own_completion_but_delivers_neighbor(tmp_path
         controls.agent = SimpleNamespace(session_id='s', hard_interrupt=lambda *a, **kw: None)
         controls.stop(processes=True)
     else:
-        await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
+        try:
+            await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
+        except RuntimeStoreError as error:
+            state = {p.id: {"receipt": read_job_receipt(p), "exited": p.exited,
+                           "pending": p._scope_stop_pending, "completion": p._completion_event.is_set()}
+                     for p in (own, neighbor)}
+            pytest.fail(f"Ready native Stop failed: {error.reason}; {state}")
         assert process_stop_pending(db, 's') is None
         db.close()
     assert registry.is_completion_consumed(own.id)

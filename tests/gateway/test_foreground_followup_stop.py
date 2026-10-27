@@ -1,5 +1,6 @@
 """Follow-up yielding preserves the original native job across Stop, reload and FIFO."""
 import asyncio
+import json
 from pathlib import Path
 import shlex
 import sys
@@ -27,8 +28,9 @@ async def test_foreground_followup_then_stop_quiesces_before_human_fifo(tmp_path
     from tools import process_registry as module
     from tools.environments.local import LocalEnvironment
     from tools.interrupt import request_yield, consume_yield
-    from tools.process_registry_job import job_quiescent, job_receipt_path, request_job_stop
+    from tools.process_registry_job import job_quiescent, job_receipt_path, read_job_receipt, request_job_stop
     from tools.terminal_tool_background import yield_to_background_handler
+    from utils import atomic_json_write
     db, authority = _authority(tmp_path, monkeypatch)
     original = module.ProcessRegistry()
     monkeypatch.setattr(module, 'process_registry', original)
@@ -88,6 +90,7 @@ if p.exists(): Path({str(effect)!r}).touch()
             assert current.get(own.id).native_job_scope
         receipt = job_receipt_path(own.id)
         if lose_receipt:
+            assert read_job_receipt(own) is not None, 'Original producer must have captured authentic native identity'
             saved = receipt.read_bytes()
             receipt.unlink()
             with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
@@ -97,7 +100,8 @@ if p.exists(): Path({str(effect)!r}).touch()
             await asyncio.wait_for(authority.sessions['s'].task, 10)
             assert executed == []
             assert any(row['status'] == 'queued' for row in list_session_admissions(db, session_id='s'))
-            receipt.write_bytes(saved)
+            atomic_json_write(receipt, json.loads(saved), mode=0o600)
+            assert read_job_receipt(own) == json.loads(saved), 'Authentic native evidence must be fully published'
             # A new ordinary human message drives native recovery; the first
             # queued human request remains ahead of it, with no manual Stop retry.
             await _submit(authority, 'follow-up human continuation')
@@ -114,14 +118,18 @@ if p.exists(): Path({str(effect)!r}).touch()
             await _submit(authority, 'human continuation')
             expected = ['human continuation']
         await asyncio.wait_for(authority.sessions['s'].task, 15)
-        assert job_quiescent(own) and not live(child)
+        assert job_quiescent(own) and not live(child), {
+            'receipt': read_job_receipt(own), 'pending': process_stop_pending(db, 's'),
+            'native': own.native_job_scope, 'pid': own.pid, 'birth': own.host_start_time,
+            'exited': own.exited, 'completion': own._completion_event.is_set(),
+            'executed': executed, 'checkpoint': module._checkpoint_path().read_text()}
         assert process_stop_pending(db, 's') is None
         assert executed == expected and not effect.exists()
         assert own.output_buffer.count('original foreground output') == 1
     finally:
         consume_yield(thread.ident)
         if receipt is not None and saved is not None and not receipt.exists():
-            receipt.write_bytes(saved)
+            atomic_json_write(receipt, json.loads(saved), mode=0o600)
         for session in [own, *neighbors]:
             if session is not None:
                 await asyncio.to_thread(request_job_stop, original, session)
