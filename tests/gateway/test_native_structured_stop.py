@@ -281,9 +281,9 @@ class NativeStructuredStopTests(unittest.IsolatedAsyncioTestCase):
         await self.start()
         untyped = self.stop('untyped')
         untyped.structured_control = 'stop'
-        handled, refusal = await self.receive(untyped)
-        self.assertTrue(handled)
-        self.assertIn('refused', refusal)
+        with self.assertRaises(RuntimeStoreError) as malformed:
+            await self.receive(untyped)
+        self.assertEqual(malformed.exception.reason, 'invalid_params')
         registry = SessionAuthorities(self.home, multiplexed=True)
         registry.add(self.home, self.authority)
         self.runner.session_authorities = registry

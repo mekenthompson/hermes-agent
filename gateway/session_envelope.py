@@ -11,7 +11,7 @@ from datetime import datetime
 import json
 import logging
 
-from gateway.platforms.event import MessageEvent, MessageType, StructuredControl
+from gateway.platforms.event import MessageEvent, MessageType, StructuredControl, valid_structured_stop
 from gateway.session import SessionSource
 from gateway.session_ingress_media import capture_native_media, restore_native_media
 from hermes_state_runtime import RuntimeStoreError
@@ -106,11 +106,7 @@ def _event_clause(runner, event, provenance, fresh_roles):
     if event.internal:
         return 'internal'
     if event.structured_control is not None:
-        adapter = runner._adapter_for_source(source)
-        if (event.structured_control is not StructuredControl.STOP
-                or getattr(adapter, 'requires_durable_input_ack', False) is not True
-                or event.allow_gateway_control or not event.message_id or event.edit_revision
-                or event.message_type is not MessageType.TEXT or event.media_urls or event.media_types):
+        if not valid_structured_stop(event, runner._adapter_for_source(source)):
             return 'structured_control'
     if _native_metadata(event) is None:
         return 'metadata'
