@@ -73,7 +73,8 @@ print('original completed output',flush=True)
                     native_job_scope=False, output_log='',
                     parent_session_id='history', task_id='history', owner_task_id='history',
                     session_key='history', notify_on_complete=False)
-                assert results.save_completed_result(history)
+                # History pressure persists without claiming original-publisher finality.
+                assert not results.save_completed_result(history)
             assert len(results._result_paths()) == results.MAX_RETAINED_RESULTS == 64
             assert not (Path(profile) / 'logs' / 'process-results' / f'{process.id}.json').exists()
         if disposition == 'revoked':
