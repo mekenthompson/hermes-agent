@@ -702,12 +702,14 @@ async def execute_managed(authority, ref, row, policy):
                 with suppress(subprocess.TimeoutExpired):
                     await asyncio.to_thread(process.wait, 10)
                 accepted = _with_stop_cause(accepted, worker)
-                from gateway.session_ancillary import finish_process_stop
-                await finish_process_stop(authority, ref)
                 # Like in-process execution, settlement belongs to the drain's stream lock.
+                # Capture before its cleanup retry: a known finished answer settles normally
+                # even while the independent native Stop fence holds every successor.
                 authority.pending_results[row['admission_id']] = {
                     'result': {**accepted, 'local_viewer': True}, 'usage': usage,
                     **await asyncio.to_thread(_settled_session_usage, authority, scope['session_id'], accepted, scope['execution_id'])}
+                from gateway.session_ancillary import retry_process_stop
+                await retry_process_stop(authority, ref)
                 return accepted['final_response']
             raise RuntimeStoreError('invalid_worker_frame')
     except (Exception, asyncio.CancelledError) as exc:

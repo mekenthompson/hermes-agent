@@ -63,8 +63,9 @@ class Model(BaseHTTPRequestHandler):
 
 
 @pytest.mark.platforms('linux')
-@pytest.mark.parametrize('refuse', [False, True], ids=['verified-cleanup', 'refused-cleanup'])
-def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypatch, refuse):
+@pytest.mark.parametrize(('refuse', 'restart'), [(False, False), (True, False), (True, True)],
+                         ids=['verified-cleanup', 'refused-cleanup', 'refused-cleanup-cold-owner'])
+def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypatch, refuse, restart):
     home, user = tmp_path / 'state', tmp_path / 'user'
     home.mkdir(mode=0o700)
     user.mkdir()
@@ -85,11 +86,20 @@ def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypat
         with closing(sqlite3.connect(home / 'state.db')) as db:
             return db.execute(sql, args).fetchall()
 
-    async def exercise(desc):
+    async def retry(desc, sid, *, stop=True):
+        async with websocket(home, desc) as ws:
+            snapshot = await rpc(ws, 'session.resume', session_id=sid)
+            assert 'result' in snapshot, snapshot
+            if stop:
+                response = await rpc(ws, 'session.interrupt', session_id=sid,
+                    execution_generation=snapshot['result']['execution_generation'])
+                assert 'result' in response, response
+
+    async def exercise(owner, desc):
         nonlocal child
         async with websocket(home, desc) as ws:
             created = await rpc(ws, 'session.create', request_id='finished-stop', source='cli', cwd=str(home),
-                model='finish-model', provider='custom', base_url=url, api_key='loopback-only',
+                model='finish-model', provider='custom', base_url=url,
                 toolsets=['terminal'], ignore_rules=True)
             assert 'result' in created, created
             sid = created['result']['session_id']
@@ -130,13 +140,27 @@ def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypat
             identity = json.dumps(['completion', child['session_id'], child['started_at']], separators=(',', ':'))
             assert controls == [(identity, 'terminal', 'cancelled', None)], controls
             if refuse:
-                assert states == {'first': 'unknown', 'follower': 'queued'} and alive(child), states
+                assert states == {'first': 'terminal', 'follower': 'queued'} and alive(child), states
+                saved = query('SELECT value FROM state_meta WHERE key=?',
+                              ('gateway.admission.result.v1.' + query(
+                                  "SELECT admission_id FROM session_admissions WHERE request_id='first'")[0][0],))
+                assert saved and json.loads(saved[0][0])['result']['final_response'] == 'FINISH_RESULT', saved
                 assert query('SELECT value FROM state_meta WHERE key=?', marker) and peer.follower_alive == []
                 (home / 'refuse-cleanup').unlink()
-                snapshot = await rpc(ws, 'session.resume', session_id=sid)
-                response = await rpc(ws, 'session.interrupt', session_id=sid,
-                    execution_generation=snapshot['result']['execution_generation'])
-                assert 'result' in response, response
+                if restart:
+                    owner.kill()
+                    owner.wait(timeout=10)
+                    with daemon(ROOT, home, env, barrier=False) as (_reloaded, reloaded_desc):
+                        await retry(reloaded_desc, sid, stop=False)
+                        try:
+                            await async_wait_until(lambda: query('SELECT status FROM session_admissions WHERE request_id=?',
+                                ('follower',)) == [('terminal',)], timeout=30, what='cold owner follower completes')
+                        except AssertionError:
+                            print(query('SELECT request_id,status,outcome FROM session_admissions'))
+                            print((home / 'restart.log').read_text()[-5000:])
+                            raise
+                else:
+                    await retry(desc, sid)
             else:
                 await async_wait_until(lambda: query('SELECT status FROM session_admissions WHERE request_id=?',
                     ('follower',)) == [('terminal',)], timeout=30, what='human follower completes')
@@ -144,13 +168,16 @@ def test_late_stop_verifies_processes_after_real_worker_exit(tmp_path, monkeypat
             assert not alive(child), 'native Stop cleared its fence with physical work still alive'
             assert not any(alive(entry) for entry in peer.effect_processes), 'a captured job descendant survived Stop'
             assert not query('SELECT value FROM state_meta WHERE key=?', marker)
+            await async_wait_until(lambda: query('SELECT status FROM session_admissions WHERE request_id=?',
+                ('follower',)) == [('terminal',)], timeout=30, what='queued human completes once cleanup is proved')
+            assert peer.follower_alive == [False]
             evidence.update(child_alive=False, follower_saw_live_process=peer.follower_alive)
 
     try:
         fixture = str(ROOT / 'tests/gateway/fixtures/managed_finished_stop_probe.py')
         with daemon(ROOT, home, env, barrier=True, fixture=fixture) as (_owner, desc):
             try:
-                asyncio.run(exercise(desc))
+                asyncio.run(exercise(_owner, desc))
             finally:
                 (home / 'parent-release-finished').touch()
                 (home / 'refuse-cleanup').unlink(missing_ok=True)
