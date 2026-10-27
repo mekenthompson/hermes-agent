@@ -126,9 +126,9 @@ def test_output_after_the_kill_is_not_added_to_the_killed_session(tmp_path, monk
 
 
 @_POSIX_PTY
-def test_chunk_read_before_the_kill_is_not_added_after_it(tmp_path, native_local):
-    # The reader has read a chunk but not yet buffered it when the kill snapshots the output
-    # and sets ``exited``. The chunk must not land in the killed session afterwards.
+def test_chunk_read_before_stop_finishes_before_successful_ack(tmp_path, native_local):
+    # A held original reader prevents a complete Stop receipt. Its pre-Stop
+    # output must finish before the successful ACK, with no later chunk admitted.
     pytest.importorskip("ptyprocess")
     registry = ProcessRegistry()
     entered, release = threading.Event(), threading.Event()
@@ -151,10 +151,22 @@ def test_chunk_read_before_the_kill_is_not_added_after_it(tmp_path, native_local
     try:
         assert entered.wait(5), "reader never read the marker"
         result = registry.kill_process(session.id)
+        assert result['status'] == 'error' and result['error'] == 'process_stop_unknown'
+        assert session._scope_stop_pending and not session._completion_event.is_set()
+        assert not session.exited
+        assert "RACE-MARKER" not in result.get("output", "")
     finally:
         release.set()
-    assert result["status"] == "killed"
-    assert _wait_for(lambda: not session._reader_thread.is_alive(), 5)
-    assert "RACE-MARKER" not in result.get("output", "")
-    assert "RACE-MARKER" not in session.output_buffer
-    assert not any("RACE-MARKER" in text for text in emitted)
+    assert session._completion_event.wait(5)
+    _wait_for_reader_close(session)
+    result = registry.kill_process(session.id)
+    assert result['status'] == 'already_exited'
+    from tools.process_registry_job import job_quiescent
+    assert job_quiescent(session)
+    assert "RACE-MARKER" in result['output'] and "RACE-MARKER" in session.output_buffer
+    assert sum("RACE-MARKER" in text for text in emitted) == 1
+    final_output, final_emitted = session.output_buffer, list(emitted)
+    # A late chunk at the existing PTY ingestion boundary is still discarded
+    # after the successful Stop, rather than added or streamed to the client.
+    registry._ingest_output(session, 'POST-ACK-CHUNK', unless_exited=True)
+    assert session.output_buffer == final_output and emitted == final_emitted
