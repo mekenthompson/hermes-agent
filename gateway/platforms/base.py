@@ -3998,7 +3998,8 @@ class BasePlatformAdapter(ProcessingLifecycleMixin, ABC):
                            expected_session_key, session_key)
             return
         from gateway.session_ingress_burst import burst_gate
-        behind_burst = await burst_gate(self, event, session_key)  # a serial reader's command waits too
+        behind_burst = (False if self.requires_durable_input_ack is True
+                        else await burst_gate(self, event, session_key))
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
@@ -4035,8 +4036,12 @@ class BasePlatformAdapter(ProcessingLifecycleMixin, ABC):
         commands / clarify replies dispatch inline, everything else is queued."""
         # The shared runtime's durable FIFO replaces the adapter's busy-message slot.
         if self._shared_runtime_owns_input(event):
-            from gateway.session_ingress_burst import dispatch_busy_burst
-            await dispatch_busy_burst(self, event, session_key)  # main's photo/text burst merge
+            if self.requires_durable_input_ack is True:
+                from gateway.session_ingress import dispatch_shared_busy
+                await dispatch_shared_busy(self, event, session_key)
+            else:
+                from gateway.session_ingress_burst import dispatch_busy_burst
+                await dispatch_busy_burst(self, event, session_key)  # main's photo/text burst merge
             return
         # Bypass commands run inline: queued they'd leak as user text (/new) or deadlock
         # (/approve, /deny — the agent is blocked on Event.wait).  Dispatch inline by
