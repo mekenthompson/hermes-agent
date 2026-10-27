@@ -20,6 +20,7 @@ class Prepared:
     stop_epoch: int
     stop_sequence: int
     approval: tuple | None = None
+    approval_text: str | None = None
 
 
 def prepare(authority, event):
@@ -55,7 +56,7 @@ def prepare(authority, event):
                 approval = ('unbound', '', ())  # no bare-route fallback
     from hermes_state_runtime import native_stop_watermark
     return Prepared(session_id, route, generation, agent, authority.route_epoch(route),
-                    native_stop_watermark(authority.db, session_id), approval)
+                    native_stop_watermark(authority.db, session_id), approval, event.text if approval else None)
 
 
 def _current(authority, event, prepared):
@@ -73,6 +74,13 @@ async def apply(authority, event, receipt, prepared, fence):
     """Only a newly committed input may steer/approve/interrupt its captured target."""
     if prepared is None or receipt.ref.session_id != prepared.session_id:
         return
+    transport_event = event
+    from gateway.session_envelope import check_native_route, restore_native
+    from hermes_state_runtime import get_session_admission
+    row = get_session_admission(authority.db, admission_id=receipt.admission_id)
+    if row['payload']['native_text_v1']['route'] != prepared.route:
+        return  # a changed admission route cannot borrow the captured running target
+    event = restore_native(row['payload'], authority.runner)
     from gateway.session_runtime_workers import tracked_write
     if not _current(authority, event, prepared):
         await tracked_write(authority, partial(cancel_session_input, authority.db,
@@ -85,6 +93,10 @@ async def apply(authority, event, receipt, prepared, fence):
             await tracked_write(authority, partial(cancel_session_input, authority.db,
                 epoch=authority.epoch, admission_id=receipt.admission_id))
             return
+    # Recheck the committed sender's connector/route and current roles. The
+    # caller may have changed any part of its event while the write was pending.
+    await check_native_route(authority.runner, row['payload'], authority.physical_target(receipt.ref),
+        event.source, authority.runner._adapter_for_source(event.source))
     if event.message_type != MessageType.TEXT or event.media_urls or event.media_types:
         return  # a complete media envelope must run as its own native turn
     runner, agent, route = authority.runner, prepared.agent, prepared.route
@@ -99,6 +111,10 @@ async def apply(authority, event, receipt, prepared, fence):
     current = lambda: _current(authority, event, prepared)
     steered = redirected = False
     if prepared.approval is not None:
+        # Prompt IDs were captured before admission; a different committed
+        # instruction cannot borrow that earlier answer or its prompt targets.
+        if not event.allow_gateway_control or event.text != prepared.approval_text:
+            return
         verb, choice, ids = prepared.approval
         if verb == 'unbound':
             return
@@ -115,12 +131,12 @@ async def apply(authority, event, receipt, prepared, fence):
                 from agent.i18n import t
                 key = ('gateway.deny.denied_' + ('plural' if count[0] > 1 else 'singular') if verb == 'deny'
                        else f"gateway.approve.{choice}_{'plural' if count[0] > 1 else 'singular'}")
-                text = await runner._deliver_approval_confirmation(event, t(key, count=count[0]), verb)
+                text = await runner._deliver_approval_confirmation(transport_event, t(key, count=count[0]), verb)
                 adapter = runner._delivery_adapter_for(event.source)
                 if adapter and text:
                     content, _ttl = adapter._unwrap_ephemeral(text)
                     if content:
-                        await runner._send_busy_reply(event, adapter, content, plain_anchor=True)
+                        await runner._send_busy_reply(transport_event, adapter, content, plain_anchor=True)
             return acknowledge
         return
     text = runner._steer_text_with_origin((event.text or '').strip(), event)
@@ -164,6 +180,6 @@ async def apply(authority, event, receipt, prepared, fence):
             demoted_for_subagents=demoted_children, demoted_for_compression=demoted_compression)
         state = runner._peek_session_state(route)
         async def acknowledge():
-            await runner._busy_interrupt_and_ack(event, route, adapter, state, agent,
+            await runner._busy_interrupt_and_ack(transport_event, route, adapter, state, agent,
                 outcome, already_interrupted=already_interrupted or mode == 'interrupt')
         return acknowledge
