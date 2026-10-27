@@ -462,19 +462,26 @@ class SessionAuthority:
         from gateway.session_automation import admit_automation
         return await admit_automation(self, adapter, event, identity, replaces)
 
-    async def admit_native(self, event):
+    async def admit_native(self, event, *, before_schedule=None):
         """Await current connector policy, then commit before ACK or scheduling execution."""
         from gateway.session_ingress_media import abandon_capture, capture_lease
         async with self._route_turn(event) as fence:
             with capture_lease(self) as scope:  # captured bytes are held until commit or refusal
                 try:
-                    return await self._admit_native(event, fence)
+                    receipt = await self._admit_native(event, fence, before_schedule=before_schedule)
                 except BaseException:
                     # Before the shielded write starts, no row can own these bytes. A cancelled copy
                     # arranges its own completion cleanup in prepare_native; other failures clean here.
                     if not scope.write_started:
                         await abandon_capture(scope)
                     raise
+        # A transport ACK can wait on I/O or fail. It owns neither admission
+        # ordering nor native scheduling, and must not hold up another input/Stop.
+        adapter = self.runner._adapter_for_source(event.source)
+        hook = getattr(adapter, 'on_message_admitted', None)
+        if callable(hook):
+            await hook(event, receipt)
+        return receipt
 
     @contextlib.asynccontextmanager
     async def _route_turn(self, event):
@@ -516,7 +523,7 @@ class SessionAuthority:
         turn read before it (``_stop_epoch``), never commit."""
         self._route_epochs[route] = self.route_epoch(route) + 1
 
-    async def _admit_native(self, event, fence=None):
+    async def _admit_native(self, event, fence=None, *, before_schedule=None):
         import json
         from gateway.session_envelope import prepare_native, restore_native_source
         self._require_admission_open()
@@ -533,11 +540,13 @@ class SessionAuthority:
         if revision := payload['native_text_v1']['event'].get('edit_revision'):
             request_id += ':edit:' + revision  # an edit is its own input, not a changed replay of the send
         committed = [ref]  # the row's target: the write may retarget a rotated-away reservation
+        fresh = [False]
         # A /retry re-send carries its transcript rewrite: it commits in this admission's own write.
         from gateway import session_retry_admission
         rewrite = session_retry_admission.take(event, self.db)
 
-        def admitted(row):
+        def admitted(committed_input):
+            row, fresh[0] = committed_input
             committed[0] = SessionRef(self.profile_id, row.get('target_session_id') or ref.session_id)
             if rewrite is not None and rewrite.applied:
                 rewrite.on_commit()
@@ -546,12 +555,22 @@ class SessionAuthority:
         if (scope := _lease_scope.get()) is not None:
             scope.write_started = True
         native_write_started.set(True)  # shielded from here: a cancelled caller may still commit
-        return await tracked_write(self, partial(
+        receipt = await tracked_write(self, partial(
             self._admit_native_write, principal_id='messaging:' + identity, session_id=ref.session_id,
             request_id=request_id, payload=payload,
             authorize=session_retry_admission.compose(rewrite, self._admission_gate(fence)),
             raw=getattr(event, 'raw_message', None)),
-            then=admitted, ordered=True, after=lambda _receipt: self._schedule_admitted(committed[0]))
+            then=admitted, ordered=True)
+        try:
+            # Commit before transport ACK or busy effects. A duplicate returns its
+            # original receipt and never re-enters approval/steer/interrupt handling.
+            if before_schedule is not None and fresh[0]:
+                await before_schedule(receipt, fence)
+                row = get_session_admission(self.db, admission_id=receipt.admission_id)
+                receipt = self._receipt(row)
+            return receipt
+        finally:
+            self._schedule_admitted(committed[0])
 
     def _admit_native_write(self, *, principal_id, session_id, request_id, payload, authorize, raw=None):
         # Off the loop and in admission order: the redelivery reconcile reads the ledger it decides
@@ -562,8 +581,15 @@ class SessionAuthority:
         try:
             payload = reconcile_native_retry(self.db, principal_id=principal_id, session_id=session_id,
                                              request_id=request_id, payload=payload, raw=raw)
-            return admit_session_input(self.db, epoch=self.epoch, principal_id=principal_id, session_id=session_id,
-                                       request_id=request_id, payload=payload, _authorize_write=authorize)
+            admission_fresh = [False]
+            def new_input(conn):
+                authorize(conn)
+                admission_fresh[0] = True
+            def replayed(_conn):
+                admission_fresh[0] = False  # also resets a rolled-back/retried new write
+            row = admit_session_input(self.db, epoch=self.epoch, principal_id=principal_id, session_id=session_id,
+                request_id=request_id, payload=payload, _authorize_write=new_input, _replay_guard=replayed)
+            return row, admission_fresh[0]
         except Exception:
             # A refused admission owns nothing it captured (unless another admission holds the same bytes).
             drop_capture_lease()

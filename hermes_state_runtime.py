@@ -350,6 +350,17 @@ def revert_steer_input(db, *, epoch: int, admission_id: str, generation: int) ->
     return db._execute_write(write)
 
 
+def interrupt_steer_input(db, *, epoch: int, admission_id: str, generation: int) -> bool:
+    """An attempted/Stopped transfer must never become another queued execution."""
+    def write(conn):
+        _epoch(conn, epoch)
+        return conn.execute("UPDATE session_admissions SET outcome='interrupted' WHERE admission_id=? "
+                            "AND status='terminal' AND outcome IN ('steering','steered') "
+                            "AND owner_epoch=? AND generation=?",
+                            (admission_id, epoch, generation)).rowcount == 1
+    return db._execute_write(write)
+
+
 REPLACEMENT_PREFIX = 'gateway.queued_replacement.v1.'
 
 

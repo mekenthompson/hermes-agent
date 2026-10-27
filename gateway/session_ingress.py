@@ -35,14 +35,21 @@ QUEUE_FULL_REPLY = ('⏳ Too many messages are already waiting in this conversat
                     'send this again after the current reply.')
 
 
-async def admit_message(authority, event):
+async def admit_message(authority, event, *, busy=False):
     from gateway.session_authority import messaging_admission
     accepted, committed = busy_acceptance.get(), busy_commit.get()
     busy_acceptance.set(None)  # the drain task this schedules must not inherit the busy caller's future
     busy_commit.set(None)
     ingress = messaging_admission.set(True if accepted is None else accepted)
+    presentation = [None]
     try:
-        receipt = await authority.admit_native(event)
+        before_schedule = None
+        if busy:
+            from gateway.session_native_busy import prepare, apply
+            prepared = prepare(authority, event)
+            async def before_schedule(receipt, fence):
+                presentation[0] = await apply(authority, event, receipt, prepared, fence)
+        receipt = await authority.admit_native(event, before_schedule=before_schedule)
         if committed is not None and not committed.done():
             committed.set_result(None)  # the row is durable (any status): a barrier may go on
     except RuntimeStoreError as exc:
@@ -61,6 +68,13 @@ async def admit_message(authority, event):
         return QUEUE_FULL_REPLY
     finally:
         messaging_admission.reset(ingress)
+    if presentation[0] is not None:
+        # Presentation is outside native admission ordering: a slow ACK cannot
+        # prevent a later input/Stop from committing or reaching the live turn.
+        try:
+            await presentation[0]()
+        except Exception:
+            logger.exception('Native busy input was accepted but its acknowledgement failed')
     if receipt.status == 'terminal':
         return None
     # Only the delivery waiter is process-local; execution reads the committed snapshot.
