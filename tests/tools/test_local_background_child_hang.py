@@ -10,16 +10,57 @@ of the backgrounded service (indefinitely for a uvicorn server).
 The fix switches ``_drain()`` to select()-based non-blocking reads and
 stops draining shortly after bash exits even if the pipe hasn't EOF'd.
 """
-import subprocess
+import contextlib
+import json
+import os
+import shlex
+import sys
 import time
 
 import pytest
 
 from tools.environments.local import LocalEnvironment
+from tests.waiting import wait_until
 
 
-def _pkill(pattern: str) -> None:
-    subprocess.run(f"pkill -9 -f {pattern!r} 2>/dev/null", shell=True, check=False)
+@pytest.fixture
+def background_command(tmp_path):
+    """Release exactly this finite fixture; never kill a process by name."""
+    import psutil
+    libc, previous = None, None
+    if sys.platform == 'linux':
+        import ctypes
+        libc, previous = ctypes.CDLL(None, use_errno=True), ctypes.c_int()
+        assert libc.prctl(37, ctypes.byref(previous), 0, 0, 0) == 0
+        assert libc.prctl(36, 1, 0, 0, 0) == 0
+    ready, release = tmp_path / 'background-ready', tmp_path / 'background-release'
+    code = f'''import json,os,time,psutil
+from pathlib import Path
+Path({str(ready)!r}).write_text(json.dumps([os.getpid(),psutil.Process().create_time()]))
+end=time.monotonic()+20
+while not Path({str(release)!r}).exists() and time.monotonic()<end: time.sleep(.01)
+'''
+    try:
+        yield shlex.join([sys.executable, '-c', code])
+    finally:
+        release.touch()
+        try:
+            wait_until(ready.exists, what='actual background fixture started')
+            if ready.exists():
+                pid, birth = json.loads(ready.read_text())
+                def finished():
+                    try:
+                        proc = psutil.Process(pid)
+                        return proc.create_time() != birth or proc.status() == psutil.STATUS_ZOMBIE
+                    except psutil.NoSuchProcess:
+                        return True
+                wait_until(finished, timeout=10, what='the released fixture child exits')
+                if libc is not None:
+                    with contextlib.suppress(ChildProcessError):
+                        os.waitpid(pid, 0)
+        finally:
+            if libc is not None:
+                assert libc.prctl(36, previous.value, 0, 0, 0) == 0
 
 
 @pytest.fixture
@@ -34,40 +75,34 @@ def local_env():
 class TestBackgroundChildDoesNotHang:
     """Regression guard for issue #8340."""
 
-    def test_plain_background_returns_promptly(self, local_env):
+    def test_plain_background_returns_promptly(self, local_env, background_command):
         """``cmd &`` with no output redirection must not hang on pipe inherit."""
         marker = "hermes_8340_plain_bg"
-        cmd = f'python3 -c "import time; time.sleep(60)" & echo {marker}'
-        try:
-            t0 = time.monotonic()
-            result = local_env.execute(cmd, timeout=15)
-            elapsed = time.monotonic() - t0
+        cmd = f'{background_command} & echo {marker}'
+        t0 = time.monotonic()
+        result = local_env.execute(cmd, timeout=15)
+        elapsed = time.monotonic() - t0
 
-            assert elapsed < 10.0, (  # hang under guard is 15s+; loose bound rides out runner stalls
-                f"terminal_tool hung for {elapsed:.1f}s — drain thread "
-                f"is still blocking on backgrounded child's inherited pipe fd"
-            )
-            assert result["returncode"] == 0
-            assert marker in result["output"]
-        finally:
-            _pkill("time.sleep(60)")
+        assert elapsed < 10.0, (  # hang under guard is 15s+; loose bound rides out runner stalls
+            f"terminal_tool hung for {elapsed:.1f}s — drain thread "
+            f"is still blocking on backgrounded child's inherited pipe fd"
+        )
+        assert result["returncode"] == 0
+        assert marker in result["output"]
 
-    def test_setsid_disown_pattern_returns_promptly(self, local_env):
+    def test_setsid_disown_pattern_returns_promptly(self, local_env, background_command):
         """The exact pattern from the issue: setsid ... & disown."""
         cmd = (
-            'setsid python3 -c "import time; time.sleep(60)" '
+            f'setsid {background_command} '
             '> /dev/null 2>&1 < /dev/null & disown; echo started'
         )
-        try:
-            t0 = time.monotonic()
-            result = local_env.execute(cmd, timeout=15)
-            elapsed = time.monotonic() - t0
+        t0 = time.monotonic()
+        result = local_env.execute(cmd, timeout=15)
+        elapsed = time.monotonic() - t0
 
-            assert elapsed < 10.0, f"setsid+disown path hung for {elapsed:.1f}s"
-            assert result["returncode"] == 0
-            assert "started" in result["output"]
-        finally:
-            _pkill("time.sleep(60)")
+        assert elapsed < 10.0, f"setsid+disown path hung for {elapsed:.1f}s"
+        assert result["returncode"] == 0
+        assert "started" in result["output"]
 
 
     @pytest.mark.platforms("linux")

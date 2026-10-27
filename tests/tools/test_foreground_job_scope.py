@@ -24,6 +24,18 @@ def handler(command, root, task='foreground', route='route'):
                                       effective_task_id=task, task_id=task, session_key=route)
 
 
+def capture_foreground_output(monkeypatch):
+    """Observe real capture readiness; command output and drain readiness differ."""
+    from tools.environments import base
+    create, collectors = base._new_output_collector, []
+    def observed(*args, **kwargs):
+        collector = create(*args, **kwargs)
+        collectors.append(collector)
+        return collector
+    monkeypatch.setattr(base, '_new_output_collector', observed)
+    return collectors
+
+
 @pytest.fixture
 def scope_reaper():
     import ctypes
@@ -52,7 +64,7 @@ def registry(monkeypatch, scope_reaper):
 
 
 @pytest.mark.parametrize('reload_owner', [False, True], ids=['live', 'cold'])
-def test_foreground_followup_adopts_existing_native_scope(tmp_path, registry, reload_owner):
+def test_foreground_followup_adopts_existing_native_scope(tmp_path, registry, reload_owner, monkeypatch):
     ready, gate, effect = (tmp_path / name for name in ('ready', 'gate', 'old-effect'))
     child = f'''import os, time
 from pathlib import Path
@@ -65,12 +77,15 @@ if Path({str(gate)!r}).exists(): Path({str(effect)!r}).touch()
     parent = f"import subprocess,sys,time; print('partial',flush=True); subprocess.Popen([sys.executable,'-c',{child!r}]); time.sleep(15)"
     command = shlex.join([sys.executable, '-c', parent])
     env = LocalEnvironment(cwd=str(tmp_path))
+    collectors = capture_foreground_output(monkeypatch)
     result = {}
     thread = threading.Thread(target=lambda: result.update(env.execute(
         command, timeout=20, yield_handler=handler(command, tmp_path))))
     thread.start()
     try:
         wait_until(ready.exists, what='actual detached command child')
+        wait_until(lambda: any('partial' in output.render() for output in collectors),
+                   what='foreground partial output actually captured')
         request_yield(thread.ident)
         thread.join(5)
         assert not thread.is_alive(), result

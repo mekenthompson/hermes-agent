@@ -11,6 +11,7 @@ import pytest
 from hermes_state_runtime import RuntimeStoreError, list_session_admissions
 from tests.gateway.test_native_job_scope_stop import live, spawn
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit
+from tests.tools.test_foreground_job_scope import capture_foreground_output
 from tests.waiting import wait_until
 
 pytestmark = pytest.mark.platforms('linux')
@@ -43,6 +44,7 @@ if p.exists(): Path({str(effect)!r}).touch()
     command = shlex.join([sys.executable, '-c',
         f"import subprocess,sys,time; print('original foreground output',flush=True); subprocess.Popen([sys.executable,'-c',{child_code!r}]); time.sleep(30)"])
     env = LocalEnvironment(cwd=str(tmp_path))
+    collectors = capture_foreground_output(monkeypatch)
     result, executed = {}, []
     def foreground():
         tokens = set_session_vars(session_id='s', session_key='route')
@@ -67,6 +69,9 @@ if p.exists(): Path({str(effect)!r}).touch()
     thread.start()
     try:
         await asyncio.to_thread(wait_until, ready.exists, timeout=15)
+        await asyncio.to_thread(wait_until,
+            lambda: any('original foreground output' in output.render() for output in collectors),
+            what='foreground partial output actually captured')
         request_yield(thread.ident)
         await asyncio.to_thread(thread.join, 8)
         assert not thread.is_alive(), result
