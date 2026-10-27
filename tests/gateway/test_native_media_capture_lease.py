@@ -73,6 +73,7 @@ async def test_refused_native_admission_leaves_no_fresh_capture(tmp_path, monkey
     """admit_native captured the message's media, then the write refused it (admission_conflict
     on a changed redelivery): the fresh capture no admission owns must not stay retained."""
     from gateway import session_authority
+    from gateway.platforms.event import MessageEvent
     from gateway.session_ingress_media import _media_root, capture_native_media
     from hermes_state_runtime import RuntimeStoreError
     authority = await _authority(tmp_path, monkeypatch)
@@ -89,6 +90,6 @@ async def test_refused_native_admission_leaves_no_fresh_capture(tmp_path, monkey
         raise RuntimeStoreError('admission_conflict')
     monkeypatch.setattr(session_authority, 'admit_session_input', refused)
     with pytest.raises(RuntimeStoreError, match='admission_conflict'):
-        await authority.admit_native(object())
+        await authority.admit_native(MessageEvent(text='x', source=authority.sessions['s'].source))
     assert not [p for p in _media_root().rglob('*') if p.is_file()], 'a refused capture stayed retained'
     assert Path(_media_root()).is_dir()

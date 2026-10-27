@@ -35,7 +35,8 @@ async def test_native_waiter_registered_after_the_claim_still_gets_the_only_deli
     monkeypatch.setattr(session_ingress, 'deliver_response', deliver)
     actor = Principal('human', 'p', frozenset({'session:submit'}), 't')
 
-    async def admit_native(event):
+    async def admit_native(event, *, before_schedule=None):
+        assert before_schedule is None  # This fixture exercises ordinary, non-busy admission.
         receipt = await authority.submit(actor, Submission('m1', SessionRef('p', 's'), {'text': 'hi'}, 'queue'))
         # The admitting caller resumes only after the drain already claimed and started the turn.
         await turn_started.wait()

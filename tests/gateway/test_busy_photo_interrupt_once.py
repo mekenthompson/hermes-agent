@@ -86,7 +86,8 @@ async def _followup_while_running(monkeypatch, event, marker, *, fail_admit=Fals
     key = runner.session_store._generate_session_key(source)
     await async_wait_until(agent_ready.is_set, what="the running agent")
     if fail_admit:
-        async def deny(authority, event):
+        async def deny(authority, event, *, busy=False):
+            assert busy is False  # This Discord fixture keeps legacy pre-admission busy effects.
             from hermes_state_runtime import RuntimeStoreError
             raise RuntimeStoreError("admission_conflict")
 

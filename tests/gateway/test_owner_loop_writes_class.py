@@ -93,6 +93,7 @@ async def _create_titled_hidden(authority, owner, tmp_path, db):
 
 
 async def _native_register(authority, owner, tmp_path, db):
+    from gateway.platforms.event import MessageEvent
     from gateway.config import Platform
     from gateway.session import SessionSource
     from gateway import session_envelope
@@ -105,11 +106,11 @@ async def _native_register(authority, owner, tmp_path, db):
     session_envelope.prepare_native = prepare_native
     original_restore = session_envelope.restore_native_source
     session_envelope.restore_native_source = lambda payload, runner=None: source
-    authority._admit_native_write = lambda **k: {'admission_id': 'a', 'status': 'queued'}
+    authority._admit_native_write = lambda **k: ({'admission_id': 'a', 'status': 'queued'}, True)
     authority._admitted = lambda ref, event, row: row
     authority._schedule = lambda ref: None
     try:
-        await authority.admit_native(SimpleNamespace())
+        await authority.admit_native(MessageEvent(text='hi', source=source, message_id='m1'))
     finally:
         session_envelope.prepare_native = session_envelope_prepare
         session_envelope.restore_native_source = original_restore

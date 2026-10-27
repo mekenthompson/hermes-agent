@@ -41,7 +41,8 @@ async def test_paused_fifo_releases_the_messaging_waiter_with_one_notice_per_epi
     try:
         actor = Principal('human', 'p', frozenset({'session:submit'}), 'fixture')
 
-        async def admit_native(event):
+        async def admit_native(event, *, before_schedule=None):
+            assert before_schedule is None  # This fixture exercises ordinary, non-busy admission.
             return await authority.submit(actor, Submission(event.text, ref, {'text': event.text}, 'queue'))
         monkeypatch.setattr(authority, 'admit_native', admit_native)
         authority._schedule = lambda ref: SessionAuthority._schedule(authority, ref)
