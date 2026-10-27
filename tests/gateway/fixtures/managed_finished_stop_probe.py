@@ -10,6 +10,7 @@ from gateway import session_ancillary
 from hermes_state_runtime import RuntimeStoreError
 from tests.waiting import async_wait_until
 from tools.process_registry import process_registry
+from utils import atomic_json_write
 
 home = Path(os.environ['HERMES_HOME'])
 next_frame, kill = ManagedWorker.next_frame, process_registry.kill_process
@@ -59,7 +60,7 @@ async def observed_drain(self, ref):
 async def held_finished(self, *args, **kwargs):
     frame = await next_frame(self, *args, **kwargs)
     if frame == {'type': 'finished'} and not (home / 'parent-held-finished.json').exists():
-        (home / 'parent-held-finished.json').write_text(json.dumps({'worker_pid': self.process.pid}))
+        atomic_json_write(home / 'parent-held-finished.json', {'worker_pid': self.process.pid})
         await async_wait_until(lambda: (home / 'parent-release-finished').exists(), timeout=90,
                                what='test releases native finished frame')
     return frame
