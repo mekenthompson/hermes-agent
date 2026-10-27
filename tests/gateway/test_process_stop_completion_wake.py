@@ -181,6 +181,11 @@ async def test_already_ready_result_subscribed_after_cleanup_rechecks_logical_st
         monkeypatch.setattr(module, 'process_registry', registry)
         assert _recover_stopped_processes(state.authority, REF)
         state.own = registry.get(state.own.id)
+        # Recovery may start the real retained-log reader asynchronously.
+        # This case specifically registers AFTER its actual final publication.
+        assert await asyncio.to_thread(state.own._completion_event.wait, 5)
+        assert save_completed_result(state.own)
+        assert not state.own._scope_stop_pending
     assert state.own._completion_event.is_set() and state.own._result_complete
     assert state.own._result_persisted_generation == state.own.ownership_generation
     assert not state.own._completion_observers
