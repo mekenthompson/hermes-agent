@@ -242,16 +242,33 @@ def spawn_foreground(session, argv, env, cwd, stdin_data):
 
 
 def adopt_foreground(registry, proc, *, command, cwd, task_id, session_key, owner_task_id,
-                     notify_on_complete):
+                     notify_on_complete, prepared=None):
     """Yield the captured job without inventing new identity from a raw PID."""
     session = proc._hermes_job_session
+    from tools.process_registry_handoff import ownership_identity
+    from tools.terminal_tool_background import _ROUTING_FIELDS
+    fields = ('persist_on_release', 'notify_on_complete', 'approval_task_reservation',
+              'watcher_interval', 'watcher_platform',
+              *(attr for attr, _ in _ROUTING_FIELDS if attr != 'parent_session_id'))
     with registry._lock, session._lock:
         if (registry._running.get(session.id) is not session or session.exited
+                or ownership_identity(session) != proc._ownership
                 or (session.command, session.task_id, session.owner_task_id, session.session_key)
                 != (command, task_id, owner_task_id, session_key)):
             raise RuntimeError('Foreground command already completed or ownership changed')
-        session.persist_on_release = False
-        session.notify_on_complete = notify_on_complete
+        missing = object()
+        previous = {field: getattr(session, field, missing) for field in fields}
+        target = prepared or {'persist_on_release': False, 'notify_on_complete': notify_on_complete}
+        for field in fields:
+            if field in target:
+                setattr(session, field, target[field])
+        if (not registry._write_checkpoint(_lock_held=True)
+                or ownership_identity(session) != proc._ownership):
+            for field, value in previous.items():
+                if value is missing:
+                    vars(session).pop(field, None)
+                else:
+                    setattr(session, field, value)
+            raise RuntimeError('Foreground handoff checkpoint failed')
     proc.stdout.close()
-    registry._write_checkpoint()
     return session

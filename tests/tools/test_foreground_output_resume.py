@@ -122,3 +122,137 @@ def test_stop_during_iterator_read_keeps_the_fetched_piece(tmp_path, monkeypatch
     finally:
         proc.stdout.close()
         env.cleanup()
+
+
+@pytest.mark.parametrize('mode', ['stamp', 'checkpoint', 'arm-false', 'arm-raise', 'armed'])
+def test_postadoption_setup_commits_delivery_or_keeps_foreground(tmp_path, monkeypatch, registry, mode):
+    from types import SimpleNamespace
+    import json
+    import utils
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import terminal_tool_background as background
+    from tools.approval_context import approval_task_context
+
+    gate, starts = tmp_path / 'release', tmp_path / 'starts'
+    code = f'''from pathlib import Path
+import time
+Path({str(starts)!r}).open('a').write('once\\n')
+print('prefix',flush=True)
+end=time.monotonic()+12
+while not Path({str(gate)!r}).exists() and time.monotonic()<end: time.sleep(.01)
+print('tail',flush=True)
+raise SystemExit(7)
+'''
+    command = shlex.join([sys.executable, '-c', code])
+    actual = handler(command, tmp_path)
+    pending = {'session_id': 'foreign-pending'}
+    registry.pending_watchers.append(pending)
+    stamped, write_failed, fail_write = threading.Event(), threading.Event(), threading.Event()
+    stages, armed = [], []
+    stamp = background._stamp_routing_if_gateway
+    def prepare(*args):
+        staged = args[1]
+        stages.append(staged)
+        stamp(*args)
+        stamped.set()
+        if mode == 'stamp':
+            staged.watcher_chat_id = 'refused-route'
+            raise RuntimeError('routing setup refused after staging')
+        if mode == 'checkpoint':
+            fail_write.set()
+    monkeypatch.setattr(background, '_stamp_routing_if_gateway', prepare)
+    atomic = utils.atomic_json_write
+    def write(path, data, *args, **kwargs):
+        if path.name == 'processes.json' and fail_write.is_set():
+            write_failed.set()
+            raise PermissionError('actual handoff checkpoint unavailable')
+        return atomic(path, data, *args, **kwargs)
+    monkeypatch.setattr(utils, 'atomic_json_write', write)
+    def arm(watcher):
+        own = registry.get(watcher['session_id'])
+        assert registry._lock.acquire(blocking=False), 'watcher callback ran under registry lock'
+        registry._lock.release()
+        assert own._lock.acquire(blocking=False), 'watcher callback ran under session lock'
+        own._lock.release()
+        armed.append(watcher)
+        if mode == 'arm-raise':
+            raise RuntimeError('gateway arming unavailable')
+        return mode == 'armed'
+    monkeypatch.setitem(sys.modules, 'gateway.run', SimpleNamespace(
+        _gateway_runner_ref=lambda: SimpleNamespace(arm_process_watcher=arm)))
+    collectors, create = [], base._new_output_collector
+    def capture(*args, **kwargs):
+        output = create(*args, **kwargs)
+        collectors.append(output)
+        return output
+    monkeypatch.setattr(base, '_new_output_collector', capture)
+    env, result = LocalEnvironment(cwd=str(tmp_path)), {}
+    def execute():
+        tokens = set_session_vars(platform='slack', chat_id='own-chat', thread_id='own-thread',
+                                  session_key='route', session_id='native-parent')
+        try:
+            with approval_task_context('Original finite command', identity='local:user', profile='profile',
+                                       session='route', task_id='admission', is_current=lambda: True):
+                result.update(env.execute(command, timeout=15, yield_handler=actual))
+        finally:
+            clear_session_vars(tokens)
+    worker = threading.Thread(target=execute)
+    worker.start()
+    try:
+        wait_until(lambda: any('prefix' in c.render() for c in collectors), timeout=5)
+        own = next(s for s in registry._running.values() if s.command == command)
+        request_yield(worker.ident)
+        assert stamped.wait(5)
+        if mode in ('stamp', 'checkpoint'):
+            if mode == 'checkpoint':
+                assert write_failed.wait(5)
+            with registry._lock, own._lock:
+                assert own.persist_on_release and not own.notify_on_complete
+                assert own.watcher_interval == 0 and own.watcher_chat_id == 'own-chat'
+                assert getattr(own, 'approval_task_reservation', None) is None
+                assert own.process.poll() is None and not own.exited
+            fail_write.clear()
+        else:
+            worker.join(5)
+            assert not worker.is_alive() and result['yielded_session_id'] == own.id
+            assert not own.persist_on_release and own.notify_on_complete
+            assert own.watcher_interval == 5 and own.approval_task_reservation.active()
+            assert len(armed) == 1
+        row = next(row for row in json.loads((tmp_path / 'processes.json').read_text())
+                   if row['session_id'] == own.id)
+        accepted = mode not in ('stamp', 'checkpoint')
+        assert row['notify_on_complete'] is accepted and row['persist_on_release'] is not accepted
+        assert row['watcher_interval'] == (5 if accepted else 0)
+        assert row['watcher_chat_id'] == 'own-chat' and row['parent_session_id'] == 'native-parent'
+        gate.touch()
+        worker.join(10)
+        assert not worker.is_alive() and own._completion_event.wait(5)
+        assert starts.read_text() == 'once\n' and own.exit_code == 7
+        assert own.output_buffer.startswith('prefix\ntail\n')
+        assert own.output_buffer.count('prefix') == own.output_buffer.count('tail') == 1
+        assert (own.owner_task_id, own.session_key, own.parent_session_id) == ('task', 'route', 'native-parent')
+        assert own._result_complete and job_quiescent(own)
+        assert registry.pending_watchers[0] is pending
+        reservation = stages[0].approval_task_reservation
+        if mode in ('stamp', 'checkpoint'):
+            assert result['returncode'] == 7 and result['output'] == 'prefix\ntail\n'
+            assert 'yielded_session_id' not in result
+            assert not reservation.active() and not armed
+            assert len(registry.pending_watchers) == 1 and registry.completion_queue.empty()
+        else:
+            assert result['output'] == 'prefix\n'
+            assert len(registry.pending_watchers) == (1 if mode == 'armed' else 2)
+            notice = registry.completion_queue.get_nowait()
+            assert notice['session_id'] == own.id and notice['exit_code'] == 7
+            assert registry.completion_queue.empty()
+            reservation.release()
+    finally:
+        fail_write.clear()
+        gate.touch()
+        consume_yield(worker.ident)
+        worker.join(15)
+        if stages:
+            reservation = getattr(stages[0], 'approval_task_reservation', None)
+            if reservation is not None:
+                reservation.release()
+        env.cleanup()

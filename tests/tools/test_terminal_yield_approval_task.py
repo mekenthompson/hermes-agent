@@ -1,14 +1,12 @@
 """A yielded foreground process retains the launching task for its completion."""
-from types import SimpleNamespace
-
 from tools.approval_context import approval_task_context
 from tools.terminal_tool_background import yield_to_background_handler
 
 
 def test_yielded_process_reserves_origin_only_for_supported_completion(monkeypatch):
-    from tools.process_registry import process_registry
+    from tools.process_registry import ProcessSession, process_registry
 
-    session = SimpleNamespace(id='yielded', pid=42, notify_on_complete=True)
+    session = ProcessSession(id='yielded', command='build', pid=42, notify_on_complete=True)
     monkeypatch.setattr(process_registry, 'adopt_local', lambda *_a, **_k: session)
     monkeypatch.setattr('tools.terminal_tool_background._stamp_routing_if_gateway', lambda *_a: None)
     handler = yield_to_background_handler(command='build', env_type='local', cwd='.',
