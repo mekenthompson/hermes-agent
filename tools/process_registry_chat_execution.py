@@ -1,5 +1,6 @@
 """Local pipe-process launch evidence, never process-tree settlement proof."""
 from uuid import uuid4
+import codecs
 import logging
 import os
 import threading
@@ -126,19 +127,27 @@ class _ForegroundOutput:
     def __init__(self, handle):
         self.handle = handle
         self.closed = threading.Event()
+        # A refused handoff restarts the drain, not this original byte stream.
+        self.offset = 0
+        self.decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        self.finished = False
 
     def __iter__(self):
         with open(self.handle._hermes_job_session.output_log, 'rb') as stream:
-            while not self.closed.is_set():
+            stream.seek(self.offset)
+            while not self.closed.is_set() and not self.finished:
                 chunk = stream.read(65536)
                 if chunk:
-                    yield chunk
+                    self.offset = stream.tell()
+                    yield self.decoder.decode(chunk)
                 elif self.handle.poll() is not None:
+                    self.finished = True
+                    yield self.decoder.decode(b'', final=True)
                     return
                 else:
                     # Yield permits the shared drain's stop event to transfer
                     # this cursor promptly even while the command is silent.
-                    yield b''
+                    yield ''
                     self.closed.wait(.02)
 
     def close(self):
