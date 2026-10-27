@@ -184,6 +184,36 @@ input; structured Stop and targeted approval controls remain available. This
 capability is declared by adapter code, not event metadata or a user permission
 flag. Its default is false, preserving established transports' busy behavior.
 
+Each immutable provider delivery keeps its own native admission, including while
+the adapter is busy: this capability bypasses text/photo burst merging. IDs are
+scoped to the authenticated source and retain their original receipt across
+conversation reset and compression. Existing terminal deletion tombstones retain
+that evidence for their normal retry horizon. Conflicting or ambiguous IDs refuse
+before reserving another conversation; pending history on a superseded route is
+held, never retargeted onto its replacement.
+The optional precommit `post_gateway_admission` consume hook is bypassed: this
+capability requires native ownership and cannot report an unrecorded handled
+reply. Authentication, profile routing, pause/drain checks and normal model/tool/
+context hooks remain in force. Existing adapters retain their consume hooks.
+
+A verified platform Stop uses `MessageEvent.structured_control =
+StructuredControl.STOP` with `allow_gateway_control=False`, a stable original
+message ID and the ordinary authenticated actor/source. It is a typed transport
+action, not model text or a slash-command permission. Unsupported adapters and
+arbitrary payload descriptors cannot create controls. The owner atomically saves
+the original target generation, queue cutoff and existing pending Stop fence in
+the native admission transaction. Control admission uses no model-work queue
+slot; pending controls reconcile before any later model claim, including restart.
+An identical redelivery never captures a newer target or cancels later input.
+
+The optional in-process `receipt.control` property reports `kind`, `request_consumed` and
+`cleanup_pending`. A transport may acknowledge its retained Stop only when
+`request_consumed` is true. This means the request was consumed, not that all
+physical effects stopped: unknown cleanup remains visibly fenced. A false
+`cleanup_pending` alone is not proof of physical quiescence. Final owner/backend
+verification remains responsible for that outcome.
+This transport-local projection does not change established RPC receipt fields.
+
 ---
 
 ## 2. Platform Enum (`gateway/config.py`)

@@ -2266,7 +2266,7 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 
 # Placed into _running_agents *before* any await so a second message can't slip past the "already
 # running" guard before the agent exists.
-_AGENT_PENDING_SENTINEL = object()
+from gateway.session_state import AGENT_PENDING_SENTINEL as _AGENT_PENDING_SENTINEL
 
 # Conversation-scoped per-session state registry (legacy contract). State lives in
 # ``SessionState.conversation`` (cleared via ``ConversationState.clear()``); this list remains for

@@ -18,6 +18,7 @@ class Prepared:
     generation: int
     agent: object
     stop_epoch: int
+    stop_sequence: int
     approval: tuple | None = None
 
 
@@ -33,6 +34,10 @@ def prepare(authority, event):
     adopted_generation, agent = authority.adopted.get(session_id, (None, None))
     if generation is None or generation != adopted_generation or agent is None:
         return None
+    from gateway.session_ancillary import process_stop_pending
+    if (authority.delivered_stops.get(session_id) == generation
+            or process_stop_pending(authority.db, session_id) is not None):
+        return None  # later input stays queued; it must not steer the stopped generation
     approval = None
     if event.allow_gateway_control:
         from tools.approval import list_gateway_approvals
@@ -48,15 +53,18 @@ def prepare(authority, event):
                 approval = (verb, choice, ids)
             elif pending:
                 approval = ('unbound', '', ())  # no bare-route fallback
-    return Prepared(session_id, route, generation, agent, authority.route_epoch(route), approval)
+    from hermes_state_runtime import native_stop_watermark
+    return Prepared(session_id, route, generation, agent, authority.route_epoch(route),
+                    native_stop_watermark(authority.db, session_id), approval)
 
 
 def _current(authority, event, prepared):
-    from hermes_state_runtime import _epoch
+    from hermes_state_runtime import _epoch, native_stop_watermark
     authority._require_admission_open()
     with authority.db._read_ctx() as conn:
         _epoch(conn, authority.epoch)
     return (authority.route_epoch(prepared.route) == prepared.stop_epoch
+            and native_stop_watermark(authority.db, prepared.session_id) == prepared.stop_sequence
             and authority.runner._is_user_authorized_for_source(event.source)
             and authority.delivered_stops.get(prepared.session_id) != prepared.generation)
 

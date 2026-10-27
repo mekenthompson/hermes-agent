@@ -1210,11 +1210,18 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # The message handler entered the routed profile's scope; its authority owns this turn.
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
+        if event.structured_control is not None and authority is None:
+            from hermes_state_runtime import RuntimeStoreError
+            reason = 'profile_mismatch' if getattr(self, 'session_authority', None) is not None else 'not_found'
+            raise RuntimeStoreError(reason, field='native_control')
         if authority is not None and not event.get_command() and not is_internal:
             from gateway.session_ingress import admit_message, executing_admission
             if not executing_admission.get():
                 intake = getattr(self, '_intake_adapter_for', lambda _source: None)(source)
                 durable_inbox = getattr(intake, 'requires_durable_input_ack', False) is True
+                if event.structured_control is not None and not durable_inbox:
+                    from hermes_state_runtime import RuntimeStoreError
+                    raise RuntimeStoreError('invalid_params', field='structured_control')
                 # Existing channels keep their live voice/approval behavior.
                 # Durable-inbox adapters declare the stronger commit-before-
                 # busy contract; event metadata can never opt into it.
@@ -1223,9 +1230,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                             await self._route_plaintext_approval_while_busy(event, _quick_key)
                             or await self._hm_busy_preempt(event, source, _quick_key))):
                     return True, None
-                _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)
-                if _consumed:
-                    return True, _consumer_reply
+                if not durable_inbox:
+                    _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)
+                    if _consumed:
+                        return True, _consumer_reply
                 if getattr(event, "_fifo_only", False) and event._stop_epoch != self._route_stop_epoch(_quick_key):
                     return True, None  # a /stop or /new came after its command, as it clears the slot
                 # A failed admit stays the authority's answer (refusal notice or turn error), never a

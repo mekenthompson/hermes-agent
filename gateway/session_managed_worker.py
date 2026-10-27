@@ -360,6 +360,14 @@ def interrupt_managed(authority, actor, ref, generation):
     if worker is None:
         return False
     authority.authorize(actor, ref, 'session:control')
+    return interrupt_managed_owned(authority, ref, generation)
+
+
+def interrupt_managed_owned(authority, ref, generation):
+    """Owner-internal path after native input or external control authorization."""
+    worker = getattr(authority, '_managed_workers', {}).get(ref.session_id)
+    if worker is None:
+        return False
     authority.check_approval_generation(ref.session_id, generation)
     from gateway.session_ancillary import record_process_stop
     record_process_stop(authority, ref, generation)

@@ -41,6 +41,11 @@ class ProcessingOutcome(Enum):
     CANCELLED = "cancelled"
 
 
+class StructuredControl(str, Enum):
+    """A platform-authenticated control, separate from conversational text."""
+    STOP = "stop"
+
+
 @dataclass
 class MessageEvent:
     """Incoming message from a platform — the normalized shape all adapters produce."""
@@ -111,6 +116,7 @@ class MessageEvent:
     # ``message_id`` with new text, so native admission keys it apart from the original send.
     # Appended for positional compat (see the field-order rule above).
     edit_revision: Optional[str] = None
+    structured_control: Optional[StructuredControl] = None
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)

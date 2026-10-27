@@ -1,6 +1,7 @@
 """Adapter processing hooks, including durable input acceptance and presentation."""
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from gateway.platforms.event import MessageEvent, ProcessingOutcome
@@ -43,3 +44,14 @@ class ProcessingLifecycleMixin:
                  ProcessingOutcome.FAILURE: self._FAIL_EMOJI}.get(outcome)
         if emoji:
             await add(chat_id, message_id, emoji)
+
+    async def _drain_pending_after_session_command(
+        self, session_key: str, command_guard: asyncio.Event) -> None:
+        """Tail of /stop, /new, /reset: release the command-scoped guard, then
+        spawn a fresh processing task for any follow-up queued meanwhile."""
+        await self._flush_text_debounce_now(session_key)
+        pending_event = self._pending_messages.pop(session_key, None)
+        self._release_session_guard(session_key, guard=command_guard)
+        if pending_event is not None:
+            self._start_session_processing(pending_event, session_key)
+

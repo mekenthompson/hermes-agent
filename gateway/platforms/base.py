@@ -3931,16 +3931,6 @@ class BasePlatformAdapter(ProcessingLifecycleMixin, ABC):
         if release_guard:
             self._release_session_guard(session_key)
 
-    async def _drain_pending_after_session_command(
-        self, session_key: str, command_guard: asyncio.Event) -> None:
-        """Tail of /stop, /new, /reset: release the command-scoped guard, then
-        spawn a fresh processing task for any follow-up queued meanwhile."""
-        await self._flush_text_debounce_now(session_key)
-        pending_event = self._pending_messages.pop(session_key, None)
-        self._release_session_guard(session_key, guard=command_guard)
-        if pending_event is not None:
-            self._start_session_processing(pending_event, session_key)
-
     async def _dispatch_active_session_command(self, event: MessageEvent, session_key: str, cmd: str) -> None:
         """Dispatch a reset-like bypass command (/stop, /new, /reset): keep a guard installed while
         the runner handles it (follow-ups stay queued), cancel the old task AFTER the response,
@@ -3996,6 +3986,9 @@ class BasePlatformAdapter(ProcessingLifecycleMixin, ABC):
         if expected_session_key and session_key != expected_session_key:
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
+            return
+        if event.structured_control is not None:
+            await self._dispatch_inline_reply(event)
             return
         from gateway.session_ingress_burst import burst_gate
         behind_burst = (False if self.requires_durable_input_ack is True
