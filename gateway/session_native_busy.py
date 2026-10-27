@@ -74,7 +74,6 @@ async def apply(authority, event, receipt, prepared, fence):
     """Only a newly committed input may steer/approve/interrupt its captured target."""
     if prepared is None or receipt.ref.session_id != prepared.session_id:
         return
-    transport_event = event
     from gateway.session_envelope import check_native_route, restore_native
     from hermes_state_runtime import get_session_admission
     row = get_session_admission(authority.db, admission_id=receipt.admission_id)
@@ -131,12 +130,12 @@ async def apply(authority, event, receipt, prepared, fence):
                 from agent.i18n import t
                 key = ('gateway.deny.denied_' + ('plural' if count[0] > 1 else 'singular') if verb == 'deny'
                        else f"gateway.approve.{choice}_{'plural' if count[0] > 1 else 'singular'}")
-                text = await runner._deliver_approval_confirmation(transport_event, t(key, count=count[0]), verb)
+                text = await runner._deliver_approval_confirmation(event, t(key, count=count[0]), verb)
                 adapter = runner._delivery_adapter_for(event.source)
                 if adapter and text:
                     content, _ttl = adapter._unwrap_ephemeral(text)
                     if content:
-                        await runner._send_busy_reply(transport_event, adapter, content, plain_anchor=True)
+                        await runner._send_busy_reply(event, adapter, content, plain_anchor=True)
             return acknowledge
         return
     text = runner._steer_text_with_origin((event.text or '').strip(), event)
@@ -180,6 +179,6 @@ async def apply(authority, event, receipt, prepared, fence):
             demoted_for_subagents=demoted_children, demoted_for_compression=demoted_compression)
         state = runner._peek_session_state(route)
         async def acknowledge():
-            await runner._busy_interrupt_and_ack(transport_event, route, adapter, state, agent,
+            await runner._busy_interrupt_and_ack(event, route, adapter, state, agent,
                 outcome, already_interrupted=already_interrupted or mode == 'interrupt')
         return acknowledge

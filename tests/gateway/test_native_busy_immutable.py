@@ -1,4 +1,4 @@
-"""Busy effects use the native commit, while transport bookkeeping keeps its event."""
+"""Busy effects and replies use the native commit; admission keeps its transport event."""
 import asyncio
 from dataclasses import replace
 import threading
@@ -51,13 +51,28 @@ class NativeBusyImmutableTests(unittest.IsolatedAsyncioTestCase):
     async def test_text_source_media_and_mode_mutation_cannot_replace_busy_effects(self):
         from gateway.platforms.event import MessageType
         await self.start()
-        origins, folded, acknowledgements = [], [], []
+        from gateway.run_busy import GatewayBusySessionMixin
+        origins, folded, acknowledgements, deliveries, transport_acks = [], [], [], [], []
         self.runner._steer_text_with_origin = lambda text, event: origins.append(event) or text
         self.runner._fold_into_running_turn = lambda agent, route, event: folded.append((route, event))
         self.runner._effective_busy_input_mode = lambda source: 'steer' if source.chat_id == 'fixture-chat' else 'queue'
 
-        async def ack(event, *args, **kwargs):
+        async def send(**kwargs):
+            deliveries.append(kwargs)
+        self.adapter._send_with_retry = send
+        self.runner._reply_anchor_for_event = lambda event: event.reply_anchor_override or event.message_id
+        self.runner._thread_metadata_for_source = lambda source, anchor: {'thread_id': source.thread_id}
+        self.runner._busy_reply_to = GatewayBusySessionMixin._busy_reply_to
+        original_hook = self.adapter.on_message_admitted
+
+        async def transport_ack(event, receipt):
+            transport_acks.append(event)
+            await original_hook(event, receipt)
+        self.adapter.on_message_admitted = transport_ack
+
+        async def ack(event, route, adapter, *args, **kwargs):
             acknowledgements.append(event)
+            await GatewayBusySessionMixin._send_busy_reply(self.runner, event, adapter, event.text)
         self.runner._busy_interrupt_and_ack = ack
         event = self.event('immutable-text', 'committed text', source=replace(self.source))
 
@@ -65,6 +80,8 @@ class NativeBusyImmutableTests(unittest.IsolatedAsyncioTestCase):
             event.text = 'unadmitted replacement'
             event.source.chat_id = 'unadmitted route'
             event.source.user_id = 'unauthorized user'
+            event.source.thread_id = 'unadmitted thread'
+            event.message_id = 'unadmitted anchor'
             event.media_urls, event.media_types = ['unadmitted media'], ['image/png']
             event.message_type = MessageType.PHOTO
 
@@ -74,7 +91,10 @@ class NativeBusyImmutableTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(origins[0].source.user_id, 'fixture-author')
         self.assertEqual(origins[0].source.chat_id, 'fixture-chat')
         self.assertEqual(folded, [(self.route, origins[0])])
-        self.assertIs(acknowledgements[0], event)
+        self.assertEqual(acknowledgements[0].text, 'committed text')
+        self.assertEqual(deliveries, [{'chat_id': 'fixture-chat', 'content': 'committed text',
+            'reply_to': 'immutable-text', 'metadata': {'thread_id': None}}])
+        self.assertIs(transport_acks[0], event)
         self.assertTrue(event._gateway_accepted)
 
     async def test_redirect_and_interrupt_receive_only_committed_instruction(self):
@@ -128,16 +148,37 @@ class NativeBusyImmutableTests(unittest.IsolatedAsyncioTestCase):
         return pending
 
     async def test_committed_approval_keeps_its_answer_after_caller_mutation(self):
+        from types import MethodType
+        from gateway.run_busy import GatewayBusySessionMixin
         await self.start()
         pending = self.pending_approval()
-        event = self.event('immutable-approval', 'yes', control=True)
+        event = self.event('immutable-approval', 'yes', control=True, source=replace(self.source))
+        confirmations, deliveries = [], []
+
+        async def confirmation(event, text, verb):
+            confirmations.append((event.text, event.source.chat_id, event.message_id, verb))
+            return 'committed confirmation'
+
+        async def send(**kwargs):
+            deliveries.append(kwargs)
+        self.runner._deliver_approval_confirmation = confirmation
+        self.adapter._send_with_retry = send
+        self.adapter._unwrap_ephemeral = lambda text: (text, None)
+        self.runner._reply_anchor_for_event = lambda event: event.message_id
+        self.runner._thread_metadata_for_source = lambda source, anchor: {'thread_id': source.thread_id}
+        self.runner._send_busy_reply = MethodType(GatewayBusySessionMixin._send_busy_reply, self.runner)
 
         def mutate():
             event.text, event.allow_gateway_control = 'no', False
+            event.source.chat_id, event.source.thread_id = 'unadmitted route', 'unadmitted thread'
+            event.message_id = 'unadmitted anchor'
         await self.mutated_commit(event, mutate)
         self.assertEqual(pending.result, 'once')
         self.assertEqual(self.row('immutable-approval')['payload']['text'], 'yes')
         self.assertEqual(self.agent.effects, [])
+        self.assertEqual(confirmations, [('yes', 'fixture-chat', 'immutable-approval', 'approve')])
+        self.assertEqual(deliveries, [{'chat_id': 'fixture-chat', 'content': 'committed confirmation',
+            'reply_to': 'immutable-approval', 'metadata': {'thread_id': None}}])
 
     async def test_changed_body_or_control_before_snapshot_cannot_borrow_approval_targets(self):
         import gateway.session_envelope as envelope
