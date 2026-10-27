@@ -512,11 +512,9 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pending.result, 'once')
         self.authority.fence_route(self.route)  # structured Stop's existing native fence remains available
 
-    async def test_actual_base_lifecycle_acks_durable_input_before_finite_turn_completion(self):
+    def base_adapter(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.base import BasePlatformAdapter, SendResult
-        from hermes_state_runtime import list_session_admissions, claim_session_input, settle_session_input
-        from tests.waiting import async_wait_until
         phases, completed = [], asyncio.Event()
         fixture = self
         class Adapter(BasePlatformAdapter):
@@ -542,6 +540,12 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
             return reply
         adapter.set_message_handler(MethodType(handle, self.runner))
         adapter.set_session_store(self.store)
+        return adapter, phases, completed
+
+    async def test_actual_base_lifecycle_acks_durable_input_before_finite_turn_completion(self):
+        from hermes_state_runtime import list_session_admissions, claim_session_input, settle_session_input
+        from tests.waiting import async_wait_until
+        adapter, phases, completed = self.base_adapter()
         await adapter.handle_message(self.event('base-lifecycle'))
         await self.accepted('base-lifecycle')
         self.assertEqual(phases, [('accepted', 'queued')])
@@ -557,6 +561,32 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(completed.wait(), 5)
         await async_wait_until(lambda: not adapter._background_tasks)
         self.assertEqual(phases[-1], ('processed', 'success'))
+
+    async def test_actual_active_base_keeps_distinct_provider_ids_and_bodies_unmerged(self):
+        from hermes_state_runtime import claim_session_input
+        from tests.waiting import async_wait_until
+        adapter, _phases, completed = self.base_adapter()
+        adapter._busy_text_mode = 'queue'  # an ordinary adapter would debounce/merge this burst
+        await adapter.handle_message(self.event('opening-base'))
+        await self.accepted('opening-base')
+        self.ref = self.receipts[0][1].ref
+        self.running = claim_session_input(self.authority.db, epoch=self.authority.epoch, session_id=self.ref.session_id)
+        self.agent = FiniteAgent()
+        self.authority.executing[self.ref.session_id] = self.running['generation']
+        self.authority.adopt_agent(self.ref.session_id, self.running['generation'], self.agent)
+        await asyncio.gather(adapter.handle_message(self.event('activity-a', 'first immutable body')),
+                             adapter.handle_message(self.event('activity-b', 'second immutable body')))
+        for message_id, body in [('activity-a', 'first immutable body'), ('activity-b', 'second immutable body')]:
+            await self.accepted(message_id)
+            self.assertEqual(self.row(message_id)['payload']['text'], body)
+            self.assertEqual(sum(mid == message_id for mid, _ in self.receipts), 1)
+        self.assertEqual(len(self.agent.effects), 2)
+        self.agent.pending.clear()
+        self.settle()
+        await async_wait_until(lambda: self.running['admission_id'] in self.authority.waiters)
+        self.authority.waiters[self.running['admission_id']].set_result(None)
+        await asyncio.wait_for(completed.wait(), 5)
+        await async_wait_until(lambda: not adapter._background_tasks)
 
     async def test_default_adapter_retains_legacy_busy_callback_without_native_claim(self):
         self.adapter.requires_durable_input_ack = False
