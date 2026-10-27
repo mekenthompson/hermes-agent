@@ -137,13 +137,17 @@ class _ForegroundOutput:
             stream.seek(self.offset)
             while not self.closed.is_set() and not self.finished:
                 chunk = stream.read(65536)
+                if not chunk and self.handle.poll() is not None:
+                    # Exit proof follows the primary's final write. The earlier
+                    # EOF may predate that write, so observe the source again.
+                    chunk = stream.read(65536)
+                    if not chunk:
+                        self.finished = True
+                        yield self.decoder.decode(b'', final=True)
+                        return
                 if chunk:
                     self.offset = stream.tell()
                     yield self.decoder.decode(chunk)
-                elif self.handle.poll() is not None:
-                    self.finished = True
-                    yield self.decoder.decode(b'', final=True)
-                    return
                 else:
                     # Yield permits the shared drain's stop event to transfer
                     # this cursor promptly even while the command is silent.
@@ -160,9 +164,13 @@ class _ForegroundJob:
     _hermes_native_foreground = True
 
     def __init__(self, registry, session, ownership):
+        from contextvars import copy_context
+        from hermes_constants import get_hermes_home, set_hermes_home_override
         self.registry = registry
         self._hermes_job_session = session
         self._ownership = ownership
+        self._context = copy_context()
+        self._context.run(set_hermes_home_override, get_hermes_home().absolute())
         self.stdout = _ForegroundOutput(self)
 
     def __getattr__(self, name):
@@ -173,12 +181,20 @@ class _ForegroundJob:
         return self.poll()
 
     def poll(self):
+        return self._context.copy().run(self._poll)
+
+    def _poll(self):
         from tools.process_registry_job import read_job_receipt
         session = self._hermes_job_session
         receipt = read_job_receipt(session)
-        if receipt and type(receipt['exit_code']) is int:
+        if receipt and not receipt.get('unit') and type(receipt['exit_code']) is int:
             return receipt['exit_code']
-        return session.process.poll()
+        if session.exited and type(session.exit_code) is int and session.completion_reason != 'lost':
+            return session.exit_code
+        if session.process.poll() is not None:
+            from tools.environments.base import CommandExecutionUnknown
+            raise CommandExecutionUnknown(session.id)
+        return None
 
     def wait(self, timeout=None):
         from subprocess import TimeoutExpired
@@ -190,8 +206,8 @@ class _ForegroundJob:
         return code
 
     def kill(self):
-        return self.registry.kill_process(self._hermes_job_session.id, source='session.interrupt',
-                                          expected_ownership=self._ownership)
+        return self._context.copy().run(self.registry.kill_process, self._hermes_job_session.id,
+            source='session.interrupt', expected_ownership=self._ownership)
 
 
 def spawn_foreground(session, argv, env, cwd, stdin_data):

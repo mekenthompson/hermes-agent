@@ -112,3 +112,34 @@ def test_registry_handoff_keeps_stale_approval_and_process_with_child():
         to_parent_session_id="parent-session",
     ) is None
     assert session.owner_task_id == "child"
+
+
+def test_owner_reply_cannot_outlive_local_lease_revocation():
+    lease = ApprovalTaskLease(lambda: True)
+    def current():
+        lease.revoke()
+        return True
+    lease.is_current = current
+    assert not lease.live()
+    assert not lease.reserve_child()
+
+
+def test_reservation_changed_during_owner_reply_keeps_new_parent_fence():
+    child, parent = Event(), Event()
+    lease = ApprovalTaskLease(lambda: True)
+    assert lease.reserve_child()
+    reservation = ApprovalTaskReservation(lease, ApprovalTaskContext('request', 'user', 'profile', 's'), (child,))
+    def current():
+        with reservation._lock:
+            reservation.stop_events = (parent,)
+        return True
+    lease.is_current = current
+    try:
+        assert not reservation.transfer_to_parent(child)
+        assert reservation.stop_events == (parent,) and reservation.active()
+        child.set()
+        assert reservation.active()
+        parent.set()
+        assert not reservation.active()
+    finally:
+        reservation.release()

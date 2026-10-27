@@ -36,22 +36,34 @@ def transfer_ownership(registry, session_id, *, from_owner, to_owner, to_task_id
         if session is None or session.exited or session.owner_task_id != from_owner or not to_parent_session_id:
             return None
         reservation = getattr(session, 'approval_task_reservation', None)
+        expected = ownership_identity(session)
+        with reservation._lock if reservation is not None else nullcontext():
+            lease = reservation.lease if reservation is not None else None
+            stop_events = reservation.stop_events if reservation is not None else ()
+    # This may round-trip to the owner. No native record/approval lock can be
+    # held: the owner may itself need those records to answer the predicate.
+    permitted = lease is None or lease.live()
+    with registry._lock:
+        if (registry._running.get(session_id) is not session or session.exited
+                or not _same_handoff_record(registry, session, expected, reservation)):
+            return None
         # Serialize approval observers with the existing native reservation lock.
         # Validate at the transfer's linearization point, before durable commit.
         # Keep child fences visible to native reservation captures during I/O;
         # publish their detachment only after the ownership commit succeeds.
         with reservation._lock if reservation is not None else nullcontext():
+            if reservation is not None and (reservation.lease is not lease or reservation.stop_events != stop_events):
+                return None
             if child_stop_event is not None and child_stop_event.is_set():
                 if reservation is not None:
                     reservation.release()
                 return None
-            if reservation is not None and (not reservation.active() or not reservation.lease.live()):
+            if reservation is not None and (not permitted or not reservation.active() or not lease._locally_live()):
                 reservation.release()
                 return None
             if any(type(value) is not int or value <= 0 for value in (session.pid, session.host_start_time)):
                 return None
             previous = tuple(getattr(session, field) for field in OWNERSHIP_FIELDS)
-            stop_events = reservation.stop_events if reservation is not None else ()
             parent_events = tuple(event for event in stop_events if event is not child_stop_event)
             target = (to_owner, to_task_id, to_session_key, to_parent_session_id, note, session.ownership_generation + 1)
             for field, value in zip(OWNERSHIP_FIELDS, target):
@@ -64,12 +76,31 @@ def transfer_ownership(registry, session_id, *, from_owner, to_owner, to_task_id
                     setattr(session, field, value)
             if not committed or tuple(getattr(session, field) for field in OWNERSHIP_FIELDS) != target:
                 if reservation is not None:
-                    if not reservation.active() or not reservation.lease.live():
+                    if not reservation.active() or not lease._locally_live():
                         reservation.release()
-                return None
-            if reservation is not None:
-                reservation.stop_events = parent_events
-            return session
+            else:
+                if reservation is not None:
+                    reservation.stop_events = parent_events
+                return session
+    _release_failed_handoff(registry, session, expected, reservation, lease, stop_events)
+    return None
+
+
+def _same_handoff_record(registry, session, expected, reservation):
+    """Revalidate a native record after its lock-free authority observation."""
+    return ((registry._running.get(session.id) or registry._finished.get(session.id)) is session
+            and ownership_identity(session) == expected
+            and getattr(session, 'approval_task_reservation', None) is reservation)
+
+
+def _release_failed_handoff(registry, session, expected, reservation, lease, stop_events):
+    """A failed old attempt cannot revoke a newer owner's reservation."""
+    if reservation is None or lease.live():
+        return
+    with registry._lock, reservation._lock:
+        if (_same_handoff_record(registry, session, expected, reservation)
+                and reservation.lease is lease and reservation.stop_events == stop_events):
+            reservation.release()
 
 
 

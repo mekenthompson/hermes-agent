@@ -1,4 +1,5 @@
 """Native command custody survives outer retry, deadline and host-exit boundaries."""
+import builtins
 import json
 import os
 from pathlib import Path
@@ -350,3 +351,129 @@ def test_handoff_before_handle_creation_does_not_grant_old_foreground_new_owners
         assert job_quiescent(session)
     finally:
         registry.kill_process(session.id)
+
+
+def test_missing_original_receipt_does_not_substitute_helper_wait_status(tmp_path, monkeypatch, registry):
+    import signal
+    import threading
+    from tools.process_registry_job import job_receipt_path
+    from tools.process_registry_results import load_completed_results
+    entered, release = threading.Event(), threading.Event()
+    read = registry._log_reader_loop
+    def held_reader(session):
+        entered.set()
+        assert release.wait(10)
+        return read(session)
+    monkeypatch.setattr(registry, '_log_reader_loop', held_reader)
+    session = registry._new_session('real signalled primary', 'boundary', 'boundary', 'route', str(tmp_path))
+    handle = execution.spawn_foreground(session, [sys.executable, '-c',
+        'import os,signal; print("original signal payload",flush=True); os.kill(os.getpid(),signal.SIGKILL)'],
+        dict(os.environ), str(tmp_path), None)
+    receipt = job_receipt_path(session.id)
+    original = None
+    try:
+        assert entered.wait(5)
+        assert session.process.wait(5) == 128 + signal.SIGKILL
+        original = receipt.read_bytes()
+        assert json.loads(original)['exit_code'] == -signal.SIGKILL and session.exit_code is None
+        receipt.unlink()
+        with pytest.raises(base.CommandExecutionUnknown):
+            handle.poll()
+        assert registry.kill_process(session.id)['error'] == 'process_stop_unknown'
+        assert session.id in {row['session_id'] for row in json.loads(module._checkpoint_path().read_text())}
+        receipt.write_bytes(original)
+        assert handle.poll() == -signal.SIGKILL
+        release.set()
+        assert session._completion_event.wait(5)
+        retained = load_completed_results(owns_entry=lambda row: row['id'] == session.id, strict=True)[session.id]
+        assert retained.exit_code == -signal.SIGKILL and retained.output_buffer == 'original signal payload\n'
+        receipt.unlink()
+        assert handle.poll() == -signal.SIGKILL  # The original reader already captured this status.
+        assert registry.kill_process(session.id)['error'] == 'process_stop_unknown'
+        receipt.write_bytes(original)
+        assert registry.kill_process(session.id)['status'] == 'already_exited'
+    finally:
+        if original is not None and not receipt.exists():
+            receipt.write_bytes(original)
+        release.set()
+        registry.kill_process(session.id)
+
+
+@pytest.mark.parametrize('home_source', ['context', 'environment'])
+def test_native_foreground_handle_keeps_producer_home_off_turn(tmp_path, monkeypatch, registry, home_source):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    producer, unrelated = tmp_path / 'producer', tmp_path / 'unrelated'
+    producer.mkdir()
+    unrelated.mkdir()
+    monkeypatch.setenv('HERMES_HOME', str(producer))
+    token = set_hermes_home_override(producer if home_source == 'context' else None)
+    try:
+        session, handle = native_handle(registry, producer)
+    finally:
+        reset_hermes_home_override(token)
+    try:
+        monkeypatch.setenv('HERMES_HOME', str(unrelated))
+        token = set_hermes_home_override(unrelated)
+        try:
+            result = handle.kill()
+            assert result['status'] == 'killed', result
+        finally:
+            reset_hermes_home_override(token)
+        assert (producer / 'logs' / 'process-results' / (session.id + '.json')).exists()
+        assert not (unrelated / 'logs' / 'process-results' / (session.id + '.json')).exists()
+        assert not (unrelated / 'processes.json').exists()
+    finally:
+        token = set_hermes_home_override(producer)
+        try:
+            registry.kill_process(session.id)
+            assert job_quiescent(session)
+        finally:
+            reset_hermes_home_override(token)
+
+
+def test_foreground_keeps_tail_published_between_read_and_exit_observation(tmp_path, monkeypatch):
+    registry = module.ProcessRegistry()
+    monkeypatch.setattr(module, 'process_registry', registry)
+    ready, release = tmp_path / 'ready', tmp_path / 'release'
+    payload = f'''from pathlib import Path
+import time
+print('prefix',flush=True)
+Path({str(ready)!r}).touch()
+end=time.monotonic()+15
+while not Path({str(release)!r}).exists() and time.monotonic()<end: time.sleep(.01)
+print('tail',flush=True)
+raise SystemExit(7)
+'''
+    command = shlex.join([sys.executable, '-c', payload])
+    session = registry._new_session(command, 'owner', 'owner', 'route', str(tmp_path))
+    env = LocalEnvironment(cwd=str(tmp_path))
+    handle = env._run_bash(command, native_session=session)
+    try:
+        wait_until(ready.exists, timeout=5)
+        class EmptyReadBoundary:
+            def __init__(self, stream):
+                self.stream = stream
+                self.released = False
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+            def read(self, count):
+                chunk = self.stream.read(count)
+                if not chunk and not self.released:
+                    self.released = True
+                    release.touch()
+                    assert session._completion_event.wait(10)
+                return chunk
+        monkeypatch.setattr(execution, 'open', lambda *args, **kwargs: EmptyReadBoundary(builtins.open(*args, **kwargs)), raising=False)
+        inline_output = ''.join(handle.stdout)
+        assert handle.poll() == session.exit_code == 7
+        assert session.output_buffer == 'prefix\ntail\n'
+        assert inline_output == session.output_buffer
+    finally:
+        release.touch()
+        registry.kill_process(session.id)
+        handle.stdout.close()
+        env.cleanup()
