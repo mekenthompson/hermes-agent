@@ -646,7 +646,7 @@ fi
 # dotenv parser and precedence as at boot: container env, $HERMES_HOME/.env, managed .env), never
 # by a second grammar here. If it cannot be decided, nothing is migrated: the agent still decides
 # at boot, and a file-mode migration simply waits for the next boot.
-_config_backend=$(s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" -c '
+_config_backend=$(as_hermes "$INSTALL_DIR/.venv/bin/python" -c '
 import sys
 from pathlib import Path
 from hermes_cli.env_loader import selected_config_backend_name
@@ -657,7 +657,7 @@ if [ "$_config_backend" = "remote" ]; then
 elif [ -z "$_config_backend" ]; then
     echo "[stage2] Warning: could not determine the config backend; skipping docker_config_migrate.py"
 elif [ -f "$HERMES_HOME/config.yaml" ]; then
-    s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/docker_config_migrate.py" \
+    as_hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/docker_config_migrate.py" \
         || echo "[stage2] Warning: docker_config_migrate.py failed; continuing"
 fi
 
@@ -670,7 +670,7 @@ fi
 # keeps the extras recorded for the next boot or install. Then collect the
 # generations nothing selects any more: no service holds a lease yet, and
 # collect_generations keeps anything younger than a day.
-s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" -c '
+as_hermes "$INSTALL_DIR/.venv/bin/python" -c '
 from pathlib import Path
 from hermes_cli.runtime_state import collect_generations
 from pm.environments import install_state_dir

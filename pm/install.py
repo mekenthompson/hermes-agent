@@ -657,7 +657,10 @@ def _runtime_state_matches(fact: dict, stamp: str, *, project_root: Path | None 
     recorded = fact.get("environment")
     if recorded is not None and (not isinstance(recorded, str) or Path(recorded).resolve() != environment):
         return False
-    return (environment / "pyvenv.cfg").is_file()
+    from pm.environments import venv_python
+
+    interpreter = venv_python(environment)
+    return (environment / "pyvenv.cfg").is_file() and interpreter.is_file() and os.access(interpreter, os.X_OK)
 
 
 def _member_inputs(plugins: PluginInput | None) -> dict:
