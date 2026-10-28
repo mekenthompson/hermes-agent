@@ -1,5 +1,6 @@
 """Vault I/O follows the native provenance on its actual CDP connection."""
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -115,7 +116,15 @@ def test_payment_confirmation_takeover_prevents_all_page_io(bound_connection, mo
         monkeypatch.setattr(session, '_active_sessions', {'task': info})
     meta = SimpleNamespace(kind='payment', label='Fixture', origin='https://example.test',
                            allowed_origins=['https://example.test'])
-    backend = SimpleNamespace(needs_unlock=False, get_meta=lambda handle: meta)
+
+    class Backend:
+        needs_unlock = False
+        fill_context = staticmethod(lambda: nullcontext())
+
+        def get_meta(self, handle):
+            return meta
+
+    backend = Backend()
     monkeypatch.setattr('agent.vault_backends.backend_for_handle', lambda handle: backend)
 
     def confirm(*args):

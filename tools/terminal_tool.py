@@ -1584,6 +1584,12 @@ def terminal_tool(
             # Pre-exec security checks (floors + dangerous command detection);
             # force=True means the user already confirmed.
             verdict = _run_approval_guards(command, env_type, plan.config, force=force)
+            from tools.approval_context import approval_task_revoked
+            if approval_task_revoked():
+                raise _Rejected(_error_json(
+                    "The originating task was stopped or completed before execution.",
+                    status="error",
+                ))
 
 
             pty_disabled = pty and _command_requires_pipe_stdin(command)

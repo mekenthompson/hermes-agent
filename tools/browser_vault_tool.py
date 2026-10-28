@@ -159,7 +159,7 @@ _TAB_PROBES = {
 }
 
 
-def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
+def _focus_bound_origin(task_id: str, origin: str, kind: str) -> str | dict | None:
     """Point the supervisor's page session at the open tab on ``origin`` that holds a ``kind`` form
     (browser_exec sessions open their own tabs, so the tab the supervisor attached to first is rarely the
     login page). Returns the origin when a tab was focused, else None (caller falls back to the current page)."""
@@ -172,6 +172,8 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
     from tools.browser_session_fence import run_vault_io
     focused = run_vault_io(supervisor, task_id,
                            lambda: supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind)))
+    if focused.get("code"):
+        return focused
     return (origin or focused.get("url")) if focused.get("ok") else None
 
 
@@ -187,6 +189,8 @@ def _bound_page_origin(task_id: str, meta: Any, probe_kind: str) -> str | dict[s
                 "error": f"Vault item {meta.id!r} has no bound origin; {meta.kind} items are filled only on "
                          "the site they were saved for."}
     page_origin = next((o for o in (_focus_bound_origin(task_id, c, probe_kind) for c in allowed) if o), None)
+    if isinstance(page_origin, dict):
+        return page_origin
     page_origin = page_origin or _current_page_origin(task_id)
     if not page_origin:
         return {"success": False,
@@ -436,14 +440,14 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
-    # Origin binding pre-check (the authoritative re-check runs inside the fill script), before the user is
-    # asked to confirm a card, before the backend's fill_context is entered and before any value is resolved.
+    if meta.kind == "payment" and not _confirm_payment_fill(
+            meta.label, next(iter(saved_origins(meta)), "")):
+        return json.dumps({"success": False, "error_type": "payment_declined",
+                           "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
+    # Origin binding pre-check after the prompt, so a takeover during confirmation does no page I/O.
     page_origin = _bound_page_origin(effective_task_id, meta, meta.kind)
     if isinstance(page_origin, dict):
         return json.dumps(page_origin)
-    if meta.kind == "payment" and not _confirm_payment_fill(meta.label, page_origin):
-        return json.dumps({"success": False, "error_type": "payment_declined",
-                           "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
 
     with backend.fill_context():
         refusal = snapshot_refusal(backend, handle, meta, page_origin)
