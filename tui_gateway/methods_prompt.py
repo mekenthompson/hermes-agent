@@ -928,7 +928,7 @@ def _(rid, params: dict) -> dict:
         response = _submit_after_chat_claim(
             rid, params, sid, session, text, raw_text, display_kind, display_metadata,
             raw_author, turn_author, hosted_task, hosted_terminal_callback, internal_hosted_submit,
-            submit_id, store, key)
+            submit_id, store, key, hosted_images)
     except BaseException:
         # A failure may have occurred after a rewind or submit-time row commit.
         # Retain the claim for reconciliation instead of asserting no effects.
@@ -942,7 +942,7 @@ def _(rid, params: dict) -> dict:
 def _submit_after_chat_claim(
     rid, params, sid, session, text, raw_text, display_kind, display_metadata,
     raw_author, turn_author, hosted_task, hosted_terminal_callback, internal_hosted_submit,
-    submit_id, store, key):
+    submit_id, store, key, hosted_images):
     # Rewritten every submit: a session alternates app window / HUD / live voice; a stale value misinforms.
     session["client_surface"] = params.get("surface") if params.get("surface") in _CLIENT_SURFACES else ""
     # Live-voice delegations carry the recent spoken transcript for the MODEL INPUT only (the persisted

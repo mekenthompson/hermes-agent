@@ -1022,16 +1022,11 @@ class SessionAuthority:
                         self.pending_stops[ref.session_id] = generation
 
                 self.delivered_stops[ref.session_id] = generation
-        # Main's Stop: hard-cancel (aborts compression too) and end the session's own background
-        # delegations (spawned by this session only: a viewer must not kill other gateway work).
-
+        # Canonical Stop hard-cancels the turn only. A background subagent is independent of
+        # the chat that spawned it; `/stop` is what ends those delegations.
         from agent.interrupt_compat import request_hard_interrupt
         if agent is not None:
             request_hard_interrupt(agent)
-
-        from tools.async_delegation import interrupt_for_session
-        for parent in dict.fromkeys((ref.session_id, self.physical_target(ref))):
-            interrupt_for_session(session_key=live.route, parent_session_id=parent, reason='user_stop')
         from gateway.session_ancillary import interrupt_processes, record_process_stop, retry_process_stop
         from gateway.session_runtime_workers import tracked_write
         await tracked_write(self, partial(record_process_stop, self, ref, generation))
@@ -1308,7 +1303,7 @@ class SessionAuthority:
         route; None when the drain must exit (paused, or stopping with committed rows left queued)."""
         backoff, conflicted, refusing = 0.0, None, None
         while True:
-
+            live.rescan = False  # Consume the prior wake; preserve a new one during this attempt.
             # The refusal handling's own reads and writes share the claim's storage retry, which finishes
             # that exact refusal first: once its cancellation commits, the claim no longer sees the row.
             try:
