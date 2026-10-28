@@ -1693,13 +1693,9 @@ DEFAULT_CONFIG = {
     "command_allowlist": [],
     # User-defined quick commands that bypass the agent loop (type: exec only).
     "quick_commands": {},
-    # Per-platform system-prompt hint overrides, keyed by platform name (whatsapp, slack, telegram,
-    # ...). Value: {"append": text} keeps the built-in hint and appends; {"replace": text}
-    # substitutes it; a bare string is shorthand for append. `replace` wins over `append` if both
-    # are given.
+    # Per-platform hint overrides (whatsapp, slack, telegram, ...): {"append": text}, {"replace": text}, or a bare string (append). `replace` wins.
     "platform_hints": {},
-    # Plugin system. `enabled`/`disabled` (`hermes plugins enable|disable`) and `disabled_by_update` (pm.plugin_eviction:
-    # plugins an update turned off, retried by later updates) are omitted so an empty default never clobbers a user's lists.
+    # Plugin enable/disable lists are omitted so an empty default never clobbers a user's lists.
     "plugins": {
         # Deadline (seconds) for one plugin Git clone, fetch or checkout. Slow repositories may
         # need more time; each network operation is capped at one hour.
@@ -2087,9 +2083,7 @@ DEFAULT_CONFIG = {
         # secret values); values are read from the environment at export time.
         "export": {"otlp": {"enabled": False, "endpoint": "", "headers_env": {}}},
     },
-    # Native hosted-room Discussion ceilings, shared by all members per discussion.
-    # Positive integers only (no unlimited/0). Read from the root owner's config at service
-    # startup for all hosted rooms; restart the owning service after changing them.
+    # Hosted-room Discussion ceilings (positive ints, no unlimited). Read at service startup; restart after changing.
     "hosted_rooms": {
         "discussion": {
             "max_rounds": 3,
@@ -2279,8 +2273,7 @@ DEFAULT_CONFIG = {
         # List delegate_task subagent runs in session lists (desktop sidebar, dashboard, session.list),
         # nested under their parent. Off by default: they are machinery, not conversations.
         "show_subagents": False,
-        # VACUUM after a prune that deleted rows (SQLite never reclaims disk on DELETE, #54189). It blocks
-        # writes (~seconds per 100MB): only at startup, only when ≥1 session went AND freelist/page_count > 25%.
+        # VACUUM after a prune that deleted rows (#54189): startup only, when a session went and freelist/page_count > 25%.
         "vacuum_after_prune": True,
         # Minimum days between VACUUM rewrites; pruning keeps its normal cadence.
         "min_vacuum_interval_days": 30,
@@ -2310,8 +2303,7 @@ DEFAULT_CONFIG = {
         # Max active messages per session for in-memory export (`hermes sessions export`); checked
         # per session, so full-DB backups of small sessions work.
         "max_export_messages": 20000,
-        # Seconds before a local session with no viewer is ended (resumable) once its turn settles; 0 = never; after a
-        # restart also >= 6h idle. Unset: dashboard.ws_orphan_reap_grace_s: 0 / startup_orphan_sweep: false opt out.
+        # Seconds before a viewerless local session is ended once its turn settles; 0 = never. After restart, also >= 6h idle.
         "orphan_end_grace_s": 300.0,
     },
     # First-touch onboarding hints (agent/onboarding.py), each latched under `seen` once shown.

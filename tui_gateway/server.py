@@ -1829,24 +1829,6 @@ _pet_payload_cache_lock = threading.Lock()
 _pet_payload_cache: dict[tuple, dict] = {}
 
 
-def _pet_sheet_revision(spritesheet) -> str:
-    """Stable revision id for one spritesheet file."""
-    with contextlib.suppress(Exception):
-        stat = spritesheet.stat()
-        return f"{stat.st_mtime_ns}:{stat.st_size}"
-    return "0:0"
-
-
-def _clone_pet_payload(payload: dict) -> dict:
-    """Shallow-clone cached payloads so callers can't mutate shared state."""
-    out = dict(payload)
-    for key, kind in (("framesByState", dict), ("framesByRow", dict), ("stateRows", list)):
-        if isinstance(payload.get(key), kind):
-            out[key] = kind(payload[key])
-    return out
-
-
-from .pet_frames import _pet_row_frame_counts
 from .session_titles import _branch_title
 
 

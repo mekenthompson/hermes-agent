@@ -308,23 +308,9 @@ def _ws_auth_reason(ws: WebSocket, *, allow_internal: bool = False,
 
         ticket = protocol_ticket or query_ticket
         if ticket:
-            try:
-                info = consume_ticket(ticket)
-                if info.get("provider") == "bot-desktop":
-                    # A display ticket admits one RFB bridge on /api/display/ws (a watch-only
-                    # capability handed to a screen viewer); it must not double as a login here.
-                    raise TicketInvalid("display ticket presented as a gateway login")
-                _stamp_identity(info)
-                if protocol_ticket:
-                    # Select only the stable public protocol during accept. The
-                    # ticket-bearing protocol is a credential and must never be
-                    # reflected back to the browser or retained after admission.
-                    ws._hermes_ws_subprotocol = _GATEWAY_WS_PROTOCOL
-                    return None, "ticket-subprotocol"
-                return None, "ticket"
-            except TicketInvalid as exc:
-                _reject(str(exc))
-                return "ticket_invalid", "ticket"
+            consumed = _consume_ws_ticket(ws, _reject, auth_required=True)
+            if consumed is not None:
+                return consumed
 
         if token:
             # Generated process credentials never enter the provider-token leg.

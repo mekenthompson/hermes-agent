@@ -1028,6 +1028,7 @@ class SessionAuthority:
         if agent is not None:
             request_hard_interrupt(agent)
 
+        from tools.async_delegation import interrupt_for_session
         for parent in dict.fromkeys((ref.session_id, self.physical_target(ref))):
             interrupt_for_session(session_key=live.route, parent_session_id=parent, reason='user_stop')
         from gateway.session_ancillary import interrupt_processes, record_process_stop, retry_process_stop
@@ -1067,6 +1068,7 @@ class SessionAuthority:
         Stop above reached the turn's own agent, not a cached one it may still replace."""
 
         from gateway.session_state import AGENT_PENDING_SENTINEL as _AGENT_PENDING_SENTINEL
+        from gateway.session_detached import running_key
 
         live = self.sessions[ref.session_id]
         running = getattr(self.runner, '_running_agents', None) or {}
