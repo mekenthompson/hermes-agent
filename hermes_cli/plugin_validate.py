@@ -232,7 +232,7 @@ class RecordingContext:
     def register_tool(self, name, *args, **kwargs):
         recorded["tools"].append(str(name))
 
-    def register_hook(self, hook_name, callback):
+    def register_hook(self, hook_name, callback, *, hold_stream=False):
         recorded["hooks"].append(str(hook_name))
 
     def register_middleware(self, kind, callback):
@@ -353,24 +353,19 @@ def _run_capability_probe(
     is the ``{tools, hooks, middleware, commands, providers}`` dict on
     success, and *error* is a human-readable failure description otherwise.
     """
-    if isinstance(probe, tuple):
-        probe_environment = probe
-        python_executable = None
-    else:
-        probe_environment = None
-        python_executable = probe
+    probe_environment = probe if isinstance(probe, tuple) else None
     with tempfile.TemporaryDirectory(prefix="hermes-validate-") as scratch:
         env = dict(probe_environment[1] if probe_environment else os.environ)
         env["HERMES_HOME"] = scratch
+        # The probe imports this tree's ``providers``; name the tree instead of relying on the cwd.
+        repo_root = str(Path(__file__).resolve().parents[1])
+        env["PYTHONPATH"] = os.pathsep.join(p for p in (repo_root, env.get("PYTHONPATH", "")) if p)
+        python, *options = probe_environment[0] if probe_environment else [probe or sys.executable]
         try:
-            executable = probe_environment[0] if probe_environment else python_executable or sys.executable
             result = subprocess.run(
                 [
-                    *(
-                        [str(part) for part in executable]
-                        if isinstance(executable, (list, tuple))
-                        else [str(executable)]
-                    ),
+                    # -P: ``-c`` would put the user's cwd ahead of Hermes and the plugin's imports.
+                    str(python), "-P", *[str(option) for option in options],
                     "-c",
                     _PROBE_SCRIPT,
                     str(plugin_dir),

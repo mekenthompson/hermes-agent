@@ -32,6 +32,12 @@ class RuntimeStoreError(ValueError):
         super().__init__(reason)
 
 
+#: The one ``admission_conflict`` that proves the request was already admitted: this principal's
+#: request id on this target holds an admission with another payload. Every other conflict (route,
+#: binding, lineage) carries no such proof, so a client tells them apart by this field.
+ADMITTED_REQUEST_CONFLICT = {'field': 'request_id', 'detail': 'this request id was already admitted with another payload'}
+
+
 def _one_line(value, limit):
     """A refusal's ``field``/``detail`` as the log line and the client frame carry it: either may hold
     client text, so whitespace collapses to single spaces, other non-printables drop (no forged log
@@ -155,11 +161,11 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
             if _control_snapshot is not None:
                 retained = json.loads(old['payload_json']).get('native_stop_v1')
                 if retained is None:
-                    raise RuntimeStoreError('admission_conflict')
+                    raise RuntimeStoreError('admission_conflict', **ADMITTED_REQUEST_CONFLICT)
                 compared = admission_fingerprint(canonical_target=session_id,
                     payload={'input': {**payload, 'native_stop_v1': retained}, 'intent': intent})
             if old['payload_digest'] != compared:
-                raise RuntimeStoreError('admission_conflict')
+                raise RuntimeStoreError('admission_conflict', **ADMITTED_REQUEST_CONFLICT)
             if _replay_guard is not None:
                 _replay_guard(conn)
             return _row(old)

@@ -133,8 +133,7 @@ def _session_end_mode() -> str:
     """
     try:
         from hermes_cli.config import get_config_path, load_config_readonly
-        from utils import fast_safe_load
-
+        from hermes_cli.config_backend import read_config_doc_readonly
         from hermes_cli.managed_scope import get_managed_dir
 
         config_paths = [get_config_path()]
@@ -143,8 +142,7 @@ def _session_end_mode() -> str:
             config_paths.append(managed_dir / "config.yaml")
         for config_path in config_paths:
             try:
-                with open(config_path, encoding="utf-8-sig") as f:
-                    user_config = fast_safe_load(f)
+                user_config = read_config_doc_readonly(config_path)
             except FileNotFoundError:
                 pass  # No user config is the historical cleanup-default state.
             except Exception:

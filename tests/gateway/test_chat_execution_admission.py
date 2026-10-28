@@ -58,6 +58,14 @@ def test_sqlite_admission_failure_is_observable(tmp_path):
 
 
 
+def _drain_lease_releases():
+    """Turn-end lease releases run on one deferred worker (``gateway.active_lease_io``); wait for it."""
+    from gateway import active_lease_io
+    pool = active_lease_io._pool
+    if pool is not None:
+        pool.submit(lambda: None).result(timeout=5)
+
+
 def inbound_fixture(home):
     """Real handler, generation and cleanup; isolate unrelated ingress and model I/O."""
     runner, _ = make_restart_runner()
@@ -115,6 +123,7 @@ async def test_actual_inbound_restart_and_memory_floor(tmp_path):
     assert runner._current_session_run_generation(key) == 0
     assert await runner._handle_message(event) == "executed"
     assert runner._handle_message_with_agent.await_args.args[-1] == 10
+    _drain_lease_releases()
     slot.release.assert_called_once_with()
     restarted, event, key, _ = inbound_fixture(tmp_path)
     restarted._session_state(key).persistent.run_generation = 17

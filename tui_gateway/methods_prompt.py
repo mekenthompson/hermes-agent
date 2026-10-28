@@ -271,12 +271,15 @@ def _typed_stop_phrase_response(rid, text, sid=None):
 _HOSTED_TASK_FIELDS = {"room_id", "task_id", "thread_id", "turn_id", "execution_generation", "member_id"}
 
 
-def _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback):
-    """Validate the hosted-room turn proof carried by an internal submit."""
+def _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback, hosted_images=None):
+    """Validate the hosted-room turn proof carried by an internal submit. ``hosted_images`` are the
+    member's event-bound images, already materialized under the image cache by the room worker."""
     if session.get("source") != "bot_room":
         return _err(rid, 4120, "hosted room turns require a bot_room session")
     valid = (
         isinstance(hosted_task, dict) and callable(hosted_terminal_callback)
+        and (hosted_images is None or (isinstance(hosted_images, list)
+                                       and all(isinstance(p, str) and p for p in hosted_images)))
         and set(hosted_task) == _HOSTED_TASK_FIELDS
         and all(isinstance(hosted_task.get(f), str) and hosted_task[f]
                 for f in _HOSTED_TASK_FIELDS - {"execution_generation"})
@@ -691,7 +694,7 @@ def _approval_origin_for_direct_submit(session, text, raw_text, *, internal_host
 
 def _run_after_agent_ready(
     rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None,
-    approval_origin=None, chat_submit_ids=(), chat_submit_key=None,
+    approval_origin=None, chat_submit_ids=(), chat_submit_key=None, hosted_images=None,
 ):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
@@ -728,7 +731,7 @@ def _run_after_agent_ready(
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
-        terminal_callback=hosted_terminal_callback, turn_author=turn_author,
+        image_paths=hosted_images, terminal_callback=hosted_terminal_callback, turn_author=turn_author,
         approval_origin=approval_origin, chat_submit_ids=chat_submit_ids,
         chat_submit_key=chat_submit_key)
 
@@ -899,9 +902,11 @@ def _(rid, params: dict) -> dict:
     turn_author = raw_author.author if raw_author is not None else None
     hosted_task = params.get("_hosted_task")
     hosted_terminal_callback = params.get("_hosted_terminal_callback")
-    internal_hosted_submit = hosted_task is not None or hosted_terminal_callback is not None
+    hosted_images = params.get("_hosted_images")
+    internal_hosted_submit = (
+        hosted_task is not None or hosted_terminal_callback is not None or hosted_images is not None)
     err = (
-        _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback)
+        _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback, hosted_images)
         if internal_hosted_submit else _legacy_group_fence_error(rid, session, params))
     if err is not None:
         return err
@@ -923,7 +928,7 @@ def _(rid, params: dict) -> dict:
         response = _submit_after_chat_claim(
             rid, params, sid, session, text, raw_text, display_kind, display_metadata,
             raw_author, turn_author, hosted_task, hosted_terminal_callback, internal_hosted_submit,
-            submit_id, store, key)
+            submit_id, store, key, hosted_images)
     except BaseException:
         # A failure may have occurred after a rewind or submit-time row commit.
         # Retain the claim for reconciliation instead of asserting no effects.
@@ -937,7 +942,7 @@ def _(rid, params: dict) -> dict:
 def _submit_after_chat_claim(
     rid, params, sid, session, text, raw_text, display_kind, display_metadata,
     raw_author, turn_author, hosted_task, hosted_terminal_callback, internal_hosted_submit,
-    submit_id, store, key):
+    submit_id, store, key, hosted_images):
     # Rewritten every submit: a session alternates app window / HUD / live voice; a stale value misinforms.
     session["client_surface"] = params.get("surface") if params.get("surface") in _CLIENT_SURFACES else ""
     # Live-voice delegations carry the recent spoken transcript for the MODEL INPUT only (the persisted
@@ -1043,7 +1048,7 @@ def _submit_after_chat_claim(
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
             rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author,
-            approval_origin, (submit_id,), key),
+            approval_origin, (submit_id,), key, hosted_images),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread
