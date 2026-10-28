@@ -214,7 +214,7 @@ def _ws_gated_access_token(ws, app, token, webapp, reject, stamp):
             reject("generated process token")
             return "token_mismatch", "token"
         session = _explicit_session_token_session()
-        stamp({"user_id": session.user_id, "provider": session.provider})
+        stamp({"user_id": getattr(session, "user_id", None), "provider": getattr(session, "provider", None)})
         return None, "explicit-token"
     view = _ws_request_view(ws, app)
     try:
@@ -227,9 +227,9 @@ def _ws_gated_access_token(ws, app, token, webapp, reject, stamp):
     if session is None:
         audit_log(AuditEvent.TOKEN_AUTH_FAILURE, reason="session_token_invalid", ip=ip, path=ws.url.path)
         return "token_invalid", "token"
-    stamp({"user_id": session.user_id, "provider": session.provider})
-    audit_log(AuditEvent.TOKEN_AUTH_SUCCESS, provider=session.provider, user_id=session.user_id,
-              ip=ip, path=ws.url.path)
+    stamp({"user_id": getattr(session, "user_id", None), "provider": getattr(session, "provider", None)})
+    audit_log(AuditEvent.TOKEN_AUTH_SUCCESS, provider=getattr(session, "provider", None),
+              user_id=getattr(session, "user_id", None), ip=ip, path=ws.url.path)
     return None, "token"
 
 
