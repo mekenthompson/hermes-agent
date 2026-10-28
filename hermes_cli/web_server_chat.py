@@ -201,6 +201,38 @@ def _ws_request_view(ws: WebSocket, app) -> Request:
     })
 
 
+def _ws_gated_access_token(ws, app, token, webapp, reject, stamp):
+    """Gated ``?token=``: explicit operator token, else a provider session token."""
+    from hermes_cli import webapp_sign_in
+    from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+    from hermes_cli.dashboard_auth.base import ProviderError
+    from hermes_cli.dashboard_auth.middleware import _verify_access_token
+    from hermes_cli.web_server import _SESSION_TOKEN, _SESSION_TOKEN_IS_EXPLICIT, _explicit_session_token_session
+
+    if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+        if not _SESSION_TOKEN_IS_EXPLICIT:
+            reject("generated process token")
+            return "token_mismatch", "token"
+        session = _explicit_session_token_session()
+        stamp({"user_id": session.user_id, "provider": session.provider})
+        return None, "explicit-token"
+    view = _ws_request_view(ws, app)
+    try:
+        session = (_verify_access_token(view, access_token=token, audit=False)
+                   if not webapp or webapp_sign_in.token_works_alone(view, token) else None)
+    except ProviderError:
+        reject("session token verify unavailable")
+        return "token_unavailable", "token"
+    ip = ws.client.host if ws.client else ""
+    if session is None:
+        audit_log(AuditEvent.TOKEN_AUTH_FAILURE, reason="session_token_invalid", ip=ip, path=ws.url.path)
+        return "token_invalid", "token"
+    stamp({"user_id": session.user_id, "provider": session.provider})
+    audit_log(AuditEvent.TOKEN_AUTH_SUCCESS, provider=session.provider, user_id=session.user_id,
+              ip=ip, path=ws.url.path)
+    return None, "token"
+
+
 def _ws_auth_reason(ws: WebSocket, *, allow_internal: bool = False,
                     socket: Optional[str] = None) -> tuple[Optional[str], str]:
     """Validate WS-upgrade auth; return ``(reason, credential)``.
@@ -313,43 +345,7 @@ def _ws_auth_reason(ws: WebSocket, *, allow_internal: bool = False,
                 return consumed
 
         if token:
-            # Generated process credentials never enter the provider-token leg.
-            # Operator-configured credentials keep their stable Desktop identity.
-            if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
-                if not _SESSION_TOKEN_IS_EXPLICIT:
-                    _reject("generated process token")
-                    return "token_mismatch", "token"
-                session = _explicit_session_token_session()
-                _stamp_identity({"user_id": session.user_id, "provider": session.provider})
-                return None, "explicit-token"
-
-            from hermes_cli import webapp_sign_in
-            from hermes_cli.dashboard_auth.base import ProviderError
-            from hermes_cli.dashboard_auth.middleware import _verify_access_token
-
-            view = _ws_request_view(ws, app)
-            try:
-                # On the Webapp a browser login's tokens work only as its cookies.
-                # Native-issued tokens may be presented alone. Other listeners retain
-                # provider verification.
-                session = (_verify_access_token(view, access_token=token, audit=False)
-                           if not webapp or webapp_sign_in.token_works_alone(view, token) else None)
-            except ProviderError:
-                # A provider outage must not crash an upgrade or leak provider
-                # diagnostics (which may contain credentials) into the audit.
-                _reject("session token verify unavailable")
-                return "token_unavailable", "token"
-            if session is not None:
-                _stamp_identity({"user_id": session.user_id, "provider": session.provider})
-                audit_log(
-                    AuditEvent.TOKEN_AUTH_SUCCESS,
-                    provider=session.provider, user_id=session.user_id,
-                    ip=(ws.client.host if ws.client else ""), path=ws.url.path)
-                return None, "token"
-            audit_log(
-                AuditEvent.TOKEN_AUTH_FAILURE, reason="session_token_invalid",
-                ip=(ws.client.host if ws.client else ""), path=ws.url.path)
-            return "token_invalid", "token"
+            return _ws_gated_access_token(ws, app, token, webapp, _reject, _stamp_identity)
         return "no_credential", "none"
 
     # Loopback: on the Webapp a one-use ticket ``/api/webapp/socket-ticket`` minted for the
