@@ -440,14 +440,14 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
-    if meta.kind == "payment" and not _confirm_payment_fill(
-            meta.label, next(iter(saved_origins(meta)), "")):
-        return json.dumps({"success": False, "error_type": "payment_declined",
-                           "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
-    # Origin binding pre-check after the prompt, so a takeover during confirmation does no page I/O.
+    # Origin binding pre-check (the authoritative re-check runs inside the fill script), before the user is
+    # asked to confirm a card, before the backend's fill_context is entered and before any value is resolved.
     page_origin = _bound_page_origin(effective_task_id, meta, meta.kind)
     if isinstance(page_origin, dict):
         return json.dumps(page_origin)
+    if meta.kind == "payment" and not _confirm_payment_fill(meta.label, page_origin or ""):
+        return json.dumps({"success": False, "error_type": "payment_declined",
+                           "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
 
     with backend.fill_context():
         refusal = snapshot_refusal(backend, handle, meta, page_origin)

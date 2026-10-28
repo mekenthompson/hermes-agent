@@ -33,6 +33,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from agent.acp_openai_bridge import (
+    LiveStream,
+    TextProgress,
     completion_to_stream_chunks as _completion_to_stream_chunks,
     extract_tool_calls_from_text as _extract_tool_calls_from_text,
     render_tool_bridge_sections as _render_tool_bridge_sections,
@@ -61,7 +63,7 @@ _INITIALIZE_PARAMS = {
     "clientCapabilities": {"fs": {"readTextFile": True, "writeTextFile": True}},
     "clientInfo": {"name": "hermes-agent", "title": "Hermes Agent", "version": "0.0.0"},
 }
-def _acp_supported(command: str, args: list[str]) -> bool | None:
+def _acp_supported(command: str, args: list[str], timeout: float = 5) -> bool | None:
     """Tri-state ``--acp`` probe (a CLI without the flag exits 1 and the parent would wait the
     full child timeout for stdout that never arrives). True = help advertises --acp; False =
     help ran cleanly without it (caller fast-fails); None = inconclusive (binary missing /
@@ -71,22 +73,25 @@ def _acp_supported(command: str, args: list[str]) -> bool | None:
     if (cached := _ACP_PROBE_CACHE.get(command)) is not None:
         return cached
     try:
-        probe = subprocess.run(
+        probe = subprocess.Popen(
             [command, "--help"],
-            # Explicit codec because text=True alone decodes with the
-            # locale default and crashes on non-ASCII help text under
-            # GBK/CP932 locales.
-            capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=5,
-            stdin=subprocess.DEVNULL,
-            check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace", start_new_session=True,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        stdout, _ = probe.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(probe.pid, 15)
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            probe.wait(timeout=0.2)
         return None
     if probe.returncode != 0:
         return None
     # ``--acp`` as a flag token; tolerate spacing and ``[--acp]`` variants.
-    verdict = _ACP_PROBE_CACHE[command] = bool(re.search(r"(?:^|[\s\[])--acp(?:[\s=\],]|$)", probe.stdout, re.MULTILINE))
+    verdict = _ACP_PROBE_CACHE[command] = bool(re.search(r"(?:^|[\s\[])--acp(?:[\s=\],]|$)", stdout or "", re.MULTILINE))
     return verdict
 
 
@@ -231,10 +236,17 @@ def _ensure_path_within_cwd(path_text: str, cwd: str, *, verb: str) -> Path:
 
 
 def _effective_timeout(timeout: Any) -> float:
-    """Normalise a float or httpx.Timeout-like object to wall-clock seconds (largest component wins)."""
+    """Normalise a float or httpx.Timeout-like object to wall-clock seconds.
+
+    A timeout object's read budget is the generation limit. Its write budget is
+    only how long a blocked send may take, and must not stretch the request.
+    """
     if isinstance(timeout, (int, float)):
         return float(timeout)
-    candidates = [getattr(timeout, attr, None) for attr in ("read", "write", "connect", "pool", "timeout")]
+    read = getattr(timeout, "read", None)
+    if isinstance(read, (int, float)):
+        return float(read)
+    candidates = [getattr(timeout, attr, None) for attr in ("write", "connect", "pool", "timeout")]
     return max((float(v) for v in candidates if isinstance(v, (int, float))), default=_DEFAULT_TIMEOUT_SECONDS)
 
 
@@ -373,23 +385,41 @@ class ACPClient:
         for proc in procs:
             self._terminate_process(proc)
 
+    @staticmethod
+    def hermes_abort_request(client) -> None:
+        """Unblock a stranger-thread abort. Lifecycle looks this up on the class and calls it with the instance."""
+        client.close()
+
     def _create_chat_completion(
         self, *, model: str | None = None, messages: list[dict[str, Any]] | None = None, timeout: float | None = None,
         tools: list[dict[str, Any]] | None = None, tool_choice: Any = None, stream: bool = False, **_: Any,
     ) -> Any:
         prompt_text = _format_messages_as_prompt(messages or [], model=model, tools=tools, tool_choice=tool_choice)
-        response_text, reasoning = self._run_prompt(prompt_text, timeout_seconds=_effective_timeout(timeout), model=model)
+        timeout_seconds = _effective_timeout(timeout)
+        if stream:
+            deadline = time.monotonic() + timeout_seconds
+            model_name = model or self.placeholder_model
+
+            def complete(publish):
+                response_text, reasoning = self._run_prompt(
+                    prompt_text, timeout_seconds=max(0.0, deadline - time.monotonic()), model=model, on_delta=publish)
+                return self._completion(response_text, reasoning, model_name)
+
+            return LiveStream(complete, self.close, model_name, deadline)
+        response_text, reasoning = self._run_prompt(prompt_text, timeout_seconds=timeout_seconds, model=model)
+        return self._completion(response_text, reasoning, model or self.placeholder_model)
+
+    def _completion(self, response_text: str, reasoning: str, model_name: str) -> SimpleNamespace:
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
         message = SimpleNamespace(
             content=cleaned_text, tool_calls=tool_calls, reasoning=reasoning or None, reasoning_content=reasoning or None,
             reasoning_details=None,
         )
-        completion = SimpleNamespace(
+        return SimpleNamespace(
             choices=[SimpleNamespace(message=message, finish_reason="tool_calls" if tool_calls else "stop")],
             usage=SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0, prompt_tokens_details=SimpleNamespace(cached_tokens=0)),
-            model=model or self.placeholder_model,
+            model=model_name,
         )
-        return _completion_to_stream_chunks(completion) if stream else completion
 
     def _spawn(self) -> subprocess.Popen[str]:
         # Fast-fail when the CLI rejects --acp (else the parent waits the full child timeout for stdout that
@@ -441,9 +471,9 @@ class ACPClient:
             for line in stream or ():
                 sink(line)
 
-        threading.Thread(target=_pump, args=(proc.stdout, lambda line: inbox.put(_decode(line))), daemon=True).start()
+        threading.Thread(target=_pump, args=(proc.stdout, lambda line: inbox.put(_decode(line))), name="acp-pump", daemon=True).start()
         stderr_pump = threading.Thread(
-            target=_pump, args=(proc.stderr, lambda line: stderr_tail.append(line.rstrip("\n"))), daemon=True)
+            target=_pump, args=(proc.stderr, lambda line: stderr_tail.append(line.rstrip("\n"))), name="acp-pump", daemon=True)
         stderr_pump.start()
         request_ids = iter(range(1, 1 << 62))
         # One budget for the WHOLE session (initialize + session/new + any prompt), not per
@@ -451,18 +481,38 @@ class ACPClient:
         session_deadline = time.monotonic() + timeout_seconds
 
         def _request(method: str, params: dict[str, Any], *, text_parts: list[str] | None = None,
-                     reasoning_parts: list[str] | None = None) -> Any:
+                     reasoning_parts: list[str] | None = None, on_delta: Callable[..., Any] | None = None) -> Any:
             request_id = next(request_ids)
-            try:
-                proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n")
-                proc.stdin.flush()
-            except OSError as exc:  # the CLI stopped reading: EPIPE, or EINVAL on a Windows pipe
-                if not isinstance(exc, BrokenPipeError) and exc.errno != errno.EINVAL:
-                    raise
+            payload = json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n"
+            write_errors: list[BaseException] = []
+
+            def _send() -> None:
+                stdin = proc.stdin
+                if stdin is None:
+                    write_errors.append(RuntimeError(f"{self.label} process has no stdin."))
+                    return
+                try:
+                    stdin.write(payload)
+                    stdin.flush()
+                except Exception as exc:
+                    write_errors.append(exc)
+
+            writer = threading.Thread(target=_send, name="acp-write", daemon=True)
+            writer.start()
+            writer.join(max(0.0, session_deadline - time.monotonic()))
+            if writer.is_alive():
+                self._terminate_process(proc)
+                writer.join(1)
+                raise TimeoutError(f"Timed out writing to {self.label}.")
+            if write_errors:
+                exc = write_errors[0]
+                if not isinstance(exc, OSError) or (not isinstance(exc, BrokenPipeError) and getattr(exc, "errno", None) != errno.EINVAL):
+                    raise exc
                 with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=5)  # dying: report its exit text below, not a bare EPIPE
-                if proc.poll() is None:  # alive but deaf: fail now, not after the whole request timeout
-                    raise
+                    proc.wait(timeout=5)
+                if proc.poll() is None:
+                    raise exc
+            text_progress, reasoning_progress = TextProgress(), TextProgress()
             deadline = session_deadline
             while time.monotonic() < deadline and proc.poll() is None:
                 try:
@@ -472,6 +522,7 @@ class ACPClient:
                 if self._handle_server_message(
                     msg, process=proc, cwd=self._acp_cwd, text_parts=text_parts,
                     reasoning_parts=reasoning_parts, allow_file_requests=allow_file_requests,
+                    on_delta=on_delta, text_progress=text_progress, reasoning_progress=reasoning_progress,
                 ) or msg.get("id") != request_id:
                     continue
                 if "error" in msg:
@@ -501,7 +552,8 @@ class ACPClient:
         with self._session(timeout_seconds, allow_file_requests=False) as (session, _):
             return _session_model_ids(session, self.model_entry_disabled)
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None) -> tuple[str, str]:
+    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None,
+                    on_delta: Callable[..., Any] | None = None) -> tuple[str, str]:
         # No `--model` spawn flag: agent CLIs may validate it (an unknown id aborts the spawn) yet ignore it
         # for the session, so the model is applied over ACP after session/new instead.
         requested_model = str(model or "").strip()
@@ -524,12 +576,13 @@ class ACPClient:
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
             prompt = {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt_text}]}
-            _request("session/prompt", prompt, text_parts=text_parts, reasoning_parts=reasoning_parts)
+            _request("session/prompt", prompt, text_parts=text_parts, reasoning_parts=reasoning_parts, on_delta=on_delta)
             return "".join(text_parts), "".join(reasoning_parts)
 
     def _handle_server_message(
         self, msg: dict[str, Any], *, process: subprocess.Popen[str], cwd: str, text_parts: list[str] | None, reasoning_parts: list[str] | None,
-        allow_file_requests: bool = True,
+        allow_file_requests: bool = True, on_delta: Callable[..., Any] | None = None,
+        text_progress: TextProgress | None = None, reasoning_progress: TextProgress | None = None,
     ) -> bool:
         """Consume a server->client message; True when handled (notification or request answered)."""
         method = msg.get("method")
@@ -539,9 +592,14 @@ class ACPClient:
             update = (msg.get("params") or {}).get("update") or {}
             content = update.get("content") or {}
             chunk_text = str(content.get("text") or "") if isinstance(content, dict) else ""
-            sinks = {"agent_message_chunk": text_parts, "agent_thought_chunk": reasoning_parts}
-            if chunk_text and (sink := sinks.get(str(update.get("sessionUpdate") or "").strip())) is not None:
-                sink.append(chunk_text)
+            sinks = {"agent_message_chunk": (text_parts, text_progress, False), "agent_thought_chunk": (reasoning_parts, reasoning_progress, True)}
+            kind = str(update.get("sessionUpdate") or "").strip()
+            if chunk_text and (slot := sinks.get(kind)) is not None:
+                sink, progress, reasoning = slot
+                if sink is not None:
+                    sink.append(chunk_text)
+                if on_delta is not None and progress is not None and (visible := progress.feed(chunk_text)):
+                    on_delta(visible, reasoning)
             return True
         if process.stdin is None:
             return True

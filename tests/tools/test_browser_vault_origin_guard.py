@@ -49,6 +49,7 @@ class _FakePage:
 
     def __init__(self, href: str, controls: list[dict]):
         self.href, self.controls, self.writes = href, controls, []
+        self.browser_session_info = None
 
     def focus_page(self, origin: str, accept=None) -> dict:
         return {"ok": bool(origin) and normalize_origin(self.href) == origin, "url": self.href}

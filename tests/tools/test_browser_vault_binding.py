@@ -127,7 +127,12 @@ def test_payment_confirmation_takeover_prevents_all_page_io(bound_connection, mo
     backend = Backend()
     monkeypatch.setattr('agent.vault_backends.backend_for_handle', lambda handle: backend)
 
+    before = {}
+
     def confirm(*args):
+        # Page I/O before the prompt (the origin pre-check) is allowed; none may follow the takeover.
+        live = registry.get('task')
+        before.update(focused=len(live.focused) if live else 0, connected=live is not None)
         lease.acquire('viewer', profile_key=owner)
         return True
 
@@ -135,9 +140,10 @@ def test_payment_confirmation_takeover_prevents_all_page_io(bound_connection, mo
     try:
         result = json.loads(vault._handle_vault({'action': 'fill', 'handle': 'fixture'}, task_id='task'))
         assert result.get('code') == 'human_has_control'
-        assert supervisor.focused == []
-        assert supervisor.evaluated == []
-        if cold_connection:
-            assert registry.get('task') is None, 'takeover started a new page connection'
+        live = registry.get('task')
+        assert (len(live.focused) if live else 0) == before['focused']
+        assert supervisor.evaluated == [] and (live is None or live.evaluated == [])
+        if cold_connection and not before['connected']:
+            assert live is None, 'takeover started a new page connection'
     finally:
         lease.release('viewer', profile_key=owner)
