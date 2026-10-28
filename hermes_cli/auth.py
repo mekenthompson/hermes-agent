@@ -2095,6 +2095,40 @@ def _external_process_spec(
     return command, args, base_url, resolve_external_process_command(command), command_env_vars
 
 
+def _external_process_provider_config(provider_id: str) -> tuple[ProviderConfig, Any]:
+    """Return process-provider metadata, rejecting unsafe process-auth collisions.
+
+    Built-in OAuth/native overlays can intentionally refine static API-key
+    metadata. A disagreement involving ``external_process`` is different: it
+    would choose HTTP credentials or a subprocess based solely on import order.
+    """
+    pconfig = _registry_lookup(provider_id)
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider_id)
+    except Exception:
+        profile = None
+    static_auth = getattr(pconfig, "auth_type", None)
+    profile_auth = getattr(profile, "auth_type", None)
+    if (
+        (static_auth == "external_process" or profile_auth == "external_process")
+        and static_auth and profile_auth and static_auth != profile_auth
+    ):
+        raise AuthError(
+            f"Provider '{provider_id}' has conflicting authentication metadata.",
+            provider=provider_id,
+            code="invalid_provider",
+        )
+    if not pconfig or pconfig.auth_type != "external_process":
+        raise AuthError(
+            f"Provider '{provider_id}' is not an external-process provider.",
+            provider=provider_id,
+            code="invalid_provider",
+        )
+    return pconfig, profile
+
+
 def get_external_process_provider_status(provider_id: str) -> dict[str, Any]:
     """Status snapshot for providers that run a local subprocess.
 

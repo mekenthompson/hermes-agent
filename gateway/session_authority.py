@@ -642,7 +642,8 @@ class SessionAuthority:
                     receipt = self._receipt(row)
                 return receipt
             finally:
-                if (live := self.sessions.get(committed[0].session_id)) is not None and not live.superseded:
+                from gateway.session_history_mount import is_history_mount
+                if (live := self.sessions.get(committed[0].session_id)) is not None and not is_history_mount(live):
                     self._schedule_admitted(committed[0])
         # Once writing starts, cancellation releases only the observer. Retirement
         # joins this same native commit, busy/control handling and drain publication.

@@ -84,7 +84,7 @@ async def close_viewer_session(authority, session_id, reason):
     live = authority.sessions[session_id]
     if live.subscribers:
         return  # a viewer attached while the detach was off the loop: nothing closes or ends
-    if is_history_mount(live) or live.superseded:
+    if is_history_mount(live):
         return  # stored history or a superseded mount: no route, agent or delegation of its own
     with live.event_stream.lock:
         for lease in list(getattr(live, 'approval_task_leases', ())):
