@@ -49,6 +49,7 @@ def _run(home: Path, backend_env: str | None) -> str:
     python.chmod(0o755)
     script = (
         "set -eu\n"
+        "as_hermes() { s6-setuidgid hermes \"$@\"; }\n"
         + f'PATH="{bin_dir}:$PATH"\nHERMES_HOME="{home}"\nINSTALL_DIR="{root / "install"}"\n'
         + _block()
     )
