@@ -2084,6 +2084,7 @@ def _external_process_spec(
         from providers import get_provider_profile as _get_provider_profile
         profile = _get_provider_profile(pconfig.id)
     except Exception:
+        logger.debug("external-process profile lookup failed", exc_info=True)
         profile = None
     command_env_vars = tuple(getattr(profile, "process_command_env_vars", ()) or ())
     args_env_var = str(getattr(profile, "process_args_env_var", "") or "")
@@ -2108,6 +2109,7 @@ def _external_process_provider_config(provider_id: str) -> tuple[ProviderConfig,
 
         profile = get_provider_profile(provider_id)
     except Exception:
+        logger.debug("external-process provider profile lookup failed", exc_info=True)
         profile = None
     static_auth = getattr(pconfig, "auth_type", None)
     profile_auth = getattr(profile, "auth_type", None)
