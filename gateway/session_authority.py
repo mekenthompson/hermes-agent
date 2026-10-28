@@ -1334,6 +1334,13 @@ class SessionAuthority:
                             refusing = None
                             if refused:
                                 continue
+                    # A readiness wake may arrive while the failed preclaim cleanup is
+                    # being checked. Re-evaluate immediately: the resource can now be
+                    # positively owned even though this attempt observed the refusal.
+                    if live.rescan:
+                        if self._drain_stopping(ref, live):
+                            return None
+                        continue
                     import logging
                     logging.getLogger(__name__).warning('Session %s paused: %s', ref.session_id, exc.reason)
                     self._pause(ref, exc.reason)
