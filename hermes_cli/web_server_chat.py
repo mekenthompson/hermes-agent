@@ -340,7 +340,7 @@ def _ws_auth_reason(ws: WebSocket, *, allow_internal: bool = False,
 
         ticket = protocol_ticket or query_ticket
         if ticket:
-            consumed = _consume_ws_ticket(ws, _reject, auth_required=True)
+            consumed = _consume_ws_ticket(ws, _reject, socket, auth_required=True)
             if consumed is not None:
                 return consumed
 
