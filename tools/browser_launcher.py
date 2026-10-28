@@ -710,13 +710,8 @@ def _launch_owned(key: str, executable: str, udd: str, *, ephemeral: bool, packa
 
 
 def _abandon_launch(proc: subprocess.Popen, starting: LaunchedBrowser) -> None:
-    with _lock:
-        _launching.pop(proc.pid, None)
-    if proc.poll() is None:  # one that already exited is reaped by poll(); its pid is no longer ours
-        _terminate(proc.pid, starting.start_time, proc)
-    _remove_record(starting)
-    if starting.ephemeral:
-        shutil.rmtree(starting.user_data_dir, ignore_errors=True)
+    from tools.browser_launcher_lifecycle import abandon_launch
+    abandon_launch(proc, starting)
 
 
 # ── Lookup / stop ────────────────────────────────────────────────────────────────────────────────────
@@ -821,16 +816,23 @@ def _terminate(pid: Optional[int], start_time: Optional[int], proc: Optional[sub
             proc.kill()
 
 
-def stop_browser(key: str) -> None:
+def stop_browser(key: str, *, force: bool = False) -> None:
     """Let go of ``key``'s browser. A throwaway one this process launched is stopped. A shared-profile one is
     stopped only by its LAST holder across Hermes processes (:func:`_last_holder_out`); one a human started is
     never stopped. Holds ``key``'s launch lock: a relaunch of ``key`` waits for this stop instead of
     registering a replacement on the dir it is about to delete."""
     with _key_lock(key):
-        _stop_locked(key)
+        _stop_locked(key, force=force)
 
 
-def _stop_locked(key: str) -> None:
+def detach_browser(key: str) -> bool:
+    """Release this client's persistent browser while retaining its process/tabs."""
+    from tools.browser_launcher_lifecycle import detach_shared_browser
+    return detach_shared_browser(key)
+
+
+def _stop_locked(key: str, *, force: bool = False) -> None:
+    from tools.browser_launcher_lifecycle import cleanup_guard, recorded_home
     with _lock:
         browser = _browsers.get(key)
         proc = _procs.get(key)
@@ -838,21 +840,24 @@ def _stop_locked(key: str) -> None:
         return
     record = None if browser.ephemeral else _record_path(browser)
     if record is None:
-        if browser.owned:
-            _terminate(browser.pid, browser.start_time, proc)
+        with cleanup_guard(browser.home_key) as admitted:
+            if browser.owned and admitted:
+                _terminate(browser.pid, browser.start_time, proc)
         with _lock:
-            _forget(key, browser)
+            _forget(key, browser, drop_record=admitted)
         return
     from tools.browser_launcher_holders import records_lock
     with records_lock(record.parent):  # the decision and the forget are one step: another key may be the heir
-        if _heir_key(browser) is None and _last_holder_out(record, browser):
-            _terminate(browser.pid, browser.start_time, proc)
-            record.unlink(missing_ok=True)
+        if _heir_key(browser) is None and _last_holder_out(record, browser, force=force):
+            with cleanup_guard(recorded_home(record, browser)) as admitted:
+                if admitted:
+                    _terminate(browser.pid, browser.start_time, proc)
+                    record.unlink(missing_ok=True)
         with _lock:
             _forget(key, browser, drop_record=False)
 
 
-def _last_holder_out(record: Path, browser: LaunchedBrowser) -> bool:
+def _last_holder_out(record: Path, browser: LaunchedBrowser, *, force: bool = False) -> bool:
     """Drop this process's hold on shared-profile ``browser`` (caller holds the records lock). True when it
     must stop it now: no other live Hermes process holds it, and Hermes launched it (a launch record names
     it). Otherwise a record this process holds, or whose owner is gone, goes to a live holder."""
@@ -870,6 +875,8 @@ def _last_holder_out(record: Path, browser: LaunchedBrowser) -> bool:
         holders.hand_over(record, data, heir)
     if others or held_elsewhere:
         return False
+    if data is not None and data.get("retained") is True and not force:
+        return False
     return browser.owned or data is not None
 
 
@@ -879,6 +886,12 @@ def stop_all_browsers() -> None:
         keys = list(_browsers)
     for key in keys:
         stop_browser(key)
+
+
+def retire_shared_profile(user_data_dir: str, *, profile_home: str) -> bool:
+    """Stop/delete a copied profile atomically; false while another holder still uses it."""
+    from tools.browser_launcher_lifecycle import retire_shared_profile as retire
+    return retire(user_data_dir, profile_home)
 
 
 # ── Per-profile records + orphan reap ────────────────────────────────────────────────────────────────
@@ -1095,6 +1108,10 @@ def _reap_record(path: Path, home: Optional[str]) -> bool:
     record = _load_record(path)
     if record is None or not holders.same_namespace(record):  # another namespace's pids name nobody here
         return False
+    if record.get("retained") is True:
+        if not _pid_alive(record.get("pid")):
+            path.unlink(missing_ok=True)
+        return False
     tracked = _tracked_browser(record)
     if tracked is not None:  # in use here, whoever launched it
         _adopt_record(tracked)
@@ -1107,16 +1124,20 @@ def _reap_record(path: Path, home: Optional[str]) -> bool:
         if heir is not None:
             holders.hand_over(path, record, heir)
         return False
-    reaped = _is_recorded_browser(record, home)
-    if reaped:
-        _terminate(record["pid"], record.get("start_time"), None)
-        logger.info("browser: reaped orphaned Chromium pid %s (%s)", record["pid"], record["user_data_dir"])
-    udd = record.get("user_data_dir")
-    if (record.get("ephemeral") and isinstance(udd, str) and _inside_ephemeral_root(udd, home)
-            and (reaped or not _browser_running_on(udd))):
-        shutil.rmtree(udd, ignore_errors=True)  # its owner is gone: no launch reuses a per-process dir
-    path.unlink(missing_ok=True)
-    return reaped
+    from tools.browser_launcher_lifecycle import cleanup_guard
+    with cleanup_guard(home or record.get("home_key")) as admitted:
+        if not admitted:
+            return False
+        reaped = _is_recorded_browser(record, home)
+        if reaped:
+            _terminate(record["pid"], record.get("start_time"), None)
+            logger.info("browser: reaped orphaned Chromium pid %s (%s)", record["pid"], record["user_data_dir"])
+        udd = record.get("user_data_dir")
+        if (record.get("ephemeral") and isinstance(udd, str) and _inside_ephemeral_root(udd, home)
+                and (reaped or not _browser_running_on(udd))):
+            shutil.rmtree(udd, ignore_errors=True)  # its owner is gone: no launch reuses a per-process dir
+        path.unlink(missing_ok=True)
+        return reaped
 
 
 def _reap_home(home: str) -> int:

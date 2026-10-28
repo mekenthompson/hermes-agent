@@ -78,19 +78,15 @@ def shares_bot_desktop_browser(session_info: dict[str, Any]) -> bool:
     """Every LOCAL session is a browser Hermes launched with this profile's Bot Desktop DISPLAY, so it is the
     screen a human who took over is typing into. Cloud / user-supplied CDP sessions are another browser. A
     human lease with the screen already gone still fences (computer_use does the same)."""
-    if not (session_info.get("features") or {}).get("local"):
-        return False
-    from tools.bot_desktop import lease as _bd_lease, runtime as _bd_runtime
-    return bool(_bd_runtime.published_env().get("DISPLAY")) or _bd_lease.human_holds()
+    from tools.browser_session_fence import shares_bot_desktop_browser as shares
+    return shares(session_info)
 
 
 def human_holds_shared_browser(session_info: dict[str, Any]) -> bool:
     """True while a human holds the Bot Desktop lease over the browser ``session_info`` shares with them; the
     janitor treats that as activity (reaping it mid-login kills the human's session, #110064)."""
-    if not shares_bot_desktop_browser(session_info):
-        return False
-    from tools.bot_desktop import lease as _bd_lease
-    return _bd_lease.human_holds()
+    from tools.browser_session_fence import human_holds_shared_browser as human_holds
+    return human_holds(session_info)
 
 
 def run_fenced(session_info: dict[str, Any], fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
@@ -99,19 +95,8 @@ def run_fenced(session_info: dict[str, Any], fn: Callable[[], dict[str, Any]]) -
     While a human holds the lease every action AND read against it is refused (the page may show their
     credential); the fence brackets the whole run so a takeover mid-command also voids the result.
     """
-    if not shares_bot_desktop_browser(session_info):
-        return fn()
-    from tools.bot_desktop import lease as _bd_lease
-    try:
-        admitted = _bd_lease.assert_agent_may_act()
-    except _bd_lease.HumanHasControl as e:
-        return {"success": False, "error": str(e), "code": "human_has_control"}
-    result = fn()
-    if _bd_lease.get().epoch != admitted.epoch:
-        return {"success": False, "code": "human_has_control",
-                "error": "A human took over the bot's screen while this browser command ran; its result was "
-                         "discarded. Tell the user what you need; retry once they hand back."}
-    return result
+    from tools.browser_session_fence import run_fenced as run
+    return run(session_info, fn)
 
 
 def ensure_screen_for_headed_chromium() -> None:
@@ -149,8 +134,12 @@ def real_profile_note(cache_key: Optional[str]) -> Optional[str]:
 
 
 def session_for_task(task_id: Optional[str]) -> dict[str, Any]:
-    """The active session serving ``task_id`` (its exact key, else one whose owner is that task), or {}."""
+    """The task's bound browser connection, else its active backend session, or {}."""
     task = task_id or "default"
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    supervised = SUPERVISOR_REGISTRY.browser_session(task)
+    if supervised is not None:
+        return supervised
     with _cleanup_lock:
         if task in _active_sessions:
             return _active_sessions[task]
@@ -330,6 +319,12 @@ def _publish(cache_key: str, session_info: dict[str, Any], home_key: str) -> dic
     session_info.setdefault("home_key", home_key)  # the profile reaped on /browser connect
     _active_sessions[cache_key] = session_info
     return session_info
+
+
+def detach_shared_browsers(profile_home: Optional[str] = None) -> int:
+    """Detach a short-lived caller from its profile's persistent local browser."""
+    from tools.browser_session_lifecycle import detach_shared_browsers as detach
+    return detach(profile_home)
 
 
 def get_session_info(cache_key: Optional[str] = None) -> dict[str, Any]:

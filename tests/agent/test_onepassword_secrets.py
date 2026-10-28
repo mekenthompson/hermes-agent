@@ -228,6 +228,46 @@ def test_op_child_env_forwards_config_directory(monkeypatch):
     assert "UNRELATED_PROVIDER_TOKEN" not in env
 
 
+@pytest.mark.platforms("linux")
+def test_op_child_env_disables_dbus_autolaunch_when_headless(monkeypatch):
+    """Headless Linux children must not let libdbus autolaunch a daemon."""
+    for name in ("DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY"):
+        monkeypatch.delenv(name, raising=False)
+
+    env = op._op_child_env("")
+
+    assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/nonexistent"
+    child = subprocess.run(
+        [sys.executable, "-c", "import os; print(os.environ['DBUS_SESSION_BUS_ADDRESS'])"],
+        env=env, check=True, capture_output=True, text=True,
+    )
+    assert child.stdout.strip() == "unix:path=/nonexistent"
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("session_variable", ["DISPLAY", "WAYLAND_DISPLAY"])
+def test_op_child_env_does_not_override_graphical_session(monkeypatch, session_variable):
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setenv(session_variable, ":1")
+
+    env = op._op_child_env("")
+
+    assert "DBUS_SESSION_BUS_ADDRESS" not in env
+
+
+@pytest.mark.platforms("linux")
+def test_op_child_env_preserves_explicit_dbus_bus(monkeypatch):
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+
+    env = op._op_child_env("")
+
+    assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1000/bus"
+
+
 # ---------------------------------------------------------------------------
 # apply_onepassword_secrets
 # ---------------------------------------------------------------------------

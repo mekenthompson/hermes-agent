@@ -141,23 +141,32 @@ def test_watch_event_gate_uses_the_owning_profiles_mode(served):
     assert served.default_adapter.calls == []
 
 
+@pytest.mark.platforms('linux')
 def test_served_profile_process_checkpoint_is_recovered_at_startup(served, monkeypatch):
     """A background process checkpointed during alpha's turn (alpha/processes.json) is re-adopted by
     the multiplexer's startup recovery, once, with its watcher re-armed."""
     from tools.process_registry import ProcessRegistry
 
     runner = served.runner
-    import os
-    entry = {"session_id": "proc_alpha01", "pid": os.getpid(), "pid_scope": "host", "command": "sleep 1",
-             "started_at": 1.0, "watcher_interval": 5, "notify_on_complete": True,
-             "session_key": "agent:alpha:telegram:dm:1001"}
-    (served.alpha / "processes.json").write_text(json.dumps([entry]))
-    registry = ProcessRegistry()
-    monkeypatch.setattr(registry, "_host_pid_is_ours", lambda pid, start: True)
-
-    recovered = registry.recover_from_checkpoint()
-    recovered += runner._recover_secondary_process_checkpoints(registry)
-    assert recovered == 1
-    assert [w["session_id"] for w in registry.pending_watchers] == ["proc_alpha01"]
-    # Idempotent across homes: the process-global registry already tracks it.
-    assert runner._recover_secondary_process_checkpoints(registry) == 0
+    import shlex
+    import sys
+    creator = ProcessRegistry()
+    with _profile_runtime_scope(served.alpha):
+        process = creator.spawn_local(shlex.join([sys.executable, '-c', 'import time; time.sleep(15)']),
+            session_key='agent:alpha:telegram:dm:1001', persist_on_release=True)
+        process.watcher_interval = 5
+        process.notify_on_complete = True
+        assert creator._write_checkpoint()
+    try:
+        registry = ProcessRegistry()
+        recovered = registry.recover_from_checkpoint()
+        recovered += runner._recover_secondary_process_checkpoints(registry)
+        assert recovered == 1
+        assert [w['session_id'] for w in registry.pending_watchers] == [process.id]
+        # Idempotent across homes: the process-global registry already tracks it.
+        assert runner._recover_secondary_process_checkpoints(registry) == 0
+        assert registry.get(process.id).native_job_scope
+    finally:
+        with _profile_runtime_scope(served.alpha):
+            assert creator.kill_process(process.id)['status'] == 'killed'
+            assert process._completion_event.wait(10)

@@ -589,7 +589,7 @@ def test_prune_keeps_entry_a_registered_hermes_process_works_in_but_reaps_orphan
     process registry's ``processes.json``) is never reaped, and the idle entry it works in is
     kept with an audit line. The orphaned grandchild of a registered shell that already exited
     is no longer Hermes' — it is still reaped and its entry removed. Red on the cwd-only reap."""
-    from tools.process_registry import ProcessRegistry
+    from tools.process_registry import ProcessRegistry, _find_shell
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     scratch = get_scratch_dir(tmp_path, prune=False)
@@ -600,12 +600,16 @@ def test_prune_keeps_entry_a_registered_hermes_process_works_in_but_reaps_orphan
     pidfile = tmp_path / "orphan.pid"
     registry = ProcessRegistry()
     worker = registry.spawn_local(sleeper, cwd=str(owned_dir))
-    lane = registry.spawn_local(f"{sleeper} >/dev/null 2>&1 </dev/null & echo $! > {shlex.quote(str(pidfile))}",
-                                cwd=str(orphan_dir))
+    # This lane is deliberately NOT registered: native registered jobs now
+    # retain their detached descendants until the job's kernel scope is empty.
+    lane = subprocess.Popen([_find_shell(), '-c',
+        f"{sleeper} >/dev/null 2>&1 </dev/null & echo $! > {shlex.quote(str(pidfile))}"],
+        cwd=str(orphan_dir), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
     def _lane_done():
-        registry.poll(lane.id)
-        return lane.exited and pidfile.exists() and pidfile.read_text(encoding="utf-8-sig").strip()
+        return lane.poll() is not None and pidfile.exists() and pidfile.read_text(encoding="utf-8-sig").strip()
     orphan = int(wait_until(_lane_done, timeout=15, what="lane shell exits after forking its orphan"))
+    orphan_process = psutil.Process(orphan)
     ancient = time.time() - 30 * 3600
     for path in (owned_dir, orphan_dir):
         os.utime(path, (ancient, ancient))
@@ -615,7 +619,7 @@ def test_prune_keeps_entry_a_registered_hermes_process_works_in_but_reaps_orphan
         assert worker.process.poll() is None, "registered Hermes worker was reaped"
         def _orphan_gone():
             try:
-                return psutil.Process(orphan).status() == psutil.STATUS_ZOMBIE
+                return orphan_process.status() == psutil.STATUS_ZOMBIE
             except psutil.NoSuchProcess:
                 return True
         wait_until(_orphan_gone, timeout=10, what="orphan reaped")
@@ -624,7 +628,7 @@ def test_prune_keeps_entry_a_registered_hermes_process_works_in_but_reaps_orphan
     finally:
         registry.kill_process(worker.id)
         with contextlib.suppress(psutil.Error):
-            psutil.Process(orphan).kill()
+            orphan_process.kill()
 
 
 @pytest.mark.platforms("posix")
@@ -692,3 +696,38 @@ def test_prune_owner_lookup_survives_symlinked_scratch_and_drops_orphaned_mcp_he
         if helper.poll() is None:
             helper.kill()
             helper.wait(timeout=10)
+
+
+@pytest.mark.platforms('linux')
+def test_prune_keeps_native_lane_descendants_until_actual_scope_stop(tmp_path, monkeypatch):
+    """A primary shell exit leaves its detached descendants inside the native job."""
+    from tools.process_registry import ProcessRegistry
+    from tools.process_registry_job import read_job_receipt, job_quiescent
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / 'native-lane'
+    entry.mkdir()
+    pidfile = tmp_path / 'native-child.pid'
+    sleeper = shlex.join([sys.executable, '-c', 'import time; time.sleep(60)'])
+    registry = ProcessRegistry()
+    lane = registry.spawn_local(
+        f'{sleeper} >/dev/null 2>&1 </dev/null & echo $! > {shlex.quote(str(pidfile))}', cwd=str(entry))
+    try:
+        def primary_done():
+            row = read_job_receipt(lane)
+            return row and row['exit_code'] == 0 and pidfile.exists()
+        wait_until(primary_done, timeout=15, what='original primary shell finished')
+        child = psutil.Process(int(pidfile.read_text()))
+        assert child.is_running() and child.status() != psutil.STATUS_ZOMBIE
+        assert lane.native_job_scope and not lane.exited and lane.process.poll() is None
+        assert not job_quiescent(lane)
+        ancient = time.time() - 30 * 3600
+        os.utime(entry, (ancient, ancient))
+        assert prune_scratch_dir(scratch) == 0 and entry.exists()
+        assert child.is_running() and child.status() != psutil.STATUS_ZOMBIE
+        assert registry.kill_process(lane.id)['status'] == 'killed'
+        assert lane._completion_event.wait(10) and job_quiescent(lane)
+        assert not child.is_running()
+        assert prune_scratch_dir(scratch) == 1 and not entry.exists()
+    finally:
+        registry.kill_process(lane.id)

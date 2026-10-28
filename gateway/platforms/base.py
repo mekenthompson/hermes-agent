@@ -435,6 +435,7 @@ from gateway.platforms.base_exec_approval import (
 from gateway.platforms.base_streaming_tts import (
     AudioFormat, StreamingTTSHandle, streaming_tts_should_skip_whole_file, streaming_tts_turn_key)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.platforms.base_processing import ProcessingLifecycleMixin
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
 from gateway.session import SessionSource, build_session_key
@@ -1861,7 +1862,7 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
-class BasePlatformAdapter(ABC):
+class BasePlatformAdapter(ProcessingLifecycleMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
@@ -1884,6 +1885,11 @@ class BasePlatformAdapter(ABC):
     # adapters (API server). Propagated to ``HERMES_SESSION_ASYNC_DELIVERY`` so tools never promise
     # a delivery they can't keep.
     supports_async_delivery: bool = True
+    # A provider inbox is acknowledged only after native admission. Opting in
+    # commits/dedupes input before busy effects; on_message_admitted gets the
+    # durable receipt. This is adapter-owned transport behavior, never a grant
+    # or event-selected flag. Existing transports retain their busy semantics.
+    requires_durable_input_ack: bool = False
     # ``send()`` chunks natively via ``truncate_message()`` -> the router skips its truncation.
     splits_long_messages: bool = False
     # Prefix users can always TYPE for Hermes commands ("!" where the client eats a leading "/").
@@ -3473,37 +3479,6 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks.pop(session_key, None)
         return callback if callable(callback) else None
 
-    # ── Processing lifecycle hooks (Discord 👀/✅/❌ reactions). Adapters exposing
-    # ``_add_reaction(chat_id, message_id, emoji)`` / ``_remove_reaction(chat_id, message_id)``
-    # can just set the emoji attributes; left ``None`` the hook is a no-op.
-    _ACK_EMOJI: Optional[str] = None
-    _OK_EMOJI: Optional[str] = None
-    _FAIL_EMOJI: Optional[str] = None
-
-    async def on_processing_start(self, event: MessageEvent) -> None:
-        """Hook called when background processing begins."""
-
-    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Hook called when background processing completes. Default: opt-in reaction ack — with
-        ``_OK_EMOJI``/``_FAIL_EMOJI`` set and ``_add_reaction``/``_remove_reaction`` present, swap
-        the in-progress reaction for the outcome one. Remove-then-add is deterministic whether the
-        platform replaces or stacks a sender's reactions. CANCELLED leaves it unreacted."""
-        if self._OK_EMOJI is None and self._FAIL_EMOJI is None:
-            return
-        add: Any = getattr(self, "_add_reaction", None)
-        remove: Any = getattr(self, "_remove_reaction", None)
-        enabled = getattr(self, "_reactions_enabled", None)
-        chat_id = getattr(event.source, "chat_id", None)
-        message_id = getattr(event, "message_id", None)
-        if (not callable(add) or not callable(remove) or (callable(enabled) and not enabled())
-                or not chat_id or not message_id):
-            return
-        await remove(chat_id, message_id)
-        emoji = {ProcessingOutcome.SUCCESS: self._OK_EMOJI,
-                 ProcessingOutcome.FAILURE: self._FAIL_EMOJI}.get(outcome)
-        if emoji:
-            await add(chat_id, message_id, emoji)
-
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
         hook = getattr(self, hook_name, None)
@@ -3956,16 +3931,6 @@ class BasePlatformAdapter(ABC):
         if release_guard:
             self._release_session_guard(session_key)
 
-    async def _drain_pending_after_session_command(
-        self, session_key: str, command_guard: asyncio.Event) -> None:
-        """Tail of /stop, /new, /reset: release the command-scoped guard, then
-        spawn a fresh processing task for any follow-up queued meanwhile."""
-        await self._flush_text_debounce_now(session_key)
-        pending_event = self._pending_messages.pop(session_key, None)
-        self._release_session_guard(session_key, guard=command_guard)
-        if pending_event is not None:
-            self._start_session_processing(pending_event, session_key)
-
     async def _dispatch_active_session_command(self, event: MessageEvent, session_key: str, cmd: str) -> None:
         """Dispatch a reset-like bypass command (/stop, /new, /reset): keep a guard installed while
         the runner handles it (follow-ups stay queued), cancel the old task AFTER the response,
@@ -4006,6 +3971,8 @@ class BasePlatformAdapter(ABC):
                 )
             return
 
+        from gateway.platforms.event import require_structured_control
+        require_structured_control(event, self)
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.
@@ -4022,8 +3989,12 @@ class BasePlatformAdapter(ABC):
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
+        if event.structured_control is not None:
+            await self._dispatch_inline_reply(event)
+            return
         from gateway.session_ingress_burst import burst_gate
-        behind_burst = await burst_gate(self, event, session_key)  # a serial reader's command waits too
+        behind_burst = (False if self.requires_durable_input_ack is True
+                        else await burst_gate(self, event, session_key))
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
@@ -4060,8 +4031,12 @@ class BasePlatformAdapter(ABC):
         commands / clarify replies dispatch inline, everything else is queued."""
         # The shared runtime's durable FIFO replaces the adapter's busy-message slot.
         if self._shared_runtime_owns_input(event):
-            from gateway.session_ingress_burst import dispatch_busy_burst
-            await dispatch_busy_burst(self, event, session_key)  # main's photo/text burst merge
+            if self.requires_durable_input_ack is True:
+                from gateway.session_ingress import dispatch_shared_busy
+                await dispatch_shared_busy(self, event, session_key)
+            else:
+                from gateway.session_ingress_burst import dispatch_busy_burst
+                await dispatch_busy_burst(self, event, session_key)  # main's photo/text burst merge
             return
         # Bypass commands run inline: queued they'd leak as user text (/new) or deadlock
         # (/approve, /deny — the agent is blocked on Event.wait).  Dispatch inline by

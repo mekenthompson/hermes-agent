@@ -2266,7 +2266,7 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 
 # Placed into _running_agents *before* any await so a second message can't slip past the "already
 # running" guard before the agent exists.
-_AGENT_PENDING_SENTINEL = object()
+from gateway.session_state import AGENT_PENDING_SENTINEL as _AGENT_PENDING_SENTINEL
 
 # Conversation-scoped per-session state registry (legacy contract). State lives in
 # ``SessionState.conversation`` (cleared via ``ConversationState.clear()``); this list remains for
@@ -2620,8 +2620,7 @@ _INTERRUPT_REASON_EVICTED = "Session ended while the turn was running"
 _INTERRUPT_TOOL_REASON_EVICTED = "session evicted"
 _INTERRUPT_TOOL_REASON_GATEWAY_SHUTDOWN = "gateway shutdown"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
-_INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
-_INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
+from gateway.session_state import _INTERRUPT_REASON_GATEWAY_SHUTDOWN, _INTERRUPT_REASON_GATEWAY_RESTART
 
 
 def _reap_gateway_turn_processes(

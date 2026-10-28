@@ -866,7 +866,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                 logger.debug("Interrupted %d %s during shutdown", count, what)
 
     def _shutdown_interrupt_reason(self) -> str:
-        from gateway.run import _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+        from gateway.session_state import _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN
         return _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
 
     async def _mark_running_sessions_resume_pending(self, log_prefix: str) -> list:

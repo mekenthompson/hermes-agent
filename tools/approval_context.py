@@ -63,9 +63,12 @@ class ApprovalTaskLease:
         self._revoked = False
 
     def live(self) -> bool:
+        return self._locally_live() and self._owner_current() and self._locally_live()
+
+    def _locally_live(self) -> bool:
+        """Current local revocation state only; never a substitute for the owner check."""
         with self._lock:
-            active = not self._revoked and (self._parent_open or self._children > 0)
-        return active and self._owner_current()
+            return not self._revoked and (self._parent_open or self._children > 0)
 
     def _owner_current(self) -> bool:
         try:
@@ -144,9 +147,15 @@ class ApprovalTaskReservation:
         with self._lock:
             if self._released:
                 return False
+            lease, events = self.lease, self.stop_events
+        # The owner predicate may perform RPC or reenter native process controls.
+        permitted = lease.live()
+        with self._lock:
+            if self.lease is not lease or self.stop_events != events or self._released:
+                return False
             # Stale ownership or a stop observed before handoff is permanent.
             # Detaching the child's event must not revive either reservation.
-            if any(event.is_set() for event in self.stop_events) or not self.lease.live():
+            if not permitted or any(event.is_set() for event in events) or not lease._locally_live():
                 self.release()
                 return False
             if child_stop_event is not None:

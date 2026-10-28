@@ -363,7 +363,7 @@ class GatewayBusySessionMixin:
             return False
 
     @staticmethod
-    def _steer_active_subagents(running_agent: Any, text: str) -> int:
+    def _steer_active_subagents(running_agent: Any, text: str, *, ticket=None, recipients=None) -> int:
         """Queue *text* into every live child of *running_agent*; returns how many accepted it.
 
         A parent blocked inside ``delegate_task`` only drains its own steer queue after the tool
@@ -385,16 +385,27 @@ class GatewayBusySessionMixin:
             if not callable(steer):
                 continue
             try:
-                accepted += bool(steer(text))
+                delivered = bool(steer(text, ticket=ticket) if ticket is not None
+                    and callable(getattr(child, 'withdraw_steer', None)) else steer(text))
+                accepted += delivered
+                if delivered and recipients is not None:
+                    recipients.append(child)
             except Exception as exc:
+                if ticket is not None:
+                    raise  # attempted native delivery is uncertain, not safe to replay
                 logger.warning("Steer into subagent %r failed: %s", getattr(child, "_delegate_id", child), exc)
         return accepted
 
-    def _steer_running_agent(self, running_agent: Any, text: str) -> bool:
+    def _steer_running_agent(self, running_agent: Any, text: str, *, ticket=None, recipients=None) -> bool:
         """``running_agent.steer(text)`` plus fan-out to its active subagents (see
         :meth:`_steer_active_subagents`); True when the parent or any child queued it."""
-        accepted = bool(running_agent.steer(text))
-        return bool(self._steer_active_subagents(running_agent, text)) or accepted
+        accepted = bool(running_agent.steer(text, ticket=ticket) if ticket is not None
+                        and callable(getattr(running_agent, 'withdraw_steer', None)) else running_agent.steer(text))
+        if accepted and recipients is not None:
+            recipients.append(running_agent)
+        children = (self._steer_active_subagents(running_agent, text, ticket=ticket, recipients=recipients)
+                    if ticket is not None else self._steer_active_subagents(running_agent, text))
+        return bool(children) or accepted
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
         """True when a compression lock is held for this session's id (callers demote interrupt →
@@ -742,9 +753,13 @@ class GatewayBusySessionMixin:
         """
         if not self._try_agent_verb(running_agent, "redirect", text, session_key, event=event):
             return False
+        self._reanchor_redirected_turn(running_agent, session_key, event)
+        return True
+
+    def _reanchor_redirected_turn(self, running_agent, session_key, event):
         turn = self._fold_into_running_turn(running_agent, session_key, event)
         if turn is None:
-            return True  # a newer turn already owns the slot; never re-anchor it
+            return  # a newer turn already owns the slot; never re-anchor it
         anchor = self._reply_anchor_for_event(event)
         inbound_id = str(event.message_id) if event.message_id else None
         if turn.event is not None and turn.event is not event:
@@ -753,7 +768,6 @@ class GatewayBusySessionMixin:
         if turn.ctx is not None:
             turn.ctx.event_message_id = anchor
             turn.ctx.inbound_message_id = inbound_id
-        return True
 
     def _fold_into_running_turn(self, running_agent, session_key: str, event: MessageEvent):
         """The running turn now answers *event* too (steer, redirect): if *event* was addressed to
@@ -957,7 +971,8 @@ class GatewayBusySessionMixin:
         await self._busy_interrupt_and_ack(event, session_key, adapter, _busy_state, running_agent, _steer)
         return True
 
-    async def _busy_interrupt_and_ack(self, event, session_key, adapter, _busy_state, running_agent, _steer) -> None:
+    async def _busy_interrupt_and_ack(self, event, session_key, adapter, _busy_state, running_agent, _steer,
+                                      *, already_interrupted=False) -> None:
         """Interrupt-mode abort (voice transcribed) and the busy ack, after the steer/redirect resolution.
         Shared by the in-process busy handler and the session authority's busy preempt."""
         from gateway.run import _AGENT_PENDING_SENTINEL
@@ -966,7 +981,7 @@ class GatewayBusySessionMixin:
         is_steer_mode = effective_mode == "steer"
         is_redirect_mode = effective_mode == "interrupt" and redirected
         if (
-            effective_mode == "interrupt" and not redirected
+            effective_mode == "interrupt" and not redirected and not already_interrupted
             and running_agent and running_agent is not _AGENT_PENDING_SENTINEL
         ):
             await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)

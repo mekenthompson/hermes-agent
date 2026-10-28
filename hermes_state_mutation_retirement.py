@@ -110,7 +110,8 @@ def retire_terminal_receipts(conn, session_ids):
             from hermes_state_media import retire_media
             retire_media(conn, json.loads(row['payload_json']), row['request_id'])
             # Keep the digest for exact retries, not another copy of user input/history.
-            row['payload_json'] = '{}'
+            control = json.loads(row['payload_json']).get('native_stop_v1')
+            row['payload_json'] = _json({'native_stop_v1': control}) if control is not None else '{}'
             row['lineage_json'] = '[]'
             row['retired_at'] = time.time()
             _compact_result(conn, row['admission_id'])

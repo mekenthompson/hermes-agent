@@ -375,7 +375,7 @@ def test_a_browser_exec_that_routed_to_the_old_endpoint_during_a_connect_reloads
     a, _b = profiles
     monkeypatch.setattr(bu_cli, "_driven_daemons", {})
     monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["browser-harness"])
-    monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id: None)
+    monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id, session_info=None: None)
     monkeypatch.setattr(bs_cdp, "resolve_cdp_override", lambda raw: raw)
     monkeypatch.setattr(server, "_cdp_http_reachable", lambda parsed, timeout=2.0: True)
     latched = {}  # like browser-harness: one daemon per identity latches BU_CDP_URL; --reload stops it
@@ -420,7 +420,7 @@ def test_a_connect_that_lands_while_browser_exec_spawns_its_daemon_reloads_it(pr
     a, _b = profiles
     monkeypatch.setattr(bu_cli, "_driven_daemons", {})
     monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["browser-harness"])
-    monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id: None)
+    monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id, session_info=None: None)
     monkeypatch.setattr(bs_cdp, "resolve_cdp_override", lambda raw: raw)
     monkeypatch.setattr(server, "_cdp_http_reachable", lambda parsed, timeout=2.0: True)
     latched, connects = {}, []

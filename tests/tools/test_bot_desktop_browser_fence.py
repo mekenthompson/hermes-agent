@@ -143,6 +143,7 @@ def test_secret_write_re_admits_after_a_takeover_during_the_code_prompt(monkeypa
     evaluated = []
 
     class Sup:
+        browser_session_info = None
         def evaluate_runtime(self, expr):
             evaluated.append(expr)
             return {"ok": True, "result": "{}"}
