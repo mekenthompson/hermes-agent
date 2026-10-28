@@ -64,6 +64,9 @@ def _current_environment(tmp_path, monkeypatch, members):
     environment = install_state_dir(repo) / "environments" / "existing" / "venv"
     environment.mkdir(parents=True)
     (environment / "pyvenv.cfg").write_text("home = test\n")
+    interpreter = environment / "bin" / "python"
+    interpreter.parent.mkdir()
+    interpreter.symlink_to(sys.executable)
     Facts(paths.runtime_facts_path()).record_state(
         "venv", Venv().expected_stamp([], plugin_dirs=members), [], environment=environment,
     )

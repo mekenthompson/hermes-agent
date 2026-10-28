@@ -184,6 +184,9 @@ for name, executable in [('python', Path(sys.executable)), ('node', node)]:
 selected = install_state_dir(root) / 'environments/fixture/venv'
 selected.mkdir(parents=True)
 (selected / 'pyvenv.cfg').write_text('home = fixture')
+binary = selected / 'bin' / 'python'
+binary.parent.mkdir()
+binary.symlink_to(Path(sys.executable))
 site = site_packages(selected)
 site.parent.mkdir(parents=True)
 site.symlink_to(deps, target_is_directory=True)

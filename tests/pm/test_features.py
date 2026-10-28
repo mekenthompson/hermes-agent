@@ -7,6 +7,8 @@ never deviates and never installs a plugin member.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 import pm.features as feats
@@ -76,6 +78,9 @@ def test_sync_venv_allows_frozen_extras_when_lazy_off(rooted, monkeypatch):
     environment = install_state_dir(repo) / "environments" / "frozen" / "venv"
     environment.mkdir(parents=True)
     (environment / "pyvenv.cfg").write_text("home = fixture\n")
+    interpreter = environment / "bin" / "python"
+    interpreter.parent.mkdir()
+    interpreter.symlink_to(sys.executable)
     Facts(runtime_facts_path(repo)).record_state("venv", "stamp", ["web"], environment=environment)
     monkeypatch.setattr(ensure_mod, "lazy_installs_allowed", lambda: False)
     venv_pkg = ensure_mod.get_package("venv")
