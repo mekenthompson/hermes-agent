@@ -46,7 +46,7 @@ async def upload_voice_file(
     duration_secs = await asyncio.to_thread(
         telegram_mod._probe_voice_duration_seconds, audio_path)
     # health: allow ASYNC230 -- streamed to the Bot API upload; a local open is non-blocking in practice
-    with open(audio_path, "rb") as audio_file:
+    with open(audio_path, "rb") as audio_file:  # noqa: ASYNC230
         ext = os.path.splitext(audio_path)[1].lower()
         if ext in {".ogg", ".opus"}:
             msg = await adapter._send_voice_bubble(
