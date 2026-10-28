@@ -5197,92 +5197,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 raise
         raise _last_parse_error or RuntimeError("Telegram send_voice failed for all caption variants")
 
-    def _voice_upload_should_retry(self, error: Exception) -> bool:
-        """True when a voice upload stalled in transit and a second attempt is safe to try.
-
-        Fleet TTS was generating the Ogg and then losing it on ``httpx.ReadError`` /
-        ``TimedOut``. Those are not Bot API rejections. One retry lets the Telegram
-        transport walk off a dead sticky IP. A rejected or unauthorized request is
-        not retried.
-        """
-        if self._is_bad_request_error(error) or self._looks_like_auth_error(error):
-            return False
-        if self._looks_like_connect_timeout(error) or self._looks_like_pool_timeout(error):
-            return True
-        markers = ("readerror", "writeerror", "readtimeout", "writetimeout", "networkerror", "timedout")
-        for cur in _iter_exception_graph(error):
-            name = cur.__class__.__name__.lower()
-            if name in {"badrequest", "forbidden", "invalidtoken", "retryafter"}:
-                return False
-            if any(marker in name for marker in markers) or "timed out" in str(cur).lower():
-                return True
-        return False
-
-    async def _upload_voice_file(
-        self, chat_id: str, audio_path: str, caption: Optional[str], reply_to: Optional[str],
-        metadata: Optional[dict[str, Any]]) -> SendResult:
-        """Upload one already-resolved audio file. Raises on transport failure."""
-        duration_secs = await asyncio.to_thread(_probe_voice_duration_seconds, audio_path)
-        with open(audio_path, "rb") as audio_file:  # noqa: ASYNC230 -- file handle is streamed to the upload; a local open() is non-blocking in practice
-            ext = os.path.splitext(audio_path)[1].lower()
-            if ext in {".ogg", ".opus"}:
-                msg = await self._send_voice_bubble(audio_file, chat_id, reply_to, metadata, caption, duration_secs)
-            elif ext in {".mp3", ".m4a"}:
-                msg = await self._send_media(
-                    self._bot.send_audio, chat_id, reply_to, metadata, "audio", reset_media=lambda: audio_file.seek(0),
-                    audio=audio_file, caption=self._caption_1024(caption), duration=duration_secs)
-            else:
-                return await self.send_document(
-                    chat_id=chat_id, file_path=audio_path, caption=caption, reply_to=reply_to, metadata=metadata)
-        return SendResult(success=True, message_id=str(msg.message_id))
-
     async def send_voice(
         self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send audio as a native Telegram voice message or audio file."""
-        if not self._bot:
-            return SendResult(success=False, error="Not connected")
-        if not os.path.exists(audio_path):
-            return SendResult(success=False, error=self._missing_media_path_error("Audio", audio_path))
-        upload_path = audio_path
-        _transcoded_voice_path: Optional[str] = None
-        try:
-            # sendVoice only accepts Ogg/Opus: an explicit voice-bubble request (is_voice) transcodes via
-            # ffmpeg; otherwise route by extension (.mp3/.m4a → sendAudio, others → document).
-            upload_path = audio_path
-            if kwargs.get("is_voice") and os.path.splitext(audio_path)[1].lower() not in (".ogg", ".opus"):
-                from gateway.platforms.base import transcode_to_ogg_opus
-                _transcoded_voice_path = await asyncio.to_thread(transcode_to_ogg_opus, audio_path)
-                if _transcoded_voice_path:
-                    upload_path = _transcoded_voice_path
-                else:
-                    logger.warning(
-                        "[%s] voice transcode unavailable for %s — sending original format (install ffmpeg for voice bubbles)",
-                        self.name, os.path.basename(audio_path))
-            try:
-                return await self._upload_voice_file(chat_id, upload_path, caption, reply_to, metadata)
-            except Exception as first_error:
-                if not self._voice_upload_should_retry(first_error):
-                    raise
-                logger.warning(
-                    "[%s] Voice upload failed (%s); retrying once",
-                    self.name, _redact_telegram_error_text(first_error))
-                return await self._upload_voice_file(chat_id, upload_path, caption, reply_to, metadata)
-        except Exception as e:
-            if self._voice_upload_should_retry(e):
-                logger.warning(
-                    "[%s] Voice upload failed after retry (%s); sending the file as a document",
-                    self.name, _redact_telegram_error_text(e))
-                return await self.send_document(
-                    chat_id=chat_id, file_path=upload_path, caption=caption, reply_to=reply_to, metadata=metadata)
-            logger.error(
-                "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s", self.name,
-                _redact_telegram_error_text(e), exc_info=True)
-            return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
-        finally:
-            if _transcoded_voice_path:
-                with contextlib.suppress(OSError):
-                    os.unlink(_transcoded_voice_path)
+        from plugins.platforms.telegram.adapter_voice_upload import deliver_voice
+        return await deliver_voice(
+            self, chat_id, audio_path, caption, reply_to, metadata, **kwargs)
 
     async def send_multiple_images(
         self, chat_id: str, images: list[tuple], metadata: Optional[dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
