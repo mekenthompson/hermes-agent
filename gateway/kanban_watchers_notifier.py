@@ -238,6 +238,9 @@ class _Collector:
         self.notifier_profiles = {notifier_profile}
         self.notifier_profiles.update(str(p).strip() for p in self.profile_adapters if str(p).strip())
         config = getattr(runner, "config", None)
+        if (not getattr(config, "multiplex_profiles", False)
+                and getattr(runner, "_standalone_transport_profile", None)):
+            self.notifier_profiles.add(runner._primary_profile_name)
         if getattr(config, "multiplex_profiles", False):
             self.notifier_profiles.update(
                 route.profile for route in config.profile_routes
@@ -655,10 +658,15 @@ class _KanbanNotification:
         # ever degrades to a fresh session, never an exception.
         _delivery_meta = sub.get("delivery_metadata") or {}
         _chat_type = str(sub.get("chat_type") or _delivery_meta.get("chat_type") or "").strip()
+        # Transport ownership is not the runtime namespace of the parent chat.
+        wake_profile = self.sub_profile or None
+        if (wake_profile and not getattr(getattr(self.runner, "config", None), "multiplex_profiles", False)
+                and wake_profile == getattr(self.runner, "_standalone_transport_profile", None)):
+            wake_profile = self.runner._primary_profile_name
         _source = SessionSource(
             platform=self.plat, chat_id=sub["chat_id"], chat_type=_chat_type or "group",
             thread_id=sub.get("thread_id") or None, user_id=sub.get("user_id"), user_id_alt=sub.get("user_id_alt"),
-            profile=self.sub_profile or None, scope_id=_wake_scope_id(self.adapter, sub),
+            profile=wake_profile, scope_id=_wake_scope_id(self.adapter, sub),
             parent_chat_id=_delivery_meta.get("parent_chat_id"),
         )
         _source._transport_adapter_ref = weakref.ref(self.adapter)
