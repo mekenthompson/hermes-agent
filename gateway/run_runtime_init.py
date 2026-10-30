@@ -5,12 +5,19 @@ import logging
 
 logger = logging.getLogger("gateway.run")  # log-record parity with gateway/run.py
 
-def _standalone_transport_owner(launch: str) -> str:
+def _standalone_transport_owner(launch: str) -> str | None:
     """Use the subscription writer's identity without relabeling a named home."""
-    from hermes_cli.profiles import current_profile_name, validate_profile_name
+    from hermes_cli.profiles import current_profile_name, normalize_profile_name, validate_profile_name
 
-    owner = current_profile_name(launch) or launch
-    validate_profile_name(owner)
+    owner = normalize_profile_name(current_profile_name(launch) or launch)
+    try:
+        validate_profile_name(owner)
+    except ValueError:
+        # Preserve ordinary startup's invalid-pin handling: no transport alias
+        # and no legacy fallback. Local ownership remains scoped to its home.
+        if launch in {"default", "custom"}:
+            return None
+        raise
     if launch not in {"default", "custom"} and owner != launch:
         raise ValueError("Standalone transport owner conflicts with the named profile home")
     return owner

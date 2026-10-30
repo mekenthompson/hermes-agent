@@ -121,6 +121,22 @@ def test_launch_identity_matrix(tmp_path, monkeypatch, named, pin, expected):
     assert runner._authorization_adapter(Platform.TELEGRAM, "unrelated") is None
 
 
+@pytest.mark.parametrize("pin,owner", [("Service-A", "service-a"), ("../escape", "default")])
+def test_default_home_preserves_launch_pin_validation(tmp_path, monkeypatch, pin, owner):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", pin)
+    monkeypatch.setenv("HERMES_AGENT_PROFILE", "legacy")
+    runner = runner_for(home, monkeypatch)
+    assert runner._kanban_notifier_profile == owner
+    assert runner._authorization_adapter(Platform.TELEGRAM, owner) is runner.adapters[Platform.TELEGRAM]
+    assert runner._authorization_adapter(Platform.TELEGRAM, pin) is None
+    assert runner._authorization_adapter(Platform.TELEGRAM, "legacy") is None
+    assert runner._configured_runtime_profile_name == (owner if owner != "default" else None)
+
+
 def test_bound_home_ignores_launch_pin(tmp_path, monkeypatch):
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
