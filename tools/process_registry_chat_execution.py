@@ -56,10 +56,11 @@ def spawn_local_pipe(registry, session, safe_command, env_vars, pty_scope_attemp
         if log and session.systemd_unit:
             from tools.process_registry_output_log import bind_unit_log
             bind_unit_log(session, output)
-        proc = facade.subprocess.Popen(
-            argv, text=True, cwd=session.cwd, env=env, encoding="utf-8", errors="replace",
+        proc = registry._spawn_job(
+            session, argv, session.persist_on_release,
+            text=True, cwd=session.cwd, env=env, encoding="utf-8", errors="replace",
             stdout=output, stderr=facade.subprocess.STDOUT,
-            stdin=facade.subprocess.DEVNULL, start_new_session=True, **popen_kwargs)
+            stdin=facade.subprocess.DEVNULL, **popen_kwargs)
     finally:
         if log:
             os.close(output)
@@ -107,6 +108,7 @@ def reap_untracked(registry, session, proc):
             registry._terminate_host_pid(proc.pid, session.host_start_time)
     with suppress(Exception):
         proc.wait(timeout=5)
+    registry._release_job_group(session)
 
 
 def retain_failed_start(registry, session):
@@ -231,6 +233,7 @@ def spawn_foreground(session, argv, env, cwd, stdin_data):
                 argv, text=True, cwd=cwd, env=env, encoding='utf-8', errors='replace',
                 stdout=output, stderr=facade.subprocess.STDOUT,
                 stdin=facade.subprocess.PIPE if stdin_data is not None else facade.subprocess.DEVNULL,
+                # detached-spawn: ok — checkpointed native registry owns this scope across worker death; Stop/timeout reap it, not the observing interpreter
                 start_new_session=True)
             session.process, session.pid = proc, proc.pid
             session.host_start_time = registry._safe_host_start_time(proc.pid)

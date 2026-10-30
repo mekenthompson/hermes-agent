@@ -27,6 +27,10 @@ def _no_chromium_download(monkeypatch):
 
 @pytest.fixture
 def browser_store(tmp_path, monkeypatch):
+    from hermes_cli import browser_runtime
+
+    # A real container image may carry Chromium independently of this PM store.
+    monkeypatch.setattr(browser_runtime, "BAKED_EXECUTABLE_FILE", tmp_path / "absent-baked-path")
     home = tmp_path / "home with spaces"
     home.mkdir()
     store = home / "tools"

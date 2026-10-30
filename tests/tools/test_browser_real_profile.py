@@ -140,7 +140,10 @@ class TestSnapshotRealProfile:
         session-cookie copies are group/world-readable.
         """
         import stat
+        import hermes_constants
 
+        # Exercise the ordinary host permission policy, not container mount sharing.
+        monkeypatch.setattr(hermes_constants, "_detect_container", lambda: False)
         import hermes_cli.browser_connect as bc
         src = self._make_profile(tmp_path / "real")
         home = tmp_path / "hermes-home"
@@ -166,7 +169,10 @@ class TestSnapshotRealProfile:
     def test_existing_lax_snapshot_heals_on_refresh(self, tmp_path, monkeypatch):
         """A snapshot left 0644 by an older build tightens on the next pass."""
         import stat
+        import hermes_constants
 
+        # Exercise the ordinary host permission policy, not container mount sharing.
+        monkeypatch.setattr(hermes_constants, "_detect_container", lambda: False)
         import hermes_cli.browser_connect as bc
         src = self._make_profile(tmp_path / "real")
         home = tmp_path / "hermes-home"
