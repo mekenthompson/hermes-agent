@@ -19,6 +19,10 @@ def test_recovery_payload_memory_does_not_scale_with_backlog(
         )
 
     class Sink:
+        def get_session(self, session_id: str) -> dict:
+            assert session_id == "sess"
+            return {"id": session_id}
+
         def append_message(self, **kwargs: object) -> None:
             assert kwargs["content"] == content
 
