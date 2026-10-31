@@ -83,6 +83,21 @@ class CanonicalSessionHandle(Result):
     execution_state: Literal['idle', 'running', 'waiting', 'unknown', 'terminal']
 
 
+class DeliveryHandleResult(Result):
+    session_id: str
+    stored_session_id: str
+    profile_id: str
+    instance_id: str
+    authority_epoch: int
+    revision: int
+    execution_generation: int
+    execution_state: Literal['idle', 'running', 'waiting', 'terminal']
+
+
+canonical_method('session.delivery_handle', params=CanonicalSessionParams, result=DeliveryHandleResult,
+                 doc='Read an already mounted local owner without adoption, attach or policy refresh.')
+
+
 class CanonicalPendingAdmission(AdmissionStatus):
     input_id: str
     text: str

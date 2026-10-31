@@ -3976,7 +3976,6 @@ class GatewayRunner(
         # Can async tools wake a later turn here? Default True (CLI/unknown); api_server declares False.
         _adapter = (getattr(self, "adapters", None) or {}).get(source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-
         source_profile = str(getattr(context.source, "profile", "") or "").strip()
         multiplex = bool(getattr(getattr(self, "config", None), "multiplex_profiles", False))
         if not source_profile and multiplex:
@@ -3987,8 +3986,11 @@ class GatewayRunner(
             source_profile = getattr(self, "_configured_runtime_profile_name", None) or ""
         from gateway.session_api_turn import api_session_vars, bind_api_transfer_session
         _history_delivery = api_session_vars().get("session_history_delivery")
+        from gateway.session_policy import policy_for_source
+        policy = policy_for_source(self, context.source)
         return bind_api_transfer_session(set_session_vars(
             platform=source.platform.value,
+            source=policy.platform if policy is not None else "",
             chat_id=source.chat_id,
             chat_type=str(source.chat_type) if source.chat_type else "",
             chat_name=source.chat_name or "",
@@ -3998,12 +4000,10 @@ class GatewayRunner(
             user_name=str(source.user_name) if source.user_name else "",
             scope_id=str(getattr(source, "scope_id", "") or ""),
             parent_chat_id=str(getattr(source, "parent_chat_id", "") or ""),
-
             session_key=context.session_key,
             # A cached agent binds HERMES_SESSION_ID only on the turn that built it; every later turn
             # (and a command it yields to the background) must still see its own session.
             session_id=context.session_id or "",
-
             message_id=str(source.message_id) if source.message_id else "",
             profile=source_profile,
 
