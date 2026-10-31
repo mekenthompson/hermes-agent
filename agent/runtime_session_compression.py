@@ -55,10 +55,12 @@ class RuntimeSessionCompressionMixin:
         return self._apply('compression.boundary', {'session_key': session_key, 'source': source})['value']
 
     def get_messages_as_conversation(self, session_id, include_ancestors=False, include_inactive=False,
-                                     repair_alternation=False, include_row_ids=False, include_compacted=False):
+                                     repair_alternation=False, include_row_ids=False, include_compacted=False,
+                                     include_display_only=False):
         return self._apply('compression.history', dict(target=session_id, include_ancestors=include_ancestors,
             include_inactive=include_inactive, repair_alternation=repair_alternation,
-            include_row_ids=include_row_ids, include_compacted=include_compacted))['messages']
+            include_row_ids=include_row_ids, include_compacted=include_compacted,
+            include_display_only=include_display_only))['messages']
 
     def get_active_message_watermark(self, session_id):
         self._session(session_id)

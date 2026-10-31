@@ -910,7 +910,7 @@ def test_deferred_hydration_falls_back_to_tip_when_lineage_exceeds_limit(server,
             raise AssertionError("must not materialize the runaway lineage")
 
         def get_messages_as_conversation(self, sid, **kwargs):
-            reads.append(("tip", kwargs.get("repair_alternation")))
+            reads.append(("tip", kwargs.get("repair_alternation", False), kwargs.get("include_display_only", False)))
             return list(tip)
 
     built = threading.Event()
@@ -932,7 +932,7 @@ def test_deferred_hydration_falls_back_to_tip_when_lineage_exceeds_limit(server,
         assert session["history"] == tip
         assert session["display_history_prefix"] == []
         assert session["resume_message_count"] == 1
-        assert reads == [("tip", True)]
+        assert reads == [("tip", True, False), ("tip", False, True)]
     finally:
         server._sessions.pop("hyd", None)
 

@@ -96,6 +96,12 @@ async def test_authority_route_runs_a_wake_receipted_before_drain_once_after_res
         lambda: admissions(runner, authority, source)[0] == ("messaging", "terminal", "completed"),
         what="the human turn to settle",
     )
+    # The receipt can race a wake already claimed by the FIFO. Let that admitted
+    # turn settle before simulating process replacement; keep queued work queued.
+    await async_wait_until(
+        lambda: admissions(runner, authority, source)[-1][1] != "started",
+        what="an already claimed wake to settle before restart",
+    )
     wake_row = admissions(runner, authority, source)[-1]
     assert wake_row[0] == "automation"
     assert wake_row[1] == "queued" or (wake_row[1:] == ("terminal", "completed") and wake_runs(executed) == ["owner"])
