@@ -15,7 +15,7 @@ def default_browser_config() -> dict:
         "command_timeout": 30,
         # headed: visible Chromium window (local); skips per-turn cleanup, idle reaper still applies
         "headed": False,
-        "allow_private_urls": False,  # allow private/internal IPs (localhost, 192.168.x.x, ...)
+        "allow_private_urls": False,  # legacy security.allow_private_urls; local/sidecar Chromium ignore it
         # Local browser engine. "auto" = Chromium; "lightpanda" = `lightpanda serve` per session
         # (faster navigation, no screenshots); "chrome" is read as "auto". Ignored while a cloud
         # provider, cdp_url or use_real_profile is active.
@@ -28,7 +28,7 @@ def default_browser_config() -> dict:
         "user_data_dir": "",
         "sandbox_required": False,  # fail closed instead of auto-disabling Chromium's sandbox
         "chromium_args": [],  # extra Chromium flags for local sessions, e.g. ["--lang=de"]
-        # With a cloud provider, auto-spawn local Chromium for LAN/localhost URLs instead
+        # Cloud provider: LAN/localhost URLs open in a local Chromium (ignores allow_private_urls; False refuses)
         "auto_local_for_private_urls": True,
         "cdp_url": "",  # persistent CDP endpoint for attaching to an existing Chromium/Chrome
         # Consent to browse with the user's REAL logins locally: runs on a Hermes-managed SNAPSHOT

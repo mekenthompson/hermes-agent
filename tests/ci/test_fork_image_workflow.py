@@ -20,6 +20,22 @@ REPOSITORY = "ghcr.io/mekenthompson/hermes-agent"
 
 
 class ForkImageWorkflowTests(unittest.TestCase):
+    def test_both_builds_stamp_the_exact_source_before_building(self) -> None:
+        import yaml
+
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        for name in ("preflight", "publish"):
+            steps = workflow["jobs"][name]["steps"]
+            stamp = next(i for i, step in enumerate(steps)
+                         if "scripts/write_install_stamp.py" in step.get("run", ""))
+            build = next(i for i, step in enumerate(steps)
+                         if str(step.get("uses", "")).startswith("docker/build-push-action@"))
+            self.assertLess(stamp, build)
+            self.assertIn('--commit "$GITHUB_SHA"', steps[stamp]["run"])
+            self.assertIn("--update-mechanism external", steps[stamp]["run"])
+            self.assertTrue(any('stamp["commit"] == os.environ["EXPECTED_REVISION"]'
+                                in step.get("run", "") for step in steps[build + 1:]))
+
     def test_publishing_retains_scan_evidence_even_on_failure(self) -> None:
         publish = WORKFLOW.read_text(encoding="utf-8").split("\n  publish:\n", 1)[1]
         self.assertIn("name: Upload publication evidence", publish)

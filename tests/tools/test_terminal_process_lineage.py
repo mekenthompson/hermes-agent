@@ -44,17 +44,18 @@ def test_actual_pipe_producer_persistence_boundaries(tmp_path, monkeypatch, phas
     store = started(tmp_path)
     registry = isolated_registry(monkeypatch)
     processes, launches, reaps = [], [], []
-    real_popen = module.subprocess.Popen
-    def popen(*args, **kwargs):
+    real_spawn = registry._spawn_job
+    def spawn(*args, **kwargs):
         row = ChatExecutionStore(tmp_path).inspect_resources("key")[0]
         assert (row["kind"], row["state"]) == ("terminal_local_process", "started")
         launches.append("launch")
         if phase == "spawn":
             raise OSError("injected launch failure")
-        proc = real_popen(*args, **kwargs)
+        proc = real_spawn(*args, **kwargs)
         processes.append(proc)
         return proc
-    monkeypatch.setattr(module.subprocess, "Popen", popen)
+    # Count actual job launches, not the owner-death supervisor's own subprocess.
+    monkeypatch.setattr(registry, "_spawn_job", spawn)
     methods = {"reserve": "reserve_concurrent_tool_resource", "start": "start_concurrent_tool_resource",
                "lineage": "record_terminal_process_lineage"}
     def broken(*a, **kw):
