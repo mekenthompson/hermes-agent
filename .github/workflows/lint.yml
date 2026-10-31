@@ -191,7 +191,9 @@ jobs:
         uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:
           ref: ${{ inputs.commit }}
-          fetch-depth: 2 # the merge commit and its first parent (the base branch tip)
+          # Frozen alignment compares both admitted ancestors; ordinary PRs still
+          # need only the synthetic merge and its first parent. Keep '0' truthy.
+          fetch-depth: ${{ github.repository == 'mekenthompson/hermes-agent' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'house/hf576-nous-6bb377a51d' && '0' || '2' }}
 
       - uses: ./.github/actions/setup-pm
         with:
