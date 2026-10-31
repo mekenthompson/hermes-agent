@@ -969,6 +969,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     last_ping_event_id INTEGER NOT NULL DEFAULT 0,
+    checkpoint_pending_event_ids TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -1668,24 +1669,6 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 
 
 # --- Comments & events ---
-
-def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
-    if not body or not body.strip():
-        raise ValueError("comment body is required")
-    if not author or not author.strip():
-        raise ValueError("comment author is required")
-    now = int(time.time())
-    # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
-    # compose comment writes under one outer commit.
-    with write_txn(conn, allow_nested=True):
-        _require_task(conn, task_id)
-        cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
-        )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
-
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
     if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
@@ -4073,3 +4056,4 @@ from hermes_cli.kanban_db_controls import (
     block_task,
     unblock_task,
 )
+from hermes_cli.kanban_db_comments import add_comment

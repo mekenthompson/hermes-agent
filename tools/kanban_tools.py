@@ -961,7 +961,9 @@ def _handle_comment(args: dict, **kw) -> str:
             "task_id is required: comments are per-task and this session has no "
             "dispatcher-assigned task to default to. Discover task ids with "
             "kanban_list, or pass the task id you mean.")
-    body = _redact(_require_text(args, "body"))
+    human_checkpoint = args.get("human_checkpoint", False)
+    _check(isinstance(human_checkpoint, bool), "human_checkpoint must be a boolean")
+    body = str(_require_text(args, "body")) if human_checkpoint else _redact(_require_text(args, "body"))
     # Author comes from the worker's runtime identity (``_persisted_identity``), never
     # caller args: comments are injected into future workers' system prompts, so an
     # args["author"] override could forge a directive from ``hermes-system``.
@@ -972,7 +974,8 @@ def _handle_comment(args: dict, **kw) -> str:
     # with what reads as a system directive. See #19713.
     author = _persisted_identity()
     with _board(args.get("board")) as (kb, conn):
-        cid = kb.add_comment(conn, tid, author=author, body=str(body))
+        cid = kb.add_comment(conn, tid, author=author, body=body,
+                             human_checkpoint=human_checkpoint, request_id=args.get("request_id"))
         return _ok(task_id=tid, comment_id=cid)
 
 
@@ -1273,8 +1276,13 @@ def _handle_unblock(args: dict, **kw) -> str:
     _check(tid, "task_id is required")
     tid = str(tid)
     _enforce_worker_task_ownership(tid)
+    target = _resolve_notify_target()
+    if target is not None:
+        _check(target["notifier_profile"] == _persisted_identity(),
+               "requesting session profile does not own this native context")
     with _board(args.get("board")) as (kb, conn):
-        _check(kb.unblock_task(conn, tid, expected_event_id=args.get("expected_event_id")),
+        _check(kb.unblock_task(conn, tid, expected_event_id=args.get("expected_event_id"),
+                               notify_target=target),
                f"could not unblock {tid} (state or expected event changed)")
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 

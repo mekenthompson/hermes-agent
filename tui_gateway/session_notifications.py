@@ -145,7 +145,11 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 
 # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds (archived/unblocked) too so the cursor advances
 # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
-_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "checkpoint")
+
+
+class _PassiveKanbanCheckpoint(str):
+    """A human update for the UI, without a synthetic agent turn."""
 # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
 # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
 _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0
@@ -410,6 +414,12 @@ _KANBAN_EVENT_FORMATTERS = {
 def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
     """Single-line notification text for one kanban event; wording mirrors gateway/kanban_watchers.py (reads the same
     as on Telegram). None for silent kinds."""
+    if getattr(ev, "kind", "") == "checkpoint":
+        from agent.redact import redact_sensitive_text
+
+        return _PassiveKanbanCheckpoint(redact_sensitive_text(
+            str((getattr(ev, "payload", None) or {}).get("body") or ""),
+            force=True, redact_url_credentials=True))
     if (entry := _KANBAN_EVENT_FORMATTERS.get(getattr(ev, "kind", ""))) is None:
         return None
     glyph, fmt = entry
@@ -517,8 +527,9 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
         from gateway.warning_notifications import DiagnosticText, render_notification
         render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": text}),
                             platform="tui", diagnostic=isinstance(text, DiagnosticText))
-    if texts:
-        session.setdefault("_kanban_pending", []).extend(texts)
+    active_texts = [text for text in texts if not isinstance(text, _PassiveKanbanCheckpoint)]
+    if active_texts:
+        session.setdefault("_kanban_pending", []).extend(active_texts)
     if not session.get("_kanban_pending") or not _notif_claim_turn(session):
         return
     with session["history_lock"]:

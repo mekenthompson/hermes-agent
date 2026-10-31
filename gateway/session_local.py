@@ -59,6 +59,18 @@ class LocalSessionAdapter(BasePlatformAdapter):
         self.sources.clear()
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
+        if metadata and metadata.get('kanban_checkpoint_event_id'):
+            live = self.authority.sessions.get(chat_id)
+            if live is None or not self.authorize_source(live.source):
+                return SendResult(success=False, error='local checkpoint destination is not live')
+            key = ('kanban-checkpoint:' + str(metadata.get('kanban_checkpoint_board') or 'default')
+                   + ':' + str(metadata.get('kanban_checkpoint_task_id') or '')
+                   + ':' + str(metadata['kanban_checkpoint_event_id']))
+            accepted = live.event_stream.publish(chat_id, {
+                'text': content, 'detail': content, 'level': 'info', 'kind': 'sticky', 'key': key,
+            }, event_type='notification.show', execution={})
+            return SendResult(success=accepted, message_id=key if accepted else None,
+                              error=None if accepted else 'local checkpoint has no attached viewer')
         # TurnRunner already publishes model/tool deltas and settlement exactly once.
         return SendResult(success=True, message_id=uuid.uuid4().hex)
 
