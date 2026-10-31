@@ -263,6 +263,8 @@ class AuthorityConnection:
         handlers['session.prune'] = partial(prune, self)
         from gateway.session_usage import stats
         handlers['session.stats'] = partial(stats, self)
+        from gateway.session_delivery_handle import delivery_handle
+        handlers['session.delivery_handle'] = partial(delivery_handle, self)
         from gateway.session_active_list import active_list
         handlers['session.active_list'] = partial(active_list, self)
         from gateway.session_viewer_automation import automation
@@ -330,7 +332,8 @@ class AuthorityConnection:
         original_params = dict(params)
         contract = contract or METHODS.get(method)
         authority = self.authority
-        if (isinstance(ref.session_id, str) and ref.session_id and not getattr(authority, 'retiring', False)
+        if (method != 'session.delivery_handle'
+                and isinstance(ref.session_id, str) and ref.session_id and not getattr(authority, 'retiring', False)
                 and ref.profile_id == getattr(authority, 'profile_id', None)
                 and ref.session_id not in getattr(authority, 'sessions', {ref.session_id: None})):
             # A first read of a session recovery never restored: its compression catch-up (#140060)

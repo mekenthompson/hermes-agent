@@ -10309,6 +10309,32 @@
         "title": "CanonicalSessionListRow",
         "type": "object"
       },
+      "CanonicalSessionParams": {
+        "additionalProperties": false,
+        "properties": {
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "CanonicalSessionParams",
+        "type": "object"
+      },
       "CanonicalSessionRef": {
         "additionalProperties": false,
         "properties": {
@@ -16469,6 +16495,61 @@
           "max_concurrent_children"
         ],
         "title": "DelegationStatusResult",
+        "type": "object"
+      },
+      "DeliveryHandleResult": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "stored_session_id": {
+            "title": "Stored Session Id",
+            "type": "string"
+          },
+          "profile_id": {
+            "title": "Profile Id",
+            "type": "string"
+          },
+          "instance_id": {
+            "title": "Instance Id",
+            "type": "string"
+          },
+          "authority_epoch": {
+            "title": "Authority Epoch",
+            "type": "integer"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "execution_generation": {
+            "title": "Execution Generation",
+            "type": "integer"
+          },
+          "execution_state": {
+            "enum": [
+              "idle",
+              "running",
+              "waiting",
+              "terminal"
+            ],
+            "title": "Execution State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "stored_session_id",
+          "profile_id",
+          "instance_id",
+          "authority_epoch",
+          "revision",
+          "execution_generation",
+          "execution_state"
+        ],
+        "title": "DeliveryHandleResult",
         "type": "object"
       },
       "DiagnosticsShareNousParams": {
@@ -48326,6 +48407,24 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/CanonicalSnapshot"
+        }
+      }
+    },
+    {
+      "name": "session.delivery_handle",
+      "summary": "Read an already mounted local owner without adoption, attach or policy refresh.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/CanonicalSessionParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/DeliveryHandleResult"
         }
       }
     },

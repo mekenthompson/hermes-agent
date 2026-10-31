@@ -4957,6 +4957,20 @@ export interface WorkerPersistParams {
 }
 /** The operation's durable receipt (``message_id`` for an append, delegation results, …). */
 export type WorkerPersistResult = Record<string, unknown>
+export interface CanonicalSessionParams {
+  profile?: string | null
+  session_id: string
+}
+export interface DeliveryHandleResult {
+  session_id: string
+  stored_session_id: string
+  profile_id: string
+  instance_id: string
+  authority_epoch: number
+  revision: number
+  execution_generation: number
+  execution_state: 'idle' | 'running' | 'waiting' | 'terminal'
+}
 export interface CanonicalCreateParams {
   profile?: string | null
   request_id?: string | null
@@ -6869,6 +6883,8 @@ export interface CanonicalRpcMethods {
   /** The classic CLI's /goal, /subgoal, /loop, /heartbeat manager calls (state writes, the goal judge, quality gates), run by the owner on the session's row. */
   'session.automation': { params: SessionAutomationParams; result: SessionAutomationResult }
   'session.create': { params: CanonicalCreateParams; result: CanonicalSnapshot }
+  /** Read an already mounted local owner without adoption, attach or policy refresh. */
+  'session.delivery_handle': { params: CanonicalSessionParams; result: DeliveryHandleResult }
   /** Drop this connection's subscription; a stale subscription id answers detached=false. end_reason (snake_case): the viewer is closing the conversation; the last viewer leaving an idle local session ends its row with that reason. */
   'session.detach': { params: SessionDetachParams; result: SessionDetachResult }
   'session.events.since': { params: CanonicalEventsParams; result: CanonicalEventsResult }
@@ -6930,6 +6946,7 @@ export const CANONICAL_RPC_METHODS = [
   'runtime.describe',
   'session.automation',
   'session.create',
+  'session.delivery_handle',
   'session.detach',
   'session.events.since',
   'session.export',
