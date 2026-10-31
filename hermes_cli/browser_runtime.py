@@ -72,6 +72,45 @@ def chromium_executable(*, allow_override: bool = True) -> str | None:
     return _system_executable() if _pm_has_no_chromium() else None
 
 
+def chromium_sandbox_required() -> bool:
+    """Whether this profile forbids automatic Chromium sandbox bypass."""
+    from hermes_cli.config import cfg_get, load_config_readonly
+
+    return cfg_get(load_config_readonly(), "browser", "sandbox_required", default=False) is True
+
+
+def validate_chromium_sandbox_args(argv) -> None:
+    """Refuse explicit sandbox-disabling switches under the profile's required policy."""
+    if not chromium_sandbox_required():
+        return
+    forbidden = {
+        "--no-sandbox", "--disable-setuid-sandbox", "--disable-seccomp-filter-sandbox",
+        "--disable-namespace-sandbox", "--single-process", "--no-zygote",
+        "--disable-gpu-sandbox", "--in-process-gpu",
+    }
+    if any(str(arg).split("=", 1)[0] in forbidden for arg in argv):
+        raise ValueError("browser.sandbox_required forbids sandbox-disabling Chromium flags; "
+                         "remove those flags and configure the container's sandbox policy.")
+
+
+def chromium_existing_sandbox_error(pid: int | None, *, foreign: bool = False) -> str | None:
+    """Do not adopt an unverifiable or explicitly unsandboxed existing browser."""
+    if not chromium_sandbox_required():
+        return None
+    import psutil
+
+    if pid is None or foreign:
+        return "browser.sandbox_required: cannot verify the existing browser; leave it running and close it normally."
+    try:
+        argv = psutil.Process(pid).cmdline()
+        if not argv:
+            raise ValueError("browser.sandbox_required: existing browser command line is unavailable.")
+        validate_chromium_sandbox_args(argv)
+    except (psutil.Error, OSError, ValueError) as exc:
+        return f"browser.sandbox_required: refusing existing browser without changing its profile: {exc}"
+    return None
+
+
 def chromium_missing_hint() -> str:
     """One actionable line for "no Chromium" on this machine. Never suggests npm."""
     from hermes_platform.host.runtime import is_termux
