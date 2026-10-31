@@ -87,7 +87,7 @@ def _rmtree_force(path: str) -> None:
             pass
     shutil.rmtree(path, onerror=_chmod_retry)
 
-def _runner_scratch_root() -> str:
+def _runner_scratch_root(base: str | None = None) -> str:
     """Per-run temp roots live on DISK, never the system temp dir: a full-suite run writes
     gigabytes of tmp_path fixtures and /tmp is RAM-backed tmpfs on many Linux hosts. /var/tmp is
     the FHS disk-backed temp root and is used because the alternatives fail tests that assume
@@ -101,7 +101,9 @@ def _runner_scratch_root() -> str:
     back that does not need root. Keying by uid means no run is blocked by another's leftovers.
     """
     name = "hermes-pytest" + (f"-{os.getuid()}" if hasattr(os, "getuid") else "")
-    if os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
+    if base is not None:
+        root = os.path.join(os.path.abspath(base), name)
+    elif os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
         root = os.path.join(tempfile.gettempdir(), name)
     else:
         root = f"/var/tmp/{name}"  # no-tmp: ok — /var/tmp is disk-backed by FHS, never tmpfs
@@ -554,6 +556,7 @@ def _run_one_file(
     repo_root: Path,
     file_timeout: float,
     retries: int = 0,
+    scratch_root: str | None = None,
 ) -> tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -588,7 +591,7 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
+        file, pytest_args, repo_root, file_timeout, scratch_root
     )
     attempt = 0
     # A worker killed by signal (OOM, SIGKILL) or the file timeout is a runaway, not a flake:
@@ -599,7 +602,7 @@ def _run_one_file(
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
+            file, pytest_args, repo_root, file_timeout, scratch_root
         )
         subproc_wall += subproc_wall2
         if rc == 0:
@@ -627,6 +630,7 @@ def _run_one_file_once(
     pytest_args: list[str],
     repo_root: Path,
     file_timeout: float,
+    scratch_root: str | None = None,
 ) -> tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
@@ -648,7 +652,7 @@ def _run_one_file_once(
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
     env = os.environ.copy()
-    temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
+    temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root(scratch_root))
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
     # Every tempfile.* call inside the test process lands in the same per-run root, so the
     # parent's cleanup of ``temproot`` removes them too instead of leaving them in /tmp.
@@ -1243,8 +1247,7 @@ def _summary_notes(
     return notes
 
 
-def main() -> int:
-    _make_stdio_glyph_safe()
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1255,6 +1258,12 @@ def main() -> int:
         type=int,
         default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4)),
         help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count)",
+    )
+    parser.add_argument(
+        "--scratch-root",
+        metavar="PATH",
+        help=("Disk-backed temporary parent; uses only its hermes-pytest-<uid> subtree. "
+              "Choose a short, non-hidden path outside HERMES_HOME. Default: /var/tmp on POSIX."),
     )
     parser.add_argument(
         "--paths",
@@ -1360,6 +1369,12 @@ def main() -> int:
             "separator is passed through to each per-file pytest invocation."
         ),
     )
+    return parser
+
+
+def main() -> int:
+    _make_stdio_glyph_safe()
+    parser = _build_parser()
     # Split argv into "our flags + positional paths" vs "pytest passthrough".
     #
     # Two ways to pass args through to the per-file pytest invocation:
@@ -1379,7 +1394,7 @@ def main() -> int:
     OUR_FLAGS = {
         "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
-        "--files-from", "--fail-on-skip",
+        "--files-from", "--fail-on-skip", "--scratch-root",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -1629,7 +1644,7 @@ def main() -> int:
 
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    _sweep_killed_run_roots(_runner_scratch_root())
+    _sweep_killed_run_roots(_runner_scratch_root(args.scratch_root))
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         # Duration cache for the timeout scaler: known-slow files get
@@ -1645,6 +1660,7 @@ def main() -> int:
                     file, repo_root, args.file_timeout, timeout_durations
                 ),
                 args.file_retries,
+                args.scratch_root,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)

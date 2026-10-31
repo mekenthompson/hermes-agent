@@ -25,6 +25,7 @@ import shutil
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -88,6 +89,7 @@ def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> Non
         [
             sys.executable,
             str(runner),
+            "--scratch-root", tempfile.gettempdir(),
             "--paths",
             str(probe_dir),
             "-j",
@@ -178,6 +180,7 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
         [
             sys.executable,
             str(runner),
+            "--scratch-root", tempfile.gettempdir(),
             "--paths",
             str(probe_dir),
             "-j",
@@ -260,6 +263,7 @@ def test_detached_grandchild_is_killed_by_runner(tmp_path: Path) -> None:
     """).lstrip(), encoding="utf-8")
     proc = subprocess.run(
         [sys.executable, str(repo_root / "scripts" / "run_tests_parallel.py"),
+         "--scratch-root", tempfile.gettempdir(),
          "--paths", str(probe_dir), "-j", "1", "--file-timeout", "30"],
         cwd=probe_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         encoding="utf-8", errors="replace", timeout=60, check=False,
@@ -302,7 +306,7 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     repo_root = _probe_root(probe_dir.parent)
     runner = repo_root / "scripts" / "run_tests_parallel.py"
     return subprocess.run(
-        [sys.executable, str(runner), "--paths", str(probe_dir),
+        [sys.executable, str(runner), "--scratch-root", tempfile.gettempdir(), "--paths", str(probe_dir),
          "-j", "1", "--file-timeout", "30", *extra],
         cwd=probe_dir,
         stdout=subprocess.PIPE,
@@ -326,7 +330,7 @@ def test_help_prints_usage_without_discovering_or_running_tests(
     runner = repo_root / "scripts" / "run_tests_parallel.py"
 
     proc = subprocess.run(
-        [sys.executable, str(runner), "--paths", str(tmp_path / "no-tests"), help_flag],
+        [sys.executable, str(runner), "--scratch-root", tempfile.gettempdir(), "--paths", str(tmp_path / "no-tests"), help_flag],
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -402,6 +406,7 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
         [
             sys.executable,
             str(runner),
+            "--scratch-root", tempfile.gettempdir(),
             "--files",
             str(probe),
             "--file-retries",
@@ -503,7 +508,7 @@ def test_runner_selection_records_actual_test_identity(tmp_path, form, expected)
         "pathsep": ["--paths", os.pathsep.join([str(probe), str(other)])],
     }[form]
     runner = _probe_root(tmp_path) / "scripts/run_tests_parallel.py"
-    result = subprocess.run([sys.executable, str(runner), *arguments, "-j", "1", "--file-timeout", "30"],
+    result = subprocess.run([sys.executable, str(runner), "--scratch-root", tempfile.gettempdir(), *arguments, "-j", "1", "--file-timeout", "30"],
                             cwd=tmp_path, capture_output=True, text=True, encoding="utf-8", timeout=60, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
     assert sorted(path.name for path in receipt.iterdir()) == expected
@@ -533,7 +538,7 @@ def test_passthrough_ignore_drops_files_the_runner_hands_pytest_explicitly(
             "glob-spaced": ["--ignore-glob", "*test_gated_*.py"],
             "path": ["--ignore=tests/probe/test_gated_skipme.py"]}[ignore]
     runner = root / "scripts/run_tests_parallel.py"
-    result = subprocess.run([sys.executable, str(runner), *pick, "-j", "1", "--file-timeout", "30", "--", *flag],
+    result = subprocess.run([sys.executable, str(runner), "--scratch-root", tempfile.gettempdir(), *pick, "-j", "1", "--file-timeout", "30", "--", *flag],
                             cwd=tmp_path, capture_output=True, text=True, encoding="utf-8", timeout=60, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
     assert sorted(path.name for path in receipt.iterdir()) == ["keep"], result.stdout
@@ -680,7 +685,7 @@ def test_named_test_path_that_does_not_exist_fails_the_run(tmp_path: Path) -> No
     missing = probe_dir / "test_probe_not_there.py"
 
     proc = subprocess.run(
-        [sys.executable, str(runner), str(probe_dir / "test_flagprobe.py"), str(missing),
+        [sys.executable, str(runner), "--scratch-root", tempfile.gettempdir(), str(probe_dir / "test_flagprobe.py"), str(missing),
          "-j", "1", "--file-timeout", "30"],
         cwd=probe_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         encoding="utf-8", errors="replace", timeout=60, check=False,
@@ -729,7 +734,7 @@ def test_files_from_dash_reads_the_list_from_stdin(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parent.parent.parent
     runner = repo_root / "scripts" / "run_tests_parallel.py"
     proc = subprocess.run(
-        [sys.executable, str(runner), "--files-from", "-",
+        [sys.executable, str(runner), "--scratch-root", tempfile.gettempdir(), "--files-from", "-",
          "-j", "1", "--file-timeout", "30", "-q"],
         input=f"{probe_dir / 'test_flagprobe.py'}\n",
         cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
