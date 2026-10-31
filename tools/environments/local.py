@@ -1140,10 +1140,11 @@ class LocalEnvironment(BaseEnvironment):
                   stdin_data: str | None = None, native_session=None) -> subprocess.Popen:
         bash = _find_bash()
         run_env = _make_run_env(self.env)
-        # Login invocations (init_session's env snapshot) source the user's rc /
-        # custom init files so nvm/asdf/pyenv land on PATH in the snapshot; then the
-        # spawn env's dirs a resetting profile dropped are re-appended (#56634).
+        # Login init contributes its tools, but must not replace the selected
+        # session toolchain's precedence in the persisted snapshot.
         if login:
+            if selected_path := run_env.get("PATH"):
+                cmd_string = f"export PATH={shlex.quote(selected_path)}:\"$PATH\"\n" + cmd_string
             cmd_string = _append_dropped_path_entries(cmd_string, run_env.get("PATH", ""))
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]

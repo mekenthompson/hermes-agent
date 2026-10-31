@@ -159,6 +159,10 @@ def peek_session(request: Request):
     checks (Webapp sign-in binding, bearers only a native app was given) and none of its side
     effects: no refresh, no cookie writes, no audit records, no 401. A public route uses it to
     decide how much to show; an expired or unverifiable session reads as signed out."""
+    import hermes_cli.web_server as _web_server
+
+    if _web_server._has_valid_explicit_session_token(request):
+        return _web_server._explicit_session_token_session()
     bearer = _extract_bearer(request)
     if bearer:
         if not webapp_sign_in.token_works_alone(request, bearer):
