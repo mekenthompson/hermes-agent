@@ -299,6 +299,14 @@ def _wait_for_devtools(proc: subprocess.Popen, user_data_dir: str, deadline: flo
         rc = proc.poll()
         if rc is not None:
             tail = _log_tail(user_data_dir)
+            from hermes_cli.browser_runtime import chromium_sandbox_required
+            if "sandbox" in tail.lower() and chromium_sandbox_required():
+                # Chromium's raw stderr can recommend bypassing the required sandbox.
+                return None, (
+                    f"Chromium exited with code {rc} during startup. Chromium's sandbox could not start; "
+                    "install or verify the reviewed container sandbox policy and keep "
+                    "browser.sandbox_required: true. Do not disable sandboxing."
+                )
             hint = (" Chromium's sandbox could not start; add --no-sandbox to browser.chromium_args."
                     if "sandbox" in tail.lower() else "")
             return None, f"Chromium exited with code {rc} during startup.{hint}" + (f"\n{tail}" if tail else "")

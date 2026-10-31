@@ -16,6 +16,36 @@ def test_required_sandbox_refuses_explicit_bypass(tmp_path, monkeypatch, flag):
 
 
 
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('required', [True, False])
+def test_startup_sandbox_failure_guidance_respects_required_policy(tmp_path, monkeypatch, required):
+    import os
+    import sys
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    atomic_config_write(tmp_path / 'config.yaml', {'browser': {'sandbox_required': required}})
+    executable = tmp_path / 'chromium'
+    executable.write_text(
+        f'#!{sys.executable}\n'
+        'import sys\n'
+        'sys.stderr.write("No usable sandbox! Try using --no-sandbox.\\n")\n'
+        'sys.exit(1)\n', encoding='utf-8'
+    )
+    executable.chmod(0o755)
+    launched, error = launcher.launch_chromium(
+        'startup-failure', executable=str(executable),
+        user_data_dir=str(tmp_path / 'browser-profile'), headed=False, env=dict(os.environ))
+    assert launched is None
+    assert error is not None
+    assert 'exited with code 1' in error
+    if required:
+        assert 'reviewed container sandbox policy' in error
+        assert 'browser.sandbox_required: true' in error
+        assert '--no-sandbox' not in error
+    else:
+        assert 'add --no-sandbox to browser.chromium_args' in error
+        assert 'No usable sandbox!' in error
+
+
 def test_browser_default_mapping_is_fresh_and_matches_config():
     from hermes_cli.config_defaults_browser import default_browser_config
     from hermes_cli.config_defaults import DEFAULT_CONFIG
@@ -85,7 +115,7 @@ def test_required_reuse_needs_kernel_renderer_evidence(tmp_path, monkeypatch, ch
     for pid, fields in [(123, parent), (124, renderer)]:
         target = tmp_path / 'proc' / str(pid) / 'status'
         target.parent.mkdir(parents=True)
-        target.write_text(''.join(f'{key}:\t{val}\n' for key, val in fields.items()))
+        target.write_text(''.join(f'{key}:\t{val}\n' for key, val in fields.items()), encoding='utf-8')
     if changed == 'missing_status':
         (tmp_path / 'proc' / '124' / 'status').unlink()
     monkeypatch.setattr(runtime, 'Path', lambda path: tmp_path / path.lstrip('/'))
