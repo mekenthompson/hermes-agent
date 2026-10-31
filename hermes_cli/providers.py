@@ -289,8 +289,8 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     # models.dev's commandcode entry uses CMD_API_KEY, not the bundled
     # CommandCode API's COMMANDCODE_API_KEY and /provider/v1 endpoint. Prefer
     # that profile (including its aliases) only for this known collision.
-    # Other catalog ids and Hermes overlays retain their routing contracts:
-    # e.g. the profile alias "meta" must not rewrite the catalog id to "meta-ai".
+    # Other canonical catalog ids and Hermes overlays retain their routing
+    # contracts after the normal plugin-alias resolution above.
     if canonical in {"commandcode", "commandcode-chat"}:
         pdef = _plugin_profile_pdef(canonical)
         if pdef is not None and pdef.base_url:
