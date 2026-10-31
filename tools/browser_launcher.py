@@ -131,6 +131,9 @@ def running_in_docker() -> bool:
 
 def needs_chromium_sandbox_bypass() -> bool:
     """True when Chromium needs --no-sandbox to start reliably (root, Docker, AppArmor userns)."""
+    from hermes_cli.browser_runtime import chromium_sandbox_required
+    if chromium_sandbox_required():
+        return False
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         return True
     if running_in_docker():
@@ -255,6 +258,8 @@ def build_chromium_argv(executable: str, user_data_dir: str, *, packaged: bool, 
     argv += [str(a) for a in extra_args]
     argv += configured
     argv.append("about:blank")
+    from hermes_cli.browser_runtime import validate_chromium_sandbox_args
+    validate_chromium_sandbox_args(argv)
     return argv
 
 
@@ -503,6 +508,9 @@ def _attach_running(key: str, user_data_dir: str, home_key: str) -> Optional[Lau
     if running is None:
         return None
     port, path, pid = running
+    from hermes_cli.browser_runtime import chromium_existing_sandbox_error
+    if error := chromium_existing_sandbox_error(pid):
+        raise ValueError(error)
     logger.info("browser: attaching to the Chromium already running on %s (pid %s)", user_data_dir, pid)
     browser = _make_browser(key, port, path, pid=pid, start_time=_start_time(pid), user_data_dir=user_data_dir,
                             owned=False, ephemeral=False, home_key=home_key)
@@ -535,6 +543,9 @@ def _bind_launch_record(records: Path, browser: LaunchedBrowser) -> None:
 def _attach_foreign(key: str, user_data_dir: str, home_key: str, pid: int) -> Optional[LaunchedBrowser]:
     """The Chromium another environment holds on ``user_data_dir``, leased, when its DevTools endpoint answers here
     (caller holds the profile's lock); None when it does not. Never adopted: its record is not ours to take."""
+    from hermes_cli.browser_runtime import chromium_existing_sandbox_error
+    if chromium_existing_sandbox_error(pid, foreign=True):
+        return None
     found = _read_devtools_file(user_data_dir)
     if found is None or not _devtools_endpoint_live(*found):
         return None
@@ -566,7 +577,10 @@ def _attach_local(key: str, user_data_dir: str, home_key: str,
     """Attach to this environment's live Chromium on ``user_data_dir``; ``(None, None)`` when none holds it (a
     launch may start one). A live holder whose endpoint does not answer (paused, hung) is waited for, then
     refused: a launch over it would only wipe its ``DevToolsActivePort`` and lose it for every later attach."""
-    attached = _attach_running(key, user_data_dir, home_key)
+    try:
+        attached = _attach_running(key, user_data_dir, home_key)
+    except ValueError as exc:
+        return None, str(exc)
     pid = _live_local_holder(user_data_dir) if attached is None else None
     if pid is None:
         return attached, None
@@ -579,7 +593,10 @@ def _attach_local(key: str, user_data_dir: str, home_key: str,
                           "Hermes will not start a second browser on it; try again once it responds, or stop it.")
         time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
         delay *= 2
-        attached = _attach_running(key, user_data_dir, home_key)
+        try:
+            attached = _attach_running(key, user_data_dir, home_key)
+        except ValueError as exc:
+            return None, str(exc)
     return attached, None
 
 
@@ -643,7 +660,9 @@ def launch_chromium(key: str, *, executable: Optional[str] = None, user_data_dir
     with _key_lock(key):  # one launch per key; other keys launch concurrently
         existing = get_browser(key)
         if existing is not None:
-            return existing, None
+            from hermes_cli.browser_runtime import chromium_existing_sandbox_error
+            error = chromium_existing_sandbox_error(existing.pid, foreign=existing.foreign)
+            return (None, error) if error else (existing, None)
         home_key = hermes_home_key()
         with _lock:
             _served_homes.add(home_key)
@@ -676,8 +695,11 @@ def _launch_owned(key: str, executable: str, udd: str, *, ephemeral: bool, packa
         _prepare_dir(udd, ephemeral)
     except OSError as exc:
         return None, f"Could not create the browser profile directory {udd}: {exc}"
-    argv = build_chromium_argv(executable, udd, packaged=packaged, headed=_resolve_headed(headed, env),
-                               sandbox_bypass=sandbox_bypass, extra_args=extra_args)
+    try:
+        argv = build_chromium_argv(executable, udd, packaged=packaged, headed=_resolve_headed(headed, env),
+                                   sandbox_bypass=sandbox_bypass, extra_args=extra_args)
+    except ValueError as exc:
+        return None, str(exc)
     try:
         proc = _spawn(argv, env, udd)
     except (OSError, subprocess.SubprocessError) as exc:

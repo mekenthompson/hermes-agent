@@ -2879,6 +2879,7 @@ browser:
   executable_path: ""            # Chromium binary override; "" = the packaged Chromium
   user_data_dir: ""              # Persistent profile shared by every session; "" = fresh profile per session
   chromium_args: []              # Extra Chromium command-line flags, e.g. ["--lang=de-DE"]
+  sandbox_required: false       # true = local launcher must not disable Chromium's sandbox
   # Cloud browser selection (written by `hermes tools` → Browser Automation)
   cloud_provider: local          # local | browserbase | browser-use | firecrawl | nous | <provider plugin>; unset = autodetect from credentials
   auto_local_for_private_urls: true  # With a cloud provider, open LAN/localhost URLs in a local Chromium
@@ -2899,6 +2900,21 @@ browser:
 Docker image) → a system `chromium` / `chromium-browser` on `PATH` (Termux and
 platforms without a packaged build). With none, the browser tool reports a hint
 instead of failing silently.
+
+**Required local sandbox.** Set `browser.sandbox_required: true` for managed
+containers whose host policy permits Chromium's namespace sandbox. The canonical
+local launcher and Bot Screen dock then suppress automatic Docker sandbox bypass,
+reject explicit sandbox-disabling flags, and refuse unsafe or unverifiable browser
+reuse without killing the existing browser or deleting profile locks. Reuse requires
+readable Linux `/proc` evidence: non-root renderers matching the browser UID, zero
+effective capabilities, no-new-privileges, a deeper PID namespace and additional
+seccomp filters beyond the browser process. Missing renderers or unavailable
+kernel evidence (including non-Linux reuse) fail closed; close the existing browser
+normally before retrying. A launch failure is an error, never a retry without the
+sandbox. This setting does not
+configure Docker security policy or attest remote/cloud CDP browsers. Validate
+`chrome://sandbox` and renderer isolation on the deployment's exact image and host
+policy before activation; keep non-root identity and `no-new-privileges` enabled.
 
 **Turning browsing off.** There is no browser config switch: disable the `browser`
 toolset with `hermes tools` (or `hermes tools disable browser [--platform NAME]`).
