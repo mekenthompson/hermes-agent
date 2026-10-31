@@ -1213,6 +1213,10 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
             ("scope_id", env("HERMES_SESSION_SCOPE_ID", "")),
             ("parent_chat_id", env("HERMES_SESSION_PARENT_CHAT_ID", "")),
         ) if v}
+    if platform.lower() == "linear" and message_id:
+        # The adapter reauthorizes this original source Activity at send time.
+        # A session/thread id is never a substitute for an absent reply anchor.
+        delivery_metadata["reply_to"] = str(message_id)
     if (platform.lower() == "telegram" and thread_id
             and (chat_type or "").lower() in {"dm", "direct", "private"}):
         delivery_metadata["telegram_dm_topic_reply_fallback"] = True
