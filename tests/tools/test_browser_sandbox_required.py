@@ -51,6 +51,54 @@ def test_required_policy_rejects_existing_unsafe_browser_without_touching_it(tmp
     assert error and 'sandbox_required' in error
 
 
+def test_required_policy_refuses_clean_argv_without_runtime_proof(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    atomic_config_write(tmp_path / 'config.yaml', {'browser': {'sandbox_required': True}})
+    existing = SimpleNamespace(pid=123, foreign=False)
+    monkeypatch.setattr(launcher, 'get_browser', lambda key: existing)
+    monkeypatch.setattr('psutil.Process', lambda pid: SimpleNamespace(
+        pid=pid, cmdline=lambda: ['/chromium'], children=lambda **kw: []))
+    launched, error = launcher.launch_chromium('unproven-policy', executable='/chromium', env={})
+    assert launched is None
+    assert error and 'sandbox_required' in error
+
+
+@pytest.mark.parametrize('changed,value', [
+    (None, None), ('NoNewPrivs', '0'), ('Seccomp', '0'),
+    ('Seccomp_filters', '1'), ('Seccomp_filters', None),
+    ('CapEff', '1'), ('NSpid', '124'), ('Uid', '0 0 0 0'),
+    ('missing_status', None), ('missing_renderer', None), ('exited', None),
+])
+def test_required_reuse_needs_kernel_renderer_evidence(tmp_path, monkeypatch, changed, value):
+    from types import SimpleNamespace
+    from hermes_cli import browser_runtime as runtime
+    monkeypatch.setattr(runtime, 'chromium_sandbox_required', lambda: True)
+    parent = {'Uid': '1000 1000 1000 1000', 'NSpid': '123', 'Seccomp_filters': '1'}
+    renderer = dict(parent, NoNewPrivs='1', Seccomp='2', Seccomp_filters='2',
+                    CapEff='0000000000000000', NSpid='124 2')
+    if changed in renderer:
+        if value is None:
+            renderer.pop(changed)
+        else:
+            renderer[changed] = value
+    for pid, fields in [(123, parent), (124, renderer)]:
+        target = tmp_path / 'proc' / str(pid) / 'status'
+        target.parent.mkdir(parents=True)
+        target.write_text(''.join(f'{key}:\t{val}\n' for key, val in fields.items()))
+    if changed == 'missing_status':
+        (tmp_path / 'proc' / '124' / 'status').unlink()
+    monkeypatch.setattr(runtime, 'Path', lambda path: tmp_path / path.lstrip('/'))
+    child = SimpleNamespace(pid=124, cmdline=lambda: ['/chromium --type=renderer'],
+                            is_running=lambda: changed != 'exited')
+    process = SimpleNamespace(pid=123, cmdline=lambda: ['/chromium'],
+        children=lambda **kw: [] if changed == 'missing_renderer' else [child],
+        is_running=lambda: True)
+    monkeypatch.setattr('psutil.Process', lambda pid: process)
+    error = runtime.chromium_existing_sandbox_error(123)
+    assert (error is None) == (changed is None)
+
+
 def test_required_policy_does_not_adopt_unsafe_shared_holder(tmp_path, monkeypatch):
     from types import SimpleNamespace
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))

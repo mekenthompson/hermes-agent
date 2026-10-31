@@ -2900,8 +2900,13 @@ instead of failing silently.
 containers whose host policy permits Chromium's namespace sandbox. The canonical
 local launcher and Bot Screen dock then suppress automatic Docker sandbox bypass,
 reject explicit sandbox-disabling flags, and refuse unsafe or unverifiable browser
-reuse without killing the existing browser or deleting profile locks. A launch
-failure is an error, never a retry without the sandbox. This setting does not
+reuse without killing the existing browser or deleting profile locks. Reuse requires
+readable Linux `/proc` evidence: non-root renderers matching the browser UID, zero
+effective capabilities, no-new-privileges, a deeper PID namespace and additional
+seccomp filters beyond the browser process. Missing renderers or unavailable
+kernel evidence (including non-Linux reuse) fail closed; close the existing browser
+normally before retrying. A launch failure is an error, never a retry without the
+sandbox. This setting does not
 configure Docker security policy or attest remote/cloud CDP browsers. Validate
 `chrome://sandbox` and renderer isolation on the deployment's exact image and host
 policy before activation; keep non-root identity and `no-new-privileges` enabled.
