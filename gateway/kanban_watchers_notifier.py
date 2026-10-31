@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 import re
 from functools import partial
 from pathlib import Path
@@ -491,6 +492,10 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
 # --- Delivery of one claimed batch (one subscription, N events) ---
 
 
+class _DeliveryHeld(RuntimeError):
+    """An adapter refusal/unconfirmed receipt is not proof of a dead destination."""
+
+
 class _KanbanNotification:
     """Deliver one subscription's claimed events, then settle the cursor.
 
@@ -691,14 +696,15 @@ class _KanbanNotification:
         _send_res = None
         async def send_ping():
             nonlocal _send_res
-            _send_res = await adapter.send(sub["chat_id"], msg, metadata=metadata)
+            reply = {"reply_to": metadata["reply_to"]} if metadata.get("reply_to") else {}
+            _send_res = await adapter.send(sub["chat_id"], msg, metadata=metadata, **reply)
         if not await present_notification(send_ping, platform=self.platform_str, diagnostic=diagnostic_event(ev)):
             return False
         # SendResult(success=False) without an exception is a FAILED delivery
         # (else the event is lost); None / non-SendResult keeps the
         # "no exception == delivered" contract.
         if getattr(_send_res, "success", True) is False:
-            raise RuntimeError(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
+            raise _DeliveryHeld(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
         logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
                      ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
         # Upload artifact paths from the handoff payload / legacy result as
@@ -717,7 +723,15 @@ class _KanbanNotification:
         return True
 
     async def _send_pings(self) -> bool:
-        """Send every text ping; False when a send failed (claim already rewound/dropped)."""
+        """Send every text ping; False when delivery is held or failed."""
+        holds = getattr(self.runner, "_kanban_delivery_holds", None)
+        if holds is None:
+            holds = self.runner._kanban_delivery_holds = {}
+        hold_key = (self.board_slug, *self.sub_key)
+        attempts, retry_at = holds.get(hold_key, (0, 0))
+        if time.monotonic() < retry_at:
+            await self.rewind()
+            return False
         for ev in self.d["events"]:
             msg = self.format_event(ev)
             if msg is None:
@@ -745,6 +759,18 @@ class _KanbanNotification:
                     event_id=ev.id,
                 ))
                 self.clear_failures()
+                holds.pop(hold_key, None)
+                attempts = 0
+            except _DeliveryHeld as exc:
+                # Durable custody remains in the subscription. Only retry timing
+                # is process-local, so a restart permits one fresh authorized try.
+                self.clear_failures()
+                delay = min(300, 30 * 2 ** min(attempts, 4))
+                holds[hold_key] = (min(attempts + 1, 4), time.monotonic() + delay)
+                logger.warning("kanban notifier: delivery held for %s on %s; subscription and cursor retained; retry in %ss: %s",
+                               self.task_id, self.platform_str, delay, exc)
+                await self.rewind()
+                return False
             except Exception as exc:
                 await self.delivery_failed(
                     "kanban notifier: send failed for %s on %s (attempt %d/%d): %s", (self.task_id, self.platform_str),

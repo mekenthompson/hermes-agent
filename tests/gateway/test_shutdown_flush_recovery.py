@@ -275,6 +275,31 @@ def test_live_write_waits_while_held_back_files_still_fail_to_drain(flush_dir, m
     assert not store._dirty_transcripts
 
 
+def test_missing_session_spool_is_explicitly_held_without_append(flush_dir, tmp_path, caplog):
+    from hermes_state import SessionDB
+    from gateway.shutdown_flush import recover_pending_spool
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        orphan = _write_spool(flush_dir, "pending-orphan.json", "missing-session",
+                              {"role": "user", "content": "private-sentinel"}, ts=100, seq=0)
+        original = orphan.read_bytes()
+        db.create_session("valid-session", source="telegram")
+        _write_spool(flush_dir, "pending-valid.json", "valid-session",
+                     {"role": "user", "content": "valid"}, ts=101, seq=1)
+        with patch.object(db, "append_message", wraps=db.append_message) as append:
+            assert recover_pending_spool(db) == (1, {"missing-session"})
+            assert [call.kwargs["session_id"] for call in append.call_args_list] == ["valid-session"]
+            assert recover_pending_spool(db) == (0, {"missing-session"})
+            assert append.call_count == 1
+        assert orphan.read_bytes() == original
+        assert db.get_session("missing-session") is None
+        assert "orphan transcript spool held" in caplog.text
+        assert "private-sentinel" not in caplog.text
+    finally:
+        db.close()
+
+
 def test_a_poisoned_spool_row_does_not_stop_later_live_rows(flush_dir, tmp_path, make_store, boot_db):
     """A spooled field sqlite cannot bind used to fail on every replay. With live writes waiting
     behind the spool, the session then stopped persisting for good, across restarts too."""
