@@ -53,6 +53,9 @@ def _doctor_fix(tmp_path, monkeypatch, cfg):
     home = cfg.get_hermes_home()
     monkeypatch.setattr(doctor, "HERMES_HOME", home)
     monkeypatch.setattr(doctor, "PROJECT_ROOT", root)
+    # Exercise the owner-only policy, not container/managed-mount permission opt-outs.
+    monkeypatch.setattr(cfg, "is_managed", lambda: False)
+    monkeypatch.setattr(cfg, "_container_or_chmod_skipped", lambda: False)
     assert _check_config_file(True).fixed == 1
     if os.name == "posix":
         assert (home / "config.yaml").stat().st_mode & 0o777 == 0o600

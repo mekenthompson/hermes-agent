@@ -26,6 +26,7 @@ def payment_prompt_check():
     supervisor = SUPERVISOR_REGISTRY.get('default')
     original_backend, original_confirm = vault_backends.backend_for_handle, vault._confirm_payment_fill
     original_focus = supervisor.focus_page
+    original_origin = vault._current_page_origin
     focused = []
     meta = SimpleNamespace(kind='payment', label='Fixture', origin='https://example.test',
                            allowed_origins=['https://example.test'])
@@ -35,11 +36,15 @@ def payment_prompt_check():
         return original_focus(*args, **kwargs)
 
     def confirm(*args):
+        focused.clear()  # pre-prompt origin selection is allowed; post-takeover I/O is not
         lease.acquire('payment-fixture-viewer')
         return True
 
     vault_backends.backend_for_handle = lambda handle: SimpleNamespace(needs_unlock=False, get_meta=lambda item: meta)
     vault._confirm_payment_fill, supervisor.focus_page = confirm, focus
+    # The native browser starts on about:blank. Supply only the saved-origin fixture;
+    # real supervisor operations and the human lease admission remain exercised.
+    vault._current_page_origin = lambda task_id: meta.origin
     try:
         result = json.loads(vault._handle_vault({'action': 'fill', 'handle': 'fixture'}, task_id='default'))
         assert result.get('code') == 'human_has_control', result
@@ -48,6 +53,7 @@ def payment_prompt_check():
     finally:
         vault_backends.backend_for_handle, vault._confirm_payment_fill = original_backend, original_confirm
         supervisor.focus_page = original_focus
+        vault._current_page_origin = original_origin
         lease.release('payment-fixture-viewer')
 
 

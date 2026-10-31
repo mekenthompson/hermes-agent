@@ -77,7 +77,7 @@ def test_gateway_session_key_uses_its_recorded_cwd(monkeypatch):
             "cli",
             "local",
             Path("/workspace"),
-            str(Path("/workspace").resolve()),
+            "/workspace",
             True,
         ),
         ("", "local", Path("."), str(Path.cwd().resolve()), True),
@@ -111,6 +111,28 @@ def test_only_local_cli_uses_host_cwd(
         assert bool(host_lookups) is uses_host
     finally:
         runtime_cwd.reset_session_cwd(token)
+
+
+@pytest.mark.platforms("posix")
+def test_absolute_local_symlink_keeps_logical_cwd(tmp_path, monkeypatch):
+    target = tmp_path / "project"
+    target.mkdir()
+    logical = tmp_path / "logical-project"
+    logical.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(runtime_cwd, "scoped_session_cwd", lambda: None)
+    monkeypatch.setattr(runtime_cwd, "resolve_agent_cwd", lambda: logical)
+    monkeypatch.setattr("tools.terminal_tool.get_session_cwd", lambda _key: None)
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env", lambda _name, default: default
+    )
+    monkeypatch.setattr(
+        "tools.terminal_scope.terminal_env", lambda _name, default: default
+    )
+
+    assert logical.resolve() == target
+    assert relay_cwd.resolve_relay_scope_cwds(
+        object(), "task-1", "session-1", "cli"
+    ) == (str(logical), str(logical))
 
 
 def test_cwd_lookup_failures_do_not_break_the_turn(monkeypatch):

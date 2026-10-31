@@ -8,21 +8,23 @@ from hermes_cli import providers as catalog
 from providers import get_provider_profile
 
 
-@pytest.mark.parametrize("provider", [
-    "meta", "openrouter", "xai", "minimax", "anthropic", "nvidia", "zai",
+@pytest.mark.parametrize(("provider", "canonical"), [
+    ("meta", "meta-ai"), ("meta-ai", "meta-ai"),
+    ("openrouter", "openrouter"), ("xai", "xai"), ("minimax", "minimax"),
+    ("anthropic", "anthropic"), ("nvidia", "nvidia"), ("zai", "zai"),
 ])
-def test_catalog_and_overlay_contract_survives_registered_profile(provider, monkeypatch):
+def test_catalog_and_overlay_contract_survives_registered_profile(provider, canonical, monkeypatch):
     """Use real bundled profiles: aliases and wire policy differ from the catalog layer."""
     assert get_provider_profile(provider) is not None
     info = SimpleNamespace(name="Catalog provider", env=("CATALOG_API_KEY",),
                            api="https://catalog.example.test/v1", doc="https://catalog.example.test/docs")
     monkeypatch.setattr(catalog, "_models_dev_info", lambda *_args, **_kwargs: info)
-    overlay = catalog.HERMES_OVERLAYS.get(provider, catalog.HermesOverlay())
+    overlay = catalog.HERMES_OVERLAYS.get(canonical, catalog.HermesOverlay())
 
     resolved = catalog.get_provider(provider, allow_network=False)
 
     assert resolved is not None
-    assert resolved.id == provider
+    assert resolved.id == canonical
     assert resolved.source == "models.dev"
     assert resolved.name == info.name
     assert resolved.transport == overlay.transport

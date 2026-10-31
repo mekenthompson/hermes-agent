@@ -25,8 +25,8 @@ from scripts.code_health.config import ENFORCEMENT
 REPO = Path(__file__).resolve().parents[2]
 _GUARD_SCRIPTS = (
     "scripts/check-windows-footguns.py", "scripts/check_bash_shebangs.py",
-    "scripts/check_no_tmp_literals.py", "scripts/check_config_yaml_writers.py",
-    "scripts/check_config_yaml_readers.py",
+    "scripts/check_no_tmp_literals.py", "scripts/check_detached_spawns.py",
+    "scripts/check_config_yaml_writers.py", "scripts/check_config_yaml_readers.py",
     "scripts/ci/check_os_marker_fakes.py", "scripts/check-case-collisions.py",
     "scripts/ci/check_lazy_deps_imports.py", "scripts/ci/check_profile_archive_boundary.py",
     "scripts/ci/check_agents_md_size.py", "scripts/ci/check_blob_size.py",
@@ -145,14 +145,14 @@ def test_alignment_baselines_require_same_repository_head(tmp_path, monkeypatch)
     repo = _engine_repo(tmp_path)
     parent = _git(repo, "rev-parse", "HEAD")
     _git(repo, "remote", "add", "origin", "https://github.com/mekenthompson/hermes-agent.git")
-    _git(repo, "checkout", "-b", "house/sync-nous-c5733167")
+    _git(repo, "checkout", "-b", "house/hf576-nous-6bb377a51d")
     resolve = runpy.run_path(str(repo / "scripts/check"))["_alignment_parents"]
     monkeypatch.setitem(resolve.__globals__, "_ALIGNMENT_PARENTS", (parent,))
     monkeypatch.delenv("GITHUB_HEAD_REF", raising=False)
     monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
     assert resolve(None) == (parent,)
     monkeypatch.setenv("GITHUB_REPOSITORY", "mekenthompson/hermes-agent")
-    monkeypatch.setenv("GITHUB_HEAD_REF", "house/sync-nous-c5733167")
+    monkeypatch.setenv("GITHUB_HEAD_REF", "house/hf576-nous-6bb377a51d")
     monkeypatch.delenv("CI_PR_HEAD_REPOSITORY", raising=False)
     assert resolve(None) == ()
     monkeypatch.setenv("CI_PR_HEAD_REPOSITORY", "other/hermes-agent")

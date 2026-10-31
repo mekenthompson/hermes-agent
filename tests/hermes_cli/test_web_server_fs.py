@@ -33,7 +33,7 @@ def client(monkeypatch):
 
 
 @pytest.fixture
-def docker_volumes(monkeypatch, tmp_path):
+def docker_volumes(monkeypatch, tmp_path, absent_container_host_paths):
     """Docker backend env whose ``/workspace`` is bind-mounted to a fresh host dir.
 
     Returns the host dir; writes there are what the agent's ``/workspace/...``
@@ -993,11 +993,13 @@ def test_fs_reads_translate_after_binding_profile_terminal_scope(client, tmp_pat
 
 
 def test_fs_read_untranslated_container_path_names_the_agent_sandbox(
-    client, docker_volumes,
+    client, docker_volumes, monkeypatch, tmp_path,
 ):
     """A container-shaped path that fails translation under the docker backend
     must 404 with the honest sandbox reason, not a bare missing-file 404."""
-    response = client.get("/api/fs/read-text", params={"path": "/workspace/never-written.txt"})
+    container = tmp_path / "absent-container-mount"
+    monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", json.dumps([f"{docker_volumes}:{container}"]))
+    response = client.get("/api/fs/read-text", params={"path": str(container / "never-written.txt")})
 
     assert response.status_code == 404
     assert "agent sandbox" in response.json()["detail"]
@@ -1056,7 +1058,7 @@ def _session_detail(cwds: dict):
 
 
 def test_fs_download_maps_workspace_container_to_its_sandbox(client, monkeypatch, tmp_path):
-    """A persistent per-workspace container stores ``/workspace/note.txt`` under
+    """A persistent per-workspace container (cwd mount on) stores ``/workspace/note.txt`` under
     ``sandboxes/docker/default_ws_<digest>-<hash>/workspace``, not the shared
     ``default`` sandbox. The download must serve that session's file, and must
     not scan every other workspace for the same relative path."""
@@ -1096,7 +1098,14 @@ def test_fs_download_maps_workspace_container_to_its_sandbox(client, monkeypatch
     assert bare.content == b"shared-file"
     only = client.get("/api/fs/download", params={"path": "/workspace/only.txt"})
     assert only.status_code == 404
+    # Without the cwd mount a session runs in the profile container: its copy is the shared one.
+    unmounted = client.get(
+        "/api/fs/download", params={"path": "/workspace/note.txt", "session_id": "sess-ws"},
+    )
+    assert (unmounted.status_code, unmounted.content) == (200, b"shared-file")
 
+    # Per-workspace containers exist only with the cwd mount on.
+    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
     response = client.get(
         "/api/fs/download", params={"path": "/workspace/note.txt", "session_id": "sess-ws"},
     )
