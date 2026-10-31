@@ -4,6 +4,7 @@ Source and supported launch settings are frozen per route, never process env.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -66,6 +67,15 @@ class LocalSessionAdapter(BasePlatformAdapter):
             key = ('kanban-checkpoint:' + str(metadata.get('kanban_checkpoint_board') or 'default')
                    + ':' + str(metadata.get('kanban_checkpoint_task_id') or '')
                    + ':' + str(metadata['kanban_checkpoint_event_id']))
+            from hermes_state_checkpoint import persist_local_checkpoint
+            try:
+                await asyncio.to_thread(
+                    persist_local_checkpoint, self.authority.db, chat_id, key, content,
+                    board=str(metadata.get('kanban_checkpoint_board') or 'default'),
+                    task_id=str(metadata.get('kanban_checkpoint_task_id') or ''))
+            except Exception:
+                logger.exception('Local checkpoint storage failed before stream delivery')
+                return SendResult(success=False, error='local checkpoint storage unavailable')
             accepted = live.event_stream.publish(chat_id, {
                 'text': content, 'detail': content, 'level': 'info', 'kind': 'sticky', 'key': key,
             }, event_type='notification.show', execution={})
