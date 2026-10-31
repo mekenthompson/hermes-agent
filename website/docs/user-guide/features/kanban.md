@@ -491,7 +491,7 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes when an incomplete parent finishes; with no open parent it is recorded as `needs_input` instead, since the wait could never be satisfied), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
-| `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
+| `kanban_comment` | Append an internal durable note, or publish an explicit human checkpoint. | `task_id`, `body`; optional `human_checkpoint: true`, stable `request_id` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
 | `kanban_attach_url` | Attach a file to a task by URL. | `url` |
 | `kanban_attachments` | List a task's attachments. | — |
@@ -989,7 +989,7 @@ hermes kanban diagnostics [--json]                     # board health snapshot (
 hermes kanban link <parent_id> <child_id>
 hermes kanban unlink <parent_id> <child_id>
 hermes kanban claim <id> [--ttl SECONDS]
-hermes kanban comment <id> "<text>" [--author NAME]
+hermes kanban comment <id> "<text>" [--author NAME] [--human-checkpoint --request-id ID]
 
 # Bulk verbs — accept multiple ids:
 hermes kanban complete <id>... [--result "..."] [--force]
@@ -1156,6 +1156,10 @@ Built-in decomposition also inherits its root's durable session. Session lineage
 `notify-unsubscribe` to change where events are delivered.
 
 A chat-originated auto-subscribe is created in `notify+wake` mode: on a terminal event the destination agent both receives the passive message **and** takes a real turn, so it can read the board context and reply in its own voice. See [Delivery modes](#delivery-modes) below.
+
+An explicit human checkpoint on `kanban_comment` also reaches subscribed chats and Desktop sessions. Set `human_checkpoint: true` and supply a stable `request_id`; the same ID and exact body can be retried without a second event, while reusing the ID with different content is refused. The body retains Markdown whitespace. Ordinary comments and heartbeats remain internal. A checkpoint is delivered passively even for a `notify+wake` subscription; review, block and completion events still wake the agent. A successful `kanban_unblock` tool call or `hermes kanban unblock` command from an authenticated conversation subscribes that origin in the same guarded task transaction, without replacing earlier subscribers. A failed or stale unblock adds no destination. The CLI checkpoint equivalent is `hermes kanban comment <id> '<Markdown>' --human-checkpoint --request-id <stable-id>`; `--max-len` is refused for checkpoints.
+
+For external sends, the subscription records a checkpoint attempt before calling the transport. A confirmed send advances its receipt; a send that may have reached the destination but lost its response stays marked uncertain and is not resent automatically. Other subscriptions and work continue. Inspect the task event and destination before reconciling an uncertain receipt.
 
 ### Output truncation in messaging
 

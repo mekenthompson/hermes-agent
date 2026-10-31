@@ -250,7 +250,7 @@ def display_rows(db, target):
     live rows leave of ``RESUME_HISTORY_BYTES`` (``truncated`` when older ones were left out). A lineage
     over the resume cap shows only the live rows."""
     from hermes_state import SessionResumeTooLargeError
-    live_rows = db.get_messages_as_conversation(target, include_row_ids=True)
+    live_rows = db.get_messages_as_conversation(target, include_row_ids=True, include_display_only=True)
     live = {row['_row_id'] for row in live_rows}
     try:
         db.assert_resume_safe(target)
@@ -339,11 +339,11 @@ def local_history(authority, ref, prepared=None):
     target = transcript_target(authority, ref)
     read_live, display, truncated = (prepared[1] if prepared is not None and prepared[0] == target
                                      else display_rows(db, target))
-    live = db.get_messages_as_conversation(target, include_row_ids=True)
+    live = db.get_messages_as_conversation(target, include_row_ids=True, include_display_only=True)
     live_ids = {row['_row_id'] for row in live}
     if not read_live <= live_ids:
         read_live, display, truncated = display_rows(db, target)
-        live = db.get_messages_as_conversation(target, include_row_ids=True)
+        live = db.get_messages_as_conversation(target, include_row_ids=True, include_display_only=True)
     elif live_ids - read_live:
         # Rows appended since the prepare count against the archive budget too (no lineage re-read).
         display, cut = _fit_archive(live, display)

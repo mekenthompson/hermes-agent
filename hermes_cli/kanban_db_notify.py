@@ -77,6 +77,7 @@ def add_notify_sub(
     notifier_profile: Optional[str] = None,
     delivery_mode: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
+    allow_nested: bool = False,
 ) -> None:
     """Register a gateway source wanting terminal-state notifications for
     ``task_id``; idempotent on (task, platform, chat, thread).
@@ -97,7 +98,7 @@ def add_notify_sub(
     # delivery mechanism at all. Explicit modes still win.
     insert_mode = valid_mode or ("notify+wake" if platform == "api_server" else "notify")
     key = _sub_key(task_id, platform, chat_id, thread_id)
-    with _kb.write_txn(conn):
+    with _kb.write_txn(conn, allow_nested=allow_nested):
         existing = conn.execute(
             "SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE,
             key,
@@ -195,6 +196,8 @@ def list_notify_subs(
         item = dict(row)
         if "delivery_metadata" in item:
             item["delivery_metadata"] = _decode_notify_delivery_metadata(item.get("delivery_metadata"))
+        if "checkpoint_pending_event_ids" in item:
+            item["checkpoint_pending_event_ids"] = json.loads(item["checkpoint_pending_event_ids"] or "[]")
         out.append(item)
     return out
 
@@ -416,6 +419,45 @@ def record_notify_ping(
             + _SUB_KEY_WHERE,
             (int(event_id), *_sub_key(task_id, platform, chat_id, thread_id)),
         )
+
+
+def begin_checkpoint_ping(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
+    thread_id: Optional[str] = None, event_id: int,
+) -> bool:
+    """Persist uncertainty before invoking an external checkpoint transport."""
+    key = _sub_key(task_id, platform, chat_id, thread_id)
+    with _kb.write_txn(conn):
+        row = conn.execute("SELECT checkpoint_pending_event_ids, last_ping_event_id "
+                           "FROM kanban_notify_subs " + _SUB_KEY_WHERE, key).fetchone()
+        if row is None or int(row["last_ping_event_id"]) >= event_id:
+            return False
+        pending = json.loads(row["checkpoint_pending_event_ids"] or "[]")
+        if event_id in pending:
+            return False
+        pending.append(event_id)
+        conn.execute("UPDATE kanban_notify_subs SET checkpoint_pending_event_ids = ? " + _SUB_KEY_WHERE,
+                     (json.dumps(pending), *key))
+        return True
+
+
+def settle_checkpoint_ping(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
+    thread_id: Optional[str] = None, event_id: int, delivered: bool,
+) -> None:
+    """Clear a witness only after confirmation or proof that send was not attempted."""
+    key = _sub_key(task_id, platform, chat_id, thread_id)
+    with _kb.write_txn(conn):
+        row = conn.execute("SELECT checkpoint_pending_event_ids FROM kanban_notify_subs "
+                           + _SUB_KEY_WHERE, key).fetchone()
+        if row is None:
+            return
+        pending = json.loads(row["checkpoint_pending_event_ids"] or "[]")
+        pending = [item for item in pending if item != event_id]
+        conn.execute("UPDATE kanban_notify_subs SET checkpoint_pending_event_ids = ?, "
+                     "last_ping_event_id = CASE WHEN ? THEN MAX(last_ping_event_id, ?) ELSE last_ping_event_id END "
+                     + _SUB_KEY_WHERE,
+                     (json.dumps(pending), int(delivered), event_id, *key))
 
 
 def rewind_notify_cursor(

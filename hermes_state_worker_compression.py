@@ -181,7 +181,7 @@ def worker_boundary(db, conn, sid, payload):
 
 def worker_history(db, conn, sid, payload):
     _fields(payload, ('target', 'include_ancestors', 'include_inactive', 'repair_alternation',
-                      'include_row_ids', 'include_compacted'))
+                      'include_row_ids', 'include_compacted'), ('include_display_only',))
     if any(type(v) is not bool for k, v in payload.items() if k != 'target'):
         raise RuntimeStoreError('invalid_params')
     view = CompressionSnapshot(db, conn)
@@ -192,6 +192,8 @@ def worker_history(db, conn, sid, payload):
     display = payload['include_compacted'] and not payload['include_inactive']
     rows = conn.execute(f'SELECT {"session_id, compacted, display_order, " if display else ""}{db._CONVERSATION_ROW_COLUMNS} FROM messages '
                         f'WHERE session_id IN ({",".join("?" for _ in ids)}){active} ORDER BY id', ids).fetchall()
+    if not (payload.get('include_display_only', False) or payload['include_compacted']):
+        rows = [row for row in rows if row['display_kind'] != 'kanban_checkpoint']
     if display:  # the owner's display reads' rule: a message whose newest copy was removed stays hidden
         from hermes_state_messages import SessionMessagesMixin
         rows = SessionMessagesMixin._with_removed_identities(view, rows, ids)

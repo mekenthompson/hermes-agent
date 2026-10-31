@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from typing import Optional
+from typing import Any, Optional
 
 
 def _event_matches(conn: sqlite3.Connection, task_id: str, expected_event_id: Optional[int]) -> bool:
@@ -165,7 +165,7 @@ def _route_block(
 
 def unblock_task(
     conn: sqlite3.Connection, task_id: str, *, expected_event_id: Optional[int] = None,
-    request_id: Optional[str] = None,
+    request_id: Optional[str] = None, notify_target: Optional[dict[str, Any]] = None,
 ) -> bool:
     """Resume blocked/scheduled work, optionally only from its observed event.
 
@@ -214,4 +214,13 @@ def unblock_task(
         if request_id is not None:
             payload = {**(payload or {}), "request_id": request_id, "expected_event_id": expected_event_id}
         kb._append_event(conn, task_id, "unblocked", payload)
+        if notify_target is not None:
+            from hermes_cli import kanban_db_notify as kbn
+
+            existing = kbn.list_notify_subs(conn, task_id)
+            if not any(sub["platform"] == notify_target["platform"]
+                       and sub["chat_id"] == notify_target["chat_id"]
+                       and (sub["thread_id"] or "") == (notify_target.get("thread_id") or "")
+                       for sub in existing):
+                kbn.add_notify_sub(conn, task_id=task_id, allow_nested=True, **notify_target)
         return True

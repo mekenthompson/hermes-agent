@@ -751,7 +751,9 @@ def _cmd_claim(args: argparse.Namespace) -> int:
 
 
 def _cmd_comment(args: argparse.Namespace) -> int:
-    body = " ".join(args.text).strip()
+    body = " ".join(args.text) if args.human_checkpoint else " ".join(args.text).strip()
+    if args.human_checkpoint and args.max_len is not None:
+        return _err("kanban: --max-len cannot trim a human checkpoint", 2)
     if args.max_len is not None:
         if args.max_len < 1:
             return _err("kanban: --max-len must be positive", 2)
@@ -760,7 +762,8 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
     with kbc.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
+        kb.add_comment(conn, args.task_id, author, body,
+                       human_checkpoint=args.human_checkpoint, request_id=args.request_id)
     print(f"Comment added to {args.task_id}")
     return 0
 
@@ -1039,9 +1042,15 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     reason = _stripped_or_none(getattr(args, "reason", None))
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
+    from tools.kanban_tools import _resolve_notify_target
+
+    target = _resolve_notify_target()
+    if target is not None and target["notifier_profile"] != _profile_author():
+        return _err("requesting session profile does not own this native context")
     with kbc.connect_closing() as conn:
         op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(
-            conn, tid, expected_event_id=expected_event_id), after=expected_event_id is not None)
+            conn, tid, expected_event_id=expected_event_id, notify_target=target),
+            after=expected_event_id is not None)
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 

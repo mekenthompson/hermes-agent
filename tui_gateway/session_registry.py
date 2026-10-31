@@ -578,7 +578,8 @@ def _load_resume_transcript(db, stored_id: str, *, model_history_only: bool = Fa
         raw_history, display_history = db.get_resume_conversations(stored_id)
         return raw_history, display_history, db.get_ancestor_display_prefix(stored_id)
     raw_history = db.get_messages_as_conversation(stored_id, repair_alternation=True, include_row_ids=True)
-    return raw_history, raw_history, []
+    display_history = db.get_messages_as_conversation(stored_id, include_row_ids=True, include_display_only=True)
+    return raw_history, display_history, []
 
 
 def _schedule_resume_hydration(sid: str, stored_id: str, db, *, close_db: bool = False,

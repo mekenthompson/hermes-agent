@@ -45,7 +45,7 @@ def _pin_first():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "checkpoint")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
@@ -470,10 +470,18 @@ def _fmt_timed_out(ev, n) -> tuple:
     return t("gateway.kanban.ping.timed_out", head=n.head, span=span), None, None
 
 
+def _fmt_checkpoint(ev, n) -> tuple:
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(str((ev.payload or {}).get("body") or ""),
+                                 force=True, redact_url_credentials=True), None, None
+
+
 # archived / unblocked are claimed (so the cursor advances past them) but
 # intentionally silent (no formatter), and excluded from _WAKE_KINDS so they
 # never wake the creator.
 _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
+    "checkpoint": _fmt_checkpoint,
     "completed": _fmt_completed,
     "blocked": lambda ev, n: (
         t("gateway.kanban.ping.blocked", head=n.head, reason=_clip(ev, "reason", "gateway.kanban.ping.reason_suffix", 160)),
@@ -693,6 +701,10 @@ class _KanbanNotification:
         metadata: dict[str, Any] = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
         if sub.get("thread_id") and not metadata.get("thread_id"):
             metadata["thread_id"] = sub["thread_id"]
+        if ev.kind == "checkpoint" and self.platform_str == "local":
+            metadata["kanban_checkpoint_event_id"] = ev.id
+            metadata["kanban_checkpoint_task_id"] = self.task_id
+            metadata["kanban_checkpoint_board"] = self.board_slug or "default"
         _send_res = None
         async def send_ping():
             nonlocal _send_res
@@ -704,6 +716,11 @@ class _KanbanNotification:
         # (else the event is lost); None / non-SendResult keeps the
         # "no exception == delivered" contract.
         if getattr(_send_res, "success", True) is False:
+            if ev.kind == "checkpoint" and self.platform_str == "local":
+                from gateway.session_local import LocalSessionAdapter
+
+                if isinstance(adapter, LocalSessionAdapter):
+                    return False  # The in-process stream refused admission before delivery.
             raise _DeliveryHeld(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
         logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
                      ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
@@ -746,17 +763,33 @@ class _KanbanNotification:
                     "on wake self-post instead", self.platform_str, self.task_id,
                 )
                 continue
-            if not self.send_passive:
+            if not self.send_passive and ev.kind != "checkpoint":
                 # Wake-only: the wake path is the sole delivery and resolves the counter.
                 continue
             if ev.id <= self.sub.get("last_ping_event_id", 0):
                 continue
+            if ev.kind == "checkpoint":
+                fresh = await _to_thread_process_service(partial(
+                    self.runner._kanban_sub_op, self.board_slug, "begin_checkpoint_ping", self.sub,
+                    event_id=ev.id,
+                ))
+                if not fresh:
+                    continue  # An earlier send is uncertain; a human can reconcile it.
             try:
                 if await self._send_event(ev, msg) is False:
+                    if ev.kind == "checkpoint":
+                        await _to_thread_process_service(partial(
+                            self.runner._kanban_sub_op, self.board_slug, "settle_checkpoint_ping", self.sub,
+                            event_id=ev.id, delivered=False,
+                        ))
+                        await self.rewind()
+                        return False
                     continue
                 await _to_thread_process_service(partial(
-                    self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,
-                    event_id=ev.id,
+                    self.runner._kanban_sub_op, self.board_slug,
+                    "settle_checkpoint_ping" if ev.kind == "checkpoint" else "record_notify_ping",
+                    self.sub, event_id=ev.id,
+                    **({"delivered": True} if ev.kind == "checkpoint" else {}),
                 ))
                 self.clear_failures()
                 holds.pop(hold_key, None)
@@ -772,6 +805,12 @@ class _KanbanNotification:
                 await self.rewind()
                 return False
             except Exception as exc:
+                if ev.kind == "checkpoint":
+                    logger.warning("kanban notifier: checkpoint send uncertain for %s on %s; retained for reconciliation: %s",
+                                   self.task_id, self.platform_str, exc)
+                    self.clear_failures()
+                    await self.rewind()
+                    return False
                 await self.delivery_failed(
                     "kanban notifier: send failed for %s on %s (attempt %d/%d): %s", (self.task_id, self.platform_str),
                     "kanban notifier: dropping subscription %s on %s after %d consecutive send failures", exc, False,

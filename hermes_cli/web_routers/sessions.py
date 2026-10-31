@@ -702,6 +702,8 @@ def _project_for_display(messages: list, *, home=None, inline_images: bool = Tru
     projected_messages = []
     for message in messages:
         message = _with_tool_call_labels(message)
+        if message.get("role") == "session_meta" and message.get("display_kind") == "kanban_checkpoint":
+            message = {**message, "role": "system"}
         if coerce is not None:
             message = coerce(message)
         # Same read-side typing as session.resume (tui_gateway/session_history.py).

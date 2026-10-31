@@ -308,6 +308,8 @@ def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: 
         if m is None:
             continue
         role = m.get("role")
+        if role == "session_meta" and m.get("display_kind") == "kanban_checkpoint":
+            role = "system"  # Display-only native notice; the model resume excludes session_meta.
         if role not in _HISTORY_ROLES:
             continue
         if role == "assistant" and m.get("tool_calls"):

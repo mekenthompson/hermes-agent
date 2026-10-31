@@ -322,6 +322,8 @@ KANBAN_COMMENT_SCHEMA = _schema(
                 "kanban_list to discover ids."
         )),
         "body": _prop("string", "Markdown-supported comment body."),
+        "human_checkpoint": _prop("boolean", "Publish this comment as a durable update for subscribed humans."),
+        "request_id": _prop("string", "Stable caller ID for this checkpoint. Required with human_checkpoint; retries must reuse it."),
     },
     ["task_id", "body"],
 )

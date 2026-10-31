@@ -282,6 +282,8 @@ _SPECS = [
         _arg("text", nargs="+", help="Comment body"),
         _arg("--author", help="Author name (default: $HERMES_PROFILE or 'user')"),
         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
+        _arg("--human-checkpoint", action="store_true", help="Deliver this exact Markdown body to subscribed humans"),
+        _arg("--request-id", help="Stable ID required for an explicit human checkpoint"),
     ], help="Append a comment"),
     _cmd("attach", [
         _TASK_ID,
