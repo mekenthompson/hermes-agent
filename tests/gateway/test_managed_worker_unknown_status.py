@@ -78,7 +78,11 @@ def _kanban_loss_recorder(monkeypatch, policy, started, release, write_s):
     """Record the order of the board's worker_lost write (held until ``release``) and the
     admission's settlement."""
     import dataclasses
-    from gateway import session_kanban, session_worker_reservation
+    from gateway import session_kanban, session_kanban_stop, session_worker_reservation
+    # This fixture substitutes board I/O, including the house Stop-state read.
+    # The simulated loss is not an aborted attempt; real Stop coverage lives in
+    # test_native_job_scope_stop and the managed cancellation suites.
+    monkeypatch.setattr(session_kanban_stop, 'attempt_aborted', lambda context: False)
     order = []
 
     def record(*_, **__):

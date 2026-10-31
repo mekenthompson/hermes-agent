@@ -6,6 +6,40 @@ import pytest
 
 
 @pytest.fixture
+def absent_container_host_paths(monkeypatch, tmp_path):
+    """Model Docker paths absent on the host, even on a Docker test runner.
+
+    Keep the real host parser and container translator; only the host lookup
+    for /workspace is rooted in an empty fixture directory. Never consult the
+    runner's real /workspace alias or let an editor stage a write outside tmp.
+    """
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from hermes_cli import web_server_files
+    from hermes_cli.web_routers import files
+
+    real_fs_path = web_server_files._fs_path
+    missing_host = tmp_path / "missing-host"
+
+    def host_path(raw_path, **kwargs):
+        raw = web_server_files._file_url_container_text(str(raw_path))
+        if raw == "/workspace" or raw.startswith("/workspace/"):
+            return real_fs_path(str(missing_host) + raw, **kwargs)
+        return real_fs_path(raw_path, **kwargs)
+
+    real_mkstemp = files.tempfile.mkstemp
+
+    def scratch_mkstemp(*args, **kwargs):
+        directory = Path(kwargs["dir"]).resolve()
+        assert directory.is_relative_to(tmp_path.resolve()), directory
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(web_server_files, "_fs_path", host_path)
+    monkeypatch.setattr(files, "tempfile", SimpleNamespace(mkstemp=scratch_mkstemp))
+
+
+@pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.
 

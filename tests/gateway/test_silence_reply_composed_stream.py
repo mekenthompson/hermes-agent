@@ -128,7 +128,8 @@ async def test_streamed_reply_then_marker_shows_the_reply_once(monkeypatch, tmp_
     entry.session_key, entry.session_id, entry.platform, entry.chat_type = key, real_loop.sid, platform, "dm"
     event = MessageEvent(text="when is my meeting?", source=source, message_id="m0", reply_expected=True)
 
-    reply = await runner._handle_message_with_agent(event, source, key, 1)
+    generation = runner._begin_session_run_generation(key)
+    reply = await runner._handle_message_with_agent(event, source, key, generation)
 
     assert not script, "the real agent must consume the whole streamed provider script"
     shown = adapter.visible() + ([reply] if reply else [])

@@ -144,7 +144,7 @@ class TestRegister:
         ctx.register_dashboard_auth_provider.assert_not_called()
         assert "enabled" in plugin.LAST_SKIP_REASON
 
-    def test_short_token_still_registers_with_warning(
+    def test_short_token_is_refused_with_warning(
             self, plugin, monkeypatch, caplog):
         token = "short-but-mine"
         monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", token)
@@ -152,8 +152,8 @@ class TestRegister:
         ctx = MagicMock()
         with caplog.at_level("WARNING"):
             plugin.register(ctx)
-        ctx.register_dashboard_auth_provider.assert_called_once()
-        assert any("short" in r.message for r in caplog.records)
+        ctx.register_dashboard_auth_provider.assert_not_called()
+        assert any("must be at least 32 characters" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
