@@ -863,7 +863,7 @@ def _prepend_shell_init(cmd_string: str, files: list[str]) -> str:
     return "\n".join(prelude) + "\n" + cmd_string
 
 
-def _append_dropped_path_entries(cmd_string: str, parent_path: str) -> str:
+def _append_dropped_path_entries(cmd_string: str, parent_path: str, *, prefer_parent: bool = False) -> str:
     """Prepend a line that re-appends *parent_path* dirs the login profile dropped.
 
     A login profile can reset PATH outright (Debian's ``/etc/profile``, so every
@@ -873,8 +873,9 @@ def _append_dropped_path_entries(cmd_string: str, parent_path: str) -> str:
     the login PATH in parent order, so a command that resolved before still resolves
     to the same binary (the user's nvm/pyenv keep precedence); only commands that had
     no match gain one. Present entries are never duplicated; missing absolute dirs are skipped.
-    Background commands (``ProcessRegistry.spawn_local``, ``bash -lic``, no snapshot) use
-    this same prelude so the two paths cannot diverge."""
+    Background commands (``ProcessRegistry.spawn_local``, ``bash -lic``, no snapshot) retain
+    that default. Login snapshots set prefer_parent to preserve the explicitly selected
+    session toolchain, deduplicating the combined PATH while retaining init-only tools."""
     if _IS_WINDOWS:
         return cmd_string  # native PATH stays ``;``-joined; bash sees a converted copy
     # Relative entries resolve against the shell's cwd, not ours, so only absolute ones are checked.
@@ -882,6 +883,14 @@ def _append_dropped_path_entries(cmd_string: str, parent_path: str) -> str:
                if d and (not os.path.isabs(d) or os.path.isdir(d))]
     if not entries:
         return cmd_string
+    if prefer_parent:
+        restore = (
+            f"__hermes_path={shlex.quote(':'.join(entries))}:\"$PATH\"; "
+            'PATH=""; while IFS= read -r -d : __hermes_p; do '
+            'case ":$PATH:" in *":$__hermes_p:"*) ;; *) PATH="${PATH:+$PATH:}$__hermes_p" ;; esac; '
+            'done <<< "${__hermes_path}:"; unset __hermes_p __hermes_path; export PATH'
+        )
+        return restore + "\n" + cmd_string
     restore = (f"for __hermes_p in {' '.join(shlex.quote(d) for d in entries)}; do "
                'case ":$PATH:" in *":$__hermes_p:"*) ;; *) PATH="${PATH:+$PATH:}$__hermes_p" ;; esac; '
                "done; unset __hermes_p; export PATH")
@@ -1143,9 +1152,7 @@ class LocalEnvironment(BaseEnvironment):
         # Login init contributes its tools, but must not replace the selected
         # session toolchain's precedence in the persisted snapshot.
         if login:
-            if selected_path := run_env.get("PATH"):
-                cmd_string = f"export PATH={shlex.quote(selected_path)}:\"$PATH\"\n" + cmd_string
-            cmd_string = _append_dropped_path_entries(cmd_string, run_env.get("PATH", ""))
+            cmd_string = _append_dropped_path_entries(cmd_string, run_env.get("PATH", ""), prefer_parent=True)
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
