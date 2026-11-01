@@ -1049,9 +1049,6 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
-    owner_stopped: bool = False
-    """A planned gateway stop/restart ended the attempt (``owner_stopped_mid_attempt``): requeued
-    without counting a failure, and never part of a same-error systemic trip."""
 
     @property
     def run_outcome(self) -> str:
@@ -1174,9 +1171,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
-        from hermes_cli.kanban_owner_recovery import (
-            apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked, owner_stopped_mid_attempt,
-        )
+        from hermes_cli.kanban_owner_recovery import apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1198,14 +1193,6 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
             apply_attempt_note(conn, row["id"], pid, dead)
-            if dead.event_kind == "crashed" and not dead.terminal_provider and owner_stopped_mid_attempt(conn, row["id"]):
-                # Every worker a planned stop interrupts dies with the same error, which used to
-                # read as a systemic failure and park them all as gave_up until someone stepped in.
-                dead.owner_stopped = True
-                dead.event_payload["owner_stopped"] = True
-                head, sep, output = dead.error_text.partition(WORKER_OUTPUT_SEP)
-                dead.error_text = (f"{head} — interrupted by a gateway stop or restart; "
-                                   f"requeued without counting a failure{sep}{output}")
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1234,12 +1221,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation or dead.owner_stopped:
-                # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
-                # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation never reaches
-                # ``_record_task_failure`` (which stamps this column), yet the
-                # board UI and retry worker need the corrective message.
+            owner_stopped = bool(dead.event_payload.get("owner_stopped"))  # a planned gateway stop: never counted
+            if dead.rate_limited or dead.protocol_violation or owner_stopped:
+                # Stamp last_failure_error WITHOUT touching ``consecutive_failures``: a rate-limited requeue
+                # must show ``check_respawn_guard`` a quota blocker; the others never reach
+                # ``_record_task_failure`` (which stamps it), yet the board UI and retry worker need the message.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),
@@ -1248,7 +1234,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 sweep.rate_limited.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
-                if not dead.owner_stopped:  # back at ``ready``; nothing for the breaker to count
+                if not owner_stopped:
                     sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
     return sweep
 

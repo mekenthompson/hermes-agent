@@ -392,10 +392,16 @@ def test_a_second_restart_mid_retry_still_does_not_give_up(board):
     assert board.state("t_twice")["consecutive_failures"] == 0
 
 
-def test_genuine_same_error_crashes_still_trip_the_systemic_breaker(board):
+@pytest.mark.parametrize("admission", [
+    ("terminal", "failed"),
+    # A killed owner: its interpreters die without an interrupted result and the successor
+    # settles each lost card turn ``interrupted`` at boot. Not a planned stop.
+    ("terminal", "interrupted"),
+], ids=["worker-crash", "owner-killed"])
+def test_genuine_same_error_crashes_still_trip_the_systemic_breaker(board, admission):
     tids = [f"t_crash{i}" for i in range(3)]
     for tid in tids:
-        _interrupted_by_stop(board, tid, exit_code=1, admission=("terminal", "failed"))
+        _interrupted_by_stop(board, tid, exit_code=1, admission=admission)
 
     kbd.detect_crashed_workers(board.conn)
     assert sorted(kbd.detect_crashed_workers._last_auto_blocked) == sorted(tids)
