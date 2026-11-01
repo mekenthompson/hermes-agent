@@ -75,7 +75,11 @@ jobs:
           python-version: "3.14"
 
       # GITHUB_SHA is the runner's exact checkout identity, passed as quoted data.
+      # .dockerignore drops only root-level __pycache__; bytecode this step
+      # wrote into pm/ changed `COPY pm/ pm/` and rebuilt every dependency stage.
       - name: Write exact source install stamp
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
         run: >-
           python3 scripts/write_install_stamp.py --output install-stamp.json
           --commit "$GITHUB_SHA" --distribution docker --source ci
@@ -194,7 +198,11 @@ jobs:
           python-version: "3.14"
 
       # GITHUB_SHA is the runner's exact checkout identity, passed as quoted data.
+      # .dockerignore drops only root-level __pycache__; bytecode this step
+      # wrote into pm/ changed `COPY pm/ pm/` and rebuilt every dependency stage.
       - name: Write exact source install stamp
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
         run: >-
           python3 scripts/write_install_stamp.py --output install-stamp.json
           --commit "$GITHUB_SHA" --distribution docker --source ci
