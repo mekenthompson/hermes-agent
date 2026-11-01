@@ -136,10 +136,6 @@ def _block_task(
         if event_kind in {'blocked', 'block_loop_detected'}:
             stops.append(conn.execute('SELECT MAX(id) FROM task_events WHERE task_id=?', (task_id,)).fetchone()[0])
         blocked_task = kb.get_task(conn, task_id)
-        if kind == "dependency":
-            # Preserve the existing dependency-lane hook ordering.
-            kb._fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
     kb._fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
 
