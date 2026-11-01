@@ -19,7 +19,7 @@ EXPECTED = {
 class ForkRunnerFallbackTests(unittest.TestCase):
     def test_matrix_covers_entire_suite_for_fork_and_upstream(self) -> None:
         text = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
-        line = next(x for x in text.splitlines() if "matrix:" in x)
+        line = next(x for x in text.splitlines() if x.strip().startswith("matrix:"))
         choices = [json.loads(x) for x in re.findall(r"'(\{.*?\})'", line)]
         self.assertEqual(choices, [{"slice": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], "slices": [16]}, {"slice": [1], "slices": [1]}])
         self.assertIn("github.repository == 'mekenthompson/hermes-agent'", line)
@@ -34,7 +34,7 @@ class ForkRunnerFallbackTests(unittest.TestCase):
 
     def test_js_matrix_shards_ui_project_for_fork_only(self) -> None:
         text = (ROOT / ".github/workflows/js-tests.yml").read_text(encoding="utf-8")
-        line = next(x for x in text.splitlines() if "matrix:" in x)
+        line = next(x for x in text.splitlines() if x.strip().startswith("matrix:"))
         self.assertIn("github.repository == 'mekenthompson/hermes-agent'", line)
         fork, upstream = [json.loads(x) for x in re.findall(r"'(\{.*?\})'", line)]
         self.assertEqual(upstream, {"unit": ["all"]})
@@ -85,7 +85,7 @@ class ForkRunnerFallbackTests(unittest.TestCase):
 
         tests_lines = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8").splitlines()
         self.assertFalse(any("matrix." in line for line in tests_lines if line.startswith("    if:")))
-        self.assertIn("          scripts/run_tests.sh --slice ${{ matrix.slice }}/${{ matrix.slices }}", tests_lines)
+        self.assertIn("scripts/run_tests.sh --slice ${{ matrix.slice }}/${{ matrix.slices }}", [line.strip() for line in tests_lines])
         expected_workers = (
             f"          HERMES_TEST_WORKERS: ${{{{ {trust_guard} && "
             "'96' || '4' }}"
