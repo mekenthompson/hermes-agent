@@ -281,6 +281,11 @@ async def execute_admission(authority, ref, row):
         # turn's resolver never re-reads (and on a transient failure drops) an admitted completion.
         event.metadata['gateway_proven_session_id'] = (
             authority.physical_target(ref) if 'native_text_v1' in row['payload'] else event.metadata['gateway_session_id'])
+    # A claim is gated on the runtime being open (``_require_admission_open``), so a claimed row was
+    # admitted before any drain: the drain gate turns away NEW work only. Without this, a drain that
+    # begins between the claim's commit and the turn's start settles an already receipted wake
+    # ``completed`` with the drain notice, and the producer (which took the receipt as final) never retries.
+    event._admitted_before_drain = True
     provenance = row['payload'].get('native_text_v1', {}).get('provenance')
     home = None
     if provenance is not None:
