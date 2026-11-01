@@ -859,8 +859,11 @@ def main() -> int:
     lanes = classify(files, run_e2e=RUN_E2E_LABEL in pull_request_labels(), fork=is_fork())
     from scripts.ci.affected_test_plan import js_plan, python_plan
 
-    plan = python_plan(files, root=Path.cwd(), fork=is_fork(), enabled=lanes["python"])
-    plan.update(js_plan(files, fork=is_fork()))
+    # Only pull requests narrow. Pushes, dispatch and schedule are the post-merge
+    # backstop (and gate image publication), so they always plan the full suite.
+    plan_files = files if os.environ.get("EVENT_NAME") == "pull_request" else []
+    plan = python_plan(plan_files, root=Path.cwd(), fork=is_fork(), enabled=lanes["python"])
+    plan.update(js_plan(plan_files, fork=is_fork()))
     out = "\n".join([
         *(f"{key}={str(value).lower()}" for key, value in lanes.items()),
         *(f"{key}={json.dumps(value) if not isinstance(value, str) else value}" for key, value in plan.items()),

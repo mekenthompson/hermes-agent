@@ -19,6 +19,7 @@ def test_standalone_test_selects_one_file_and_one_shard(tmp_path, monkeypatch, c
     target.write_text("def test_example():\n    assert True\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("REPO", "mekenthompson/hermes-agent")
+    monkeypatch.setenv("EVENT_NAME", "pull_request")
     monkeypatch.setattr(classify_changes.sys, "stdin", io.StringIO("tests/test_example.py\n"))
     monkeypatch.setattr(classify_changes, "pull_request_labels", list)
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
@@ -140,6 +141,7 @@ def test_imported_test_retains_full_suite(tmp_path):
 ])
 def test_js_selection_isolated_sources_and_shared_fallback(paths, units, monkeypatch, capsys):
     monkeypatch.setenv("REPO", "mekenthompson/hermes-agent")
+    monkeypatch.setenv("EVENT_NAME", "pull_request")
     monkeypatch.setattr(classify_changes.sys, "stdin", io.StringIO("\n".join(paths)))
     monkeypatch.setattr(classify_changes, "pull_request_labels", list)
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
@@ -150,9 +152,30 @@ def test_js_selection_isolated_sources_and_shared_fallback(paths, units, monkeyp
 
 def test_fork_empty_exact_diff_cannot_be_narrowed_by_live_pr_files(monkeypatch, capsys):
     monkeypatch.setenv("REPO", "mekenthompson/hermes-agent")
+    monkeypatch.setenv("EVENT_NAME", "pull_request")
     monkeypatch.setattr(classify_changes.sys, "stdin", io.StringIO(""))
     monkeypatch.setattr(classify_changes, "pull_request_changed_files", lambda: ["README.md"])
     monkeypatch.setattr(classify_changes, "pull_request_labels", list)
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
     assert classify_changes.main() == 0
     assert "python=true" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("event", ["push", "workflow_dispatch", "schedule"])
+@pytest.mark.parametrize("changed", ["tests/test_example.py", "web/src/App.tsx"])
+def test_non_pull_request_events_always_plan_the_full_suite(event, changed, tmp_path, monkeypatch, capsys):
+    target = tmp_path / "tests" / "test_example.py"
+    target.parent.mkdir()
+    target.write_text("def test_example():\n    assert True\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REPO", "mekenthompson/hermes-agent")
+    monkeypatch.setenv("EVENT_NAME", event)
+    monkeypatch.setattr(classify_changes.sys, "stdin", io.StringIO(changed + "\n"))
+    monkeypatch.setattr(classify_changes, "pull_request_labels", list)
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    assert classify_changes.main() == 0
+    outputs = dict(line.split("=", 1) for line in capsys.readouterr().out.splitlines())
+    assert json.loads(outputs["python_files"]) == []
+    if outputs["python"] == "true":
+        assert json.loads(outputs["python_matrix"]) == {"slice": list(range(1, 17)), "slices": [16]}
+    assert json.loads(outputs["js_matrix"]) == {"unit": ["checks", "ui-1/3", "ui-2/3", "ui-3/3"]}
