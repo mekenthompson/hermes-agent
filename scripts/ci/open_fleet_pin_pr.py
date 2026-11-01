@@ -16,6 +16,9 @@ Behaviour, in order:
 4. PUT ``release/agent-image-manifest.json`` via the contents API, reuse or
    create the PR, then ``gh pr merge --auto --squash`` so hermes-fleet's
    required checks remain the merge gate.
+5. Wait up to 12 minutes for the merge, refreshing a ``BEHIND`` PR. If the
+   checks are still running when the wait ends, succeed with a notice as long
+   as the PR is open, auto-merge is armed and the pin content matches.
 
 ``--dry-run`` performs every read and prints every write without performing
 it (auto-merge included).
@@ -425,7 +428,37 @@ def reconcile_and_wait(github: GitHub, url: str, *, expected_content: bytes) -> 
         # update-branch is asynchronous.  In particular, a BEHIND PR may retain its
         # old head briefly after the request; wait for observation before deciding it failed.
         github.sleep(WAIT_SECONDS)
-    raise HandoffError(f"PR {number} did not merge within {WAIT_ATTEMPTS * WAIT_SECONDS} seconds")
+    return settle_after_wait(github, number, expected_content=expected_content)
+
+
+def settle_after_wait(github: GitHub, number: int, *, expected_content: bytes) -> str:
+    """Decide the outcome once the wait budget is spent.
+
+    Fleet's required checks can take longer than the wait. A PR that is still
+    open with auto-merge armed and the exact pin content will merge on its own,
+    so the hand-off has done its job: succeed with a notice. Anything else
+    (closed, auto-merge disarmed, wrong content) stays a failure.
+    """
+    budget = f"PR {number} did not merge within {WAIT_ATTEMPTS * WAIT_SECONDS} seconds"
+    status = github.pr_status(number)
+    state = status.get("state")
+    head = require_sha(status.get("headRefOid"), f"PR {number} head")
+    actual, _ = github.file(FLEET_MANIFEST_PATH, head)
+    if actual != expected_content:
+        raise HandoffError(f"{budget} and its head no longer carries the expected pin content")
+    if state == "MERGED":
+        return "merged"
+    if state != "OPEN":
+        raise HandoffError(f"{budget}; it ended in state {state!r}")
+    if not status.get("autoMergeRequest"):
+        raise HandoffError(f"{budget} and auto-merge is not armed on it")
+    print(
+        f"::notice::{budget}, but auto-merge is armed and the pin content matches; "
+        f"hermes-fleet's required checks will merge it ({status.get('url') or number})",
+        file=sys.stderr,
+        flush=True,
+    )
+    return f"auto-merge armed; still waiting on hermes-fleet checks after {WAIT_ATTEMPTS * WAIT_SECONDS}s"
 
 
 # ---------------------------------------------------------------------------
