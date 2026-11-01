@@ -1155,7 +1155,7 @@ Built-in decomposition also inherits its root's durable session. Session lineage
 `session_id` does not replace existing subscriptions; use `notify-subscribe` and
 `notify-unsubscribe` to change where events are delivered.
 
-A chat-originated auto-subscribe is created in `notify+wake` mode: on a terminal event the destination agent both receives the passive message **and** takes a real turn, so it can read the board context and reply in its own voice. See [Delivery modes](#delivery-modes) below.
+A chat-originated auto-subscribe is created in `wake` mode: on a terminal event the destination agent takes a real turn, reads the board context and replies in its own voice. That reply is the one completion message in the chat; no separate template ping is sent (checkpoints and a handoff's files are still delivered as-is). See [Delivery modes](#delivery-modes) below.
 
 An explicit human checkpoint on `kanban_comment` also reaches subscribed chats and Desktop sessions. Set `human_checkpoint: true` and supply a stable `request_id`; the same ID and exact body can be retried without a second event, while reusing the ID with different content is refused. The body retains Markdown whitespace. Ordinary comments and heartbeats remain internal. A checkpoint is delivered passively even for a `notify+wake` subscription; review, block and completion events still wake the agent. A successful `kanban_unblock` tool call or `hermes kanban unblock` command from an authenticated conversation subscribes that origin in the same guarded task transaction, without replacing earlier subscribers. A failed or stale unblock adds no destination. The CLI checkpoint equivalent is `hermes kanban comment <id> '<Markdown>' --human-checkpoint --request-id <stable-id>`; `--max-len` is refused for checkpoints.
 
@@ -1311,8 +1311,8 @@ Subscriptions created from inside the chat (`/kanban create`, `kanban_create`) r
 | Mode | Passive message | Wakes the agent | Use it when |
 |------|-----------------|-----------------|-------------|
 | `notify` | yes | no | You just want a heads-up message in the chat (default). |
-| `notify+wake` | yes | yes | You also want the destination agent to take a real turn — read the board context and reply in its own voice. Chat-originated auto-subscribes use this. |
-| `wake` | no | yes | You only want the agent to act on the event, with no separate ping. |
+| `notify+wake` | yes | yes | You also want the destination agent to take a real turn — read the board context and reply in its own voice, plus a separate ping. |
+| `wake` | no | yes | You only want the agent to act on the event, with no separate ping. Chat-originated auto-subscribes use this. Checkpoints and a handoff's files are still delivered. |
 
 For `notify+wake`, delivery completes only once the wake is admitted to the adapter's turn queue as well as the passive ping being sent. Missing handlers, rejected routes, and full queues are retried on later notifier ticks without expiring the subscription. Sent pings are checkpointed separately in SQLite, so a rejected wake does not repeat an already checkpointed ping. `notify` remains passive and never starts a turn. Admission is not a guarantee of model execution or a successful reply; normal turn gates still apply. This is not exactly-once delivery: a process crash between a send and its checkpoint can repeat the ping, and the existing claim-before-delivery cursor is not a crash-recoverable queue.
 
