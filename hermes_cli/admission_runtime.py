@@ -92,8 +92,30 @@ def _git(workspace: Path, *args: str) -> str:
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
-        raise RuntimeError(detail or "git verification failed")
+        # Some refusals are silent (merge-base with no common ancestor exits 1 with no output).
+        raise RuntimeError(detail or f"git {' '.join(args)} failed (exit {result.returncode})")
     return result.stdout.strip()
+
+
+def _main_line_base(path: Path) -> str:
+    """The merge-base of HEAD with the first advertised main line that shares its history.
+
+    An ``upstream`` remote can name a different project (a private fleet repo pointing at the
+    public core), so an existing ``upstream/main`` with no common ancestor is skipped rather than
+    failing the launch while ``origin/main`` would prove ancestry.
+    """
+    refs = [ref for ref in ("upstream/main", "origin/main") if _git_ref_exists(path, ref)]
+    if not refs:
+        raise RuntimeError("workspace has no verified upstream/main or origin/main base")
+    for ref in refs:
+        result = subprocess.run(
+            ["git", "-C", str(path), "merge-base", "HEAD", ref],
+            text=True, encoding="utf-8", capture_output=True, timeout=15, check=False,
+        )
+        base = result.stdout.strip() if result.returncode == 0 else ""
+        if base:
+            return base
+    raise RuntimeError(f"workspace shares no history with {' or '.join(refs)}")
 
 
 def _worktree_request(
@@ -113,12 +135,7 @@ def _worktree_request(
     # A source-writing task must be anchored to the repository's advertised
     # main line.  Falling back to a parent commit would turn arbitrary history
     # into 'proof', so missing remotes fail closed instead.
-    base_ref = next((ref for ref in ("upstream/main", "origin/main") if _git_ref_exists(path, ref)), None)
-    if base_ref is None:
-        raise RuntimeError("workspace has no verified upstream/main or origin/main base")
-    base = _git(path, "merge-base", "HEAD", base_ref)
-    if not base:
-        raise RuntimeError("workspace has no merge-base with its configured main line")
+    base = _main_line_base(path)
     now = int(time.time())
     dependencies = tuple(str(item) for item in dependency_ids)
     unresolved = tuple(str(item) for item in unresolved_dependency_ids)
