@@ -155,7 +155,7 @@ def test_guard_still_prevents_a_duplicate_spawn_without_an_unblock(kanban_home):
 
 
 def test_other_guard_reasons_are_recorded_once_not_every_tick(kanban_home, monkeypatch):
-    calls, spawn = _spawned()
+    _calls, spawn = _spawned()
     monkeypatch.setattr(kbd, "check_respawn_guard", lambda *_a, **_k: "rate_limit_cooldown")
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="cooling down", assignee="dev")
