@@ -1221,12 +1221,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
-                # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
-                # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation never reaches
-                # ``_record_task_failure`` (which stamps this column), yet the
-                # board UI and retry worker need the corrective message.
+            owner_stopped = bool(dead.event_payload.get("owner_stopped"))  # a planned gateway stop: never counted
+            if dead.rate_limited or dead.protocol_violation or owner_stopped:
+                # Stamp last_failure_error WITHOUT touching ``consecutive_failures``: a rate-limited requeue
+                # must show ``check_respawn_guard`` a quota blocker; the others never reach
+                # ``_record_task_failure`` (which stamps it), yet the board UI and retry worker need the message.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),
@@ -1235,7 +1234,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 sweep.rate_limited.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
-                sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+                if not owner_stopped:
+                    sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
     return sweep
 
 

@@ -342,3 +342,82 @@ def test_an_earlier_runs_live_pid_does_not_hide_the_current_dead_run(board):
     board.event("t_ghost", run - 1, "spawned", {"pid": os.getpid()}, NOW - 100_000)
     board.conn.commit()
     assert [d.kind for d in board.diagnostics("t_ghost") if d.kind == "stale_running"] == ["stale_running"]
+
+
+# --- a planned gateway stop/restart is not a systemic failure ------------------------------
+# 2026-11-01 00:40Z: a routine restart interrupted 5 running Kanban workers. Each owner admission
+# settled ``interrupted``, each submitter exited 130 with the same error, and the crash sweep read
+# 3+ identical errors as a systemic failure: all 5 were parked ``gave_up`` (sticky) until a human
+# said "do all". The owner Stopped those turns on its own way out, so the cards did nothing wrong.
+
+def _interrupted_by_stop(board, tid, *, exit_code=130, admission=("terminal", "interrupted"), **kw):
+    """A dead managed attempt whose bound interpreter recorded ``exit_code`` before it went."""
+    worker = _absent_pid(base=3_700_000 + sum(map(ord, tid)) * 10)
+    run = board.dead_attempt(tid, worker_pid=worker, worker_bound=True, admission=admission,
+                             dead_hours=0, expires_age_seconds=-3600, **kw)
+    lock = board.state(tid)["claim_lock"]
+    board.event(tid, run, "worker_result",
+                {"pid": worker, "claim_lock": lock, "exit_code": exit_code, "last_output": ""}, NOW)
+    board.conn.commit()
+    return run
+
+
+def test_workers_interrupted_by_a_planned_restart_all_go_back_to_ready(board):
+    tids = [f"t_restart{i}" for i in range(5)]
+    for tid in tids:
+        _interrupted_by_stop(board, tid)
+
+    assert sorted(kbd.detect_crashed_workers(board.conn)) == sorted(tids)
+    assert kbd.detect_crashed_workers._last_auto_blocked == []
+    for tid in tids:
+        state = board.state(tid)
+        assert state["status"] == "ready", tid
+        assert state["consecutive_failures"] == 0     # a restart never spends the card's budget
+        assert "gateway stop or restart" in state["last_failure_error"]
+        kinds = [e["kind"] for e in board.events(tid)]
+        assert "gave_up" not in kinds
+        crashed = [json.loads(e["payload"]) for e in board.events(tid) if e["kind"] == "crashed"]
+        assert crashed[-1]["owner_stopped"] is True
+        assert kbd.check_respawn_guard(board.conn, tid) is None   # the dispatcher picks it up again
+
+
+def test_a_second_restart_mid_retry_still_does_not_give_up(board):
+    """DEFAULT_FAILURE_LIMIT is 2: two counted restarts in a row would have parked the card."""
+    for _ in range(kbd.DEFAULT_FAILURE_LIMIT + 1):
+        board.conn.execute("DELETE FROM tasks WHERE id='t_twice'")
+        board.conn.commit()
+        _interrupted_by_stop(board, "t_twice")
+        kbd.detect_crashed_workers(board.conn)
+        assert board.state("t_twice")["status"] == "ready"
+    assert board.state("t_twice")["consecutive_failures"] == 0
+
+
+@pytest.mark.parametrize("admission", [
+    ("terminal", "failed"),
+    # A killed owner: its interpreters die without an interrupted result and the successor
+    # settles each lost card turn ``interrupted`` at boot. Not a planned stop.
+    ("terminal", "interrupted"),
+], ids=["worker-crash", "owner-killed"])
+def test_genuine_same_error_crashes_still_trip_the_systemic_breaker(board, admission):
+    tids = [f"t_crash{i}" for i in range(3)]
+    for tid in tids:
+        _interrupted_by_stop(board, tid, exit_code=1, admission=admission)
+
+    kbd.detect_crashed_workers(board.conn)
+    assert sorted(kbd.detect_crashed_workers._last_auto_blocked) == sorted(tids)
+    for tid in tids:
+        assert board.state(tid)["status"] == "blocked"
+        gave_up = [json.loads(e["payload"]) for e in board.events(tid) if e["kind"] == "gave_up"]
+        assert gave_up and gave_up[-1]["sticky"] is True
+
+
+def test_an_interrupt_while_the_owner_stays_up_is_still_counted(board):
+    """A user's Stop leaves the owner running: not a planned stop, so the breaker still counts it."""
+    me = psutil.Process(os.getpid())
+    _interrupted_by_stop(board, "t_user_stop", owner_pid=os.getpid(), owner_birth=worker_birth(me))
+
+    kbd.detect_crashed_workers(board.conn)
+    state = board.state("t_user_stop")
+    assert state["status"] == "ready"
+    assert state["consecutive_failures"] == 1
+    assert "gateway stop or restart" not in state["last_failure_error"]
