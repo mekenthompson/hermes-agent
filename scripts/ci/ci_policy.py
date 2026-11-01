@@ -98,7 +98,7 @@ def selected_jobs(
         "catalog-tests": on("catalog"),
         "native-install-tests": False,
         "tests-os": on("python") and not fork,
-        "lint": on("python"),
+        "lint": on("python") or on("frontend"),
         "js-tests": on("frontend"),
         "installer-tests": on("installer") and not fork,
         "rust-tests": on("rust") and not fork,

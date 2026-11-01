@@ -184,6 +184,25 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
     return settled or (bool(pids) and _owner_process_gone(receipt))
 
 
+def owner_stopped_mid_attempt(conn, task_id, dead) -> bool:
+    """True when a planned gateway stop or restart ended this attempt, not the card.
+
+    On its way out the owner Stops every managed turn it is running: the live interpreter
+    records its interrupted turn (``worker_result`` exit 130), the owner settles the admission
+    ``interrupted`` and then exits. All three must hold. A user's Stop leaves the owner alive; a
+    killed owner's interpreter dies without a result (its successor settles the lost turn at
+    boot); a ``worker_lost`` note is the owner saying the worker itself failed. Those stay
+    counted crashes, so every worker a planned stop interrupts no longer reads as a same-error
+    systemic failure. Missing evidence is never proof.
+    """
+    if dead.code != 130 or _latest_run_event(conn, task_id, 'worker_result').get('exit_code') != 130:
+        return False
+    receipt = _owner_receipt(conn, task_id)
+    if not receipt or _latest_run_event(conn, task_id, 'worker_lost'):
+        return False
+    return _admission_row(receipt) == ('terminal', 'interrupted') and _owner_process_gone(receipt)
+
+
 def owner_attempt_note(conn, task_id, lost=None) -> str:
     """One clause naming why the owner says the attempt ended, or ``""``.
 
@@ -225,6 +244,10 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     if not note:
         return
     dead.event_payload["attempt_note"] = note
+    if owner_stopped_mid_attempt(conn, task_id, dead):
+        # The sweep requeues it without charging the breaker (``owner_stopped``).
+        dead.event_payload["owner_stopped"] = True
+        note += "; interrupted by a gateway stop or restart, requeued without counting a failure"
     if lost:
         dead.event_payload["worker_lost"] = lost
         if dead.protocol_violation:

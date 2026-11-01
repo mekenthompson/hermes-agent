@@ -58,6 +58,15 @@ def test_evaluate_needs_requires_selected_success_and_explicit_non_applicability
     assert _mod.evaluate_needs(needs, selected).failed == expected_failed
 
 
+def test_frontend_only_requires_code_health_but_not_python_tests() -> None:
+    selected = _mod.selected_jobs(
+        {"frontend": "true", "python": "false"}, _mod.FORK, "pull_request"
+    )
+    assert selected["lint"] is True
+    assert selected["tests"] is False
+    assert _mod.evaluate_needs({"lint": {"result": "skipped"}}, {"lint": selected["lint"]}).failed == ["lint"]
+
+
 def test_selection_uses_boolean_values_and_fork_scope() -> None:
     lanes = {
         key: "false"

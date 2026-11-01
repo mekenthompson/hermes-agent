@@ -36,6 +36,36 @@ class ForkImageWorkflowTests(unittest.TestCase):
             self.assertTrue(any('stamp["commit"] == os.environ["EXPECTED_REVISION"]'
                                 in step.get("run", "") for step in steps[build + 1:]))
 
+    def test_stamp_step_leaves_the_cached_build_context_unchanged(self) -> None:
+        # .dockerignore excludes only root-level __pycache__. Bytecode written
+        # into pm/ by the stamp step changed `COPY pm/ pm/` on every build and
+        # invalidated every dependency stage after it.
+        import os
+        import shutil
+
+        import yaml
+
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        for name in ("preflight", "publish"):
+            step = next(step for step in workflow["jobs"][name]["steps"]
+                        if "scripts/write_install_stamp.py" in step.get("run", ""))
+            with tempfile.TemporaryDirectory() as td:
+                context = Path(td)
+                for tree in ("pm", "hermes_cli", "scripts"):
+                    shutil.copytree(ROOT / tree, context / tree,
+                                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                for module in ROOT.glob("*.py"):
+                    shutil.copy2(module, context / module.name)
+                env = {key: value for key, value in os.environ.items()
+                       if not key.startswith("PYTHON")}
+                env.update({key: str(value) for key, value in step.get("env", {}).items()})
+                env["GITHUB_SHA"] = SHA
+                subprocess.run(["bash", "-c", step["run"]], cwd=context, env=env, check=True,
+                               capture_output=True, text=True)
+                self.assertTrue((context / "install-stamp.json").is_file())
+                bytecode = sorted(str(path.relative_to(context)) for path in context.rglob("*.pyc"))
+                self.assertEqual(bytecode, [], name)
+
     def test_publishing_retains_scan_evidence_even_on_failure(self) -> None:
         publish = WORKFLOW.read_text(encoding="utf-8").split("\n  publish:\n", 1)[1]
         self.assertIn("name: Upload publication evidence", publish)
