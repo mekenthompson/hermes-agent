@@ -1404,3 +1404,5 @@ interface SystemActionItem {
   runningLabel: string;
   spin: boolean;
 }
+
+// hf584 bench: frontend source change
