@@ -4,7 +4,9 @@ The guard never clears on its own while the PR comment is fresh, so refusing
 the card every tick left it spinning in ``ready`` ("Ready for 15h with no
 worker") and wrote one ``respawn_guarded`` event per tick. Instead the card is
 parked as a sticky ``needs_input`` block with one plain reason, and an explicit
-unblock lets exactly one run through.
+unblock lets exactly one run through. The park is not a worker asking for input,
+so it stays out of the block-loop breaker (a card that once asked a question
+must not drop to ``triage``, where ``unblock`` cannot reach it).
 """
 from __future__ import annotations
 
@@ -39,7 +41,8 @@ def record_respawn_guard(conn: sqlite3.Connection, task_id: str, reason: str, *,
         # The observed event guards the park: any newer event (a claim, a
         # human move) wins and this tick falls back to the plain record.
         if last is not None and kb.block_task(
-                conn, task_id, reason=why, kind="needs_input", expected_event_id=last):
+                conn, task_id, reason=why, kind="needs_input", expected_event_id=last,
+                count_recurrence=False):
             return
     payload = {"reason": reason}
     with kb.write_txn(conn):

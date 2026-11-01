@@ -115,7 +115,11 @@ def test_explicit_unblock_lets_one_run_through_then_guard_holds(kanban_home):
         assert kbd.check_respawn_guard(conn, tid) == "active_pr"
         kbd.dispatch_once(conn, spawn_fn=spawn)
         assert calls == [tid]
-        assert _status(conn, tid)["status"] in ("blocked", "triage")
+        row = _status(conn, tid)
+        assert (row["status"], row["block_kind"]) == ("blocked", "needs_input")
+        assert [e["reason"] for e in _events(conn, tid, "blocked")] == [
+            "waiting for PR #44 to merge"] * 2
+        assert _events(conn, tid, "block_loop_detected") == []
 
 
 def test_unblock_with_a_pr_comment_in_the_same_second_still_lifts(kanban_home):
@@ -163,3 +167,62 @@ def test_other_guard_reasons_are_recorded_once_not_every_tick(kanban_home, monke
             kbd.dispatch_once(conn, spawn_fn=spawn)
         assert _status(conn, tid)["status"] == "ready"
         assert _events(conn, tid, "respawn_guarded") == [{"reason": "rate_limit_cooldown"}]
+
+
+def _crash_after_pr(conn, tid):
+    """The worker opened the PR, then crashed / was reclaimed: back in ready."""
+    claimed = kb.claim_task(conn, tid)
+    kb.add_comment(conn, tid, author="dev", body=PR_COMMENT)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET outcome='crashed', status='failed', ended_at=? WHERE id=?",
+            (claimed.created_at, claimed.current_run_id))
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=?", (tid,))
+
+
+def test_park_after_an_earlier_needs_input_block_is_not_a_block_loop(kanban_home):
+    """A card that once asked Ken a question, was unblocked, opened its PR and
+    crashed must park as "waiting for PR #N to merge", not drop to triage via
+    the block-loop breaker (where ``unblock`` can no longer reach it)."""
+    calls, spawn = _spawned()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="asked once", assignee="dev")
+        kb.block_task(conn, tid, reason="which repo?", kind="needs_input")
+        assert kb.unblock_task(conn, tid)
+        _crash_after_pr(conn, tid)
+
+        for _ in range(3):
+            kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert calls == []
+        row = _status(conn, tid)
+        assert (row["status"], row["block_kind"]) == ("blocked", "needs_input")
+        assert _events(conn, tid, "block_loop_detected") == []
+        assert _events(conn, tid, "blocked")[-1]["reason"] == "waiting for PR #44 to merge"
+
+        # The explicit resume still works from here: exactly one run goes.
+        assert kb.unblock_task(conn, tid)
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert calls == [tid]
+
+
+def test_park_leaves_the_block_loop_counter_as_it_was(kanban_home):
+    """The dispatcher's park is not a worker asking for input: it neither
+    counts toward nor erases the same-reason block-loop history."""
+    calls, spawn = _spawned()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="fresh", assignee="dev")
+        _crash_after_pr(conn, tid)
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert kb.unblock_task(conn, tid)
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert calls == [tid]
+        # The resumed worker genuinely needs input: its first real ask parks it.
+        assert kb.block_task(conn, tid, reason="need creds", kind="needs_input")
+        assert _status(conn, tid)["status"] == "blocked"
+        # A real repeat of the same ask is still caught by the breaker.
+        assert kb.unblock_task(conn, tid)
+        kb.claim_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="need creds", kind="needs_input")
+        assert _status(conn, tid)["status"] == "triage"
