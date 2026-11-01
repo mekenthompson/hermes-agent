@@ -12,6 +12,7 @@ import asyncio
 
 import pytest
 
+from gateway.platforms.event import MessageEvent
 from tests.waiting import async_wait_until
 
 WAKE = "[Kanban task completed] t_1"
@@ -67,6 +68,13 @@ def admissions(runner, authority, source):
     return [(row["principal_id"].split(":")[0], row["status"], row.get("outcome")) for row in rows]
 
 
+def owner_quiesced(authority):
+    """True once the owner's drains, receipt tasks and tracked writes have all ended."""
+    from gateway.run_runtime import _authority_tasks
+
+    return all(task.done() for task in _authority_tasks(authority))
+
+
 def wake_runs(executed):
     return [owner for owner, text in executed if text == WAKE]
 
@@ -74,7 +82,6 @@ def wake_runs(executed):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("busy", [False, True], ids=["idle", "busy"])
 async def test_authority_route_runs_a_wake_receipted_before_drain_once_after_restart(monkeypatch, busy):
-    from gateway.platforms.event import MessageEvent
     from gateway.run_runtime import recover_profile_native_sessions
     from gateway.wake import deliver_wake
 
@@ -96,12 +103,11 @@ async def test_authority_route_runs_a_wake_receipted_before_drain_once_after_res
         lambda: admissions(runner, authority, source)[0] == ("messaging", "terminal", "completed"),
         what="the human turn to settle",
     )
-    # The receipt can race a wake already claimed by the FIFO. Let that admitted
-    # turn settle before simulating process replacement; keep queued work queued.
-    await async_wait_until(
-        lambda: admissions(runner, authority, source)[-1][1] != "started",
-        what="an already claimed wake to settle before restart",
-    )
+    # The receipt can race a claim already in flight: its off-loop transaction passed the admission gate
+    # before ``_draining`` was set and commits after any row read taken now. A real restart joins that
+    # owner work before releasing ownership (``_authority_tasks``); join it here too, so the row is read
+    # once settled and no owner write lands after the successor takes the epoch (``stale_epoch``).
+    await async_wait_until(lambda: owner_quiesced(authority), what="the owner's in-flight claims to settle")
     wake_row = admissions(runner, authority, source)[-1]
     assert wake_row[0] == "automation"
     assert wake_row[1] == "queued" or (wake_row[1:] == ("terminal", "completed") and wake_runs(executed) == ["owner"])
@@ -113,3 +119,35 @@ async def test_authority_route_runs_a_wake_receipted_before_drain_once_after_res
         what="the wake to run",
     )
     assert len(wake_runs(executed)) == 1  # ran once, on whichever gateway claimed it
+
+
+@pytest.mark.asyncio
+async def test_authority_route_wake_claimed_before_drain_runs_when_the_drain_begins_mid_claim(monkeypatch):
+    """The drain can begin between a wake's claim and its turn start; that wake is still admitted work.
+
+    Deterministic form of the window the idle case above hits under load: the drain flag flips after the
+    claim committed, before the claimed turn reaches the runner's drain gate. The turn must run (and
+    settle), not be answered with the drain notice while its row settles ``completed`` unrun.
+    """
+    import gateway.session_ingress as ingress
+    from gateway.wake import deliver_wake
+
+    executed = []
+    runner, adapter, authority, source = await authority_route(monkeypatch, "owner", executed)
+    await adapter.handle_message(MessageEvent(text="A", source=source, message_id="A"))
+    await async_wait_until(
+        lambda: admissions(runner, authority, source) == [("messaging", "terminal", "completed")],
+        what="the human turn to settle",
+    )
+    execute_admission = ingress.execute_admission
+
+    async def drain_after_claim(authority, ref, row):
+        if row["payload"].get("text") == WAKE:
+            runner._draining = True  # claimed (committed, stamped) but not yet started
+        return await execute_admission(authority, ref, row)
+
+    monkeypatch.setattr(ingress, "execute_admission", drain_after_claim)
+    await asyncio.wait_for(deliver_wake(adapter, text=WAKE, source=source), 10)
+    await async_wait_until(lambda: owner_quiesced(authority), what="the claimed wake to settle")
+    assert admissions(runner, authority, source)[-1] == ("automation", "terminal", "completed")
+    assert wake_runs(executed) == ["owner"]
