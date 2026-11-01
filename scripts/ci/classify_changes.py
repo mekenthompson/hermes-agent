@@ -847,7 +847,7 @@ def pull_request_labels() -> list[str]:
 
 def main() -> int:
     files = sys.stdin.read().splitlines()
-    if not any(f.strip() for f in files):
+    if not is_fork() and not any(f.strip() for f in files):
         recovered = pull_request_changed_files()
         if recovered:
             print(
@@ -857,8 +857,16 @@ def main() -> int:
             )
             files = recovered
     lanes = classify(files, run_e2e=RUN_E2E_LABEL in pull_request_labels(), fork=is_fork())
+    from scripts.ci.affected_test_plan import js_plan, python_plan
+
+    # Only pull requests narrow. Pushes, dispatch and schedule are the post-merge
+    # backstop (and gate image publication), so they always plan the full suite.
+    plan_files = files if os.environ.get("EVENT_NAME") == "pull_request" else []
+    plan = python_plan(plan_files, root=Path.cwd(), fork=is_fork(), enabled=lanes["python"])
+    plan.update(js_plan(plan_files, fork=is_fork()))
     out = "\n".join([
         *(f"{key}={str(value).lower()}" for key, value in lanes.items()),
+        *(f"{key}={json.dumps(value) if not isinstance(value, str) else value}" for key, value in plan.items()),
         f"ci_review_files={json.dumps(ci_review_files(files))}",
     ])
     if dest := os.environ.get("GITHUB_OUTPUT"):

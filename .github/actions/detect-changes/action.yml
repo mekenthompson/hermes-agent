@@ -12,6 +12,15 @@ inputs:
     default: ${{ github.token }}
 
 outputs:
+  js_matrix:
+    description: JSON workspace check matrix.
+    value: ${{ steps.classify.outputs.js_matrix }}
+  python_files:
+    description: JSON selected test modules; empty list keeps full discovery.
+    value: ${{ steps.classify.outputs.python_files }}
+  python_matrix:
+    description: JSON shard matrix sized for the selected modules.
+    value: ${{ steps.classify.outputs.python_matrix }}
   python:
     description: Run Python tests / ruff / ty / windows-footguns.
     value: ${{ steps.classify.outputs.python }}
