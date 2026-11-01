@@ -1652,8 +1652,54 @@ def check_respawn_guard(
                 conn, "task_events", task_id, max(pr_times),
                 "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
             return None
+        # An explicit unblock (orchestrator-only: CLI / kanban_unblock) is a
+        # deliberate "run it anyway" for ONE run: it lifts the guard until the
+        # next claim spends it. Event ids order it, not timestamps, so a PR link
+        # in the unblock's own same-second comment cannot re-arm the guard.
+        latest = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? AND kind IN ('unblocked', 'claimed') "
+            "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        if latest is not None and latest["kind"] == "unblocked":
+            return None
         return "active_pr"
 
+    return None
+
+
+def _record_respawn_guard(conn: sqlite3.Connection, task_id: str, reason: str, *, lane: str) -> None:
+    """Make a refused spawn visible without writing a row every tick.
+
+    ``active_pr`` never clears on its own, so the card leaves ``ready`` for a
+    sticky ``needs_input`` block naming the PR ("waiting for PR #N to merge");
+    an explicit unblock then runs it once (see :func:`check_respawn_guard`).
+    Other reasons expire by themselves and stay in ``ready``; their event is
+    written only when it differs from the card's latest event, so
+    ``hermes kanban tail`` still says why the card waits."""
+    if reason == "active_pr" and lane == "ready":
+        last = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()[0]
+        pr = _newest_pr_number(conn, task_id)
+        why = f"waiting for PR #{pr} to merge" if pr else "waiting for its open PR to merge"
+        # The observed event guards the park: any newer event (a claim, a
+        # human move) wins and this tick falls back to the plain record.
+        if last is not None and _kb.block_task(
+                conn, task_id, reason=why, kind="needs_input", expected_event_id=last):
+            return
+    payload = {"reason": reason}
+    with _kb.write_txn(conn):
+        last = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        if last is None or last["kind"] != "respawn_guarded" or last["payload"] != _kb._json_or_null(payload):
+            _kb._append_event(conn, task_id, "respawn_guarded", payload)
+
+
+def _newest_pr_number(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """PR number from the newest comment carrying a GitHub PR URL, if any."""
+    for row in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC", (task_id,)):
+        urls = _RESPAWN_GUARD_PR_URL_RE.findall(_kb._lossy_text(row["body"]) or "")
+        if urls:
+            return urls[-1].rsplit("/", 1)[-1]
     return None
 
 
@@ -2100,16 +2146,8 @@ def _dispatch_lane_task(
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
-        # Event so ``hermes kanban tail`` shows why the task looks stuck.
-        # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
-        # operator-configured fallback exists, persist the assignment and proceed. This removes the
-        # dashboard footgun where a task created without an assignee parks in 'ready' forever even though
-        # the operator's intent ("default") was perfectly clear (#27145). Mutating the row (not just the
-        # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
-        # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
         if not dry_run:
-            with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+            _record_respawn_guard(conn, task_id, guard_reason, lane=lane)
         return False
 
     def _count_spawn(name: str) -> None:
