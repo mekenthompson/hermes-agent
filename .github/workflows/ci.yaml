@@ -86,6 +86,9 @@ jobs:
     # on hosted runners before classification even starts.
     timeout-minutes: 10
     outputs:
+      js_matrix: ${{ inputs.release != true && steps.classify.outputs.js_matrix || '' }}
+      python_files: ${{ inputs.release != true && steps.classify.outputs.python_files || '[]' }}
+      python_matrix: ${{ inputs.release != true && steps.classify.outputs.python_matrix || '' }}
       python: ${{ steps.gate-lanes.outputs.python }}
       python_prod: ${{ steps.gate-lanes.outputs.python_prod }}
       frontend: ${{ steps.gate-lanes.outputs.frontend }}
@@ -186,6 +189,8 @@ jobs:
     if: ${{ fromJSON(needs.detect.outputs.selected_jobs).tests }}
     uses: ./.github/workflows/tests.yml
     with:
+      python_files: ${{ needs.detect.outputs.python_files }}
+      python_matrix: ${{ needs.detect.outputs.python_matrix }}
       commit: ${{ inputs.commit }}
       upgrade: ${{ github.repository != 'mekenthompson/hermes-agent' && needs.detect.outputs.upgrade == 'true' }}
       upgrade_partition: ${{ github.repository == 'mekenthompson/hermes-agent' && inputs.release != true && 'runtime' || 'all' }}
@@ -244,6 +249,7 @@ jobs:
     if: ${{ fromJSON(needs.detect.outputs.selected_jobs)['js-tests'] }}
     uses: ./.github/workflows/js-tests.yml
     with:
+      js_matrix: ${{ needs.detect.outputs.js_matrix }}
       commit: ${{ inputs.commit }}
 
   installer-tests:

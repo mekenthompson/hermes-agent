@@ -3,6 +3,14 @@ name: Tests
 on:
   workflow_call:
     inputs:
+      python_files:
+        description: JSON selected modules; empty list retains full discovery.
+        type: string
+        default: '[]'
+      python_matrix:
+        description: JSON shard matrix; omitted retains full-suite defaults.
+        type: string
+        default: ''
       commit:
         description: Commit to test and build. Empty keeps the triggering commit.
         type: string
@@ -71,7 +79,7 @@ jobs:
     # partition identical across slices. Upstream retains its one 96-core job.
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(github.repository == 'mekenthompson/hermes-agent' && '{"slice":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],"slices":[16]}' || '{"slice":[1],"slices":[1]}') }}
+      matrix: ${{ fromJSON(inputs.python_matrix || (github.repository == 'mekenthompson/hermes-agent' && '{"slice":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],"slices":[16]}' || '{"slice":[1],"slices":[1]}')) }}
     runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'ubuntu-latest-96-core' || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
@@ -135,11 +143,28 @@ jobs:
         # with bounded parallelism. No xdist, no shared workers, no
         # module-level state leakage between files.
         #
-        # No --files: the runner discovers the suite itself. The discovered
-        # set is identical to the list the removed matrix job used to pass in.
+        # Unknown impact keeps full discovery. Explicit plans use the same
+        # isolated runner and its deterministic cache-independent partition.
         run: |
-          scripts/run_tests.sh --slice ${{ matrix.slice }}/${{ matrix.slices }}
+          if [ "$PYTHON_FILES" = '[]' ]; then
+            scripts/run_tests.sh --slice ${{ matrix.slice }}/${{ matrix.slices }}
+          else
+            python3 - <<'PY'
+          import json, os, pathlib
+          files = json.loads(os.environ['PYTHON_FILES'])
+          assert isinstance(files, list) and files and len(files) == len(set(files))
+          root = pathlib.Path.cwd()
+          for name in files:
+              path = pathlib.Path(name)
+              assert name.startswith('tests/') and path.name.startswith('test_') and path.suffix == '.py'
+              assert '\n' not in name and '\r' not in name
+              assert path.resolve().is_relative_to(root) and path.is_file(), name
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'selected-tests.txt').write_text('\n'.join(files), encoding='utf-8')
+          PY
+            scripts/run_tests.sh --files-from "$RUNNER_TEMP/selected-tests.txt" --slice ${{ matrix.slice }}/${{ matrix.slices }}
+          fi
         env:
+          PYTHON_FILES: ${{ inputs.python_files }}
           # This is the maximum number of test FILES that run together.
           # run_tests_parallel.py starts one pytest subprocess for each file
           # from a single ThreadPoolExecutor, so this value IS the limit. The
