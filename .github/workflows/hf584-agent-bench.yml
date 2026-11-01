@@ -24,18 +24,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - variant: baseline
-            cache_to: type=gha,mode=max,scope=hf584-bench-baseline-v1,ignore-error=true
-            cache_from: type=gha,scope=hf584-bench-baseline-v1
+          - variant: max
+            cache_to: type=gha,mode=max,scope=hf584-bench-max-v2,ignore-error=true
+            cache_from: type=gha,scope=hf584-bench-max-v2
             outputs: type=docker
-          - variant: zstd-cache
-            cache_to: type=gha,mode=max,scope=hf584-bench-zstd-v1,ignore-error=true,compression=zstd
-            cache_from: type=gha,scope=hf584-bench-zstd-v1
+          - variant: min
+            cache_to: type=gha,mode=min,scope=hf584-bench-min-v2,ignore-error=true
+            cache_from: type=gha,scope=hf584-bench-min-v2
             outputs: type=docker
-          - variant: zstd-cache-raw-load
-            cache_to: type=gha,mode=max,scope=hf584-bench-zstdraw-v1,ignore-error=true,compression=zstd
-            cache_from: type=gha,scope=hf584-bench-zstdraw-v1
-            outputs: type=docker,compression=uncompressed
     env:
       TEST_IMAGE: hf584-bench:${{ github.sha }}
     steps:
