@@ -746,7 +746,7 @@ class _KanbanNotification:
                 adapter=self.adapter, chat_id=self.sub["chat_id"], metadata=metadata,
                 event_payload=getattr(ev, "payload", None), task=self.task,
             )
-        except Exception as art_exc:
+        except Exception as art_exc:  # health: allow BLE001 -- moved: a failed upload must not block the completion delivery
             logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
 
     async def _send_pings(self) -> bool:
