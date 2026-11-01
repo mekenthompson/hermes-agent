@@ -184,6 +184,22 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
     return settled or (bool(pids) and _owner_process_gone(receipt))
 
 
+def owner_stopped_mid_attempt(conn, task_id) -> bool:
+    """True when the owner ended this attempt on its own way out: it settled the admission
+    ``interrupted`` and is no longer the process that admitted it.
+
+    That is a planned gateway stop or restart (``hermes gateway stop``, a service stop, an update):
+    the owner Stops every managed turn it is running before it exits. A user's Stop leaves the
+    owner alive; a killed owner cannot settle anything (its successor settles the admission
+    ``unknown``). So the card did nothing wrong and the crash sweep requeues it without charging
+    the breaker. Missing evidence is never proof.
+    """
+    receipt = _owner_receipt(conn, task_id)
+    if not receipt:
+        return False
+    return _admission_row(receipt) == ('terminal', 'interrupted') and _owner_process_gone(receipt)
+
+
 def owner_attempt_note(conn, task_id, lost=None) -> str:
     """One clause naming why the owner says the attempt ended, or ``""``.
 
