@@ -25,12 +25,12 @@ jobs:
       matrix:
         include:
           - variant: max
-            cache_to: type=gha,mode=max,scope=hf584-bench-max-v2,ignore-error=true
-            cache_from: type=gha,scope=hf584-bench-max-v2
+            cache_to: type=gha,mode=max,scope=hf584-bench-max-v3,ignore-error=true
+            cache_from: type=gha,scope=hf584-bench-max-v3
             outputs: type=docker
           - variant: min
-            cache_to: type=gha,mode=min,scope=hf584-bench-min-v2,ignore-error=true
-            cache_from: type=gha,scope=hf584-bench-min-v2
+            cache_to: type=gha,mode=min,scope=hf584-bench-min-v3,ignore-error=true
+            cache_from: type=gha,scope=hf584-bench-min-v3
             outputs: type=docker
     env:
       TEST_IMAGE: hf584-bench:${{ github.sha }}
@@ -44,6 +44,9 @@ jobs:
           python-version: "3.14"
 
       - name: Write exact source install stamp
+        env:
+          # Candidate fix under test: keep bytecode out of the build context.
+          PYTHONDONTWRITEBYTECODE: "1"
         run: >-
           python3 scripts/write_install_stamp.py --output install-stamp.json
           --commit "$GITHUB_SHA" --distribution docker --source ci
