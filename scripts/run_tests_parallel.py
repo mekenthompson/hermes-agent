@@ -1565,10 +1565,7 @@ def main() -> int:
     # Apply slicing if requested (partition from the checkout alone; see _slice_files).
     if slice_index is not None:
         durations = _load_durations(repo_root)
-        files = _slice_files(
-            files, slice_index, slice_count, durations, repo_root,
-            by_durations=args.slice_by_durations,
-        )
+        files = _slice_files(files, slice_index, slice_count, durations, repo_root, by_durations=args.slice_by_durations)
         # Recount after slicing.
         test_counts = {f: test_counts[f] for f in files if f in test_counts}
         approx_total_tests = sum(test_counts.values())
