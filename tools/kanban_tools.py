@@ -1232,7 +1232,10 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
         user_id=env("HERMES_SESSION_USER_ID", "") or None,
         user_id_alt=env("HERMES_SESSION_USER_ID_ALT", "") or None,
         notifier_profile=notifier_profile,
-        delivery_mode="notify+wake" if platform != "tui" else None,
+        # Wake only: the woken agent's reply is the single completion message in
+        # the chat. ``notify+wake`` also sent a template ping, so every completion
+        # arrived twice. Checkpoints stay passive (the notifier sends them as-is).
+        delivery_mode="wake" if platform != "tui" else None,
         delivery_metadata=delivery_metadata or None)
 
 
