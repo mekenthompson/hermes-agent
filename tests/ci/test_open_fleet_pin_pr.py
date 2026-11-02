@@ -364,6 +364,69 @@ class StrictMainReconciliationTests(unittest.TestCase):
         with self.assertRaisesRegex(mod.HandoffError, "expected pin content"):
             mod.reconcile_and_wait(github, PR_URL, expected_content=mod.canonical_json(manifest()).encode("utf-8"))
 
+    def _slow_gh(self, *, auto_merge: Any, head_content: bytes, final_state: str = "OPEN") -> tuple[Any, list[int]]:
+        """gh fake whose PR stays OPEN/BLOCKED (checks still running) for the whole wait budget."""
+        views = [0]
+
+        def gh(args: list[str], input_text: str | None = None) -> str:
+            if args[:2] == ["pr", "view"]:
+                views[0] += 1
+                state = final_state if views[0] > mod.WAIT_ATTEMPTS else "OPEN"
+                return json.dumps({
+                    "url": PR_URL, "number": 77, "state": state, "headRefOid": BRANCH_SHA,
+                    "mergeStateStatus": "BLOCKED", "autoMergeRequest": auto_merge,
+                })
+            if args[:2] == ["api", f"repos/{REPO}/contents/{mod.FLEET_MANIFEST_PATH}?ref={BRANCH_SHA}"]:
+                return json.dumps(contents_payload(head_content))
+            raise AssertionError(args)
+
+        return gh, views
+
+    def test_slow_checks_with_auto_merge_armed_succeed_with_a_notice(self) -> None:
+        # fc9954cf / fe43b3d / e7174eb: the pin PR merged minutes after the 720s
+        # wait; the handoff must not go red just because Fleet CI was slow.
+        expected = mod.canonical_json(manifest()).encode("utf-8")
+        gh, views = self._slow_gh(auto_merge={"enabledAt": "now"}, head_content=expected)
+        github = mod.GitHub(REPO, gh, sleep=lambda _: None)
+        import contextlib
+        import io
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            outcome = mod.reconcile_and_wait(github, PR_URL, expected_content=expected)
+
+        self.assertTrue(outcome.startswith("auto-merge armed"), outcome)
+        self.assertIn("::notice::", err.getvalue())
+        self.assertIn("PR 77", err.getvalue())
+        self.assertEqual(views[0], mod.WAIT_ATTEMPTS + 1)
+
+    def test_pr_that_merges_right_at_the_deadline_is_reported_merged(self) -> None:
+        expected = mod.canonical_json(manifest()).encode("utf-8")
+        gh, _ = self._slow_gh(auto_merge={"enabledAt": "now"}, head_content=expected, final_state="MERGED")
+        github = mod.GitHub(REPO, gh, sleep=lambda _: None)
+        self.assertEqual(mod.reconcile_and_wait(github, PR_URL, expected_content=expected), "merged")
+
+    def test_timeout_without_auto_merge_armed_still_fails(self) -> None:
+        expected = mod.canonical_json(manifest()).encode("utf-8")
+        gh, _ = self._slow_gh(auto_merge=None, head_content=expected)
+        github = mod.GitHub(REPO, gh, sleep=lambda _: None)
+        with self.assertRaisesRegex(mod.HandoffError, "did not merge within 720 seconds.*auto-merge is not armed"):
+            mod.reconcile_and_wait(github, PR_URL, expected_content=expected)
+
+    def test_timeout_with_wrong_pin_content_still_fails(self) -> None:
+        expected = mod.canonical_json(manifest()).encode("utf-8")
+        gh, _ = self._slow_gh(auto_merge={"enabledAt": "now"}, head_content=b"wrong manifest\n")
+        github = mod.GitHub(REPO, gh, sleep=lambda _: None)
+        with self.assertRaisesRegex(mod.HandoffError, "did not merge within 720 seconds.*expected pin content"):
+            mod.reconcile_and_wait(github, PR_URL, expected_content=expected)
+
+    def test_timeout_on_a_closed_pr_still_fails(self) -> None:
+        expected = mod.canonical_json(manifest()).encode("utf-8")
+        gh, _ = self._slow_gh(auto_merge={"enabledAt": "now"}, head_content=expected, final_state="CLOSED")
+        github = mod.GitHub(REPO, gh, sleep=lambda _: None)
+        with self.assertRaisesRegex(mod.HandoffError, "CLOSED"):
+            mod.reconcile_and_wait(github, PR_URL, expected_content=expected)
+
     def test_wait_budget_is_twelve_minutes(self) -> None:
         self.assertEqual(mod.WAIT_ATTEMPTS * mod.WAIT_SECONDS, 12 * 60)
 
