@@ -212,11 +212,12 @@ def attempt_instance_replaced(conn, task_id, run_id, session_id=None) -> bool:
     another instantiation is not executing in this one. All must hold: the run's
     ``owner_admitted`` receipt (for ``session_id`` when given) names an owner process that is
     gone, the run recorded at least one worker, and every recorded worker (``spawned``,
-    ``worker_registered``, ``worker_bound``) carries a readable, different instantiation and is
-    not alive here. A worker of this instantiation, or any unreadable value, is never proof.
+    ``worker_registered``, ``worker_bound``) carries a readable, different instantiation. A
+    worker of this instantiation, or any unreadable value, is never proof. This assumes one live
+    instance per board and owner ledger (each container its own home), as ``_worker_alive``
+    already does: a home shared by two live containers with separate PID namespaces is outside it.
     """
     from gateway.drain_control import current_instantiation_epoch
-    from hermes_cli.kanban_db_dispatch import _worker_alive
     current = current_instantiation_epoch()
     if not current:
         return False
@@ -239,9 +240,29 @@ def attempt_instance_replaced(conn, task_id, run_id, session_id=None) -> bool:
         if type(pid) is not int or pid <= 0 or not isinstance(fingerprint, str) or fingerprint.count('|') != 1:
             return False
         recorded = fingerprint.partition('|')[0]
-        if not recorded or recorded == current or _worker_alive(pid, fingerprint):
+        if not recorded or recorded == current:
             return False
     return all(_owner_process_gone(receipt) for receipt in receipts)
+
+
+# Restarts of the whole instance in a row that are requeued without charging the card. A card that
+# takes its own instance down (memory, a restart it runs) must still reach the failure limit.
+RESTART_REQUEUE_LIMIT = 3
+
+
+def _restart_streak(conn, task_id) -> int:
+    """How many of the task's latest ended runs in a row its instance's restart ended."""
+    streak = 0
+    for (metadata,) in conn.execute("SELECT metadata FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
+                                    "ORDER BY id DESC", (task_id,)).fetchall():
+        try:
+            booked = json.loads(metadata or '{}')
+        except (TypeError, ValueError):
+            break
+        if not isinstance(booked, dict) or not booked.get('instance_replaced'):
+            break
+        streak += 1
+    return streak
 
 
 def owner_instance_replaced(conn, task_id) -> bool:
@@ -302,6 +323,11 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     if not note and not replaced:
         return
     note = note or "owner instance restarted"
+    if replaced:
+        dead.event_payload["instance_replaced"] = True
+        if _restart_streak(conn, task_id) >= RESTART_REQUEUE_LIMIT:
+            replaced = False  # counted from here on: the card may be what keeps taking it down
+            note += f"; its instance restarted {RESTART_REQUEUE_LIMIT}+ times in a row, counted as a failure"
     dead.event_payload["attempt_note"] = note
     if replaced or owner_stopped_mid_attempt(conn, task_id, dead):
         # The sweep requeues it without charging the breaker (``owner_stopped``).

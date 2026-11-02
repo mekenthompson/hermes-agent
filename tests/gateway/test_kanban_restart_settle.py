@@ -96,10 +96,17 @@ class _Restart:
             host_start = process_registry._safe_host_start_time(job_pid)
         route = authority.sessions[self.sid].route
         self.record = 'proc_restartjob1'
-        _checkpoint_path().write_text(json.dumps([{
-            'session_id': self.record, 'command': 'sleep 600', 'pid': job_pid, 'pid_scope': 'host',
-            'host_start_time': host_start, 'native_job_scope': True, 'cwd': str(self.tmp_path),
-            'started_at': 1.0, 'task_id': self.sid, 'owner_task_id': self.sid, 'session_key': route}]))
+        own = {'session_id': self.record, 'command': 'sleep 600', 'pid': job_pid, 'pid_scope': 'host',
+               'host_start_time': host_start, 'native_job_scope': True, 'cwd': str(self.tmp_path),
+               'started_at': 1.0, 'task_id': self.sid, 'owner_task_id': self.sid, 'session_key': route}
+        if record == 'sandbox':  # a backend sandbox can outlive this PID namespace
+            own['pid_scope'] = 'sandbox'
+        elif record == 'systemd':  # so can a host systemd scope
+            own['systemd_unit'] = 'hermes-worker-restartjob1.scope'
+        # Another conversation's job: never this attempt's to retire.
+        neighbor = {**own, 'session_id': 'proc_neighborjob', 'pid_scope': 'host', 'systemd_unit': '',
+                    'task_id': 'other-session', 'owner_task_id': 'other-session', 'session_key': 'other-route'}
+        _checkpoint_path().write_text(json.dumps([own, neighbor]))
         # The interpreter dies first: the owner fences its Stop, then dies with the turn ``started``.
         claimed = claim_session_input(authority.db, epoch=authority.epoch, session_id=self.sid)
         record_process_stop(authority, self.ref, claimed['generation'])
@@ -193,7 +200,7 @@ def test_restart_mid_run_settles_the_lost_attempt_and_its_respawn_completes(card
             assert accepted['session_id'] != restart.sid and accepted['receipt']['status'] == 'queued'
             assert _admission(authority.db, restart.sid) == ('terminal', 'interrupted')
             assert process_stop_pending(authority.db, restart.sid) is None
-            assert restart.record not in _checkpoint_ids()
+            assert restart.record not in _checkpoint_ids() and 'proc_neighborjob' in _checkpoint_ids()
             with closing(connect(board='owned')) as conn:
                 assert kb.complete_task(conn, params['task_id'], summary='done', expected_run_id=params['run_id'])
             status, kinds = _task(params['task_id'])
@@ -210,7 +217,9 @@ def test_restart_mid_run_settles_the_lost_attempt_and_its_respawn_completes(card
     dict(worker='live'),                  # its interpreter is still running in this instance
     dict(owner_alive=True),               # the gateway that admitted it is still alive
     dict(record='live'),                  # a process it started is alive here with its birth
-], ids=['live-worker', 'live-owner', 'live-process'])
+    dict(record='sandbox'),               # a process in a backend sandbox
+    dict(record='systemd'),               # a process in a host systemd scope
+], ids=['live-worker', 'live-owner', 'live-process', 'sandbox-process', 'systemd-process'])
 def test_an_attempt_that_might_still_run_keeps_its_fence(card_owner, monkeypatch, tmp_path, shape):
     from gateway.session_ancillary import process_stop_pending
     from gateway.session_kanban_stop import settle_replaced_card_attempts
@@ -244,5 +253,27 @@ def test_an_attempt_that_might_still_run_keeps_its_fence(card_owner, monkeypatch
         finally:
             restart.close()
             await owner.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_stop_this_owner_recorded_is_never_discharged(card_owner, monkeypatch, tmp_path):
+    """Only an earlier epoch's fence qualifies: this owner's own Stop goes through native cleanup."""
+    from gateway.session_ancillary import _PROCESS_STOP_PREFIX, process_stop_pending
+    from gateway.session_kanban_stop import settle_replaced_card_attempts
+    restart = _Restart(card_owner, monkeypatch, tmp_path)
+
+    async def scenario():
+        try:
+            authority = await restart.admit_and_lose()
+            authority.db.set_meta(_PROCESS_STOP_PREFIX + restart.sid, f'{authority.epoch}:1')
+            await settle_replaced_card_attempts(authority)
+            assert _admission(authority.db, restart.sid) == ('unknown', None)
+            assert process_stop_pending(authority.db, restart.sid) == f'{authority.epoch}:1'
+            assert restart.record in _checkpoint_ids()
+            await restart.connection.close()
+        finally:
+            restart.close()
+            await card_owner.close()
 
     asyncio.run(scenario())

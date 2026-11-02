@@ -476,6 +476,20 @@ def test_a_worker_lost_to_a_restart_of_its_instance_requeues_without_counting(bo
     assert "gave_up" not in [e["kind"] for e in board.events("t_restarted")]
 
 
+def test_a_card_that_keeps_taking_its_instance_down_still_gives_up(board):
+    """Uncounted restarts are bounded: past RESTART_REQUEUE_LIMIT in a row each one is charged."""
+    limit = kanban_owner_recovery.RESTART_REQUEUE_LIMIT
+    for attempt in range(limit + kbd.DEFAULT_FAILURE_LIMIT):
+        state = board.state("t_oom") if attempt else {"consecutive_failures": 0}
+        _lost_in(board, "t_oom", OLD_INSTANCE, failures=state["consecutive_failures"])
+        kbd.detect_crashed_workers(board.conn)
+        state = board.state("t_oom")
+        assert state["consecutive_failures"] == max(0, attempt + 1 - limit), attempt
+    assert state["status"] == "blocked"
+    assert "times in a row" in state["last_failure_error"]
+    assert "gave_up" in [e["kind"] for e in board.events("t_oom")]
+
+
 def test_a_worker_lost_while_its_instance_keeps_running_still_gives_up(board):
     """Same evidence, but the worker was of THIS instantiation: a real crash, charged every time."""
     _lost_in(board, "t_crashing", FINGERPRINT)

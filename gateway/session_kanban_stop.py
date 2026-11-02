@@ -178,8 +178,12 @@ async def settle_replaced_card_attempts(authority):
     from hermes_state_local import local_receipt
     from hermes_state_runtime import _row
     logger = logging.getLogger(__name__)
-    rows = [_row(row) for row in authority.db._read_all(
-        "SELECT * FROM session_admissions WHERE status='unknown' ORDER BY seq")]
+    try:
+        rows = [_row(row) for row in authority.db._read_all(
+            "SELECT * FROM session_admissions WHERE status='unknown' ORDER BY seq")]
+    except (RuntimeStoreError, sqlite3.Error) as exc:
+        logger.warning('Card attempts from an earlier instance left for their respawns: %s', type(exc).__name__)
+        return
     for row in rows:
         sid, card = row['target_session_id'], (row.get('payload') or {}).get('kanban_card_v1')
         if (not card or row['owner_epoch'] >= authority.epoch or not is_unattended(row)
@@ -246,11 +250,12 @@ async def retire_previous_attempts(connection, context):
         async with authority.sessions[sid].claim_gate:
             if sid in authority.executing:
                 raise RuntimeStoreError('kanban_previous_execution_unknown')
+            gone = await asyncio.to_thread(previous_workers_gone, context, binding)
             # Before this owner records its own Stop: only an earlier epoch's fence can qualify.
-            replaced = await discharge_replaced_instance(authority, ref, context, binding['run_id'])
+            replaced = gone and await discharge_replaced_instance(authority, ref, context, binding['run_id'])
             handle = await authority.resolve(connection.actor, ref)
             await tracked_write(authority, partial(record_process_stop, authority, ref, handle.execution_generation))
-            if (not await asyncio.to_thread(previous_workers_gone, context, binding)
+            if (not gone
                     or not await retry_process_stop(authority, ref)
                     or process_stop_pending(authority.db, sid) is not None):
                 raise RuntimeStoreError('kanban_previous_execution_unknown')
