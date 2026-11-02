@@ -178,13 +178,12 @@ async def settle_replaced_card_attempts(authority):
     from hermes_state_local import local_receipt
     from hermes_state_runtime import _row
     logger = logging.getLogger(__name__)
-    with authority.db._read_ctx() as conn:
-        rows = [_row(row) for row in conn.execute(
-            "SELECT * FROM session_admissions WHERE status='unknown' AND owner_epoch<? ORDER BY seq",
-            (authority.epoch,)).fetchall()]
+    rows = [_row(row) for row in authority.db._read_all(
+        "SELECT * FROM session_admissions WHERE status='unknown' ORDER BY seq")]
     for row in rows:
         sid, card = row['target_session_id'], (row.get('payload') or {}).get('kanban_card_v1')
-        if not card or not is_unattended(row) or process_stop_pending(authority.db, sid) is None:
+        if (not card or row['owner_epoch'] >= authority.epoch or not is_unattended(row)
+                or process_stop_pending(authority.db, sid) is None):
             continue  # an unfenced card row already settled in boot recovery
         try:
             policy = restore_policy(local_receipt(authority.db, sid)['policy'])
