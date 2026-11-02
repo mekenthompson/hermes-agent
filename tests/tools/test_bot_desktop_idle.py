@@ -1,3 +1,4 @@
+# HF-581 probe: comment-only change to exercise narrow PR test selection. Do not merge.
 """Bot Desktop idle auto-stop: a screen nobody used past ``bot_desktop.idle_stop_minutes`` is stopped,
 one a human holds or that saw recent use is not."""
 
