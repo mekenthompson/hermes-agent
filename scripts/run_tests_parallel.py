@@ -1009,13 +1009,20 @@ def _slice_files(
     slice_count: int,
     durations: dict[str, float],
     repo_root: Path,
+    *,
+    by_durations: bool = False,
 ) -> list[Path]:
     """Return the subset of *files* belonging to slice *slice_index*.
 
-    Every slice job computes the partition on its own, so it must come only from
-    the checkout: a duration cache restored separately per job can differ (a main
-    push saves a newer one in between) and silently drop or double-run files.
-    Sorted round-robin balances within seconds of timed LPT at this suite size.
+    Every slice job computes the partition on its own, so by default it comes
+    only from the checkout: a duration cache restored separately per job can
+    differ (a main push saves a newer one in between) and silently drop or
+    double-run files.
+
+    ``by_durations`` (``--slice-by-durations``) runs timed LPT on *durations*
+    instead. Pass it only when every slice job is guaranteed the byte-identical
+    cache (CI pins one immutable cache key for the whole run); with that
+    guarantee the partition is still the same in every slice.
 
     ``slice_index`` is 1-indexed (1..slice_count) for ergonomics —
     ``--slice 1/4`` reads more naturally than ``--slice 0/4``.
@@ -1029,7 +1036,9 @@ def _slice_files(
         )
         sys.exit(2)
 
-    bucket_files = _compute_lpt_slices(sorted(files), slice_count, {}, repo_root)
+    bucket_files = _compute_lpt_slices(
+        sorted(files), slice_count, durations if by_durations else {}, repo_root
+    )
 
     target = bucket_files[slice_index - 1]
     target_dur = sum(
@@ -1042,7 +1051,8 @@ def _slice_files(
     )
     print(
         f"Slice {slice_index}/{slice_count}: {len(target)} files "
-        f"(~{target_dur:.0f}s estimated of {total_dur:.0f}s total)",
+        f"(~{target_dur:.0f}s estimated of {total_dur:.0f}s total, "
+        f"partition by {'durations' if by_durations else 'file count'})",
         flush=True,
     )
 
@@ -1316,6 +1326,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--slice-by-durations",
+        action="store_true",
+        help=(
+            "With --slice, balance slices by the per-file durations in "
+            "test_durations.json (timed LPT) instead of by file count. Only "
+            "safe when every slice job reads the identical cache file."
+        ),
+    )
+    parser.add_argument(
         "--generate-slices",
         metavar="N",
         type=int,
@@ -1394,7 +1413,7 @@ def main() -> int:
     OUR_FLAGS = {
         "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
-        "--files-from", "--fail-on-skip", "--scratch-root",
+        "--files-from", "--fail-on-skip", "--scratch-root", "--slice-by-durations",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -1546,7 +1565,10 @@ def main() -> int:
     # Apply slicing if requested (partition from the checkout alone; see _slice_files).
     if slice_index is not None:
         durations = _load_durations(repo_root)
-        files = _slice_files(files, slice_index, slice_count, durations, repo_root)
+        files = _slice_files(
+            files, slice_index, slice_count, durations, repo_root,
+            by_durations=args.slice_by_durations,
+        )
         # Recount after slicing.
         test_counts = {f: test_counts[f] for f in files if f in test_counts}
         approx_total_tests = sum(test_counts.values())

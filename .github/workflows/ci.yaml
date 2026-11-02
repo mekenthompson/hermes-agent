@@ -89,6 +89,7 @@ jobs:
       js_matrix: ${{ inputs.release != true && steps.classify.outputs.js_matrix || '' }}
       python_files: ${{ inputs.release != true && steps.classify.outputs.python_files || '[]' }}
       python_matrix: ${{ inputs.release != true && steps.classify.outputs.python_matrix || '' }}
+      durations_key: ${{ steps.durations.outputs.cache-matched-key }}
       python: ${{ steps.gate-lanes.outputs.python }}
       python_prod: ${{ steps.gate-lanes.outputs.python_prod }}
       frontend: ${{ steps.gate-lanes.outputs.frontend }}
@@ -130,6 +131,22 @@ jobs:
       - name: Reject production imports of tools.lazy_deps
         if: github.repository == 'mekenthompson/hermes-agent'
         run: python3 scripts/ci/check_lazy_deps_imports.py
+      - name: Resolve the per-file duration cache for test slicing
+        # Lookup only (no download). The one key resolved here is passed to
+        # every Python test slice, which restores that exact immutable entry,
+        # so all slices see the same durations and balance by timed LPT.
+        # File-count slicing left the slowest slice ~2x the fastest
+        # (633s vs 326s, run 41389593152). No cache yet: empty key, slices
+        # keep the file-count partition.
+        id: durations
+        if: github.repository == 'mekenthompson/hermes-agent'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: test_durations.json
+          key: test-durations-never-exact
+          restore-keys: |
+            test-durations-
+          lookup-only: true
       - name: Detect affected areas
         id: classify
         uses: ./.github/actions/detect-changes
@@ -191,6 +208,7 @@ jobs:
     with:
       python_files: ${{ needs.detect.outputs.python_files }}
       python_matrix: ${{ needs.detect.outputs.python_matrix }}
+      durations_key: ${{ needs.detect.outputs.durations_key }}
       commit: ${{ inputs.commit }}
       upgrade: ${{ github.repository != 'mekenthompson/hermes-agent' && needs.detect.outputs.upgrade == 'true' }}
       upgrade_partition: ${{ github.repository == 'mekenthompson/hermes-agent' && inputs.release != true && 'runtime' || 'all' }}

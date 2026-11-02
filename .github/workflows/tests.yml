@@ -11,6 +11,13 @@ on:
         description: JSON shard matrix; omitted retains full-suite defaults.
         type: string
         default: ''
+      durations_key:
+        description: >-
+          Exact actions/cache key of the per-file duration cache, resolved once
+          by the caller. When set, every slice restores that one immutable entry
+          and balances by timed LPT; empty keeps the file-count partition.
+        type: string
+        default: ''
       commit:
         description: Commit to test and build. Empty keeps the triggering commit.
         type: string
@@ -76,7 +83,9 @@ jobs:
     # slower, 12.5-16 min (run 40064743667): the lane is CPU-bound, so add
     # runners, not workers. Setup is ~25s per slice. Slicing is LPT by file count
     # (test_durations.json is not committed), which is what keeps the
-    # partition identical across slices. Upstream retains its one 96-core job.
+    # partition identical across slices, unless the caller pins one exact
+    # duration cache key (durations_key), which every slice then shares.
+    # Upstream retains its one 96-core job.
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.python_matrix || (github.repository == 'mekenthompson/hermes-agent' && '{"slice":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],"slices":[16]}' || '{"slice":[1],"slices":[1]}')) }}
@@ -128,14 +137,18 @@ jobs:
         # and laundered into a FLAKY retry. The scaler reads
         # test_durations.json from the checkout; without this restore the
         # file is absent on a fresh runner and the scaler is inert.
-        # Exact key never matches (run_id differs); restore-keys picks the
-        # most recent cache saved by a main push. PRs read, only main writes.
+        # Without durations_key: the exact key never matches (run_id differs)
+        # and restore-keys picks the most recent cache saved by a main push.
+        # With durations_key (fork CI resolves it once in detect): every slice
+        # restores that same immutable entry, so the timed partition below is
+        # identical in every slice. A miss then fails the slice rather than
+        # letting slices partition differently. PRs read, only main writes.
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: test_durations.json
-          key: test-durations-never-exact
-          restore-keys: |
-            test-durations-
+          key: ${{ inputs.durations_key || 'test-durations-never-exact' }}
+          restore-keys: ${{ inputs.durations_key == '' && 'test-durations-' || '' }}
+          fail-on-cache-miss: ${{ inputs.durations_key != '' }}
 
       - name: Run tests
         # Per-file isolation via scripts/run_tests.sh: each test file runs
@@ -146,8 +159,10 @@ jobs:
         # Unknown impact keeps full discovery. Explicit plans use the same
         # isolated runner and its deterministic cache-independent partition.
         run: |
+          slice_mode=()
+          if [ -n "$DURATIONS_KEY" ]; then slice_mode=(--slice-by-durations); fi
           if [ "$PYTHON_FILES" = '[]' ]; then
-            scripts/run_tests.sh --slice ${{ matrix.slice }}/${{ matrix.slices }}
+            scripts/run_tests.sh --slice ${{ matrix.slice }}/${{ matrix.slices }} "${slice_mode[@]}"
           else
             python3 - <<'PY'
           import json, os, pathlib
@@ -161,10 +176,11 @@ jobs:
               assert path.resolve().is_relative_to(root) and path.is_file(), name
           pathlib.Path(os.environ['RUNNER_TEMP'], 'selected-tests.txt').write_text('\n'.join(files), encoding='utf-8')
           PY
-            scripts/run_tests.sh --files-from "$RUNNER_TEMP/selected-tests.txt" --slice ${{ matrix.slice }}/${{ matrix.slices }}
+            scripts/run_tests.sh --files-from "$RUNNER_TEMP/selected-tests.txt" --slice ${{ matrix.slice }}/${{ matrix.slices }} "${slice_mode[@]}"
           fi
         env:
           PYTHON_FILES: ${{ inputs.python_files }}
+          DURATIONS_KEY: ${{ inputs.durations_key }}
           # This is the maximum number of test FILES that run together.
           # run_tests_parallel.py starts one pytest subprocess for each file
           # from a single ThreadPoolExecutor, so this value IS the limit. The
