@@ -1,0 +1,101 @@
+name: Test durations merge
+
+# Fork-only. Folds every Python test slice's fresh per-file durations from a
+# completed CI run on main into ONE complete duration cache.
+#
+# Why: each slice saves its own cache (test-durations-<run>-<slice>) holding
+# the entries it restored plus fresh ones for its own files. The next run
+# restores just one of those, so only one slice's files were ever refreshed
+# and most entries went stale: the cache summed 22,115 file-seconds while
+# the same files measured ~30,000 (runs 41389593152, 41391363871). The
+# slices balance by these durations (ci.yaml detect -> tests.yml
+# durations_key), so stale entries mean unbalanced slices.
+#
+# This only writes a cache entry; it gates nothing and runs off the CI
+# critical path. If it fails or is skipped, the newest per-slice cache is
+# used instead and slicing still covers every file exactly once.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: test-durations-merge
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    name: Merge slice durations into one cache
+    if: >-
+      github.repository == 'mekenthompson/hermes-agent' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Count fresh slice durations in the CI run
+        id: locate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          count=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select((.name | startswith("test-durations-fresh-")) and .expired == false)] | length')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "$count slice duration artifacts in run $RUN_ID"
+
+      - name: Restore the newest duration cache as the base
+        if: steps.locate.outputs.count != '0'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: test_durations.json
+          key: test-durations-never-exact
+          restore-keys: |
+            test-durations-
+
+      - name: Download fresh slice durations
+        if: steps.locate.outputs.count != '0'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          pattern: test-durations-fresh-*
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/fresh
+
+      - name: Merge
+        if: steps.locate.outputs.count != '0'
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          out = pathlib.Path('test_durations.json')
+          merged = json.loads(out.read_text(encoding='utf-8')) if out.is_file() else {}
+          before = len(merged)
+          fresh_total = 0
+          for path in sorted(pathlib.Path(os.environ['RUNNER_TEMP'], 'fresh').rglob('fresh.json')):
+              fresh = json.loads(path.read_text(encoding='utf-8'))
+              assert isinstance(fresh, dict)
+              for key, value in fresh.items():
+                  assert isinstance(key, str) and isinstance(value, (int, float)), key
+                  merged[key] = value
+              fresh_total += len(fresh)
+          out.write_text(json.dumps(merged, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          print(f'base {before} entries, {fresh_total} fresh, merged {len(merged)} entries, '
+                f'{sum(merged.values()):.0f} file-seconds')
+          PY
+
+      - name: Save the merged duration cache
+        if: steps.locate.outputs.count != '0'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: test_durations.json
+          # Same prefix as the per-slice caches and created after them, so it is
+          # the newest match for ci.yaml detect's restore-keys lookup.
+          key: test-durations-${{ github.event.workflow_run.id }}-merged

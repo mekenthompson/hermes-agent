@@ -85,7 +85,7 @@ class ForkRunnerFallbackTests(unittest.TestCase):
 
         tests_lines = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8").splitlines()
         self.assertFalse(any("matrix." in line for line in tests_lines if line.startswith("    if:")))
-        self.assertIn("scripts/run_tests.sh --slice ${{ matrix.slice }}/${{ matrix.slices }}", [line.strip() for line in tests_lines])
+        self.assertIn('scripts/run_tests.sh --slice ${{ matrix.slice }}/${{ matrix.slices }} "${slice_mode[@]}"', [line.strip() for line in tests_lines])
         expected_workers = (
             f"          HERMES_TEST_WORKERS: ${{{{ {trust_guard} && "
             "'96' || '4' }}"

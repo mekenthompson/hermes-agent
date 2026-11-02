@@ -150,6 +150,12 @@ jobs:
           restore-keys: ${{ inputs.durations_key == '' && 'test-durations-' || '' }}
           fail-on-cache-miss: ${{ inputs.durations_key != '' }}
 
+      - name: Snapshot the restored durations (main only)
+        # Lets the step after the run publish only this slice's fresh entries.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'mekenthompson/hermes-agent'
+        run: |
+          if [ -f test_durations.json ]; then cp test_durations.json "$RUNNER_TEMP/durations-base.json"; else echo '{}' > "$RUNNER_TEMP/durations-base.json"; fi
+
       - name: Run tests
         # Per-file isolation via scripts/run_tests.sh: each test file runs
         # in its own freshly-spawned `python -m pytest <file>` subprocess
@@ -219,6 +225,34 @@ jobs:
           # Per-slice key: each slice's file keeps the restored entries for the other
           # slice's files and refreshes its own, so the cache stays complete.
           key: test-durations-${{ github.run_id }}-${{ matrix.slice }}
+
+      - name: Publish this slice's fresh durations (main only)
+        # Each slice cache above refreshes only that slice's files, and the next
+        # run restores just one of them, so most entries went stale (the cache
+        # summed 22,115 file-seconds against ~30,000 measured, runs 41389593152
+        # and 41391363871). test-durations-merge.yml folds every slice's fresh
+        # entries into one complete cache after CI on main completes.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'mekenthompson/hermes-agent' && hashFiles('test_durations.json') != ''
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          tmp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          base = json.loads((tmp / 'durations-base.json').read_text(encoding='utf-8'))
+          now = json.loads(pathlib.Path('test_durations.json').read_text(encoding='utf-8'))
+          fresh = {k: v for k, v in now.items() if base.get(k) != v}
+          (tmp / 'durations-fresh').mkdir(exist_ok=True)
+          (tmp / 'durations-fresh' / 'fresh.json').write_text(json.dumps(fresh, sort_keys=True), encoding='utf-8')
+          print(f'{len(fresh)} fresh duration entries from this slice')
+          PY
+
+      - name: Upload this slice's fresh durations (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'mekenthompson/hermes-agent' && hashFiles('test_durations.json') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: test-durations-fresh-${{ matrix.slice }}
+          path: ${{ runner.temp }}/durations-fresh/fresh.json
+          retention-days: 1
+          if-no-files-found: ignore
 
       - name: Check the checkout is clean
         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
