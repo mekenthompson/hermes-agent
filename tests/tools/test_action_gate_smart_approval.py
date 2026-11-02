@@ -68,6 +68,15 @@ def test_smart_approve_runs_computer_use_action_without_prompt(monkeypatch):
     assert prompts == []
 
 
+def test_guardian_sees_the_value_a_set_value_would_enter(monkeypatch):
+    _mode(monkeypatch, "smart")
+    seen = _record_guardian(monkeypatch, "approve")
+    _record_prompts(monkeypatch, "deny")
+
+    assert cua_tool._request_approval("set_value", {"action": "set_value", "value": "hunter2", "element": 7}) is None
+    assert seen == [("computer_use: set_value 'hunter2' on element #7", "cua:set_value:background")]
+
+
 def test_smart_escalate_still_asks_the_owner(monkeypatch):
     _mode(monkeypatch, "smart")
     seen = _record_guardian(monkeypatch, "escalate")

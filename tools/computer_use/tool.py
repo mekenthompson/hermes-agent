@@ -474,7 +474,10 @@ _ACTIONS: dict[str, _ActionSpec] = {
                   summarize=lambda a, args, fg: f"key {args.get('keys', '')!r}{fg}"),
     "set_value": _input(lambda backend, action, args, **_: (
         json.dumps({"error": "set_value requires `value`"}) if args.get("value") is None
-        else backend.set_value(value=str(args["value"]), element=args.get("element")))),
+        else backend.set_value(value=str(args["value"]), element=args.get("element"))),
+        summarize=lambda a, args, fg: (f"set_value {str(args.get('value', ''))[:60]!r}"
+                                       + ("..." if len(str(args.get("value", ""))) > 60 else "")
+                                       + (f" on element #{args['element']}" if args.get("element") is not None else ""))),
     "focus_app": _ActionSpec(lambda backend, action, args, **_: (
         json.dumps({"error": "focus_app requires `app`"}) if not args.get("app")
         else backend.focus_app(args["app"], raise_window=bool(args.get("raise_window")))), destructive=True,
