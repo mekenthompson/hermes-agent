@@ -49,6 +49,8 @@ TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "st
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
+# Handoff kinds whose staged files upload to the chat as native attachments.
+_ARTIFACT_KINDS = ("completed", "review_requested")
 
 
 def diagnostic_event(ev) -> bool:
@@ -697,14 +699,7 @@ class _KanbanNotification:
         """Send one text ping; raises on adapter exception or SendResult(success=False)."""
         from gateway.warning_notifications import present_notification
         sub, adapter = self.sub, self.adapter
-        delivery_metadata = sub.get("delivery_metadata")
-        metadata: dict[str, Any] = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
-        if sub.get("thread_id") and not metadata.get("thread_id"):
-            metadata["thread_id"] = sub["thread_id"]
-        if ev.kind == "checkpoint" and self.platform_str == "local":
-            metadata["kanban_checkpoint_event_id"] = ev.id
-            metadata["kanban_checkpoint_task_id"] = self.task_id
-            metadata["kanban_checkpoint_board"] = self.board_slug or "default"
+        metadata = self._delivery_metadata(ev)
         _send_res = None
         async def send_ping():
             nonlocal _send_res
@@ -724,20 +719,35 @@ class _KanbanNotification:
             raise _DeliveryHeld(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
         logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
                      ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
-        # Upload artifact paths from the handoff payload / legacy result as
-        # native files. Both handoff kinds stage files for exactly this: a
-        # review-bound card's files exist precisely so the human sees them at
-        # handoff time. Retry exposure matches ``completed`` (the sub cursor is
-        # rewound only when a send failed).
-        if ev.kind in ("completed", "review_requested"):
-            try:
-                await self.runner._deliver_kanban_artifacts(
-                    adapter=adapter, chat_id=sub["chat_id"], metadata=metadata,
-                    event_payload=getattr(ev, "payload", None), task=self.task,
-                )
-            except Exception as art_exc:
-                logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
+        if ev.kind in _ARTIFACT_KINDS:
+            await self._deliver_artifacts(ev, metadata)
         return True
+
+    def _delivery_metadata(self, ev: Any) -> dict[str, Any]:
+        """Routing metadata for one event's sends (thread anchor, local checkpoint ids)."""
+        sub = self.sub
+        delivery_metadata = sub.get("delivery_metadata")
+        metadata: dict[str, Any] = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
+        if sub.get("thread_id") and not metadata.get("thread_id"):
+            metadata["thread_id"] = sub["thread_id"]
+        if ev.kind == "checkpoint" and self.platform_str == "local":
+            metadata["kanban_checkpoint_event_id"] = ev.id
+            metadata["kanban_checkpoint_task_id"] = self.task_id
+            metadata["kanban_checkpoint_board"] = self.board_slug or "default"
+        return metadata
+
+    async def _deliver_artifacts(self, ev: Any, metadata: dict[str, Any]) -> None:
+        """Upload artifact paths from the handoff payload / legacy result as
+        native files. Both handoff kinds stage files for exactly this: a
+        review-bound card's files exist precisely so the human sees them at
+        handoff time. Upload errors are logged, never raised."""
+        try:
+            await self.runner._deliver_kanban_artifacts(
+                adapter=self.adapter, chat_id=self.sub["chat_id"], metadata=metadata,
+                event_payload=getattr(ev, "payload", None), task=self.task,
+            )
+        except Exception as art_exc:  # health: allow BLE001 -- moved: a failed upload must not block the completion delivery
+            logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
 
     async def _send_pings(self) -> bool:
         """Send every text ping; False when delivery is held or failed."""
@@ -764,7 +774,13 @@ class _KanbanNotification:
                 )
                 continue
             if not self.send_passive and ev.kind != "checkpoint":
-                # Wake-only: the wake path is the sole delivery and resolves the counter.
+                # Wake-only: the wake path is the sole text delivery and resolves the
+                # counter. A handoff's files are not text, so they still upload once.
+                if ev.kind in _ARTIFACT_KINDS and ev.id > self.sub.get("last_ping_event_id", 0):
+                    await self._deliver_artifacts(ev, self._delivery_metadata(ev))
+                    await _to_thread_process_service(partial(
+                        self.runner._kanban_sub_op, self.board_slug, "record_notify_ping",
+                        self.sub, event_id=ev.id))
                 continue
             if ev.id <= self.sub.get("last_ping_event_id", 0):
                 continue

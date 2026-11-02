@@ -256,6 +256,45 @@ def test_the_launcher_runs_its_idle_check_through_the_installs_stable_command(tm
     assert command == [str(root / ".hermes/bin/hermes"), "--run-module", "tools.bot_desktop.idle_watch"]
 
 
+def _sealed_payload(root):
+    """The Docker image's in-place payload: ``manifest.json`` on the tree (``repo: "."``), its launchers
+    under ``libexec/``, and a store Python recorded in ``tools/facts.json``. No ``.hermes/bin`` exists."""
+    import json
+
+    python = root / "tools/python-3/bin/python3"
+    python.parent.mkdir(parents=True)
+    python.write_text("")
+    (root / "tools/facts.json").write_text(json.dumps({"packages": {"python": {"entry": "python-3"}}}))
+    (root / "libexec").mkdir()
+    (root / "libexec/hermes").write_text("")
+    (root / "manifest.json").write_text(json.dumps({
+        "schema": 1, "target": "linux-x64", "repo": ".", "venv": ".venv", "store": "tools",
+        "runtime": {"repoDir": ".", "toolsDir": "tools", "storePython": ".venv/bin/python",
+                    "sitePackages": ".venv/lib/python3.14/site-packages",
+                    "commands": {"hermes": "libexec/hermes"}}}))
+    return python
+
+
+@pytest.mark.platforms("posix")
+def test_a_sealed_payload_never_gets_the_source_install_launcher_it_does_not_have(tmp_path, monkeypatch):
+    """The Docker image has a store Python but no ``<root>/.hermes/bin/hermes`` (its launchers are the
+    payload's ``libexec/``). Naming that missing launcher made every idle check exit 127 ("No such file or
+    directory" in launcher.log), so the Bot Screen never stopped itself when idle. A payload's command is the
+    store-Python bootstrap, which resolves the payload's own environment at every run."""
+    from hermes_cli import _launchers
+
+    monkeypatch.delenv("HERMES_RUNTIME_DIR", raising=False)
+    root = tmp_path / "opt-hermes"
+    python = _sealed_payload(root)
+
+    command = _launchers.installation_command(root, module="tools.bot_desktop.idle_watch")
+    assert command == _launchers.runtime_command(root, module="tools.bot_desktop.idle_watch")
+    assert command[0] == str(python.resolve())
+    assert not any(".hermes" in part for part in command)
+    assert _launchers.installation_command(root, ["gateway", "run"]) == _launchers.runtime_command(
+        root, ["gateway", "run"])
+
+
 @pytest.mark.platforms("posix")
 def test_a_stale_idle_check_never_writes_into_the_replacement_screens_log(tmp_path, monkeypatch):
     """The old screen's idle check runs in a session of its own and can outlive its screen (it waited on

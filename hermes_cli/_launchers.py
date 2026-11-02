@@ -21,7 +21,7 @@ from pathlib import Path
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pm.environments import owning_home_root, store_root
+from pm.environments import owning_home_root, payload_command_dir, store_root
 
 # ``sys`` attribute a launcher sets before ``import hermes_bootstrap``: pin HERMES_HOME to the
 # install's default root once the launch-time repair ran (``hermes_bootstrap._pin_launcher_home``).
@@ -93,7 +93,9 @@ def installation_command(repo_root: Path, args=(), *, module: str = "hermes_cli.
     the managed Python pin changes.
     """
     root = Path(repo_root)
-    if resolve_store_python(root) is None:
+    # A sealed payload (the Docker image, desktop bundles) ships its own launchers (``libexec/``) and never
+    # publishes ``.hermes/bin/hermes``; naming it there fails with exit 127 on every run.
+    if resolve_store_python(root) is None or payload_command_dir(root) is not None:
         return runtime_command(root, args, module=module, python=python, home=home)
     prefix = [] if module == "hermes_cli.main" else ["--run-module", module]
     return [str(root / ".hermes" / "bin" / "hermes"), *prefix, *args]
