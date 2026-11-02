@@ -5,6 +5,7 @@ import logging
 from typing import TYPE_CHECKING
 import asyncio
 import dataclasses
+import functools
 import inspect
 import json
 import os
@@ -621,14 +622,18 @@ class GatewayTurnPersistenceMixin:
             response = ""
 
         adapter = self._delivery_adapter_for(source)
-        # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.
+        # Auto voice reply (audio follows the text) unless streaming TTS already delivered audio.
         _streaming_tts_done = adapter is not None and bool(
             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
         )
         if not _streaming_tts_done and self._should_send_voice_reply(
             event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
-            await self._send_voice_reply(event, response)
+            if agent_result.get("already_sent"):
+                await self._send_voice_reply(event, response)  # streaming already delivered the text
+            else:
+                # The adapter sends the returned text; it then awaits this so TTS never delays it.
+                event._post_text_voice_reply = functools.partial(self._send_voice_reply, event, response)
 
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
