@@ -29,6 +29,7 @@ from pathlib import Path
 import psutil
 import pytest
 
+from gateway.drain_control import current_instantiation_epoch
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
@@ -44,7 +45,9 @@ from hermes_cli.kanban_owner_recovery import (
 
 NOW = int(time.time())
 HOST = kb._claimer_id().split(":", 1)[0]
-FINGERPRINT = "6a232414-2dbf-40ab-a534-d9b71db05658:116|4162240"
+# A worker of THIS instantiation: these cards lose their worker while its instance keeps running.
+# Another instantiation's fingerprint reads as the whole instance restarting (``owner_instance_replaced``).
+FINGERPRINT = f"{current_instantiation_epoch() or '6a232414-2dbf-40ab-a534-d9b71db05658:116'}|4162240"
 
 
 def _absent_pid(base: int = 3_500_000) -> int:
@@ -437,3 +440,74 @@ def test_an_interrupt_while_the_owner_stays_up_is_still_counted(board):
     assert state["status"] == "ready"
     assert state["consecutive_failures"] == 1
     assert "gateway stop or restart" not in state["last_failure_error"]
+
+
+# --- a restart of the whole instance is not the card failing either ------------------------
+# HF-617 (2026-11-02): ``docker compose restart`` killed the managed interpreter before the gateway
+# could Stop it (the owner recorded ``worker_lost``, its admission ``unknown``) and then the gateway
+# itself. Neither #200's planned-stop shape nor a settled result was left, so the restart was charged
+# to the card and its respawn's refusal used up the rest of the budget: ``gave_up``.
+
+OLD_INSTANCE = "00000000-0000-4000-8000-000000000000:1|4162240"  # a worker of an earlier instantiation
+
+
+def _lost_in(board, tid, fingerprint, *, admission=("unknown", None), failures=0):
+    """A dead managed attempt whose owner saw its worker die (``worker_lost``) and then died too."""
+    board.conn.execute("DELETE FROM tasks WHERE id=?", (tid,))
+    worker = _absent_pid(base=3_710_000 + sum(map(ord, tid)) * 10)
+    run = board.dead_attempt(tid, worker_pid=worker, worker_fingerprint=fingerprint, worker_bound=True,
+                             admission=admission, dead_hours=0, expires_age_seconds=-3600)
+    board.conn.execute("UPDATE tasks SET consecutive_failures=? WHERE id=?", (failures, tid))
+    board.event(tid, run, "worker_lost", {"reason": "EOFError", "claim_lock": board.state(tid)["claim_lock"],
+                                          "run_id": run, "pid": worker, "bound": True}, NOW)
+    board.conn.commit()
+
+
+@pytest.mark.parametrize("admission", [("unknown", None), ("terminal", "interrupted")],
+                         ids=["before-successor-settles", "successor-settled"])
+def test_a_worker_lost_to_a_restart_of_its_instance_requeues_without_counting(board, admission):
+    for attempt in range(kbd.DEFAULT_FAILURE_LIMIT + 1):  # DEFAULT_FAILURE_LIMIT restarts used to park it
+        _lost_in(board, "t_restarted", OLD_INSTANCE, admission=admission,
+                 failures=board.state("t_restarted")["consecutive_failures"] if attempt else 0)
+        assert kbd.detect_crashed_workers(board.conn) == ["t_restarted"]
+        state = board.state("t_restarted")
+        assert state["status"] == "ready" and state["consecutive_failures"] == 0
+        assert "gateway stop or restart" in state["last_failure_error"]
+    assert "gave_up" not in [e["kind"] for e in board.events("t_restarted")]
+
+
+def test_a_card_that_keeps_taking_its_instance_down_still_gives_up(board):
+    """Uncounted restarts are bounded: past RESTART_REQUEUE_LIMIT in a row each one is charged."""
+    limit = kanban_owner_recovery.RESTART_REQUEUE_LIMIT
+    for attempt in range(limit + kbd.DEFAULT_FAILURE_LIMIT):
+        state = board.state("t_oom") if attempt else {"consecutive_failures": 0}
+        _lost_in(board, "t_oom", OLD_INSTANCE, failures=state["consecutive_failures"])
+        kbd.detect_crashed_workers(board.conn)
+        state = board.state("t_oom")
+        assert state["consecutive_failures"] == max(0, attempt + 1 - limit), attempt
+    assert state["status"] == "blocked"
+    assert "times in a row" in state["last_failure_error"]
+    assert "gave_up" in [e["kind"] for e in board.events("t_oom")]
+
+
+def test_a_worker_lost_while_its_instance_keeps_running_still_gives_up(board):
+    """Same evidence, but the worker was of THIS instantiation: a real crash, charged every time."""
+    _lost_in(board, "t_crashing", FINGERPRINT)
+    kbd.detect_crashed_workers(board.conn)
+    assert board.state("t_crashing")["consecutive_failures"] == 1
+    _lost_in(board, "t_crashing", FINGERPRINT, failures=1)
+    kbd.detect_crashed_workers(board.conn)
+    assert board.state("t_crashing")["status"] == "blocked"
+    assert "gave_up" in [e["kind"] for e in board.events("t_crashing")]
+
+
+@pytest.mark.parametrize("shape", ["live-owner", "unreadable-fingerprint", "settled-failed"])
+def test_restart_evidence_that_is_not_proof_is_still_counted(board, shape):
+    me = psutil.Process(os.getpid())
+    owner = dict(owner_pid=os.getpid(), owner_birth=worker_birth(me)) if shape == "live-owner" else {}
+    fingerprint = "unreadable" if shape == "unreadable-fingerprint" else OLD_INSTANCE
+    admission = ("terminal", "failed") if shape == "settled-failed" else ("unknown", None)
+    worker = _absent_pid(base=3_720_000)
+    board.dead_attempt("t_unproven", worker_pid=worker, worker_fingerprint=fingerprint, worker_bound=True,
+                       admission=admission, dead_hours=0, expires_age_seconds=-3600, **owner)
+    assert not kanban_owner_recovery.owner_instance_replaced(board.conn, "t_unproven")

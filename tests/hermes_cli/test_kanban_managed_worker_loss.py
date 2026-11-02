@@ -22,6 +22,7 @@ from pathlib import Path
 import psutil
 import pytest
 
+from gateway.drain_control import current_instantiation_epoch
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
@@ -29,7 +30,9 @@ from hermes_cli import kanban_owner_recovery
 
 NOW = int(time.time())
 HOST = kb._claimer_id().split(":", 1)[0]
-FINGERPRINT = "6a232414-2dbf-40ab-a534-d9b71db05658:116|4162240"
+# A worker of THIS instantiation: these cards lose their worker while its instance keeps running.
+# Another instantiation's fingerprint reads as the whole instance restarting (``owner_instance_replaced``).
+FINGERPRINT = f"{current_instantiation_epoch() or '6a232414-2dbf-40ab-a534-d9b71db05658:116'}|4162240"
 CLAIM_LAPSED = -1800  # claim_expires_in for a claim that expired half an hour ago
 
 

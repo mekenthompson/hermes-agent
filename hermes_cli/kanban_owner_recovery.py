@@ -203,6 +203,84 @@ def owner_stopped_mid_attempt(conn, task_id, dead) -> bool:
     return _admission_row(receipt) == ('terminal', 'interrupted') and _owner_process_gone(receipt)
 
 
+def attempt_instance_replaced(conn, task_id, run_id, session_id=None) -> bool:
+    """True when an owner attempt ran in an earlier instantiation of this host and nothing it
+    recorded can still be running.
+
+    ``current_instantiation_epoch`` (``boot_id`` + PID 1's start) changes on every reboot and
+    container restart, and a PID namespace ends with its PID 1, so a worker fingerprinted in
+    another instantiation is not executing in this one. All must hold: the run's
+    ``owner_admitted`` receipt (for ``session_id`` when given) names an owner process that is
+    gone, the run recorded at least one worker, and every recorded worker (``spawned``,
+    ``worker_registered``, ``worker_bound``) carries a readable, different instantiation. A
+    worker of this instantiation, or any unreadable value, is never proof. This assumes one live
+    instance per board and owner ledger (each container its own home), as ``_worker_alive``
+    already does: a home shared by two live containers with separate PID namespaces is outside it.
+    """
+    from gateway.drain_control import current_instantiation_epoch
+    current = current_instantiation_epoch()
+    if not current:
+        return False
+    receipts, workers = [], []
+    for kind, payload in conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? AND run_id=? AND kind IN "
+            "('owner_admitted','spawned','worker_registered','worker_bound')", (task_id, run_id)).fetchall():
+        try:
+            value = json.loads(payload)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(value, dict):
+            return False
+        (receipts if kind == 'owner_admitted' else workers).append(value)
+    if not receipts or not workers or any(
+            session_id is not None and receipt.get('session_id') != session_id for receipt in receipts):
+        return False
+    for worker in workers:
+        pid, fingerprint = worker.get('pid'), worker.get('started_at')
+        if type(pid) is not int or pid <= 0 or not isinstance(fingerprint, str) or fingerprint.count('|') != 1:
+            return False
+        recorded = fingerprint.partition('|')[0]
+        if not recorded or recorded == current:
+            return False
+    return all(_owner_process_gone(receipt) for receipt in receipts)
+
+
+# Restarts of the whole instance in a row that are requeued without charging the card. A card that
+# takes its own instance down (memory, a restart it runs) must still reach the failure limit.
+RESTART_REQUEUE_LIMIT = 3
+
+
+def _restart_streak(conn, task_id) -> int:
+    """How many of the task's latest ended runs in a row its instance's restart ended."""
+    streak = 0
+    for (metadata,) in conn.execute("SELECT metadata FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
+                                    "ORDER BY id DESC", (task_id,)).fetchall():
+        try:
+            booked = json.loads(metadata or '{}')
+        except (TypeError, ValueError):
+            break
+        if not isinstance(booked, dict) or not booked.get('instance_replaced'):
+            break
+        streak += 1
+    return streak
+
+
+def owner_instance_replaced(conn, task_id) -> bool:
+    """True when a restart of the whole instance, not the card, ended the current run's attempt.
+
+    The restart can kill the interpreter before its owner stops it (``worker_lost``) and kill the
+    owner before it settles the admission, so neither #200's planned-stop shape nor a settled
+    result is left behind. The owner's admission is still ``unknown`` or its successor settled it
+    ``interrupted``, and ``attempt_instance_replaced`` proves the old instantiation is gone. A
+    worker that crashes while its instance keeps running never matches, so it is still counted.
+    """
+    receipt = _owner_receipt(conn, task_id)
+    if not receipt or _admission_row(receipt) not in {('unknown', None), ('terminal', 'interrupted')}:
+        return False
+    run = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+    return run is not None and attempt_instance_replaced(conn, task_id, run[0])
+
+
 def owner_attempt_note(conn, task_id, lost=None) -> str:
     """One clause naming why the owner says the attempt ended, or ``""``.
 
@@ -241,10 +319,17 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     """
     lost = _latest_run_event(conn, task_id, "worker_lost")
     note = owner_attempt_note(conn, task_id, lost)
-    if not note:
+    replaced = owner_instance_replaced(conn, task_id)
+    if not note and not replaced:
         return
+    note = note or "owner instance restarted"
+    if replaced:
+        dead.event_payload["instance_replaced"] = True
+        if _restart_streak(conn, task_id) >= RESTART_REQUEUE_LIMIT:
+            replaced = False  # counted from here on: the card may be what keeps taking it down
+            note += f"; its instance restarted {RESTART_REQUEUE_LIMIT}+ times in a row, counted as a failure"
     dead.event_payload["attempt_note"] = note
-    if owner_stopped_mid_attempt(conn, task_id, dead):
+    if replaced or owner_stopped_mid_attempt(conn, task_id, dead):
         # The sweep requeues it without charging the breaker (``owner_stopped``).
         dead.event_payload["owner_stopped"] = True
         note += "; interrupted by a gateway stop or restart, requeued without counting a failure"
