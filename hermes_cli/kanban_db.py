@@ -1970,10 +1970,12 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     (unified-budget) ``gave_up`` carries no marker and is judged by the counter,
     so raising ``failure_limit`` or ``assign_task`` to a fresh profile still
     releases it; a task with no such event at all (direct DB edit) auto-recovers.
+    A newer ``promoted`` (the dispatcher releasing its own ``active_pr`` park)
+    means that ``blocked`` was already left behind.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'promoted') "
         "ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
     if row and row["kind"] == "blocked":
