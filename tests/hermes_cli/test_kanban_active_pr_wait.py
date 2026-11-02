@@ -9,7 +9,9 @@ cannot be unblocked at all, so nobody could tell it to go.
 Now: the first refusal parks the card as blocked (``needs_input``) with one
 plain reason, "waiting for PR #N to merge". An explicit unblock lets exactly
 one run through; after that run the guard holds again, so the duplicate-PR
-protection still stands.
+protection still stands. The park releases itself exactly when the guard
+would have let a ready card go: the PR comment ages out of the 24h window, or
+the card is handed to another profile.
 """
 
 from __future__ import annotations
@@ -226,3 +228,100 @@ def test_park_leaves_the_block_loop_counter_as_it_was(kanban_home):
         kb.claim_task(conn, tid)
         assert kb.block_task(conn, tid, reason="need creds", kind="needs_input")
         assert _status(conn, tid)["status"] == "triage"
+
+
+def _age_pr_comment(conn, tid, seconds):
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_comments SET created_at = created_at - ? WHERE task_id = ?", (seconds, tid))
+
+
+def _spawned_as():
+    calls: list[tuple[str, str]] = []
+
+    def spawn(task, workspace, board=None):
+        calls.append((task.id, task.assignee))
+
+    return calls, spawn
+
+
+def test_park_releases_itself_when_the_pr_window_runs_out(kanban_home):
+    """Before the park existed, the guard stopped refusing once the PR comment
+    was older than the 24h window and the card ran by itself (the worker saw
+    the merged PR and finished). The park must keep that self-recovery."""
+    calls, spawn = _spawned()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="already PRed", assignee="dev")
+        kb.add_comment(conn, tid, author="dev", body=PR_COMMENT)
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert _status(conn, tid)["status"] == "blocked"
+
+        _age_pr_comment(conn, tid, kbd._RESPAWN_GUARD_PR_WINDOW + 3600)
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert calls == [tid]
+        assert _status(conn, tid)["status"] == "running"
+        assert _events(conn, tid, "promoted") == [{"source": "respawn_guard"}]
+        # The release is not an explicit unblock: it grants no one-run consent.
+        assert _events(conn, tid, "unblocked") == []
+
+
+def test_handing_a_parked_card_to_another_profile_runs_it(kanban_home):
+    """An operator reassign after the PR comment is a deliberate handoff (a
+    closer finishing that PR, #111910). It must work from the parked state."""
+    calls, spawn = _spawned_as()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="already PRed", assignee="dev")
+        kb.add_comment(conn, tid, author="dev", body=PR_COMMENT)
+        _age_pr_comment(conn, tid, 10)  # the handoff lands strictly after it
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert _status(conn, tid)["status"] == "blocked"
+
+        assert kb.assign_task(conn, tid, "closer")
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert calls == [(tid, "closer")]
+        assert _status(conn, tid)["status"] == "running"
+
+
+def test_parked_card_stays_parked_while_the_guard_holds(kanban_home):
+    """No expiry, no handoff: a same-profile re-assign does not release it."""
+    calls, spawn = _spawned()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="already PRed", assignee="dev")
+        kb.add_comment(conn, tid, author="dev", body=PR_COMMENT)
+        _age_pr_comment(conn, tid, 10)
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert kb.assign_task(conn, tid, "dev")
+        for _ in range(3):
+            kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert calls == []
+        assert _status(conn, tid)["status"] == "blocked"
+        assert _events(conn, tid, "promoted") == []
+
+
+def test_a_human_stop_on_a_parked_card_is_not_released_automatically(kanban_home):
+    """Only the dispatcher's own park self-releases; a human block wins."""
+    calls, spawn = _spawned()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="already PRed", assignee="dev")
+        kb.add_comment(conn, tid, author="dev", body=PR_COMMENT)
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        last = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0]
+        assert kb.block_task(conn, tid, reason="hold this one", kind="needs_input", expected_event_id=last)
+
+        _age_pr_comment(conn, tid, kbd._RESPAWN_GUARD_PR_WINDOW + 3600)
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert calls == []
+        assert _status(conn, tid)["status"] == "blocked"
+
+
+def test_a_released_park_does_not_make_a_later_block_sticky(kanban_home):
+    """After the release, the park's ``blocked`` event must not keep a later
+    non-sticky block (e.g. a breaker trip) from auto-recovering."""
+    _calls, spawn = _spawned()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="already PRed", assignee="dev")
+        kb.add_comment(conn, tid, author="dev", body=PR_COMMENT)
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert kb._has_sticky_block(conn, tid)
+        _age_pr_comment(conn, tid, kbd._RESPAWN_GUARD_PR_WINDOW + 3600)
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert not kb._has_sticky_block(conn, tid)

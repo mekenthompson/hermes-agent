@@ -2222,6 +2222,7 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    result.promoted += _guard_wait.release_parked(conn)
 
 
 def _tick_spawn_budget(

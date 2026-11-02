@@ -45,6 +45,7 @@ def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
     expected_event_id: Optional[int] = None, count_recurrence: bool = True,
+    source: Optional[str] = None,
 ) -> bool:
     """Commit the guarded block, then request native Stop for its owned work.
 
@@ -53,11 +54,12 @@ def block_task(
 
     ``count_recurrence=False`` is for a block nobody asked for (the dispatcher
     parking a card): it neither counts toward nor erases the block-loop history.
+    ``source`` marks the ``blocked`` event so its owner can find the block again.
     """
     stops = []
     changed = _block_task(conn, task_id, reason=reason, kind=kind, expected_run_id=expected_run_id,
                           expected_event_id=expected_event_id, stops=stops,
-                          count_recurrence=count_recurrence)
+                          count_recurrence=count_recurrence, source=source)
     if changed and stops:
         from hermes_cli.kanban_process_stop import request_native_stop
         request_native_stop(conn, task_id, stops[-1])
@@ -66,7 +68,7 @@ def block_task(
 
 def _block_task(
     conn: sqlite3.Connection, task_id: str, *, reason, kind, expected_run_id, expected_event_id, stops,
-    count_recurrence: bool = True,
+    count_recurrence: bool = True, source: Optional[str] = None,
 ) -> bool:
     """Block active work; an explicit ``needs_input`` also stops queued work.
 
@@ -116,6 +118,8 @@ def _block_task(
             prev_recurrences=int(kb._row_get(cur_row, "block_recurrences") or 0),
             count=count_recurrence,
         )
+        if source:
+            payload["source"] = source
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason
