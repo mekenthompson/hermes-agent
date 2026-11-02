@@ -392,6 +392,22 @@ def test_a_second_restart_mid_retry_still_does_not_give_up(board):
     assert board.state("t_twice")["consecutive_failures"] == 0
 
 
+@pytest.mark.parametrize("exit_code,flagged", [(130, False), (1, True)], ids=["planned-stop", "worker-crash"])
+def test_repeated_crash_diagnostic_skips_planned_stops(board, exit_code, flagged):
+    """Two rollouts in a row must not light up the board's repeated-crash alarm either."""
+    for _ in range(2):
+        board.conn.execute("DELETE FROM tasks WHERE id='t_rolled'")
+        board.conn.commit()
+        _interrupted_by_stop(board, "t_rolled", exit_code=exit_code)
+        kbd.detect_crashed_workers(board.conn)
+    runs = kb.list_runs(board.conn, "t_rolled")
+    assert [r.outcome for r in runs] == ["crashed", "crashed"]
+    diagnostics = kd.compute_task_diagnostics(
+        board.state("t_rolled"), board.events("t_rolled"), runs, now=NOW,
+        config={"crash_threshold": 2, "failure_threshold": 99})
+    assert ("repeated_crashes" in {d.kind for d in diagnostics}) is flagged
+
+
 @pytest.mark.parametrize("admission", [
     ("terminal", "failed"),
     # A killed owner: its interpreters die without an interrupted result and the successor
