@@ -14,6 +14,9 @@ MANIFEST = ROOT / "scripts/emit-image-manifest.py"
 COMPACT_SBOM = ROOT / "scripts/compact-spdx-sbom.py"
 REMOTE_CONFIG = ROOT / "scripts/verify-remote-image-config.py"
 PUSH_DIGEST = ROOT / "scripts/extract-image-push-digest.py"
+EVIDENCE_ACTION = ROOT / ".github/actions/image-evidence/action.yml"
+EVIDENCE_SCRIPT = ROOT / ".github/actions/image-evidence/run.sh"
+EVIDENCE_USES = "./.github/actions/image-evidence"
 SHA = "1" * 40
 DIGEST = "sha256:" + "2" * 64
 REPOSITORY = "ghcr.io/mekenthompson/hermes-agent"
@@ -125,7 +128,7 @@ class ForkImageWorkflowTests(unittest.TestCase):
         login = next(i for i, step in enumerate(steps) if str(step.get("uses", "")).startswith("docker/login-action@"))
         push = next(i for i, step in enumerate(steps) if "docker push" in step.get("run", ""))
         build = next(i for i, step in enumerate(steps) if str(step.get("uses", "")).startswith("docker/build-push-action@"))
-        scan = next(i for i, step in enumerate(steps) if str(step.get("uses", "")).startswith("aquasecurity/trivy-action@"))
+        scan = next(i for i, step in enumerate(steps) if step.get("uses") == EVIDENCE_USES)
         self.assertLess(build, gate, names)
         self.assertLess(scan, gate, names)
         self.assertLess(gate, login, names)
@@ -176,10 +179,13 @@ class ForkImageWorkflowTests(unittest.TestCase):
         self.assertIn("push: false", text)
         self.assertIn("HERMES_GIT_SHA=${{ github.sha }}", text)
         self.assertIn("/etc/hermes/image-provenance.json", text)
-        self.assertIn("anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26", text)
-        self.assertIn("aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25", text)
-        self.assertIn("severity: CRITICAL", text)
-        self.assertIn("exit-code: 1", text)
+        self.assertEqual(text.count(f"uses: {EVIDENCE_USES}\n"), 2)
+        action = EVIDENCE_ACTION.read_text(encoding="utf-8")
+        self.assertIn("anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26", action)
+        self.assertIn("aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514", action)
+        script = EVIDENCE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("--severity CRITICAL", script)
+        self.assertIn("--exit-code 1", script)
 
     def test_node_source_pin_uses_sha_verified_pm_artifacts(self) -> None:
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
@@ -306,11 +312,12 @@ candidate-123-1: digest: sha256:222222222222222222222222222222222222222222222222
         self.assertIn("scripts/emit-image-manifest.py", text)
 
     def test_every_external_action_is_sha_pinned(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        for action in re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", text):
-            if action.startswith("./"):
-                continue
-            self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$", action)
+        for path in (WORKFLOW, EVIDENCE_ACTION):
+            text = path.read_text(encoding="utf-8")
+            for action in re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", text):
+                if action.startswith("./"):
+                    continue
+                self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$", f"{path.name}: {action}")
 
     def test_documentation_states_release_boundary_and_handoff(self) -> None:
         text = DOC.read_text(encoding="utf-8").lower()
@@ -559,6 +566,196 @@ candidate-123-1: digest: sha256:222222222222222222222222222222222222222222222222
             check=False,
         )
         self.assertNotEqual(result.returncode, 0)
+
+
+class ImageEvidenceStepTests(unittest.TestCase):
+    """SBOM and critical scan run together but remain two fail-closed gates."""
+
+    def _steps(self, job: str) -> list[dict]:
+        import yaml
+
+        return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"][job]["steps"]
+
+    def test_both_jobs_sbom_and_scan_the_built_image_before_any_consumer(self) -> None:
+        for job in ("preflight", "publish"):
+            with self.subTest(job=job):
+                steps = self._steps(job)
+                names = [step.get("name", "") for step in steps]
+                build = next(i for i, s in enumerate(steps)
+                             if str(s.get("uses", "")).startswith("docker/build-push-action@"))
+                evidence = [i for i, s in enumerate(steps) if s.get("uses") == EVIDENCE_USES]
+                self.assertEqual(len(evidence), 1, names)
+                evidence = evidence[0]
+                step = steps[evidence]
+                self.assertNotIn("if", step)
+                self.assertNotIn("continue-on-error", step)
+                # Same image the build loaded and the runtime checks verified.
+                self.assertEqual(steps[build]["with"]["tags"], "${{ env.TEST_IMAGE }}")
+                self.assertEqual(step["with"], {
+                    "image": "${{ env.TEST_IMAGE }}",
+                    "sbom-output": "agent-image.spdx.json",
+                    "scan-output": "trivy-image.json",
+                })
+                self.assertLess(build, evidence, names)
+                for i, s in enumerate(steps):
+                    if '"$TEST_IMAGE"' in s.get("run", "") and "docker run" in s.get("run", ""):
+                        self.assertLess(i, evidence, names)
+                compact = next(i for i, s in enumerate(steps)
+                               if "scripts/compact-spdx-sbom.py" in s.get("run", ""))
+                self.assertLess(evidence, compact, names)
+                self.assertFalse(any("anchore/" in str(s.get("uses", "")) or "aquasecurity/" in str(s.get("uses", ""))
+                                     for s in steps), names)
+
+    def test_publication_starts_only_after_sbom_and_scan(self) -> None:
+        steps = self._steps("publish")
+        names = [step.get("name", "") for step in steps]
+        evidence = next(i for i, s in enumerate(steps) if s.get("uses") == EVIDENCE_USES)
+        for i, s in enumerate(steps):
+            uses = str(s.get("uses", ""))
+            run = s.get("run", "")
+            if (uses.startswith(("docker/login-action@", "actions/attest-"))
+                    or "docker push" in run or "scripts/verify-exact-main-ci.py" in run):
+                self.assertGreater(i, evidence, names[i])
+                self.assertNotIn("if", s, names[i])
+
+    def test_action_reuses_the_replaced_actions_tools_and_cache(self) -> None:
+        import yaml
+
+        action = yaml.safe_load(EVIDENCE_ACTION.read_text(encoding="utf-8"))
+        steps = action["runs"]["steps"]
+        by_uses = {str(s.get("uses", "")).split("@")[0]: s for s in steps if s.get("uses")}
+        self.assertEqual(by_uses["aquasecurity/setup-trivy"]["with"]["version"], "v0.70.0")
+        cache = by_uses["actions/cache"]["with"]
+        self.assertEqual(cache["path"], "${{ github.workspace }}/.cache/trivy")
+        self.assertEqual(cache["key"], "cache-trivy-${{ steps.date.outputs.date }}")
+        run = steps[-1]
+        self.assertEqual(run["env"]["TRIVY_CACHE_DIR"], "${{ github.workspace }}/.cache/trivy")
+        self.assertEqual(run["env"]["SYFT_CMD"], "${{ steps.syft.outputs.cmd }}")
+        self.assertIn("run.sh", run["run"])
+        script = EVIDENCE_SCRIPT.read_text(encoding="utf-8")
+        for flag in ("-o spdx-json", "--format json", "--scanners vuln", "--severity CRITICAL",
+                     "--ignore-unfixed", "--exit-code 1"):
+            self.assertIn(flag, script)
+        self.assertIn("SYFT_CHECK_FOR_APP_UPDATE=false", script)
+        self.assertIn('wait "$sbom_pid" || sbom_status=$?', script)
+        self.assertIn('wait "$scan_pid" || scan_status=$?', script)
+
+    # --- behaviour, with stub docker/syft/trivy on PATH -------------------
+
+    STUBS = {
+        "docker": """#!/usr/bin/env bash
+case "$*" in
+  *"{{.Id}}"*) cat "$STUB_STATE/image_id" ;;
+  *"{{.Size}}"*) echo "${STUB_IMAGE_SIZE:-1000}" ;;
+  *) echo "unexpected docker $*" >&2; exit 99 ;;
+esac
+""",
+        "syft": """#!/usr/bin/env bash
+[ "$1 $2" = "scan $IMAGE" ] && [ "$3 $4" = "-o spdx-json" ] || { echo "bad syft args $*" >&2; exit 98; }
+touch "$STUB_STATE/syft.started"
+for _ in $(seq 1 "${STUB_WAIT_TICKS:-50}"); do
+  [ -e "$STUB_STATE/trivy.started" ] && { echo overlap > "$STUB_STATE/syft.saw"; break; }
+  sleep 0.1
+done
+[ -n "${STUB_RETAG:-}" ] && echo sha256:other > "$STUB_STATE/image_id"
+echo "syft log line" >&2
+[ -n "${STUB_SYFT_FAIL:-}" ] && { echo "syft exploded" >&2; echo partial; exit 3; }
+echo '{"spdxVersion": "SPDX-2.3"}'
+""",
+        "trivy": """#!/usr/bin/env bash
+touch "$STUB_STATE/trivy.started"
+for _ in $(seq 1 "${STUB_WAIT_TICKS:-50}"); do
+  [ -e "$STUB_STATE/syft.started" ] && { echo overlap > "$STUB_STATE/trivy.saw"; break; }
+  sleep 0.1
+done
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in --output) out=$2; shift ;; esac
+  shift
+done
+echo '{"Results": []}' > "$out"
+echo "trivy log line"
+[ -n "${STUB_TRIVY_FAIL:-}" ] && { echo "CRITICAL found" ; exit 1; }
+exit 0
+""",
+    }
+
+    def _run(self, **env_overrides: str):
+        import os
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        bin_dir, state, work = root / "bin", root / "state", root / "work"
+        for d in (bin_dir, state, work):
+            d.mkdir()
+        for name, body in self.STUBS.items():
+            (bin_dir / name).write_text(body, encoding="utf-8")
+            (bin_dir / name).chmod(0o755)
+        (state / "image_id").write_text("sha256:" + "a" * 64 + "\n", encoding="utf-8")
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "HOME": str(root),
+            "RUNNER_TEMP": str(root),
+            "IMAGE": "ghcr.io/example/image:sha-test",
+            "SBOM_OUTPUT": str(work / "agent-image.spdx.json"),
+            "SCAN_OUTPUT": str(work / "trivy-image.json"),
+            "SYFT_CMD": str(bin_dir / "syft"),
+            "TRIVY_CACHE_DIR": str(root / "cache"),
+            "STUB_STATE": str(state),
+        }
+        env.update(env_overrides)
+        result = subprocess.run(["bash", str(EVIDENCE_SCRIPT)], cwd=work, env=env,
+                                capture_output=True, text=True, timeout=60, check=False)
+        return result, state, work
+
+    def test_runs_both_tools_concurrently_and_writes_unchanged_outputs(self) -> None:
+        result, state, work = self._run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((state / "syft.saw").exists(), "syft never overlapped trivy")
+        self.assertTrue((state / "trivy.saw").exists(), "trivy never overlapped syft")
+        self.assertEqual(json.loads((work / "agent-image.spdx.json").read_text())["spdxVersion"], "SPDX-2.3")
+        self.assertTrue((work / "trivy-image.json").is_file())
+        self.assertIn("syft log line", result.stdout)
+        self.assertIn("trivy log line", result.stdout)
+
+    def test_sbom_failure_fails_closed_with_logs_and_no_partial_sbom(self) -> None:
+        result, _, work = self._run(STUB_SYFT_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SBOM generation failed with exit 3", result.stdout)
+        self.assertIn("syft exploded", result.stdout + result.stderr)
+        self.assertFalse((work / "agent-image.spdx.json").exists())
+        self.assertTrue((work / "trivy-image.json").is_file())
+
+    def test_scan_failure_fails_closed_and_keeps_report(self) -> None:
+        result, _, work = self._run(STUB_TRIVY_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Critical vulnerability scan failed with exit 1", result.stdout)
+        self.assertIn("CRITICAL found", result.stdout + result.stderr)
+        self.assertTrue((work / "trivy-image.json").is_file())
+
+    def test_both_failures_are_reported(self) -> None:
+        result, _, _ = self._run(STUB_SYFT_FAIL="1", STUB_TRIVY_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SBOM generation failed", result.stdout)
+        self.assertIn("Critical vulnerability scan failed", result.stdout)
+
+    def test_image_changing_under_the_tools_fails_closed(self) -> None:
+        result, _, _ = self._run(STUB_RETAG="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("changed from", result.stdout)
+
+    def test_low_disk_falls_back_to_sequential_and_still_gates(self) -> None:
+        huge = str(1 << 60)
+        result, state, _ = self._run(STUB_IMAGE_SIZE=huge, STUB_WAIT_TICKS="2")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("sequentially", result.stdout)
+        self.assertFalse((state / "syft.saw").exists())
+        result, _, _ = self._run(STUB_IMAGE_SIZE=huge, STUB_WAIT_TICKS="2", STUB_TRIVY_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        result, _, _ = self._run(STUB_IMAGE_SIZE=huge, STUB_WAIT_TICKS="2", STUB_SYFT_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+
 
 
 if __name__ == "__main__":

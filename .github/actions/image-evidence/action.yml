@@ -1,0 +1,59 @@
+name: Image SBOM and critical vulnerability scan
+description: >-
+  Generate the SPDX image SBOM (Syft) and run the critical vulnerability scan
+  (Trivy) against one locally loaded image at the same time, so the step takes
+  max(sbom, scan) instead of their sum. Both stay gates: the step fails if
+  either tool fails, if the image ID behind the tag changes while they run, or
+  if an expected output is missing. Each tool's log is printed in full.
+
+  Tool versions and invocations match the actions this replaces:
+  anchore/sbom-action@v0.24.2 (`syft scan <image> -o spdx-json`, Syft 1.51.1)
+  and aquasecurity/trivy-action@v0.36.0 (Trivy v0.70.0, same DB cache key).
+
+inputs:
+  image:
+    description: Local Docker image reference to SBOM and scan
+    required: true
+  sbom-output:
+    description: Path of the SPDX JSON SBOM to write
+    required: true
+  scan-output:
+    description: Path of the Trivy JSON report to write
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install pinned Syft
+      id: syft
+      uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+
+    # The same installer, version and binary cache trivy-action@v0.36.0 uses.
+    - name: Install pinned Trivy
+      uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+      with:
+        version: v0.70.0
+        cache: true
+
+    - name: Get current date
+      id: date
+      shell: bash
+      run: echo "date=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+    # Same path and keys as trivy-action@v0.36.0, so the DB cache is shared.
+    - name: Restore Trivy DB from cache
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ${{ github.workspace }}/.cache/trivy
+        key: cache-trivy-${{ steps.date.outputs.date }}
+        restore-keys: cache-trivy-
+
+    - name: Generate SBOM and scan critical vulnerabilities concurrently
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        SBOM_OUTPUT: ${{ inputs.sbom-output }}
+        SCAN_OUTPUT: ${{ inputs.scan-output }}
+        SYFT_CMD: ${{ steps.syft.outputs.cmd }}
+        TRIVY_CACHE_DIR: ${{ github.workspace }}/.cache/trivy
+      run: bash "$GITHUB_ACTION_PATH/run.sh"

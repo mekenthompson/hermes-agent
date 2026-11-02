@@ -132,13 +132,15 @@ jobs:
             --mount type=bind,src="$PWD/scripts/verify-dashboard-oauth-image.py",dst=/tmp/verify-dashboard-oauth-image.py,readonly \
             "$TEST_IMAGE" /tmp/verify-dashboard-oauth-image.py
 
-      - name: Generate image SBOM
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+      # Syft (SBOM) and Trivy (critical scan, exit 1) read the same loaded
+      # image ID at the same time: ~60s + ~40s became max() not sum. Both are
+      # gates; the step fails if either fails or the image ID changes.
+      - name: Generate image SBOM and scan critical vulnerabilities
+        uses: ./.github/actions/image-evidence
         with:
           image: ${{ env.TEST_IMAGE }}
-          format: spdx-json
-          output-file: agent-image.spdx.json
-          upload-artifact: false
+          sbom-output: agent-image.spdx.json
+          scan-output: trivy-image.json
 
       - name: Create bounded package SBOM for attestation
         run: |
@@ -147,17 +149,6 @@ jobs:
             --input agent-image.spdx.json \
             --output agent-image.attestation.spdx.json \
             --max-bytes 16777216
-
-      - name: Scan critical image vulnerabilities
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.TEST_IMAGE }}
-          format: json
-          output: trivy-image.json
-          scanners: vuln
-          severity: CRITICAL
-          ignore-unfixed: true
-          exit-code: 1
 
       - name: Upload pre-publication evidence
         if: always()
@@ -256,13 +247,15 @@ jobs:
             --mount type=bind,src="$PWD/scripts/verify-dashboard-oauth-image.py",dst=/tmp/verify-dashboard-oauth-image.py,readonly \
             "$TEST_IMAGE" /tmp/verify-dashboard-oauth-image.py
 
-      - name: Generate image SBOM
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+      # Syft (SBOM) and Trivy (critical scan, exit 1) read the same loaded
+      # image ID at the same time: ~60s + ~40s became max() not sum. Both are
+      # gates; the step fails if either fails or the image ID changes.
+      - name: Generate image SBOM and scan critical vulnerabilities
+        uses: ./.github/actions/image-evidence
         with:
           image: ${{ env.TEST_IMAGE }}
-          format: spdx-json
-          output-file: agent-image.spdx.json
-          upload-artifact: false
+          sbom-output: agent-image.spdx.json
+          scan-output: trivy-image.json
 
       - name: Create bounded package SBOM for attestation
         run: |
@@ -271,17 +264,6 @@ jobs:
             --input agent-image.spdx.json \
             --output agent-image.attestation.spdx.json \
             --max-bytes 16777216
-
-      - name: Scan critical image vulnerabilities
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.TEST_IMAGE }}
-          format: json
-          output: trivy-image.json
-          scanners: vuln
-          severity: CRITICAL
-          ignore-unfixed: true
-          exit-code: 1
 
       # The build, runtime checks, SBOM, and scan above need no registry
       # credentials (base images are public), so they overlap with CI. Nothing
