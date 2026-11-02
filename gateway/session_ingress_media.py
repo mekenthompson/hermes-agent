@@ -199,6 +199,15 @@ def ingress_fingerprint(payload, raw=None):
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def _committed_receive_time(retained, payload):
+    """``payload`` carrying the committed delivery's receive time, so only content decides."""
+    committed = retained.get('native_text_v1', {}).get('timestamp')
+    envelope = payload.get('native_text_v1')
+    if committed is None or envelope is None or envelope.get('timestamp') in (None, committed):
+        return payload
+    return {**payload, 'native_text_v1': {**envelope, 'timestamp': committed}}
+
+
 def reconcile_native_retry(db, *, principal_id, session_id, request_id, payload, raw=None):
     """A redelivered native message (lost provider ACK, Relay buffer replay) re-downloads its media
     under a fresh disposable staging name, so its captured path differs from the committed one.
@@ -208,12 +217,15 @@ def reconcile_native_retry(db, *, principal_id, session_id, request_id, payload,
     changed bytes or any other changed field still conflict. A delivery committed in
     ``pre_gateway_dispatch``-rewritten form resolves to its committed payload when the resend matches
     the fingerprint recorded at ingress (``ingress_fingerprint``); a changed resend, or a row
-    committed before fingerprints, is compared exactly as above."""
+    committed before fingerprints, is compared exactly as above. The envelope ``timestamp`` is this
+    gateway's receive time, not message content: a redelivery (Slack Socket Mode replays an event
+    whose ACK a stopping gateway never sent) keeps the committed one."""
     fresh = payload.get('native_text_v1', {}).get('media') or []
     with db._read_ctx() as conn:
         row = conn.execute('SELECT status, payload_json FROM session_admissions WHERE principal_id=? AND '
                            'target_session_id=? AND request_id=?', (principal_id, session_id, request_id)).fetchone()
     retained = json.loads(row[1]) if row is not None else {}
+    payload = _committed_receive_time(retained, payload)
     recorded = retained.get('native_text_v1', {}).get('ingress_sha256')
     if recorded is not None and recorded == ingress_fingerprint(payload, raw):
         resolved = retained
