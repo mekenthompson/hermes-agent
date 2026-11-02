@@ -12,7 +12,7 @@ import unittest
 import pytest
 
 from tests.gateway import test_native_inbound_retry as base
-from tests.gateway.test_native_inbound_retry import no_bootstrap  # noqa: F401 - autouse fixture
+from tests.gateway.test_native_inbound_retry import no_bootstrap  # autouse fixture
 
 
 
