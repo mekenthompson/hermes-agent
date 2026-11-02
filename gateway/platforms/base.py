@@ -442,6 +442,7 @@ from gateway.platforms.base_streaming_tts import (
     AudioFormat, StreamingTTSHandle, streaming_tts_should_skip_whole_file, streaming_tts_turn_key)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.platforms.base_processing import ProcessingLifecycleMixin
+from gateway.platforms.auto_tts_delivery import run_auto_tts, run_deferred_voice_reply
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
 from hermes_cli.home_data_layout import SECRET_CACHE_STORES
@@ -4479,23 +4480,14 @@ class BasePlatformAdapter(ProcessingLifecycleMixin, ABC):
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
-                _tts_paths, _tts_requested_path = [], None
-                if self._wants_auto_tts(
-                        event, session_key, interrupt_event, text_content, media_files):
-                    _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content)
-                # TTS plays before text; generated files are removed afterwards.
-                _tts_caption_delivered = False
-                for _tts_index, _tts_path in enumerate(_tts_paths):
-                    try:
-                        _tts_caption_delivered |= await self._play_tts_file(
-                            event, text_content, _tts_path, _tts_index == 0, _final_thread_metadata,
-                            _record_delivery)
-                    finally:
-                        with contextlib.suppress(OSError):
-                            os.remove(_tts_path)
-                if not _tts_paths and _tts_requested_path is not None:
-                    with contextlib.suppress(OSError):
-                        os.remove(_tts_requested_path)
+                _tts_paths, _tts_caption_delivered = [], False
+                _tts_wanted = self._wants_auto_tts(
+                    event, session_key, interrupt_event, text_content, media_files)
+                # Text goes first everywhere; only Telegram synthesizes first (audio caption = text).
+                _tts_first = _tts_wanted and self.platform == Platform.TELEGRAM
+                if _tts_first:
+                    _tts_caption_delivered, _tts_paths = await run_auto_tts(
+                        self, event, text_content, _final_thread_metadata, _record_delivery)
                 # Suspend the typing refresh before the first delivery attempt, not just in
                 # the turn's finally (#117300): if the final send stalls (platform accepted it
                 # but the HTTP ack never returns), control never reaches the finally, and
@@ -4516,6 +4508,10 @@ class BasePlatformAdapter(ProcessingLifecycleMixin, ABC):
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
+                if _tts_wanted and not _tts_first:
+                    await run_auto_tts(
+                        self, event, text_content, _final_thread_metadata, _record_delivery)
+                await run_deferred_voice_reply(event)
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.

@@ -417,7 +417,7 @@ class GatewayVoiceMixin:
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
-        """Generate TTS audio and send as a voice message before the text reply. The TTS tool
+        """Generate TTS audio and send it as a voice message (after the text reply; see _hmwa_deliver_turn_response). The TTS tool
         may return one combined file or several separately valid ones (combination unavailable /
         over a platform limit); legacy single-file results keep working."""
         audio_path, actual_paths = None, []
