@@ -987,6 +987,7 @@ def _run_approval_gate(
     advice: str = "Find an alternative approach that avoids this action.",
     cron_deny_message: str = "", single_query_deny_message: str = "", unattended_deny_message: str = "",
     autoapprove_log_prefix: str, fail_closed_when_no_human: bool = False, no_human_block_message: str = "",
+    smart_eligible: bool = False,
 ) -> dict:
     """Shared human-approval gate for a flagged action (tool call or write): decision core for
     :func:`request_tool_approval` and the file-tool write gates.
@@ -995,7 +996,11 @@ def _run_approval_gate(
     prompt → persistence. Input-shape checks (hardline, allowlist, pattern detection) are the
     caller's job. ``fail_closed_when_no_human``: a non-interactive, non-gateway, non-cron
     context without an ask bridge BLOCKS instead of auto-approving, so a plugin-flagged action
-    never runs ungated.
+    never runs ungated. ``smart_eligible``: under ``approvals.mode: smart`` the guardian LLM
+    assesses the action before a human is asked (APPROVE runs it, ESCALATE asks, DENY lets a
+    present owner override once), exactly like a flagged terminal command. Callers whose
+    action is a typed, inspectable operation opt in; protected-file writes and plugin rules
+    that explicitly demand a human keep the human-only path.
     Unattended deny text is ``ctx.block_message(subject, noun, advice)`` unless the caller passes
     an explicit ``*_deny_message`` (the file-tool write gates word their own).
     """
@@ -1054,6 +1059,7 @@ def _run_approval_gate(
         _ACTION_GATE, command=display_target, description=description, pattern_key=pattern_key,
         pattern_keys=[pattern_key], session_key=session_key,
         approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
+        smart=smart_eligible and approval_context._get_approval_mode() == "smart",
     )
 
 

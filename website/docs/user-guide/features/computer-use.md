@@ -177,7 +177,11 @@ unrestricted modes use a private embedded daemon, launched through
 `CuaDriver.app` on macOS (see above).
 
 `smart` approval remains `standard`: an LLM classification cannot stand in for
-a reviewed manifest.
+a reviewed manifest. Within `standard`, `approvals.mode: smart` sends each
+desktop action (click, type, key, focus) to the same guardian that reviews
+flagged terminal commands before anyone is asked: APPROVE runs it, ESCALATE
+prompts you, and `approvals.smart_policy` can add operator rules for desktop
+input.
 
 <div class="alert alert--warning">
 
