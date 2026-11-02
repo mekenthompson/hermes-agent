@@ -43,6 +43,31 @@ def test_stopped_bot_desktop_leaves_the_seat_env_alone(monkeypatch):
     assert "XAUTHORITY" not in env or env.get("XAUTHORITY") == ""
 
 
+def test_desktop_private_xdg_dirs_do_not_reach_terminal_commands(monkeypatch):
+    # The launcher also publishes its private XDG dirs for GUI children it spawns itself; a terminal
+    # command inheriting them reads gh/git/pip/op config from the desktop's xfconf home instead of
+    # the profile's, so `gh` reports "not logged in" whenever the screen is up.
+    _publish(
+        monkeypatch,
+        {
+            "DISPLAY": ":20",
+            "XAUTHORITY": "/run/hermes/bot-desktop/xauth",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/hermes/bot-desktop/bus",
+            "XDG_CONFIG_HOME": "/run/hermes/bot-desktop/xdg",
+            "XDG_CACHE_HOME": "/run/hermes/bot-desktop/xdg/.cache",
+            "XDG_DATA_HOME": "/run/hermes/bot-desktop/xdg/.local-share",
+        },
+    )
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", "/home/user/.cache")
+    env = _make_run_env({})
+    assert env["DISPLAY"] == ":20"
+    assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/hermes/bot-desktop/bus"
+    assert "XDG_CONFIG_HOME" not in env
+    assert env["XDG_CACHE_HOME"] == "/home/user/.cache"
+    assert "XDG_DATA_HOME" not in env or not env["XDG_DATA_HOME"].startswith("/run/hermes/bot-desktop")
+
+
 def test_routing_does_not_stamp_bot_desktop_activity(monkeypatch):
     stamps = []
     _publish(monkeypatch, {"DISPLAY": ":20"})
