@@ -813,3 +813,23 @@ def test_slices_partition_the_suite_exactly_even_with_different_duration_caches(
     slices = [rtp._slice_files(list(reversed(files)) if i % 2 else files, i % 3 + 1, 3, caches[i % 3], root)
               for i in range(3)]
     assert sorted(f for s in slices for f in s) == sorted(files)
+
+
+def test_slice_by_durations_partitions_exactly_and_balances_with_one_shared_cache(capsys) -> None:
+    """CI pins one immutable duration cache per run; timed slices must still cover every file once."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "rtp_timed_slices", Path(__file__).resolve().parents[2] / "scripts" / "run_tests_parallel.py")
+    rtp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rtp)
+    root = Path("/repo")
+    files = [root / f"tests/t_{i:03d}.py" for i in range(60)]
+    # Heavy files clustered at the front: count-based slicing piles them together.
+    cache = {f"tests/t_{i:03d}.py": (100.0 if i < 6 else 1.0) for i in range(60)}
+    timed = [rtp._slice_files(list(reversed(files)) if i % 2 else files, i + 1, 3, cache, root, by_durations=True)
+             for i in range(3)]
+    assert sorted(f for s in timed for f in s) == sorted(files)
+    totals = [sum(cache[str(f.relative_to(root))] for f in s) for s in timed]
+    assert max(totals) - min(totals) <= 2.0
+    capsys.readouterr()
