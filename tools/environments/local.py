@@ -773,6 +773,10 @@ def _path_env_key(run_env: dict) -> str | None:
     return next((k for k in run_env if k.upper() == "PATH"), None) if _IS_WINDOWS else "PATH"
 
 
+# What a running Bot Desktop contributes to terminal children: where GUI apps open, nothing else.
+_BOT_DESKTOP_ROUTING_KEYS = ("DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS")
+
+
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping. The process env is
     the LAUNCH profile's; under a routed home override its ``.env`` residue is dropped first
@@ -792,14 +796,17 @@ def _make_run_env(env: dict) -> dict:
     # plain ``ls`` must not keep the screen alive past idle_stop_minutes), and it wins over the
     # login snapshot's seat DISPLAY; a user who wants their own seat uses an inline
     # ``DISPLAY=:0 cmd`` prefix, which bash applies after this env. Empty (or module missing) →
-    # the seat env passes through untouched.
+    # the seat env passes through untouched. Only the display-routing keys ride along: the launcher
+    # also publishes its private XDG_* dirs for the GUI children it spawns, and a terminal command
+    # that inherits them reads gh/git/pip config from the desktop's xfconf home, not the profile's.
     try:
         from tools.bot_desktop.runtime import published_env
         published = published_env()
     except Exception:
         published = {}
-    if published:
-        run_env.update(published)
+    routing = {k: published[k] for k in _BOT_DESKTOP_ROUTING_KEYS if k in published}
+    if routing:
+        run_env.update(routing)
         run_env.pop("WAYLAND_DISPLAY", None)  # X11 desktop; a leaked Wayland socket flips GTK/Chromium backends
     return run_env
 
