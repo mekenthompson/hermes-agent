@@ -43,6 +43,7 @@ def record_respawn_guard(conn: sqlite3.Connection, task_id: str, reason: str, *,
     event is written only when it differs from the card's latest event, so
     ``hermes kanban tail`` still says why the card waits."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_controls import _block_task
 
     if reason == "active_pr" and lane == "ready":
         last = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()[0]
@@ -50,9 +51,12 @@ def record_respawn_guard(conn: sqlite3.Connection, task_id: str, reason: str, *,
         why = f"waiting for PR #{pr} to merge" if pr else "waiting for its open PR to merge"
         # The observed event guards the park: any newer event (a claim, a
         # human move) wins and this tick falls back to the plain record.
-        if last is not None and kb.block_task(
-                conn, task_id, reason=why, kind="needs_input", expected_event_id=last,
-                count_recurrence=False, source=PARK_SOURCE):
+        # A ready card has no running work, so the park sends no native Stop
+        # (``stops`` is discarded): delivery to an earlier owner could fail
+        # and abort the rest of the board's tick.
+        if last is not None and _block_task(
+                conn, task_id, reason=why, kind="needs_input", expected_run_id=None,
+                expected_event_id=last, stops=[], count_recurrence=False, source=PARK_SOURCE):
             return
     payload = {"reason": reason}
     with kb.write_txn(conn):

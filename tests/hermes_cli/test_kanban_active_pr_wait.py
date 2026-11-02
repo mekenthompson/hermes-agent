@@ -325,3 +325,30 @@ def test_a_released_park_does_not_make_a_later_block_sticky(kanban_home):
         _age_pr_comment(conn, tid, kbd._RESPAWN_GUARD_PR_WINDOW + 3600)
         kbd.dispatch_once(conn, spawn_fn=spawn)
         assert not kb._has_sticky_block(conn, tid)
+
+
+def test_park_sends_no_stop_to_earlier_owners_and_the_tick_goes_on(kanban_home, monkeypatch):
+    """The park has no running work to stop. A card with an earlier admitted
+    owner must not get a native Stop delivered (whose failure would escape
+    ``dispatch_once`` and starve the rest of the board's tick)."""
+    from types import SimpleNamespace
+
+    delivered = []
+    monkeypatch.setattr("hermes_cli.gateway_runtime.discover_gateway_endpoint",
+                        lambda home: delivered.append(home) or SimpleNamespace(state="stopped", endpoint=None))
+    calls, spawn = _spawned()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="already PRed", assignee="dev")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "owner_admitted", {
+                "db": str(kanban_home / "other-profile" / "state.db"),
+                "session_id": "earlier", "request_id": "run-1"})
+        kb.add_comment(conn, tid, author="dev", body=PR_COMMENT)
+        other = kb.create_task(conn, title="independent work", assignee="dev")
+
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+
+        assert delivered == []
+        row = _status(conn, tid)
+        assert (row["status"], row["block_kind"]) == ("blocked", "needs_input")
+        assert calls == [other]
