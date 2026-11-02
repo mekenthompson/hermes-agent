@@ -1,3 +1,4 @@
+// HF-581 probe: comment-only change to exercise narrow JS workspace selection. Do not merge.
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router";
 import "./index.css";
