@@ -44,16 +44,22 @@ def _block_parked(conn, task_id, row, reason, kind, expected_run_id, expected_ev
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
-    expected_event_id: Optional[int] = None,
+    expected_event_id: Optional[int] = None, count_recurrence: bool = True,
+    source: Optional[str] = None,
 ) -> bool:
     """Commit the guarded block, then request native Stop for its owned work.
 
     A delivery error leaves the block committed and reports unconfirmed cleanup;
     neither the state change nor a Stop acknowledgement proves physical quiescence.
+
+    ``count_recurrence=False`` is for a block nobody asked for (the dispatcher
+    parking a card): it neither counts toward nor erases the block-loop history.
+    ``source`` marks the ``blocked`` event so its owner can find the block again.
     """
     stops = []
     changed = _block_task(conn, task_id, reason=reason, kind=kind, expected_run_id=expected_run_id,
-                          expected_event_id=expected_event_id, stops=stops)
+                          expected_event_id=expected_event_id, stops=stops,
+                          count_recurrence=count_recurrence, source=source)
     if changed and stops:
         from hermes_cli.kanban_process_stop import request_native_stop
         request_native_stop(conn, task_id, stops[-1])
@@ -62,6 +68,7 @@ def block_task(
 
 def _block_task(
     conn: sqlite3.Connection, task_id: str, *, reason, kind, expected_run_id, expected_event_id, stops,
+    count_recurrence: bool = True, source: Optional[str] = None,
 ) -> bool:
     """Block active work; an explicit ``needs_input`` also stops queued work.
 
@@ -109,7 +116,10 @@ def _block_task(
         new_status, event_kind, set_sql, params, payload = kb._route_block(
             kind, reason, source_status, prev_kind=kb._row_get(cur_row, "block_kind"),
             prev_recurrences=int(kb._row_get(cur_row, "block_recurrences") or 0),
+            count=count_recurrence,
         )
+        if source:
+            payload["source"] = source
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason
@@ -142,7 +152,7 @@ def _block_task(
 
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
-    prev_kind: Optional[str], prev_recurrences: int,
+    prev_kind: Optional[str], prev_recurrences: int, count: bool = True,
 ) -> tuple[str, str, str, tuple, dict]:
     """Resolve the existing dependency lane and block-loop policy."""
     from hermes_cli import kanban_db as kb
@@ -150,10 +160,10 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
-    recurrences = prev_recurrences + 1 if prev_kind == kind else 1
+    recurrences = (prev_recurrences if prev_kind == kind else 0) + (1 if count else 0)
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
-    if recurrences >= kb.BLOCK_RECURRENCE_LIMIT:
+    if count and recurrences >= kb.BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = kb.BLOCK_RECURRENCE_LIMIT
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
