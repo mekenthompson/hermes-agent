@@ -76,12 +76,16 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/tools
 # names (see .hermes/plans/termux-removal-commit-spec.md).
 # tmux backs the hermes-agent skill's interactive spawning recipe; the runtime
 # user cannot apt-get it later (no root, and the root fs resets on restart).
+# linux-libc-dev (headers, via gcc/g++ -> libc6-dev) must carry DSA-6602-1
+# (CVE-2026-99083, fixed 6.12.115-2): the floor check fails the build if a
+# stale mirror or cached layer would otherwise bake the vulnerable version.
 RUN apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils tmux \
     libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends --only-upgrade \
-        libglib2.0-0t64 libmbedcrypto16 perl perl-base libperl5.40 perl-modules-5.40 && \
+        libglib2.0-0t64 libmbedcrypto16 perl perl-base libperl5.40 perl-modules-5.40 linux-libc-dev && \
+    dpkg --compare-versions "$(dpkg-query -W -f='${Version}' linux-libc-dev)" ge 6.12.115-2 && \
     rm -rf /var/lib/apt/lists/*
 
 # Bot Screen (opt-in): PACKAGES["apt"] from tools/bot_desktop/runtime.py plus apt
