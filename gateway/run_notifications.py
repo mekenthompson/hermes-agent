@@ -26,6 +26,7 @@ from gateway.session import SessionEntry, SessionSource, SessionStore
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
 from gateway.run_notifications_update import GatewayUpdateNotificationsMixin
 from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
+from gateway.run_notifications_batch import GatewayCompletionBatchMixin
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -110,6 +111,21 @@ def _mark_internal_notification(text: str) -> str:
     return text + "\n\n" + INTERNAL_NOTIFICATION_FOOTER
 
 
+def _held_reason(source, platform: str, multiplexed: bool) -> str:
+    """Why a completion has no transport, naming what is actually missing: the saved receiving bot
+    is down, or the route never saved one (a row older than the column), which no reconnect fixes."""
+    from gateway.session_identity import identity_of
+    identity = identity_of(source)
+    runtime = getattr(source, "profile", None) or "default"
+    if identity is not None and identity.multiplexed and not identity.transport_inferred:
+        return (f"the {platform} bot of profile {identity.transport_profile!r} that received this chat "
+                f"(runtime profile {runtime!r}) is not connected; the row stays pending until it reconnects")
+    if multiplexed:
+        return (f"the {platform} route of profile {runtime!r} has no saved receiving bot and no shared bot "
+                f"covers it; the row stays pending until a new message in that chat records the bot")
+    return f"no live {platform} transport for profile {runtime!r}; the row stays pending until it connects"
+
+
 def _raw_process_event_session_id(evt: dict) -> str:
     """Recognize API routes, not malformed structured or partial messaging routes."""
     session_key = str(evt.get("session_key") or "").strip()
@@ -170,7 +186,8 @@ def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
     return metadata
 
 
-class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin):
+class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin,
+                                GatewayCompletionBatchMixin):
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
     # Coalescing keys: process completions (short-window fan-in) and async delegations (+ parent session).
@@ -867,15 +884,24 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return owner[0]
             if getattr(source, "delivered_via_upstream_relay", False) is True:
                 return self.adapters.get(Platform.RELAY)
-        # One resolver with authz/kanban/cron: a secondary's own map, or the primary's for a
-        # shared-bot satellite; a disconnected secondary fails closed to ``{}``.
-        adapters = self._adapters_for_profile(getattr(source, "profile", None))
+        # A pinned identity names the bot that received the conversation: it answers, as
+        # ``_delivery_adapter_for`` rules (a ``bot_profile`` route's runtime may own no adapter for this
+        # platform, #139726). Otherwise one resolver with authz/kanban/cron: a secondary's own map, or the
+        # primary's for a shared-bot satellite; a disconnected bot fails closed to ``{}``.
+        from gateway.session_identity import identity_of
+        identity = identity_of(source)
+        pinned = (identity is not None and identity.multiplexed and not identity.transport_inferred
+                  and self._restored_transport_trusted(source, identity))
+        adapters = self._adapters_for_profile(
+            identity.transport_profile if pinned else getattr(source, "profile", None))
         try:
             _transport = resolve_delivery_transport(Platform(platform_name), self.config, adapters)
         except Exception:
             _transport = None
         if _transport is not None:
             return _transport.adapter
+        if not pinned and source is not None and (borrowed := self._routed_primary_adapter(source)) is not None:
+            return borrowed
         if source is not None and (relay := self._committed_relay_adapter(source)) is not None:
             return relay
         return next((a for p, a in adapters.items() if p.value == platform_name), None)
@@ -1149,8 +1175,16 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             adapter = self.adapters.get(Platform.API_SERVER) if raw_sid else None
             if adapter is not None and adapter_supports_push(adapter):
                 return False
+        warned = self.__dict__.setdefault("_completion_no_transport_warned", set())
+        key = (getattr(source, "profile", None), platform) if source is not None else None
         if adapter is None:
+            # The watcher requeues silently every tick; say once per outage which lane has no transport.
+            if key is not None and key not in warned:
+                warned.add(key)
+                logger.warning("Async completion held: %s", _held_reason(
+                    source, platform, getattr(getattr(self, "config", None), "multiplex_profiles", False)))
             return False
+        warned.discard(key)
         if not adapter_supports_push(adapter):
             ensure = getattr(adapter, "_ensure_session_db", None)
             try:
@@ -1484,55 +1518,6 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         batches.clear()
         getattr(self, "_completion_notification_batch_tasks", {}).clear()
         getattr(self, "_completion_notification_batch_flush_tasks", set()).clear()
-
-    async def _enqueue_process_completion_notification(self, synth_text: str, evt: dict) -> Optional[bool]:
-        """Fan in policy-admitted process completions with compatible pinned owners."""
-        # Lazy defaults: lifecycle tests build GatewayRunner via object.__new__.
-        for attr, default in (
-            ("_completion_notification_batches", dict), ("_completion_notification_batch_tasks", dict),
-            ("_completion_notification_batch_flush_tasks", set),
-            ("_completion_batch_preflights", dict), ("_completion_batch_preflight_ready", dict),
-            ("_completion_notification_batch_window", lambda: 0.1),
-            ("_completion_notification_batches_stopping", lambda: False), ("_background_tasks", set),
-        ):
-            if not hasattr(self, attr):
-                setattr(self, attr, default())
-        if self._completion_notification_batches_stopping:
-            return False
-        # A route key alone is not ownership: /new can leave old and new pins
-        # in the same queue. Never settle one pin on another pin's acceptance.
-        route_key = self._event_route_key(
-            evt, (*self._COMPLETION_BATCH_KEY_FIELDS, "parent_session_id", "origin_session_id"))
-        self._completion_batch_preflights[route_key] = self._completion_batch_preflights.get(route_key, 0) + 1
-        try:
-            # Filter each event before it can contaminate (or suppress) a foreground batch.
-            # The shared queue may be drained outside the owning profile's runtime scope.
-            async with self._completion_event_scope(evt):
-                from tools.process_registry_notifications import should_surface_notification
-                if not should_surface_notification(evt):
-                    return None
-                from gateway.session_approval_completion import completion_batch_origin_for_event
-                origin = completion_batch_origin_for_event(evt, str(evt.get('session_key') or ''))
-            if self._completion_notification_batches_stopping:
-                return False
-            key = (*route_key, origin)
-            future = asyncio.get_running_loop().create_future()
-            self._completion_notification_batches.setdefault(key, []).append((synth_text, evt, future))
-            if key not in self._completion_notification_batch_tasks:
-                task = asyncio.create_task(self._flush_process_completion_batch(key))
-                self._completion_notification_batch_tasks[key] = task
-                # Keep the flush alive under the gateway's normal lifecycle accounting.
-                self._retain_background_task(task)
-                self._track_task_in(self._completion_notification_batch_flush_tasks, task)
-        finally:
-            remaining = self._completion_batch_preflights[route_key] - 1
-            if remaining:
-                self._completion_batch_preflights[route_key] = remaining
-            else:
-                self._completion_batch_preflights.pop(route_key)
-                if ready := self._completion_batch_preflight_ready.pop(route_key, None):
-                    ready.set()
-        return await future
 
     def _enrich_async_delegation_routing(self, evt: dict) -> None:
         """Fill platform/chat_id/thread_id/chat_type on an async-delegation event.

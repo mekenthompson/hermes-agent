@@ -283,6 +283,14 @@ CASES = {
         ["scripts/run_tests_parallel.py"],
         _lanes(python=True, scan=True, e2e=True, e2e_upgrade=True),
     ),
+    "runner launch module → same lanes as the runner": (
+        ["scripts/run_tests_launch.py"],
+        _lanes(python=True, scan=True, e2e=True, e2e_upgrade=True),
+    ),
+    "fork-server child → same lanes as the runner": (
+        ["scripts/run_tests_fork_child.py"],
+        _lanes(python=True, scan=True, e2e=True, e2e_upgrade=True),
+    ),
     # Supply-chain lanes
     ".pth file → scan and review": (["evil.pth"], _lanes(python=True, scan=True, ci_review=True)),
     "setup.py → scan": (["setup.py"], _lanes(python=True, scan=True, docker=True, nix=True, e2e_upgrade=True)),

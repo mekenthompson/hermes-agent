@@ -118,6 +118,9 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
         async def ack(*args, **kwargs):
             self.acks.append(args[0].message_id)
         self.runner._busy_interrupt_and_ack = ack
+        from gateway.run_inbound import GatewayInboundMixin
+        # The authority path admits through the runner's own FIFO step (upstream ``_hm_admit_to_fifo``).
+        self.runner._hm_admit_to_fifo = MethodType(GatewayInboundMixin._hm_admit_to_fifo, self.runner)
         async def no_consume(*args):
             return False, None
         self.runner._hm_post_admission_consume = no_consume

@@ -170,10 +170,18 @@ async def test_native_profile_batch_filters_before_fifo_and_preserves_human(tmp_
                 added = [row for row in rows if row['admission_id'] not in {prior['admission_id'] for prior in before}]
                 assert len(added) == 1
                 text = added[0]['payload']['text']
-                assert f'LIVE_RESULT_{index}' in text and 'CANCELLED_RESULT' not in text and 'ALREADY_RESULT' not in text
+                # The live result folds into the already-queued completion at the FIFO tail (upstream
+                # completion folding): one turn carries both, the Stop-consumed result never enters.
+                assert f'LIVE_RESULT_{index}' in text and 'CANCELLED_RESULT' not in text
+                assert text.count(f'ALREADY_RESULT_{index}') == 1
                 descriptor = added[0]['payload'].get('local_automation_v1') or added[0]['payload']['native_text_v1']['automation']
-                assert descriptor.get('identities', [descriptor.get('identity')]) == [producer_identity(runner, live_event)]
-                assert completion_admission(runner, already_event)['admission_id'] == already_row['admission_id']
+                assert descriptor.get('identities', [descriptor.get('identity')]) == sorted(
+                    [producer_identity(runner, already_event), producer_identity(runner, live_event)])
+                assert producer_identity(runner, cancelled_event) not in descriptor.get('identities', [])
+                folded = completion_admission(runner, already_event)
+                assert folded['admission_id'] == already_row['admission_id']
+                assert (folded['status'], folded['outcome']) == ('terminal', 'cancelled')
+                assert 'ALREADY_RESULT' not in folded['payload']['text']
                 retained = load_completed_results(owns_entry=lambda row: row['id'] == cancelled.id, strict=True)
                 if retention == 'retained':
                     assert retained[cancelled.id].exit_code == 0 and f'CANCELLED_RESULT_{index}' in retained[cancelled.id].output_buffer
@@ -190,7 +198,7 @@ async def test_native_profile_batch_filters_before_fifo_and_preserves_human(tmp_
                 monkeypatch.setattr(SessionAuthority, '_schedule', lambda self, ref: None)
             leg = [item for item in executed if item[0] == home and item[1] in
                    {already_row['request_id'], added[0]['request_id'], f'follow-{index}'}]
-            assert [item[1] for item in leg] == [already_row['request_id'], added[0]['request_id'], f'follow-{index}']
+            assert [item[1] for item in leg] == [added[0]['request_id'], f'follow-{index}']
             assert all('CANCELLED_RESULT' not in item[2] for item in leg)
             assert follower.ref.session_id == seed.ref.session_id
     finally:
