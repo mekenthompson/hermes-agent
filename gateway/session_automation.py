@@ -191,7 +191,9 @@ async def _admit_folded_completion(authority, adapter, event, evt, identity):
             return await authority.admit_automation(adapter, event, identity, replaces=waiting['admission_id'],
                                                     fold=waiting['_skip'])
         except RuntimeStoreError as exc:
-            if exc.reason != 'stale_generation':
+            # A waiting result the running turn consumed (process log/wait/poll) refuses the batch's
+            # write guard, not this result: queue it alone, whose retry checks only its own identity.
+            if exc.reason not in ('stale_generation', 'process_result_consumed'):
                 raise
             event.text, event.metadata = unfolded
     return await authority.admit_automation(adapter, event, identity)

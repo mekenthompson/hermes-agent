@@ -46,6 +46,7 @@ async def _discord_session(tmp_path, monkeypatch):
                'chat_id': '42', 'user_id': '42', 'output': f'{name} still running', 'omitted': 0}
         assert await runner._inject_watch_notification(f'[IMPORTANT: {name} still running]', evt) is True
     complete.tick = tick
+    complete.runner, complete.owner = runner, owner
 
     def queued():
         return [row for row in list_session_admissions(authority.db, session_id=owner) if row['status'] == 'queued']
