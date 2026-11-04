@@ -199,7 +199,7 @@ class _PausingAuthority:
         self.db, self.native_waiters, self.waiters = None, set(), {}
         self.sessions = {"sid": SimpleNamespace(pause_notified=False, source=None)}
 
-    async def admit_native(self, event):
+    async def admit_native(self, event, before_schedule=None):  # house admit_message passes the busy hook
         return SimpleNamespace(status="queued", admission_id="adm-p", ref=SimpleNamespace(session_id="sid"))
 
 
@@ -415,8 +415,8 @@ async def test_a_busy_message_cancelled_before_admission_reads_its_row_counts_as
     busy.note_busy_admitting(follow_up)
     commit = authority.admit_native
 
-    async def commit_then_stop(event):
-        receipt = await commit(event)
+    async def commit_then_stop(event, before_schedule=None):
+        receipt = await commit(event, before_schedule=before_schedule)
         stop = MessageEvent(text="/stop", source=source)
         with native_callback(runner, stop, get_hermes_home()):
             await runner._handle_message(stop)

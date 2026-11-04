@@ -36,6 +36,12 @@ class _Venv:
         environment = install_state_dir(self.project_root()) / "environments" / str(len(self.applied)) / "venv"
         environment.mkdir(parents=True)
         (environment / "pyvenv.cfg").write_text("home = fixture\n")
+        # The house stamp check also requires the environment's interpreter to be runnable.
+        from pm.environments import venv_python
+        interpreter = venv_python(environment)
+        interpreter.parent.mkdir(parents=True, exist_ok=True)
+        interpreter.write_text("")
+        interpreter.chmod(0o755)
         return {"environment": environment}
 
 

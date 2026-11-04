@@ -237,9 +237,15 @@ def test_authenticated_desktop_process_completion_retains_command_authority(tmp_
         db.close()
 
 
-def test_unowned_process_completion_settles_its_reservation():
+def test_unowned_process_completion_settles_its_reservation(monkeypatch):
+    """An unowned completion is parked for its owner's return (notification_park) and keeps its
+    reservation while parked; when the park lets it go, the reservation is settled."""
     from tools.process_registry import ProcessSession, process_registry
     from tools.approval_context import reserve_background_approval_task
+    from tui_gateway import notification_park
+    monkeypatch.setattr(notification_park, '_parked', [])
+    # Its owner never returns: the copy is already past its retention window when parked.
+    monkeypatch.setattr(notification_park, 'RETENTION_SECONDS', -1.0)
 
     proc = ProcessSession(id='proc_orphaned_approval', command='printf done',
                           session_key='retired-session', started_at=1700000100.0,
@@ -256,6 +262,11 @@ def test_unowned_process_completion_settles_its_reservation():
     try:
         assert server._notif_handle_event('other', _session(session_key='other-session'), event,
                                           set(), process_registry, lambda _event: 'done', None)
+        assert notification_park.parked() == [event]
+        assert proc.approval_task_reservation is reservation and reservation.active()
+        # The next poll expires it: the park lets the copy go.
+        assert notification_park.claim(lambda _event: False) == []
+        assert notification_park.parked() == []
         assert proc.approval_task_reservation is None
         assert not reservation.active()
     finally:
