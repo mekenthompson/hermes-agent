@@ -109,7 +109,7 @@ def test_explicit_unblock_lets_one_run_through_then_guard_holds(kanban_home):
         run_id = kb.get_task(conn, tid).current_run_id
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE task_runs SET outcome='crashed', status='failed', ended_at=? WHERE id=?",
+                "UPDATE task_runs SET outcome='reclaimed', status='failed', ended_at=? WHERE id=?",
                 (kb.get_task(conn, tid).created_at, run_id))
             conn.execute(
                 "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
@@ -150,7 +150,7 @@ def test_guard_still_prevents_a_duplicate_spawn_without_an_unblock(kanban_home):
         kb.add_comment(conn, tid, author="dev", body=PR_COMMENT)
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE task_runs SET outcome='crashed', status='failed', ended_at=? WHERE id=?",
+                "UPDATE task_runs SET outcome='reclaimed', status='failed', ended_at=? WHERE id=?",
                 (claimed.created_at, claimed.current_run_id))
             conn.execute(
                 "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
@@ -172,12 +172,12 @@ def test_other_guard_reasons_are_recorded_once_not_every_tick(kanban_home, monke
 
 
 def _crash_after_pr(conn, tid):
-    """The worker opened the PR, then crashed / was reclaimed: back in ready."""
+    """The worker opened the PR, then was reclaimed (not a crash; HF-628 keeps this guarded): back in ready."""
     claimed = kb.claim_task(conn, tid)
     kb.add_comment(conn, tid, author="dev", body=PR_COMMENT)
     with kb.write_txn(conn):
         conn.execute(
-            "UPDATE task_runs SET outcome='crashed', status='failed', ended_at=? WHERE id=?",
+            "UPDATE task_runs SET outcome='reclaimed', status='failed', ended_at=? WHERE id=?",
             (claimed.created_at, claimed.current_run_id))
         conn.execute(
             "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
