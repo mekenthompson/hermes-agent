@@ -1637,12 +1637,8 @@ def check_respawn_guard(
             conn, "task_events", task_id, success, "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')")):
         return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
+    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR. Exceptions: a later handoff
+    #    (reassign, changes_requested, review reopen; #111910) or ONE crash recovery (kanban_db_crash_recovery).
     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
                 if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
@@ -1652,72 +1648,10 @@ def check_respawn_guard(
                 conn, "task_events", task_id, max(pr_times),
                 "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
             return None
-        if _guard_wait.unblock_unspent(conn, task_id):
-            return None
-        # A crash/interruption (not a normal exit) is not a handoff, but the
-        # PR it left behind needs finishing: allow ONE recovery respawn per
-        # crashed run, told to continue that PR (HF-628).
-        if allow_crash_recovery and _crash_recovery_run_id(conn, task_id, latest_run) is not None:
-            return None
-        return "active_pr"
+        crashed = allow_crash_recovery and _crash.recovery_run_id(conn, task_id, latest_run) is not None
+        return None if _guard_wait.unblock_unspent(conn, task_id) or crashed else "active_pr"
 
     return None
-
-
-CRASH_RECOVERY_EVENT = "crash_recovery_respawn"
-
-
-def _crash_recovery_run_id(conn: sqlite3.Connection, task_id: str, latest_run: Any) -> Optional[int]:
-    """Id of the newest closed run when it ended in a genuine crash/interruption
-    (``crashed``, not a clean-exit protocol violation) and no recovery respawn
-    has been spent on it yet; else ``None``. Fail closed on anything unreadable."""
-    if latest_run is None or latest_run["outcome"] != "crashed":
-        return None
-    try:
-        if _kb._json_dict(latest_run["metadata"]).get("protocol_violation"):
-            return None
-        run = conn.execute(
-            "SELECT id, error FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
-            "ORDER BY ended_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
-        if run is None:
-            return None
-        head = (run["error"] or "").partition(WORKER_OUTPUT_SEP)[0]
-        if "protocol violation" in head:
-            return None
-        run_id = int(run["id"])
-        for pr_row in conn.execute("SELECT created_at, body FROM task_comments WHERE task_id = ?", (task_id,)):
-            if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(pr_row["body"]) or "") \
-                    and _kb._to_epoch(pr_row["created_at"]) is None:
-                return None  # unreadable PR-comment time: stay failed-closed
-        for ev in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
-                               (task_id, CRASH_RECOVERY_EVENT)):
-            if _kb._json_dict(ev["payload"]).get("run_id") == run_id:
-                return None  # already spent on this crashed run
-        return run_id
-    except Exception:
-        return None
-
-
-def _record_crash_recovery(conn: sqlite3.Connection, task_id: str) -> None:
-    """After a recovery claim: spend the one bypass and leave the worker a note."""
-    run = conn.execute(
-        "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
-    url = None
-    for row in conn.execute("SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC", (task_id,)):
-        m = _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(row["body"]) or "")
-        if m:
-            url = m.group(0)
-            break
-    if run is None or url is None:
-        return
-    with _kb.write_txn(conn):
-        _kb._append_event(conn, task_id, CRASH_RECOVERY_EVENT, {"run_id": int(run["id"]), "pr_url": url})
-    _kb.add_comment(
-        conn, task_id, author="dispatcher",
-        body=(f"Crash recovery: the previous worker run crashed or was interrupted. An existing PR "
-              f"from this task exists: {url}. Continue/supervise that PR to this task's acceptance "
-              f"criteria. Do NOT open a new PR."))
 
 
 _GUARD_TIME_COLS = {"task_runs": "ended_at", "task_events": "created_at", "task_comments": "created_at"}
@@ -2161,8 +2095,7 @@ def _dispatch_lane_task(
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
-    recovery = (guard_reason is None and lane == "ready"
-                and check_respawn_guard(conn, task_id, lane=lane, allow_crash_recovery=False) == "active_pr")
+    recovery = _crash.recovery_pending(conn, task_id, lane, guard_reason)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         if not dry_run:
@@ -2183,11 +2116,7 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
-    if recovery:
-        try:
-            _record_crash_recovery(conn, claimed.id)
-        except Exception:
-            _kb._log.warning("kanban dispatcher: crash-recovery note for %s failed", claimed.id, exc_info=True)
+    _crash.note_recovery(conn, claimed.id, recovery)
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
@@ -3026,3 +2955,4 @@ from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_workspace as _kbw
 from hermes_cli import kanban_db_guard_wait as _guard_wait
+from hermes_cli import kanban_db_crash_recovery as _crash
