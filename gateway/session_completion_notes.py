@@ -8,8 +8,8 @@ it (``completion_admission``), results already admitted are left out of a new ba
 outcome, note or turn, covers the whole batch. When that admission comes up for execution with no
 viewer attached (the authority's own subscriber records) the executor records it in the session's
 history, where the next turn sees it, and settles the admission without a model call. Queue order, restart survival and
-exactly-once are the admission contract's. With a viewer attached, or with ``sessions.unviewed_local_completions: turn``,
-it runs as the turn it always was, except a local cron result, which is always a note; messaging, Kanban, ``/loop`` and heartbeat wakes
+exactly-once are the admission contract's. With a viewer attached it runs as the turn it always was,
+except a local cron result, which is always a note; messaging, Kanban, ``/loop`` and heartbeat wakes
 never reach here.
 """
 import json
@@ -28,17 +28,6 @@ def _producer(identity):
         return json.loads(identity)[0]
     except (ValueError, TypeError, IndexError, KeyError):
         return None
-
-
-def unviewed_completions_run_turns(authority):
-    """``sessions.unviewed_local_completions: turn`` in the owning profile's config: an unviewed
-    completion runs the turn it would run with a viewer attached, so work the session started keeps
-    going after its viewers leave (the gateway owns the session either way). ``note`` (default)
-    keeps main's parity: written into history, no model call. Read when the admission runs."""
-    from pathlib import Path
-    from gateway.run import _load_gateway_config
-    sessions = _load_gateway_config(Path(authority.profile_id) / 'config.yaml').get('sessions')
-    return isinstance(sessions, dict) and sessions.get('unviewed_local_completions') == 'turn'
 
 
 def noted_completion(row):
@@ -69,8 +58,7 @@ async def note_if_unviewed(authority, ref, row):
     from gateway.session_runtime_workers import tracked_write
     live = authority.sessions.get(ref.session_id)
     descriptor = row['payload']['local_automation_v1']
-    if live is None or ((live.subscribers or unviewed_completions_run_turns(authority))
-                        and _producer(descriptor['identity']) not in _ALWAYS_NOTED):
+    if live is None or (live.subscribers and _producer(descriptor['identity']) not in _ALWAYS_NOTED):
         # The claim left a closed row closed for a note; the turn reopens it as any first turn does.
         await reopen_for_turn(authority, ref)
         return None

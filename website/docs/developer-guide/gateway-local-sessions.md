@@ -32,13 +32,6 @@ admission, not inference completion. Closing every viewer leaves the execution a
 pending approval alive. A new viewer can resume the same identity and answer through
 `approval.respond({session_id, execution_generation, prompt_id, choice})`.
 
-A background-process, watch-pattern or async-delegation completion that comes up for execution
-while no viewer is attached is written into the session's history as a note, without a model
-call (main's CLI parity). Set `sessions.unviewed_local_completions: turn` in the profile's
-`config.yaml` to run the same turn it would run with a viewer attached, so work the session
-started continues after its viewers leave. The value is read when the admission runs; a local
-cron result stays a note either way.
-
 ## Deliberate behavior change: shared operator access
 
 Verified operators of the same gateway profile may attach to canonical local sessions
