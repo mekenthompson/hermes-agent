@@ -817,6 +817,8 @@ retain their single-query policy and never gain unattended approval.
 The managed worker's real clarification request joins the consumer route's ordinary native
 clarification registry and adapter renderer. The owner forwards an answer only while the same
 consumer association, task claim and execution generation remain current. Stop, timeout and
-worker retirement withdraw the request; a later run cannot consume an old choice. Adapters with
+worker retirement withdraw the request; a later run cannot consume an old choice.
+A withdrawal sends an exact prompt cancellation over that worker's private channel, so even an
+unlimited clarification wait ends without supplying an answer or changing approval policy. Adapters with
 persistent question cards may use their existing `retire_clarify_card` implementation to repair
 the visible state after withdrawal.

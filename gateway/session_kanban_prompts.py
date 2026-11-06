@@ -113,12 +113,16 @@ async def deliver(authority, ref, row, policy, worker, frame):
                     worker.respond('clarify', entry.clarify_id, response)
                     forwarded = True
         finally:
-            retire_prompt(entry)
-            controls.remote_responders.pop(entry.clarify_id, None)
-            controls.snapshot(ref.session_id, row['generation'])
-            retire = getattr(adapter, 'retire_clarify_card', None)
-            if not forwarded and callable(retire):
-                await retire(entry.clarify_id, 'The question is no longer waiting for an answer.')
+            try:
+                if not forwarded:
+                    worker.control({'type': 'clarify_cancel', 'prompt_id': entry.clarify_id})
+            finally:
+                retire_prompt(entry)
+                controls.remote_responders.pop(entry.clarify_id, None)
+                controls.snapshot(ref.session_id, row['generation'])
+                retire = getattr(adapter, 'retire_clarify_card', None)
+                if not forwarded and callable(retire):
+                    await retire(entry.clarify_id, 'The question is no longer waiting for an answer.')
 
     task = asyncio.create_task(relay())
     if not hasattr(worker, 'clarify_tasks'):
@@ -129,8 +133,12 @@ async def deliver(authority, ref, row, policy, worker, frame):
         if not done.cancelled() and (error := done.exception()) is not None:
             logging.getLogger(__name__).warning('Card clarification withdrawn (%s)', type(error).__name__)
     task.add_done_callback(settled)
-    result = await adapter.send_clarify(source.chat_id, entry.question, entry.choices, entry.clarify_id,
-                                       route, metadata={'thread_id': source.thread_id})
+    try:
+        result = await adapter.send_clarify(source.chat_id, entry.question, entry.choices, entry.clarify_id,
+                                           route, metadata={'thread_id': source.thread_id})
+    except BaseException:
+        retire_prompt(entry)
+        raise
     if not result.success and not result.retryable:
         retire_prompt(entry)
 
