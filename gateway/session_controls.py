@@ -556,10 +556,16 @@ class AuthorityConnection:
 
     async def info(self, ref, params):
         from gateway.session_local_inventory import snapshot_info
-        if set(params) != {'session_id'}:
+        from gateway.session_execution_progress import execution_info, execution_progress
+        if (set(params) - {'session_id', 'execution_only'} or 'session_id' not in params
+                or ('execution_only' in params and type(params['execution_only']) is not bool)):
             raise RuntimeStoreError('invalid_params')
         await self.authority.resolve(self.actor, ref)
-        return await snapshot_info(self.authority, ref)
+        if params.get('execution_only'):
+            return execution_info(self.authority, ref)
+        info = await snapshot_info(self.authority, ref)
+        info['execution_progress'] = execution_progress(self.authority, ref)
+        return info
 
     async def list_sessions(self, ref, params):
         if 'session:read' not in self.actor.capabilities:
