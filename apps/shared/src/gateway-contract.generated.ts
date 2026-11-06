@@ -4736,6 +4736,7 @@ export interface CommandObserveResult {
 }
 export interface CanonicalSessionInfoParams {
   session_id: string
+  execution_only?: boolean
 }
 /** ``gateway/session_local_inventory.py::snapshot_info``: ``local_session_info`` + the inventory. */
 export interface CanonicalSessionInfo {
@@ -4762,6 +4763,7 @@ export interface CanonicalSessionInfo {
   profile_id: string
   desktop_protocol: string
   profile_name: string
+  execution_progress?: ExecutionProgress | null
   cwd?: string | null
   edit_approval_policy?: 'ask' | 'workspace_session' | 'session' | null
   launch_request?: Record<string, unknown> | null
@@ -4778,6 +4780,11 @@ export interface CanonicalSessionInfo {
   credential_hint?: string | null
   config_warning?: string | null
   [key: string]: unknown
+}
+export interface ExecutionProgress {
+  execution_generation: number
+  tool: string
+  progress_at: number
 }
 export interface SessionStatsParams {
   session_id: string
@@ -6936,7 +6943,7 @@ export interface CanonicalRpcMethods {
   'session.events.since': { params: CanonicalEventsParams; result: CanonicalEventsResult }
   /** The /save transcript rendered for the client to write (the gateway writes nothing). */
   'session.export': { params: SessionExportParams; result: SessionExportResult }
-  /** Frozen launch policy projection of one local session. */
+  /** Frozen launch policy projection of one local session. execution_only skips inventory and returns a minimal session envelope with the current execution's tool summary. */
   'session.info': { params: CanonicalSessionInfoParams; result: CanonicalSessionInfo }
   'session.interrupt': { params: CanonicalControlParams; result: CanonicalSessionHandle }
   'session.list': { params: CanonicalListParams; result: CanonicalListResult }

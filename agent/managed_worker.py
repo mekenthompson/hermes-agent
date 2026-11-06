@@ -246,7 +246,6 @@ class WorkerControls:
         return True
 
     def read(self):
-        from tools.approval import resolve_gateway_approval
         try:
             while True:
                 frame = read_frame(sys.stdin.buffer)
@@ -265,25 +264,40 @@ class WorkerControls:
                             state['current'] = frame['current']
                             state['event'].set()
                     continue
-                if (set(frame) != {'type', 'prompt_id', 'value'} or frame['type'] not in {'approval', 'clarify'}
-                        or not isinstance(frame['prompt_id'], str) or not isinstance(frame['value'], str)
-                        or len(frame['value']) > 16384):
-                    raise ValueError('invalid_managed_control')
-                if frame['type'] == 'approval':
-                    if frame['value'] not in {'once', 'deny', 'session', 'always'}:
-                        raise ValueError('invalid_managed_control')
-                    resolve_gateway_approval(self.route, frame['value'], request_id=frame['prompt_id'])
-                else:
-                    with self.lock:
-                        state = self.clarifications.get(frame['prompt_id'])
-                        if state is not None:
-                            state['answer'] = frame['value']
-                            state['event'].set()
+                self.prompt_control(frame)
         except (EOFError, OSError, ValueError) as exc:
             self.stop()
             self.finish.set()
             if not isinstance(exc, ValueError):
                 _die_with_owner()
+
+    def prompt_control(self, frame):
+        """Only the owner of this worker pipe may settle its exact pending prompt.
+        Cancellation has no answer payload and cannot satisfy another prompt.
+        """
+        if frame.get('type') == 'clarify_cancel':
+            if set(frame) != {'type', 'prompt_id'} or not isinstance(frame['prompt_id'], str) or not frame['prompt_id']:
+                raise ValueError('invalid_managed_control')
+            self._settle_clarification(frame['prompt_id'], _INTERRUPTED)
+            return
+        if (set(frame) != {'type', 'prompt_id', 'value'} or frame['type'] not in {'approval', 'clarify'}
+                or not isinstance(frame['prompt_id'], str) or not isinstance(frame['value'], str)
+                or len(frame['value']) > 16384):
+            raise ValueError('invalid_managed_control')
+        if frame['type'] == 'approval':
+            from tools.approval import resolve_gateway_approval
+            if frame['value'] not in {'once', 'deny', 'session', 'always'}:
+                raise ValueError('invalid_managed_control')
+            resolve_gateway_approval(self.route, frame['value'], request_id=frame['prompt_id'])
+        else:
+            self._settle_clarification(frame['prompt_id'], frame['value'])
+
+    def _settle_clarification(self, prompt_id, answer):
+        with self.lock:
+            state = self.clarifications.get(prompt_id)
+            if state is not None:
+                state['answer'] = answer
+                state['event'].set()
 
     def approval(self, data):
         from tools.approval import ack_gateway_approval
@@ -313,7 +327,11 @@ class WorkerControls:
         ``-z``, bound by worker_turn_scope) answers headless at once: its viewer cannot answer."""
         from gateway.session_finite import finite_clarify_reply, finite_turn_required
         if finite_turn_required() is True:
-            return finite_clarify_reply()
+            from gateway.session_policy import active_policy
+            policy = active_policy()
+            context = json.loads(policy.kanban_json or '{}') if policy else {}
+            if not context.get('prompt_consumer_admission_id'):
+                return finite_clarify_reply()
         answers = {}
         reply = {'answers': answers, 'outcome': 'submitted'}
         for entry in questions:

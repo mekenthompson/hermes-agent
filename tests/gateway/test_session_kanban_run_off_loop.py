@@ -45,7 +45,7 @@ def test_run_task_kanban_write_never_blocks_the_loop(tmp_path, monkeypatch):
     async def resume(ref, params):
         calls.append('resume')
     db = SimpleNamespace(get_session=lambda sid: None, db_path=str(tmp_path / 'state.db'))
-    authority = SimpleNamespace(profile_id=str(tmp_path), db=db, submit=submit)
+    authority = SimpleNamespace(sessions={}, runner=SimpleNamespace(adapters={}), profile_id=str(tmp_path), db=db, submit=submit)
     actor = Principal('owner', str(tmp_path), frozenset({'session:create'}), 'transport')
     connection = SimpleNamespace(authority=authority, actor=actor, native_owner=True, resume=resume)
     params = dict(board='owned', task_id=task_id, run_id=task.current_run_id, claim_lock=task.claim_lock)

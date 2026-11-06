@@ -43,7 +43,7 @@ def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
     assert context['board'] == 'owned' and context['claim_lock'] == task.claim_lock
     assert context['skills'] == ['owned-skill'] and context['goal_mode'] and context['goal_max_turns'] == 3
     assert context['accept_hooks'] is True and 'Goal criteria' in context['goal_text']
-    for changed in ({'run_id': task.current_run_id + 1}, {'board': 'foreign'}, {'claim_lock': 'forged'}, {'cwd': '/tmp'}):
+    for changed in ({'run_id': task.current_run_id + 1}, {'board': 'foreign'}, {'claim_lock': 'forged'}, {'cwd': '/tmp'}, {'prompt_consumer_admission_id': 'forged'}):
         with pytest.raises(RuntimeStoreError):
             build_kanban_policy(connection, params | changed, config)
     connection.native_owner = False
@@ -136,7 +136,7 @@ def test_claim_reclaimed_before_admission_marker_is_refused(tmp_path, monkeypatc
     async def resume(ref, params):
         calls.append(('resume', ref))
     db = SimpleNamespace(get_session=lambda sid: None, db_path=str(tmp_path / 'state.db'))
-    authority = SimpleNamespace(profile_id=str(tmp_path), db=db, submit=submit)
+    authority = SimpleNamespace(sessions={}, runner=SimpleNamespace(adapters={}), profile_id=str(tmp_path), db=db, submit=submit)
     actor = Principal('owner', str(tmp_path), frozenset({'session:create'}), 'transport')
     connection = SimpleNamespace(authority=authority, actor=actor, native_owner=True, resume=resume)
     params = dict(board='owned', task_id=task_id, run_id=old.current_run_id, claim_lock=old.claim_lock)
