@@ -49,9 +49,11 @@ async def test_question_consumer_requires_current_native_route_and_claim(tmp_pat
         fixture.adapter.kanban_prompt_consumer = lambda card: 'another-admission'
         with pytest.raises(RuntimeStoreError, match='consumer_unavailable'):
             await require_consumer(fixture.authority, bound)
-        fixture.adapter.kanban_prompt_consumer = lambda card: fixture.running['admission_id']
-        with connect_closing(board='owned') as conn:
-            kb.block_task(conn, tid, reason='Operator Stop', expected_run_id=claim.current_run_id)
+        def stop_during_provider_read(card):
+            with connect_closing(board='owned') as conn:
+                kb.block_task(conn, tid, reason='Operator Stop', expected_run_id=claim.current_run_id)
+            return fixture.running['admission_id']
+        fixture.adapter.kanban_prompt_consumer = stop_during_provider_read
         with pytest.raises(RuntimeStoreError, match='stale_kanban_claim'):
             await require_consumer(fixture.authority, bound)
     finally:

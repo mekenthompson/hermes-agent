@@ -42,6 +42,7 @@ async def consumer(authority, context, admission_id=None):
             raise RuntimeStoreError('invalid_kanban_prompt_consumer')
         await check_native_route(authority.runner, row['payload'],
                                  authority.physical_target(SessionRef(authority.profile_id, sid)), source, adapter)
+        await asyncio.to_thread(current)  # Stop during provider/route reauthorization wins.
         return candidate, row, adapter
     return None
 
