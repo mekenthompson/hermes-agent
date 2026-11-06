@@ -313,7 +313,11 @@ class WorkerControls:
         ``-z``, bound by worker_turn_scope) answers headless at once: its viewer cannot answer."""
         from gateway.session_finite import finite_clarify_reply, finite_turn_required
         if finite_turn_required() is True:
-            return finite_clarify_reply()
+            from gateway.session_policy import active_policy
+            policy = active_policy()
+            context = json.loads(policy.kanban_json or '{}') if policy else {}
+            if not context.get('prompt_consumer_admission_id'):
+                return finite_clarify_reply()
         answers = {}
         reply = {'answers': answers, 'outcome': 'submitted'}
         for entry in questions:

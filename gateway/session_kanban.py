@@ -109,6 +109,8 @@ async def run_task(connection, params):
         ref = restore_local_session(authority, sid)
     else:
         policy, private = build_kanban_policy(connection, params, _load_gateway_config())
+        from gateway.session_kanban_prompts import bind_consumer
+        policy = await bind_consumer(authority, policy)
         ref = create_local_session(authority, connection.actor, {'request_id': request_id},
                                    trusted_policy=policy, trusted_secrets=private)
     from hermes_cli.kanban_db_connect import connect_closing

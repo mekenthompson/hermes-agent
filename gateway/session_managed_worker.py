@@ -380,7 +380,7 @@ def interrupt_managed_owned(authority, ref, generation):
     return True
 
 
-def _prompt_frame(authority, ref, row, worker, frame):
+def _prompt_frame(authority, ref, row, worker, frame, *, clarify_entry=None):
     live = authority.sessions[ref.session_id]
     controls = live.controls
     kind = frame.get('type')
@@ -409,6 +409,9 @@ def _prompt_frame(authority, ref, row, worker, frame):
         controls.remote_responders.pop(prompt_id, None)
         saved = controls.pending.pop(prompt_id, None)
         if saved:
+            if saved[1]['kind'] == 'clarify' and hasattr(saved[0], 'response'):
+                from gateway.session_kanban_prompts import retire_prompt
+                retire_prompt(saved[0])
             live.event_stream.publish(ref.session_id, {'prompt_id': prompt_id,
                 'execution_generation': row['generation']}, event_type=saved[1]['kind'] + '.settled')
         return True
@@ -434,8 +437,8 @@ def _prompt_frame(authority, ref, row, worker, frame):
     if kind == 'approval':
         authority.register_approval(ref.session_id, row['generation'], live.route, data)
     else:
-        entry = SimpleNamespace(clarify_id=prompt_id, question=frame['question'], choices=frame['choices'],
-                                multi_select=frame['multi_select'], event=threading.Event())
+        entry = clarify_entry or SimpleNamespace(clarify_id=prompt_id, question=frame['question'], choices=frame['choices'],
+                                                 multi_select=frame['multi_select'], event=threading.Event())
         authority.register_clarify(ref.session_id, row['generation'], entry)
     return True
 
@@ -721,9 +724,9 @@ async def execute_managed(authority, ref, row, policy):
             # The claim's execution stamp, not a ledger read per frame (publish_execution fences the same way).
             if authority.executing.get(ref.session_id) != row['generation']:
                 raise RuntimeStoreError('stale_generation')
-            with authority.sessions[ref.session_id].event_stream.lock:
-                if _prompt_frame(authority, ref, row, worker, frame):
-                    continue
+            from gateway.session_kanban_prompts import dispatch_prompt_frame
+            if await dispatch_prompt_frame(authority, ref, row, policy, worker, frame):
+                continue
             if frame == {'type': 'error', 'reason': 'managed_worker_failed'}:
                 raise RuntimeStoreError('managed_worker_failed')
             kind = frame.get('type')
@@ -788,5 +791,7 @@ async def execute_managed(authority, ref, row, policy):
         # committed unknown row deliberately pauses every accepted follower.
         raise ManagedExecutionUnknown('managed_worker_unknown') from exc
     finally:
+        from gateway.session_kanban_prompts import retire_worker
+        await retire_worker(worker)
         workers.pop(ref.session_id, None)
         await asyncio.to_thread(worker.close)

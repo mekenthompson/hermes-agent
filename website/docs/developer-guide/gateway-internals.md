@@ -798,3 +798,22 @@ Plugins that load after the adapters connected (install/enable from the CLI, Des
 - [ACP Internals](./acp-internals.md)
 - [Agent Loop Internals](./agent-loop.md)
 - [Messaging Gateway (User Guide)](../user-guide/messaging/index.md)
+
+
+### Native card clarification consumers
+
+An adapter may implement `kanban_prompt_consumer(card)` to return the existing native human
+admission ID whose provider conversation currently receives that exact `board`, `task_id`,
+`run_id` and `db` card's questions. This is a trusted adapter association, never task text,
+metadata or a client launch flag. Return `None` without a current verified provider binding.
+The owner independently verifies the persisted admission, original source authorization,
+current route and native claim, then freezes the admission ID in the card's private launch
+policy. Only this card receives the `clarify` toolset. Its execution remains finite: approvals
+retain their single-query policy and never gain unattended approval.
+
+The managed worker's real clarification request joins the consumer route's ordinary native
+clarification registry and adapter renderer. The owner forwards an answer only while the same
+consumer association, task claim and execution generation remain current. Stop, timeout and
+worker retirement withdraw the request; a later run cannot consume an old choice. Adapters with
+persistent question cards may use their existing `retire_clarify_card` implementation to repair
+the visible state after withdrawal.

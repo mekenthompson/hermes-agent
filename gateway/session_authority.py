@@ -1183,6 +1183,8 @@ class SessionAuthority:
         if capability is None:
             raise RuntimeStoreError("invalid_params")
         self.authorize(actor, ref, capability)
+        from gateway.session_kanban_prompts import check_response
+        await check_response(self, ref, kind)
         live = self.sessions[ref.session_id]
         with live.event_stream.lock:
             if actor not in live.subscribers.values():
