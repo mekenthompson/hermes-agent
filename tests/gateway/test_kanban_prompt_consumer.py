@@ -42,6 +42,11 @@ async def test_question_consumer_requires_current_native_route_and_claim(tmp_pat
         bound = await bind_consumer(fixture.authority, policy)
         assert json.loads(bound.kanban_json)['prompt_consumer_admission_id'] == fixture.running['admission_id']
         assert 'clarify' in bound.toolsets
+        followup = await fixture.authority.admit_native(fixture.event('ordinary-status-followup', 'What is the status?'))
+        assert followup.admission_id != fixture.running['admission_id']
+        fixture.adapter.kanban_prompt_consumer = lambda card: card.get('consumer_admission_id', followup.admission_id)
+        verified, _row, _adapter = await require_consumer(fixture.authority, bound)
+        assert verified == fixture.running['admission_id']
         fixture.allowed.remove(fixture.source.user_id)
         with pytest.raises(RuntimeStoreError, match='permission_denied'):
             await require_consumer(fixture.authority, bound)

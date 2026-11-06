@@ -23,6 +23,8 @@ async def consumer(authority, context, admission_id=None):
             require_current_claim(conn, context)
     await asyncio.to_thread(current)
     card = {key: context[key] for key in ('board', 'task_id', 'run_id', 'db')}
+    if admission_id is not None:
+        card['consumer_admission_id'] = admission_id
     for adapter in tuple(local_adapter_map(authority).values()):
         callback = getattr(adapter, 'kanban_prompt_consumer', None)
         if not callable(callback):

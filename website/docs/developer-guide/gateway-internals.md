@@ -806,6 +806,9 @@ An adapter may implement `kanban_prompt_consumer(card)` to return the existing n
 admission ID whose provider conversation currently receives that exact `board`, `task_id`,
 `run_id` and `db` card's questions. This is a trusted adapter association, never task text,
 metadata or a client launch flag. Return `None` without a current verified provider binding.
+On revalidation, `card.consumer_admission_id` names the consumer frozen for that run. Validate
+that exact admitted provider conversation instead of substituting the newest input: an ordinary
+follow-up changes the conversation's reply anchor without changing the worker's receiver.
 The owner independently verifies the persisted admission, original source authorization,
 current route and native claim, then freezes the admission ID in the card's private launch
 policy. Only this card receives the `clarify` toolset. Its execution remains finite: approvals
