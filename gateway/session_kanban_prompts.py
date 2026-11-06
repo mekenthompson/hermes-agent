@@ -99,6 +99,7 @@ async def deliver(authority, ref, row, policy, worker, frame):
         controls.remote_responders[entry.clarify_id] = lambda _kind, prompt_id, value: clarify.resolve_gateway_clarify(prompt_id, value)
 
     async def relay():
+        forwarded = False
         try:
             timeout = clarify.resolve_clarify_timeout(policy.config())
             response = await asyncio.to_thread(clarify.wait_for_response, entry.clarify_id, timeout)
@@ -107,12 +108,13 @@ async def deliver(authority, ref, row, policy, worker, frame):
                 authority.check_approval_generation(ref.session_id, row['generation'])
                 if not worker.stop.is_set():
                     worker.respond('clarify', entry.clarify_id, response)
+                    forwarded = True
         finally:
             retire_prompt(entry)
             controls.remote_responders.pop(entry.clarify_id, None)
             controls.snapshot(ref.session_id, row['generation'])
             retire = getattr(adapter, 'retire_clarify_card', None)
-            if callable(retire):
+            if not forwarded and callable(retire):
                 await retire(entry.clarify_id, 'The question is no longer waiting for an answer.')
 
     task = asyncio.create_task(relay())
