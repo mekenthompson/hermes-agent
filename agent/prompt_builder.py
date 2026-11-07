@@ -260,6 +260,19 @@ SESSION_SEARCH_GUIDANCE = (
 # (agent/context_compressor_tail.py::with_skill_safety_rule): fresh sessions no longer pay for it.
 SKILLS_GUIDANCE = "When you work out a non-trivial workflow, record it with skill_manage for future reuse."
 
+KANBAN_HEADLESS_AMBIGUITY = (
+    "4. **Block on genuine ambiguity.** If you need a human decision you cannot infer (missing credentials, UX choice, "
+    "paywalled source, peer output you need first), call `kanban_block(reason=\"...\")` and stop. Don't guess. The "
+    "user will unblock with context and the dispatcher will respawn you.\n"
+)
+
+KANBAN_HEADLESS_QUESTIONS = (
+    "- Do not call `clarify` to ask questions. You are running headless — there is no live user to answer. The call "
+    "will time out and the task will sit silently in `running` with no signal to the operator. Instead: "
+    "`kanban_comment` the context, then `kanban_block(reason=...)` so the task surfaces on the board as needing "
+    "input.\n"
+)
+
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from the shared board at `~/.hermes/kanban.db`. Your task id is in "
@@ -279,9 +292,7 @@ KANBAN_GUIDANCE = (
     "`kanban.dispatch_stale_timeout_seconds` (default 4 hours) when no heartbeat has arrived in the last hour. A "
     "reclaim re-queues the task as `ready` without penalty (no failure counter tick), but you lose your current run's "
     "progress.\n"
-    "4. **Block on genuine ambiguity.** If you need a human decision you cannot infer (missing credentials, UX choice, "
-    "paywalled source, peer output you need first), call `kanban_block(reason=\"...\")` and stop. Don't guess. The "
-    "user will unblock with context and the dispatcher will respawn you.\n"
+    + KANBAN_HEADLESS_AMBIGUITY +
     "5. **Finish with the review model encoded by the task graph.** Always include the structured handoff (`summary`, "
     "`metadata`) on the lifecycle transition itself; never put secrets, tokens, or raw PII in these durable fields. If "
     "`kanban_show()` lists child IDs, inspect those cards with `kanban_show(task_id=...)` before choosing the terminal "
@@ -332,14 +343,41 @@ KANBAN_GUIDANCE = (
     "- Do not shell out to `hermes kanban <verb>` for board operations. Use the `kanban_*` tools — they work across "
     "all terminal backends.\n"
     "- Do not complete a task you didn't actually finish. Block it.\n"
-    "- Do not call `clarify` to ask questions. You are running headless — there is no live user to answer. The call "
-    "will time out and the task will sit silently in `running` with no signal to the operator. Instead: "
-    "`kanban_comment` the context, then `kanban_block(reason=...)` so the task surfaces on the board as needing "
-    "input.\n"
+    + KANBAN_HEADLESS_QUESTIONS +
     "- Do not assign follow-up work to yourself. Assign it to the right specialist profile.\n"
     "- Do not call `delegate_task` as a board substitute. `delegate_task` is for short reasoning subtasks inside your "
     "own run; board tasks are for cross-agent handoffs that outlive one API loop."
 )
+
+def build_kanban_guidance(valid_tool_names) -> str:
+    """Select once from the worker's frozen native-consumer capability, never env hints.
+
+    Prompt wording is not authority: the owner still reauthorizes the actual
+    consumer and task claim when rendering questions and accepting answers.
+    """
+    from gateway.session_policy import active_policy
+
+    policy = active_policy()
+    if policy is None or policy.source != "kanban" or "clarify" not in valid_tool_names:
+        return KANBAN_GUIDANCE
+    context = json.loads(policy.kanban_json or "{}")
+    if not context.get("prompt_consumer_admission_id"):
+        return KANBAN_GUIDANCE
+    return KANBAN_GUIDANCE.replace(
+        KANBAN_HEADLESS_AMBIGUITY,
+        "4. **Ask about genuine ambiguity.** If you need a human decision you cannot infer, "
+        "use `clarify` to ask the human in this task's bound conversation and wait for the answer. "
+        "Continue this same task after the answer. If the question cannot be answered or a genuine "
+        "external dependency prevents progress, record the context and `kanban_block(reason=\"...\")`. "
+        "Do not guess or claim completion.\n",
+    ).replace(
+        KANBAN_HEADLESS_QUESTIONS,
+        "- This worker has a trusted human conversation for `clarify`. Use the tool for questions; "
+        "do not substitute a status comment or block the task merely to ask. The runtime checks "
+        "that the conversation and task are still current. If it reports no available answer, "
+        "comment the context and block for input instead of repeatedly asking.\n",
+    )
+
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
