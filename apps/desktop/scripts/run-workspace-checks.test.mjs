@@ -18,26 +18,37 @@ async function fixture() {
   fixtures.push(dir)
   const bin = join(dir, 'bin')
   await mkdir(bin)
-  const fakeNpm = `#!/usr/bin/env node
+  const packages = ['pass-a', 'fail', 'pass-b']
+  await writeFile(join(dir, 'package.json'), JSON.stringify({ name: 'scheduler-fixture', private: true }))
+  await writeFile(join(dir, 'pnpm-workspace.yaml'), `packages:\n${packages.map(name => `  - ${name}\n`).join('')}`)
+  await Promise.all(
+    packages.map(async name => {
+      await mkdir(join(dir, name))
+      await writeFile(join(dir, name, 'package.json'), JSON.stringify({ name, scripts: { check: 'true' } }))
+    })
+  )
+  const fakePnpm = `#!/usr/bin/env node
+const assert = require('node:assert/strict')
 const { appendFileSync } = require('node:fs')
 const args = process.argv.slice(2)
-if (args[0] === 'query') {
-  process.stdout.write(JSON.stringify([
-    { location: '/pass-a', scripts: { check: 'true' } },
-    { location: '/fail', scripts: { check: 'true' } },
-    { location: '/pass-b', scripts: { check: 'true' } },
-  ]))
+assert.equal(process.cwd(), ${JSON.stringify(dir)})
+if (args[0] === 'ls') {
+  assert.deepEqual(args, ['ls', '--recursive', '--depth', '-1', '--json'])
+  process.stdout.write(JSON.stringify(${JSON.stringify([dir, ...packages.map(name => join(dir, name))].map(path => ({ path })))}))
   process.exit(0)
 }
-const prefix = args[args.indexOf('--prefix') + 1]
-appendFileSync(process.env.EVENTS, JSON.stringify({ event: 'start', prefix, at: Date.now() }) + '\\n')
+assert.equal(args[0], '--dir')
+assert.deepEqual(args.slice(2), ['run', 'check'])
+const pkg = args[1]
+assert.ok(${JSON.stringify(packages)}.includes(pkg))
+appendFileSync(process.env.EVENTS, JSON.stringify({ event: 'start', pkg, at: Date.now() }) + '\\n')
 setTimeout(() => {
-  appendFileSync(process.env.EVENTS, JSON.stringify({ event: 'end', prefix, at: Date.now() }) + '\\n')
-  process.exit(prefix === '/fail' ? 1 : 0)
+  appendFileSync(process.env.EVENTS, JSON.stringify({ event: 'end', pkg, at: Date.now() }) + '\\n')
+  process.exit(pkg === 'fail' ? 1 : 0)
 }, 100)
 `
-  await writeFile(join(bin, 'npm'), fakeNpm)
-  chmodSync(join(bin, 'npm'), 0o755)
+  await writeFile(join(bin, 'pnpm'), fakePnpm)
+  chmodSync(join(bin, 'pnpm'), 0o755)
   await writeFile(join(dir, 'events'), '')
   return { dir, events: join(dir, 'events') }
 }
@@ -46,13 +57,14 @@ describe('run-workspace-checks scheduler', () => {
   it('limits active checks to its budget and reports every check after a failure', async () => {
     const { dir, events } = await fixture()
     const result = spawnSync(process.execPath, [runner], {
+      cwd: dir,
       encoding: 'utf8',
       env: {
         ...process.env,
         EVENTS: events,
         PATH: `${join(dir, 'bin')}:${process.env.PATH}`,
-        WORKSPACE_CHECK_CONCURRENCY: '2',
-      },
+        WORKSPACE_CHECK_CONCURRENCY: '2'
+      }
     })
 
     expect(result.status).toBe(1)
@@ -62,6 +74,14 @@ describe('run-workspace-checks scheduler', () => {
     const entries = (await readFile(events, 'utf8')).trim().split('\n').map(JSON.parse)
     expect(entries.filter(entry => entry.event === 'start')).toHaveLength(3)
     expect(entries.filter(entry => entry.event === 'end')).toHaveLength(3)
+    for (const event of ['start', 'end']) {
+      expect(
+        entries
+          .filter(entry => entry.event === event)
+          .map(entry => entry.pkg)
+          .sort()
+      ).toEqual(['fail', 'pass-a', 'pass-b'])
+    }
 
     let active = 0
     let maxActive = 0

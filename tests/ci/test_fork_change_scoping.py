@@ -18,6 +18,9 @@ from pathlib import Path
 
 import pytest
 
+from tests.ci import _gha_expr as gha
+from tests.ci import workflow_steps
+
 yaml = pytest.importorskip("yaml")
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -192,14 +195,39 @@ def test_fork_orchestrator_actions_and_scripts_still_fail_open():
     assert _fork([])["docker"] is True
 
 
+@pytest.mark.parametrize("path", [
+    "apps/desktop/src/app.tsx",
+    "apps/desktop/vite.webapp.config.ts",
+    "hermes_agent/__main__.py",
+    "hermes_cli/config.py",
+    "run_agent.py",
+    "ui-tui/src/app.tsx",
+    "optional-skills/example/SKILL.md",
+    "new-runtime-package/module.py",
+])
+def test_fork_image_lane_includes_built_and_copied_runtime_inputs(path):
+    # The fork builds the final runtime stage, including the Webapp renderer,
+    # and COPY . . includes new runtime packages. Unknown paths fail open.
+    assert _fork([path])["docker"] is True
+
+
 def test_fork_image_lane_tracks_what_the_dockerfile_copies():
-    assert _fork(["apps/desktop/src/app.tsx"])["docker"] is False
     assert _fork(["apps/shared/src/x.ts"])["docker"] is True
     assert _fork(["web/src/x.ts"])["docker"] is True
-    assert _fork(["package-lock.json"])["docker"] is True
+    assert _fork(["pnpm-lock.yaml"])["docker"] is True
     assert _fork(["tests/agent/test_x.py"])["docker"] is False
     assert _fork(["Dockerfile"])["docker"] is True
     assert _fork(["skills/github/SKILL.md"])["docker"] is True
+
+
+@pytest.mark.parametrize("path", [
+    "apps/bootstrap-installer/src-tauri/src/main.rs",
+    "tests/agent/test_x.py", "website/src/index.tsx", "nix/package.nix",
+    "README.md", ".github/workflows/ci.yaml",
+])
+def test_fork_image_lane_skips_known_unshipped_inputs(path):
+    assert _fork([path])["docker"] is False
+    assert _fork([path, "hermes_agent/__main__.py"])["docker"] is True
 
 
 def test_fork_falls_back_to_fail_open_when_ci_yaml_is_unparseable(tmp_path):
@@ -251,16 +279,60 @@ def test_fork_only_gates_in_ci_yaml():
     assert fork["tests"] and upstream["tests"]
     assert not fork["tests-os"] and upstream["tests-os"]
     assert not fork["docs-site"] and upstream["docs-site"]
-    assert not fork["contributor-check"] and upstream["contributor-check"]
+    assert fork["repo-guards"] and upstream["repo-guards"]
     assert not fork["osv-scanner"] and upstream["osv-scanner"]
     lanes["uv_lock"] = "true"
     assert policy.selected_jobs(lanes, FORK, "pull_request")["osv-scanner"]
 
 
+@pytest.mark.parametrize("files", [
+    ["README.md"], ["infographic/pr.png"], ["exports/profile.tgz"],
+])
+def test_consolidated_hygiene_guards_run_without_a_binary_lane(files):
+    policy = _load("ci_policy")
+    lanes = {key: gha.to_string(value) for key, value in _fork(files).items()}
+    selected = policy.selected_jobs(lanes, FORK, "pull_request")
+    assert selected["repo-guards"]
+    assert policy.image_selected_jobs(selected)["repo-guards"]
+    call = _yaml(".github/workflows/ci.yaml")["jobs"]["repo-guards"]
+    assert call["needs"] == "detect"
+    assert call["uses"] == "./.github/workflows/repo-guards.yml"
+    ctx = {
+        "needs": {"detect": {"outputs": lanes}},
+        "__status__": {"success": True, "cancelled": False},
+    }
+    workflow_steps.required(call, ctx)
+    # Guard failures must not hide later hygiene checks in the combined job.
+    ctx["__status__"]["success"] = False
+    guards = _yaml(call["uses"][2:])["jobs"]["guards"]
+    for name, command in (
+        ("Reject committed PR-infographic images", "git ls-files -z"),
+        ("Reject profile exports in the checkout", "scripts/ci/check_profile_archive_boundary.py"),
+        ("Judge files added or modified against the base branch tip", "scripts/ci/check_blob_size.py --base HEAD^1"),
+    ):
+        step = next(step for step in guards["steps"] if step.get("name") == name)
+        workflow_steps.required(step, ctx)
+        assert command in step["run"]
+
+
+@pytest.mark.parametrize("python,catalog", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("repository", [FORK, UPSTREAM])
+def test_consolidated_contributor_guard_keeps_its_lane_gates(python, catalog, repository):
+    guards = _yaml(".github/workflows/repo-guards.yml")["jobs"]["guards"]
+    step = next(step for step in guards["steps"] if step.get("id") == "check-emails")
+    ctx = {
+        "inputs": {"python": python, "catalog": catalog},
+        "github": {"repository": repository},
+        "__status__": {"success": False, "cancelled": False},
+    }
+    assert gha.condition(step["if"], ctx) is (python or catalog)
+    assert not step.get("continue-on-error", False)
+
+
 def test_detect_declares_every_lane_the_fork_gates_read():
     ci = _yaml(".github/workflows/ci.yaml")
     action = _yaml(".github/actions/detect-changes/action.yml")
-    for lane in ("os_tests", "binary_artifacts", "upgrade"):
+    for lane in ("os_tests", "upgrade"):
         assert lane in ci["jobs"]["detect"]["outputs"]
         assert lane in action["outputs"]
 
@@ -312,7 +384,7 @@ def test_fork_python_lane_defaults_to_sixteen_slices():
         ("ci-review-comment.yml", "comment"),
         ("publish-e2e-evidence.yml", "publish"),
         ("nix.yml", "detect"),
-        ("docker.yml", "detect"),
+        ("docker.yml", "mode"),
         ("skills-index-freshness.yml", "check-freshness"),
         ("skills-index.yml", "build-index"),
     ],

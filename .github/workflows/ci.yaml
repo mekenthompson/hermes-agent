@@ -62,23 +62,6 @@ concurrency:
   cancel-in-progress: ${{ inputs.release != true && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.repository == 'mekenthompson/hermes-agent' && github.ref == 'refs/heads/main')) }}
 
 jobs:
-  # ─────────────────────────────────────────────────────────────────────
-  # detect: run the classifier once. Every downstream job reads its outputs
-  # to decide whether to run. On push/dispatch the classifier fails open
-  # (all lanes true) so post-merge validation is never weakened.
-  #
-  # status even when some deps were skipped.
-  #
-  # Non-release (PR/push): failure fails, skipped counts as success.
-  # Release (inputs.release): strict — every required job must be success;
-  # only PR-only jobs and deferred Desktop E2E may skip. The OSV scan's
-  # findings are advisory, but its execution is required.
-  #
-  # Fork (mekenthompson): main pushes are scoped to the pushed range and
-  # several jobs carry fork-only gates. Never add paths: to push triggers:
-  # fork-agent-image.yml waits for a successful CI run of the exact SHA.
-  # detect and all-checks-pass always run, including when every lane skips.
-  # ─────────────────────────────────────────────────────────────────────
   detect:
     name: Detect affected areas
     runs-on: ubuntu-latest
@@ -113,7 +96,6 @@ jobs:
       ci_review: ${{ steps.classify.outputs.ci_review }}
       ci_review_files: ${{ steps.classify.outputs.ci_review_files }}
       os_tests: ${{ steps.classify.outputs.os_tests }}
-      binary_artifacts: ${{ steps.classify.outputs.binary_artifacts }}
       upgrade: ${{ steps.gate-lanes.outputs.upgrade }}
       selected_jobs: ${{ steps.select-jobs.outputs.selected_jobs }}
       event_name: ${{ github.event_name }}
@@ -189,15 +171,6 @@ jobs:
           RELEASE: ${{ inputs.release }}
         run: python3 scripts/ci/ci_policy.py --select
 
-  # ─────────────────────────────────────────────────────────────────────
-  # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
-  # Skipped workflows (if condition is false) don't spin up runners.
-  #
-  # Fork validation is unit tests, lint, bundled JS, and dependency checks.
-  # E2E, upgrade, Desktop, other OS runners, and native installers are
-  # upstream product surfaces. A sync that touches those paths must not
-  # schedule them here.
-  # ─────────────────────────────────────────────────────────────────────
   tests:
     name: Python tests
     needs: detect
@@ -216,8 +189,6 @@ jobs:
       e2e_upgrade: ${{ github.repository != 'mekenthompson/hermes-agent' && needs.detect.outputs.e2e_upgrade == 'true' }}
       strict_acceptance: ${{ inputs.strict_acceptance || '' }}
 
-  # Not selected on this fork. Upstream keeps the combined install call in its
-  # own repository. The job remains so a synced workflow graph still names it.
   native-install-tests:
     name: Native install tests
     needs: detect
@@ -230,12 +201,6 @@ jobs:
       upgrade: true
       upgrade_partition: native
 
-  # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
-  # the OS-marked tests it collects are skipped there by design (see the
-  # `_OS_MARKS` comment in tests/conftest.py) — this is where they run.
-  # Fork: selected_jobs.tests-os requires python and os_tests. The fork ships
-  # Linux containers, so a diff with no OS-specific surface skips Windows and
-  # macOS. desktop_updater is still passed into the workflow below.
   tests-os:
     name: OS-specific tests
     needs: detect
@@ -376,134 +341,32 @@ jobs:
     with:
       commit: ${{ inputs.commit }}
 
-  history-check:
-    name: Deny unrelated histories
+  repo-guards:
+    name: Repository guards
     needs: detect
-    if: ${{ fromJSON(needs.detect.outputs.selected_jobs)['history-check'] }}
-    uses: ./.github/workflows/history-check.yml
-    with:
-      commit: ${{ inputs.commit }}
-
-  contributor-check:
-    name: Check contributors
-    needs: detect
-    # Fork: PRs only. On a main push HEAD == origin/main, so the merge-base
-    # range is empty and the job checks nothing.
-    if: ${{ fromJSON(needs.detect.outputs.selected_jobs)['contributor-check'] }}
-    uses: ./.github/workflows/contributor-check.yml
-    with:
-      commit: ${{ inputs.commit }}
-
-  uv-lockfile:
-    name: Check uv.lock
-    needs: detect
-    # Gated: `uv lock --check` re-resolves the whole dependency graph against
-    # PyPI, so on every PR it spent a network round-trip — and, on a registry
-    # blip, a blocking red X — for diffs that cannot desync the lockfile
-    # (docs, frontend, prose). Only pyproject.toml / uv.lock can. A
-    # `.github/` change still forces it on via the classifier's fail-open.
-    if: ${{ fromJSON(needs.detect.outputs.selected_jobs)['uv-lockfile'] }}
-    uses: ./.github/workflows/uv-lockfile-check.yml
-    with:
-      commit: ${{ inputs.commit }}
-
-  # Both tree checks reject files by extension; the fork runs them only when
-  # the diff carries such a file (classifier ``binary_artifacts``).
-  infographic-check:
-    name: Check no committed infographics
-    needs: detect
-    if: ${{ fromJSON(needs.detect.outputs.selected_jobs)['infographic-check'] }}
-    uses: ./.github/workflows/infographic-check.yml
-    with:
-      commit: ${{ inputs.commit }}
-
-  profile-artifact-check:
-    name: Profile artifact check
-    needs: detect
-    if: ${{ fromJSON(needs.detect.outputs.selected_jobs)['profile-artifact-check'] }}
-    uses: ./.github/workflows/profile-artifact-check.yml
-    with:
-      commit: ${{ inputs.commit }}
-
-  icons-freshness-check:
-    name: Icon assets freshness
-    needs: detect
-    if: ${{ fromJSON(needs.detect.outputs.selected_jobs)['icons-freshness-check'] }}
-    uses: ./.github/workflows/icons-freshness-check.yml
-    with:
-      commit: ${{ inputs.commit }}
-
-  case-collision-check:
-    name: Check no case-colliding filenames
-    needs: detect
-    if: github.repository != 'mekenthompson/hermes-agent'
-    uses: ./.github/workflows/case-collision-check.yml
-    with:
-      commit: ${{ inputs.commit }}
-
-  blob-size-check:
-    name: Check no large binaries
-    needs: detect
-    uses: ./.github/workflows/blob-size-check.yml
-    with:
-      commit: ${{ inputs.commit }}
-
-  lazy-deps-guard:
-    name: No production imports of the tools.lazy_deps stub
-    needs: detect
-    if: github.repository != 'mekenthompson/hermes-agent'
-    uses: ./.github/workflows/lazy-deps-guard.yml
-    with:
-      commit: ${{ inputs.commit }}
-
-  lockfile-diff:
-    name: package-lock.json diff
-    needs: detect
-    if: ${{ fromJSON(needs.detect.outputs.selected_jobs)['lockfile-diff'] }}
-    uses: ./.github/workflows/lockfile-diff.yml
-    with:
-      commit: ${{ inputs.commit }}
-
-  # Advisory summary of the committed prompt-surface snapshot's diff. A stdlib-only job over two
-  # committed directories: cheap enough to run on every Python PR, and silent when nothing moved.
-  prompt-surface-diff:
-    name: Prompt surface diff
-    needs: detect
-    if: needs.detect.outputs.event_name == 'pull_request' && needs.detect.outputs.python == 'true'
-    uses: ./.github/workflows/prompt-surface-diff.yml
-    with:
-      commit: ${{ inputs.commit }}
-
-  docker-lint:
-    name: Lint Docker scripts
-    needs: detect
-    if: ${{ fromJSON(needs.detect.outputs.selected_jobs)['docker-lint'] }}
-    uses: ./.github/workflows/docker-lint.yml
-    with:
-      commit: ${{ inputs.commit }}
-
-  supply-chain:
-    name: Supply-chain scan
-    needs: detect
-    if: ${{ fromJSON(needs.detect.outputs.selected_jobs)['supply-chain'] }}
-    uses: ./.github/workflows/supply-chain-audit.yml
+    uses: ./.github/workflows/repo-guards.yml
     with:
       commit: ${{ inputs.commit }}
       event_name: ${{ needs.detect.outputs.event_name }}
+      python: ${{ needs.detect.outputs.python == 'true' }}
+      catalog: ${{ needs.detect.outputs.catalog == 'true' }}
       scan: ${{ needs.detect.outputs.scan == 'true' }}
       deps: ${{ needs.detect.outputs.deps == 'true' }}
+      npm_lock: ${{ needs.detect.outputs.npm_lock == 'true' }}
+      uv_lock: ${{ needs.detect.outputs.uv_lock == 'true' }}
+      docker_meta: ${{ needs.detect.outputs.docker_meta == 'true' }}
 
   review-labels:
     name: Review label gate
-    needs: [detect, supply-chain]
-    if: always() && (fromJSON(needs.detect.outputs.selected_jobs)['review-labels'] || (needs.detect.outputs.event_name == 'pull_request' && needs.supply-chain.outputs.critical_findings == 'true'))
+    needs: [detect, repo-guards]
+    if: always() && (fromJSON(needs.detect.outputs.selected_jobs)['review-labels'] || (needs.detect.outputs.event_name == 'pull_request' && needs.repo-guards.outputs.critical_findings == 'true'))
     uses: ./.github/workflows/review-labels.yml
     with:
       commit: ${{ inputs.commit }}
       ci_review: ${{ needs.detect.outputs.ci_review == 'true' }}
       ci_review_files: ${{ needs.detect.outputs.ci_review_files }}
       mcp_catalog: ${{ needs.detect.outputs.mcp_catalog == 'true' }}
-      supply_chain: ${{ needs.supply-chain.outputs.critical_findings == 'true' }}
+      supply_chain: ${{ needs.repo-guards.outputs.critical_findings == 'true' }}
 
   osv-scanner:
     name: OSV scan
@@ -516,27 +379,6 @@ jobs:
     with:
       commit: ${{ inputs.commit }}
 
-  # ─────────────────────────────────────────────────────────────────────
-  # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped.
-  # Fork gate: selected_jobs decides which lanes must succeed. A skipped
-  # unselected lane is success. The OSV scan's findings are advisory, but its
-  # execution is required. Deferred Desktop E2E may skip.
-  #
-  # Upstream release mode (non-fork only): every required job must be
-  # success. A skipped required lane fails that gate; only the PR-only jobs
-  # (history-check, lockfile-diff, prompt-surface-diff, supply-chain,
-  # review-labels) and the deferred Desktop E2E may skip.
-  #
-  # Branch protection should require ONLY this check.
-  #
-  # Fork ruleset "main: pipeline gate" requires the unversioned context
-  # "All required checks pass". Do not add an upstream "(v2)" suffix here
-  # unless that ruleset is updated in the same change.
-  #
-  # Outputs ``needs-json`` — a compact ``{job_name: result}`` dict — so
-  # the live comment poller can list failed jobs in the PR comment.
-  # ─────────────────────────────────────────────────────────────────────
   all-checks-pass:
     name: All required checks pass
     needs:
@@ -555,19 +397,7 @@ jobs:
       - e2e-desktop-core
       - e2e-desktop-update
       - docs-site
-      - history-check
-      - contributor-check
-      - uv-lockfile
-      - infographic-check
-      - case-collision-check
-      - blob-size-check
-      - lazy-deps-guard
-      - lockfile-diff
-      - prompt-surface-diff
-      - docker-lint
-      - profile-artifact-check
-      - icons-freshness-check
-      - supply-chain
+      - repo-guards
       - osv-scanner
       - review-labels
       # OSV findings are advisory, but dependency-manifest PRs aggregate its
@@ -579,7 +409,7 @@ jobs:
       # run open. That is what blocked ``gh run rerun``.
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     outputs:
       needs-json: ${{ steps.evaluate.outputs.needs-json }}
     steps:
@@ -596,7 +426,7 @@ jobs:
           RELEASE: ${{ inputs.release }}
           REPO: ${{ github.repository }}
           SELECTED_JOBS: ${{ needs.detect.outputs.selected_jobs }}
-          CRITICAL_FINDINGS: ${{ needs.supply-chain.outputs.critical_findings }}
+          CRITICAL_FINDINGS: ${{ needs.repo-guards.outputs.critical_findings }}
         run: |
           if [ "$RELEASE" = true ] && [ "$REPO" != "mekenthompson/hermes-agent" ]; then
             printf '%s' "$NEEDS" | python3 scripts/ci/required_results.py --release
@@ -604,8 +434,117 @@ jobs:
             echo "$NEEDS" | python3 scripts/ci/ci_policy.py
           fi
 
-  # Publication only: runtime lanes this fork actually ships gate the Linux
-  # image. Unshipped surfaces are not selected, so they do not delay publication.
+      # CI timing report: collect per-job/step durations from the GitHub API,
+      # cache them on main (as a baseline), and on PRs generate an HTML diff
+      # report with a gantt chart + per-step breakdown. The report is uploaded
+      # as an artifact and a markdown summary is written to $GITHUB_STEP_SUMMARY.
+      #
+      # These steps used to be a separate `ci-timings` job that started right
+      # after this one, on the same runner, with its own checkout: a second
+      # billed minute for ~15s of work. They are advisory: every one runs
+      # whatever the verdict above was (`always()`), never fails the gate
+      # (`continue-on-error`), and is time-boxed so a slow GitHub API cannot
+      # hold the required check open.
+      #
+      # The live comment poller dynamically fetches all review-status-* artifacts
+      # across the orchestrator and sub-workflow runs every cycle, so its link
+      # points straight at that report.
+      # ───────────────────────────────────────────────────────────────────
+      - name: Restore timing baseline cache (PR only)
+        if: always() && github.event_name == 'pull_request'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ci-timings-baseline.json
+          # Prefix-match: exact key will never hit (run_id differs), so
+          # restore-keys finds the most recent baseline from main.
+          key: ci-timings-baseline-never-exact
+          restore-keys: |
+            ci-timings-baseline-
+
+      - name: Collect timings and generate report
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci/timings_report.py \
+            --own-job-last-step "Evaluate job results" \
+            --baseline ci-timings-baseline.json \
+            --output ci-timings-report.html \
+            --json-out ci-timings.json \
+            --summary-out ci-timings-summary.md
+
+      - name: Upload HTML timing report
+        if: always() && hashFiles('ci-timings-report.html') != ''
+        # Advisory report — artifact-service blips must not fail the job.
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: ci-timings-html
+        with:
+          path: ci-timings-report.html
+          archive: false
+          retention-days: 14
+
+      - name: Build linked review status
+        if: always() && hashFiles('ci-timings.json') != ''
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          CI_TIMINGS_REPORT_URL: ${{ steps.ci-timings-html.outputs.artifact-url }}
+        run: |
+          python3 scripts/ci/timings_report.py \
+            --from-json ci-timings.json \
+            --baseline ci-timings-baseline.json \
+            --review-status-out review-status.json \
+            --review-status-only
+
+      - name: Upload review status
+        if: always() && hashFiles('review-status.json') != ''
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: review-status-ci-timings
+          path: review-status.json
+          retention-days: 14
+
+      - name: Output timing summary
+        if: always() && hashFiles('ci-timings-summary.md') != ''
+        continue-on-error: true
+        env:
+          REPORT_URL: ${{ steps.ci-timings-html.outputs.artifact-url}}
+        run: |
+          {
+            echo "# CI Timing report"
+            echo "[View the full interactive report]($REPORT_URL)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat ci-timings-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save timing baseline (main only)
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          # Degraded runs (API rate-limited) produce no ci-timings.json —
+          # skip rather than fail, and never cache an empty baseline.
+          if [ -f ci-timings.json ]; then
+            cp ci-timings.json ci-timings-baseline.json
+          else
+            echo "No timings JSON this run — skipping baseline update"
+          fi
+
+      - name: Upload timing baseline to cache (main only)
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('ci-timings-baseline.json') != ''
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ci-timings-baseline.json
+          key: ci-timings-baseline-${{ github.run_id }}
+
   image-checks-pass:
     name: Image required checks pass
     needs:
@@ -614,17 +553,7 @@ jobs:
       - catalog-tests
       - lint
       - js-tests
-      - history-check
-      - contributor-check
-      - uv-lockfile
-      - infographic-check
-      - case-collision-check
-      - lazy-deps-guard
-      - lockfile-diff
-      - docker-lint
-      - profile-artifact-check
-      - icons-freshness-check
-      - supply-chain
+      - repo-guards
       - osv-scanner
       - review-labels
       - remote-backends
@@ -641,109 +570,5 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           SELECTED_JOBS: ${{ needs.detect.outputs.selected_jobs }}
-          CRITICAL_FINDINGS: ${{ needs.supply-chain.outputs.critical_findings }}
+          CRITICAL_FINDINGS: ${{ needs.repo-guards.outputs.critical_findings }}
         run: printf '%s' "$NEEDS" | python3 scripts/ci/ci_policy.py --image
-
-  # ─────────────────────────────────────────────────────────────────────
-  # CI timing report: collect per-job/step durations from the GitHub API,
-  # cache them on main (as a baseline), and on PRs generate an HTML diff
-  # report with a gantt chart + per-step breakdown. The report is uploaded
-  # as an artifact and a markdown summary is written to $GITHUB_STEP_SUMMARY.
-  #
-  # The live comment poller dynamically fetches all review-status-* artifacts
-  # across the orchestrator and sub-workflow runs every cycle, so its link
-  # points straight at that report.
-  # ─────────────────────────────────────────────────────────────────────
-  ci-timings:
-    name: CI timing report
-    permissions:
-      contents: read
-      actions: read # download completed jobs' cache transfer logs
-    needs: [all-checks-pass]
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout code
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
-        with:
-          ref: ${{ inputs.commit }}
-
-      - name: Restore baseline cache (PR only)
-        if: github.event_name == 'pull_request'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ci-timings-baseline.json
-          # Prefix-match: exact key will never hit (run_id differs), so
-          # restore-keys finds the most recent baseline from main.
-          key: ci-timings-baseline-never-exact
-          restore-keys: |
-            ci-timings-baseline-
-
-      - name: Collect timings and generate report
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          python3 scripts/ci/timings_report.py \
-            --baseline ci-timings-baseline.json \
-            --output ci-timings-report.html \
-            --json-out ci-timings.json \
-            --summary-out ci-timings-summary.md
-
-      - name: Upload HTML report
-        # Advisory report — artifact-service blips must not fail the job.
-        continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        id: ci-timings-html
-        with:
-          path: ci-timings-report.html
-          archive: false
-          retention-days: 14
-
-      - name: Build linked review status
-        if: hashFiles('ci-timings.json') != ''
-        env:
-          CI_TIMINGS_REPORT_URL: ${{ steps.ci-timings-html.outputs.artifact-url }}
-        run: |
-          python3 scripts/ci/timings_report.py \
-            --from-json ci-timings.json \
-            --baseline ci-timings-baseline.json \
-            --review-status-out review-status.json \
-            --review-status-only
-
-      - name: Upload review status
-        if: hashFiles('review-status.json') != ''
-        continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: review-status-ci-timings
-          path: review-status.json
-          retention-days: 14
-
-      - name: Output summary
-        env:
-          REPORT_URL: ${{ steps.ci-timings-html.outputs.artifact-url}}
-        run: |
-          {
-            echo "# CI Timing report"
-            echo "[View the full interactive report]($REPORT_URL)"
-          } >> "$GITHUB_STEP_SUMMARY"
-          cat ci-timings-summary.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Save baseline cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          # Degraded runs (API rate-limited) produce no ci-timings.json —
-          # skip rather than fail, and never cache an empty baseline.
-          if [ -f ci-timings.json ]; then
-            cp ci-timings.json ci-timings-baseline.json
-          else
-            echo "No timings JSON this run — skipping baseline update"
-          fi
-
-      - name: Upload baseline to cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('ci-timings-baseline.json') != ''
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ci-timings-baseline.json
-          key: ci-timings-baseline-${{ github.run_id }}

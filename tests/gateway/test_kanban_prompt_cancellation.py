@@ -21,7 +21,7 @@ channel.send('private_waiter_result', cancelled=result is _INTERRUPTED, answered
 
 async def _check_withdrawal(tmp_path, monkeypatch, failure, fixture):
     from gateway.platforms.base import SendResult
-    from gateway.session_contract import Principal, Submission
+    from gateway.session_contract import SessionActor, Submission
     from gateway.session_kanban import build_kanban_policy
     from gateway.session_kanban_prompts import bind_consumer, deliver, retire_worker
     from gateway.session_local import create_local_session
@@ -46,7 +46,7 @@ async def _check_withdrawal(tmp_path, monkeypatch, failure, fixture):
                 workspace_kind='dir', workspace_path=str(home))
             task = kb.claim_task(conn, tid)
         fixture.adapter.kanban_prompt_consumer = lambda card: fixture.running['admission_id']
-        actor = Principal('owner', str(home), frozenset({'session:create', 'session:submit'}), 'test')
+        actor = SessionActor('owner', str(home), frozenset({'session:create', 'session:submit'}), 'test')
         connection = SimpleNamespace(native_owner=True, actor=actor, authority=fixture.authority)
         params = dict(board='owned', task_id=tid, run_id=task.current_run_id, claim_lock=task.claim_lock)
         policy, secrets = build_kanban_policy(connection, params, {'agent': {'clarify_timeout': 0},

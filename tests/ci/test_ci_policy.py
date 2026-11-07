@@ -44,10 +44,13 @@ def test_cancel_in_progress_preserves_upstream_pushes(
         ({"tests": {"result": "success"}}, {"tests": True, "lint": True}, ["lint"]),
         ({"tests": {"result": "skipped"}}, {"tests": True}, ["tests"]),
         ({"tests": {"result": "skipped"}}, {"tests": False}, []),
+        ({}, {"tests": False}, ["tests"]),
         ({"tests": {"result": "cancelled"}}, {"tests": False}, ["tests"]),
         ({"tests": {"result": "failure"}}, {"tests": True}, ["tests"]),
         ({"tests": {}}, {"tests": True}, ["tests"]),
         ({"tests": {"result": "skipped"}}, {"tests": "false"}, ["selected_jobs"]),
+        ({"tests": {"result": "success"}, "unknown": {"result": "skipped"}},
+         {"tests": True}, ["unknown"]),
     ],
 )
 def test_evaluate_needs_requires_selected_success_and_explicit_non_applicability(
@@ -86,14 +89,13 @@ def test_selection_uses_boolean_values_and_fork_scope() -> None:
             "docker_meta",
             "rust",
             "site",
-            "binary_artifacts",
         )
     }
     selected = _mod.selected_jobs(lanes, "mekenthompson/hermes-agent", "pull_request")
     assert selected["tests"] is False
     assert selected["tests-os"] is False
     assert selected["installer-tests"] is False
-    assert selected["history-check"] is True
+    assert selected["repo-guards"] is True
     lanes["python"] = "true"
     lanes["os_tests"] = "true"
     assert (
@@ -143,7 +145,7 @@ def test_selection_covers_each_orchestrator_prerequisite() -> None:
         (_PATH.parents[2] / ".github/workflows/ci.yaml").read_text()
     )
     jobs = workflow["jobs"]
-    expected = set(jobs) - {"all-checks-pass", "image-checks-pass", "ci-timings"}
+    expected = set(jobs) - {"all-checks-pass", "image-checks-pass"}
     selected = _mod.selected_jobs({}, "mekenthompson/hermes-agent", "pull_request")
     assert set(selected) == expected == set(jobs["all-checks-pass"]["needs"])
 
@@ -159,8 +161,8 @@ def test_image_gate_keeps_runtime_failures_and_excludes_only_other_surfaces() ->
         "native-install-tests",
         "tests-os", "installer-tests", "rust-tests", "bootstrap-installer",
         "e2e-desktop", "e2e-desktop-core", "e2e-desktop-update", "docs-site",
-        "prompt-surface-diff", "blob-size-check",
     }
+    assert image["repo-guards"] is True
     needs = {name: {"result": "success"} for name in image}
     assert not _mod.evaluate_needs(needs, image).failed
     for name in image:
@@ -212,35 +214,70 @@ def test_upgrade_applicability_reaches_real_upgrade_suite() -> None:
             assert _mod.evaluate_needs(needs, selected).failed == ["native-install-tests"]
 
 
-def test_review_label_gate_uses_critical_finding_result() -> None:
-    needs = {"review-labels": {"result": "skipped"}}
+@pytest.mark.parametrize("image", [False, True])
+@pytest.mark.parametrize("result", ["success", "skipped", "failure", "cancelled", None])
+def test_review_label_gate_uses_critical_finding_result(image, result) -> None:
+    needs = {} if result is None else {"review-labels": {"result": result}}
     selected = {"review-labels": False}
-    assert _mod.evaluate_needs(needs, selected).failed == []
-    assert _mod.evaluate_needs(needs, selected, critical_findings=True).failed == [
+    if image:
+        selected = _mod.image_selected_jobs(selected)
+    expected = [] if result in {"success", "skipped"} else ["review-labels"]
+    assert _mod.evaluate_needs(needs, selected).failed == expected
+    critical_expected = [] if result == "success" else ["review-labels"]
+    assert _mod.evaluate_needs(needs, selected, critical_findings=True).failed == critical_expected
+
+
+def test_critical_findings_require_review_even_when_selection_omits_it() -> None:
+    needs = {"repo-guards": {"result": "success"}}
+    assert _mod.evaluate_needs(needs, {"repo-guards": True}, critical_findings=True).failed == [
         "review-labels"
     ]
 
 
-def test_folded_guards_gate_detect_and_keep_release_checks() -> None:
+@pytest.mark.parametrize("repository", [_mod.FORK, "NousResearch/hermes-agent"])
+@pytest.mark.parametrize("event", ["pull_request", "push"])
+@pytest.mark.parametrize("release", [False, True])
+def test_repo_guards_are_always_selected_for_source_and_image(repository, event, release) -> None:
+    selected = _mod.selected_jobs({}, repository, event, release=release)
+    assert selected["repo-guards"] is True
+    assert _mod.image_selected_jobs(selected)["repo-guards"] is True
+
+
+@pytest.mark.parametrize("image", [False, True])
+@pytest.mark.parametrize("result", ["success", "skipped", "failure", "cancelled", "missing", None])
+def test_repo_guards_fail_closed_when_missing_or_skipped(image, result) -> None:
+    selected = _mod.selected_jobs({}, _mod.FORK, "pull_request")
+    if image:
+        selected = _mod.image_selected_jobs(selected)
+    needs = {name: {"result": "success" if required else "skipped"}
+             for name, required in selected.items()}
+    if result is None:
+        needs.pop("repo-guards", None)
+    else:
+        needs["repo-guards"] = {"result": result}
+    expected = [] if result == "success" else ["repo-guards"]
+    assert _mod.evaluate_needs(needs, selected).failed == expected
+
+
+@pytest.mark.parametrize(
+    ("lanes", "expected"),
+    [({}, False), ({"python": "true"}, False), ({"frontend": "true"}, False),
+     ({"uv_lock": "true"}, True), ({"npm_lock": "true"}, True), ({"deps": "true"}, True)],
+)
+def test_fork_osv_scanner_remains_dependency_scoped(lanes, expected) -> None:
+    selected = _mod.selected_jobs(lanes, _mod.FORK, "pull_request")
+    assert selected["osv-scanner"] is expected
+    assert _mod.image_selected_jobs(selected)["osv-scanner"] is expected
+
+
+def test_both_gates_consume_consolidated_critical_findings() -> None:
     yaml = pytest.importorskip("hermes_yaml")
     jobs = yaml.safe_load((_PATH.parents[2] / ".github/workflows/ci.yaml").read_text())["jobs"]
-    commands = {step.get("run"): step for step in jobs["detect"]["steps"]}
-    for command in (
-        "python3 scripts/check-case-collisions.py",
-        "python3 scripts/ci/check_lazy_deps_imports.py",
-    ):
-        step = commands[command]
-        assert step["if"] == "github.repository == 'mekenthompson/hermes-agent'"
-        assert not step.get("continue-on-error", False)
-    fork = _mod.selected_jobs({}, "mekenthompson/hermes-agent", "pull_request")
-    upstream = _mod.selected_jobs({}, "NousResearch/hermes-agent", "pull_request")
-    for job in ("case-collision-check", "lazy-deps-guard"):
-        assert fork[job] is False
-        assert upstream[job] is True
-        assert jobs[job]["if"] == "github.repository != 'mekenthompson/hermes-agent'"
-    assert fork["detect"] is True
-    # A guard failure stops classification; its required parent cannot be skipped.
-    assert _mod.evaluate_needs({"detect": {"result": "failure"}}, {"detect": True}).failed == ["detect"]
+    for name in ("all-checks-pass", "image-checks-pass"):
+        gate_steps = [step for step in jobs[name]["steps"]
+                      if "CRITICAL_FINDINGS" in step.get("env", {})]
+        assert len(gate_steps) == 1
+        assert gate_steps[0]["env"]["CRITICAL_FINDINGS"] == "${{ needs.repo-guards.outputs.critical_findings }}"
 
 
 def test_policy_file_runs_as_the_aggregate_job_entrypoint(tmp_path: Path) -> None:
@@ -263,22 +300,39 @@ def test_policy_file_runs_as_the_aggregate_job_entrypoint(tmp_path: Path) -> Non
     assert output_path.read_text(encoding="utf-8") == 'needs-json={"tests":"success"}\n'
 
 
+@pytest.mark.parametrize("image", [False, True])
+def test_aggregate_entrypoint_refuses_skipped_review_for_critical_findings(image) -> None:
+    result = subprocess.run(
+        [sys.executable, str(_PATH), *(["--image"] if image else [])],
+        input=json.dumps({"repo-guards": {"result": "success"},
+                          "review-labels": {"result": "skipped"}}),
+        text=True,
+        capture_output=True,
+        env={**os.environ, "SELECTED_JOBS": '{"repo-guards":true,"review-labels":false}',
+             "CRITICAL_FINDINGS": "true"},
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "job(s) did not pass: review-labels" in result.stdout
+
+
 def test_fork_sync_does_not_select_unshipped_surfaces() -> None:
     lanes = {key: "true" for key in (
         "python", "python_prod", "frontend", "os_tests", "installer", "bootstrap",
-        "rust", "site", "upgrade", "e2e", "e2e_upgrade", "binary_artifacts",
+        "rust", "site", "upgrade", "e2e", "e2e_upgrade",
         "uv_lock", "npm_lock", "scan", "deps", "docker_meta", "ci_review",
     )}
     selected = _mod.selected_jobs(lanes, "mekenthompson/hermes-agent", "push", release=True)
     for job in (
         "native-install-tests", "tests-os", "installer-tests", "rust-tests",
         "bootstrap-installer", "e2e-desktop", "e2e-desktop-core", "e2e-desktop-update",
-        "docs-site", "contributor-check", "infographic-check", "icons-freshness-check",
+        "docs-site",
     ):
         assert selected[job] is False
     assert selected["tests"] is True
     assert selected["lint"] is True
     assert selected["js-tests"] is True
+    assert selected["repo-guards"] is True
 
 
 def test_disabled_upstream_workflows_are_not_fork_selected_calls() -> None:
@@ -290,7 +344,7 @@ def test_disabled_upstream_workflows_are_not_fork_selected_calls() -> None:
         if line.split("#", 1)[0].strip()
     }
     jobs = yaml.safe_load((root / ".github/workflows/ci.yaml").read_text())["jobs"]
-    lanes = {key: "true" for key in ("python", "frontend", "uv_lock", "npm_lock", "scan", "deps", "docker_meta", "ci_review", "binary_artifacts")}
+    lanes = {key: "true" for key in ("python", "frontend", "uv_lock", "npm_lock", "scan", "deps", "docker_meta", "ci_review")}
     selected = _mod.selected_jobs(lanes, "mekenthompson/hermes-agent", "pull_request")
     called = set()
     for name, job in jobs.items():

@@ -13,7 +13,7 @@ async def test_process_spawn_completion_reviewer_uses_live_origin(tmp_path, monk
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
-    from gateway.session_contract import Principal, Submission
+    from gateway.session_contract import SessionActor, Submission
     from gateway.session_local import create_local_session
     from hermes_state import AsyncSessionDB, SessionDB
     from tools import approval_context
@@ -36,7 +36,7 @@ async def test_process_spawn_completion_reviewer_uses_live_origin(tmp_path, monk
     runner.session_store._db = db
     runner._session_db = AsyncSessionDB(db)
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner', db=db)
-    viewer = Principal('test-owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}), 'viewer')
+    viewer = SessionActor('test-owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}), 'viewer')
     ref = create_local_session(authority, viewer, dict(request_id='cli', source='cli', model='fixture', toolsets=[]))
     await authority.attach(viewer, ref)
     live = authority.sessions[ref.session_id]
@@ -110,7 +110,7 @@ async def test_delegation_dispatch_completion_reviewer_uses_origin(tmp_path, mon
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
-    from gateway.session_contract import Principal, Submission
+    from gateway.session_contract import SessionActor, Submission
     from gateway.session_local import create_local_session
     from hermes_state import AsyncSessionDB, SessionDB
     from tools import async_delegation as delegation
@@ -130,7 +130,7 @@ async def test_delegation_dispatch_completion_reviewer_uses_origin(tmp_path, mon
     runner.session_store._db = db
     runner._session_db = AsyncSessionDB(db)
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner', db=db)
-    viewer = Principal('test-owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}), 'viewer')
+    viewer = SessionActor('test-owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}), 'viewer')
     ref = create_local_session(authority, viewer, dict(request_id='cli', source='cli', model='fixture', toolsets=[]))
     await authority.attach(viewer, ref)
     live = authority.sessions[ref.session_id]
