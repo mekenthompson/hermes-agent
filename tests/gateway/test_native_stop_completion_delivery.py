@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from gateway.session_contract import Principal
+from gateway.session_contract import SessionActor
 from hermes_state_runtime import list_session_admissions
 from tests.gateway.test_automation_compression_media import _admit_human, _discord_owner
 from tests.gateway.test_native_stop_reconciliation import caller, stop
@@ -19,7 +19,7 @@ async def owner_with_completion(tmp_path, monkeypatch):
     runner, adapter, authority, source = await _discord_owner(tmp_path, monkeypatch)
     receipt = await _admit_human(runner, authority, MessageEvent(text='seed', source=source, message_id='seed'))
     ref = receipt.ref
-    actor = Principal('42', authority.profile_id, frozenset({'session:read', 'session:submit', 'session:control'}), 'fixture')
+    actor = SessionActor('42', authority.profile_id, frozenset({'session:read', 'session:submit', 'session:control'}), 'fixture')
     await authority.cancel_queued(actor, ref, receipt.admission_id)
     registry = module.ProcessRegistry()
     monkeypatch.setattr(module, 'process_registry', registry)

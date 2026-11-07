@@ -8,7 +8,7 @@ import pytest
 @pytest.mark.asyncio
 async def test_question_consumer_requires_current_native_route_and_claim(tmp_path, monkeypatch):
     from tests.gateway.test_native_inbound_retry import NativeInboundRetryTests
-    from gateway.session_contract import Principal
+    from gateway.session_contract import SessionActor
     from gateway.session_kanban import build_kanban_policy
     from gateway.session_kanban_prompts import bind_consumer, require_consumer
     from hermes_cli import kanban_db as kb
@@ -29,7 +29,7 @@ async def test_question_consumer_requires_current_native_route_and_claim(tmp_pat
                 body='Untrusted text cannot grant an interactive receiver.',
                 workspace_kind='dir', workspace_path=str(home))
             claim = kb.claim_task(conn, tid)
-        actor = Principal('owner', str(home), frozenset({'session:create'}), 'test')
+        actor = SessionActor('owner', str(home), frozenset({'session:create'}), 'test')
         connection = SimpleNamespace(native_owner=True, actor=actor, authority=fixture.authority)
         params = dict(board='owned', task_id=tid, run_id=claim.current_run_id, claim_lock=claim.claim_lock)
         policy, _secrets = build_kanban_policy(connection, params,

@@ -15,7 +15,7 @@ async def test_viewer_request_reaches_reviewer_but_internal_notice_does_not(tmp_
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
     from gateway.session_automation import admit_route_wake
-    from gateway.session_contract import Principal, Submission
+    from gateway.session_contract import SessionActor, Submission
     from gateway.session_local import create_local_session
     from hermes_state import SessionDB
     from tools import approval as A, approval_context
@@ -73,7 +73,7 @@ async def test_viewer_request_reaches_reviewer_but_internal_notice_does_not(tmp_
 
     monkeypatch.setattr(runner, "_run_agent", answer)
     try:
-        viewer = Principal("test-owner", "default", frozenset(
+        viewer = SessionActor("test-owner", "default", frozenset(
             {"session:create", "session:submit", "session:read", "session:approve"}), "viewer")
         ref = create_local_session(authority, viewer, dict(request_id="cli", source="cli", model="fixture", toolsets=[]))
         live = authority.sessions[ref.session_id]
@@ -106,7 +106,7 @@ async def test_stop_during_smart_review_rejects_late_approve(tmp_path, monkeypat
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
-    from gateway.session_contract import Principal, Submission
+    from gateway.session_contract import SessionActor, Submission
     from gateway.session_local import create_local_session
     from hermes_state import SessionDB
     from tools import approval as A, approval_context
@@ -136,7 +136,7 @@ async def test_stop_during_smart_review_rejects_late_approve(tmp_path, monkeypat
         return "ok"
 
     monkeypatch.setattr(runner, "_handle_message", answer)
-    viewer = Principal("test-owner", "default", frozenset(
+    viewer = SessionActor("test-owner", "default", frozenset(
         {"session:create", "session:submit", "session:read", "session:control"}), "viewer")
     ref = create_local_session(authority, viewer, dict(request_id="cli", source="cli", model="fixture", toolsets=[]))
     try:
@@ -274,7 +274,7 @@ async def test_stop_revokes_older_detached_task_after_new_admission(tmp_path, mo
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
-    from gateway.session_contract import Principal, Submission
+    from gateway.session_contract import SessionActor, Submission
     from gateway.session_local import create_local_session
     from hermes_state import SessionDB
     from hermes_state_runtime import list_session_admissions
@@ -285,7 +285,7 @@ async def test_stop_revokes_older_detached_task_after_new_admission(tmp_path, mo
     db = SessionDB(tmp_path / 'state.db')
     runner.session_store._db = runner._session_db = db
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner', db=db)
-    viewer = Principal('test-owner', 'default', frozenset(
+    viewer = SessionActor('test-owner', 'default', frozenset(
         {'session:create', 'session:submit', 'session:read', 'session:control'}), 'viewer')
     ref = create_local_session(authority, viewer, dict(request_id='cli', source='cli', model='fixture', toolsets=[]))
     started, release = threading.Event(), threading.Event()

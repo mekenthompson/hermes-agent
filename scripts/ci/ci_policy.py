@@ -16,8 +16,6 @@ _NON_IMAGE_JOBS = frozenset({
     "native-install-tests",
     "tests-os", "installer-tests", "rust-tests", "bootstrap-installer",
     "e2e-desktop", "e2e-desktop-core", "e2e-desktop-update", "docs-site",
-    # Advisory PR summary and always-on blob hygiene are not image runtime.
-    "prompt-surface-diff", "blob-size-check",
 })
 
 _FORK_IMAGE_WORKFLOW = ".github/workflows/fork-agent-image.yml"
@@ -107,23 +105,11 @@ def selected_jobs(
         "e2e-desktop-core": product and not fork,
         "e2e-desktop-update": product and not fork,
         "docs-site": on("site") and not fork,
-        "history-check": pr,
-        "contributor-check": on("python") and not fork,
-        "uv-lockfile": on("uv_lock"),
-        "infographic-check": not fork,
-        "profile-artifact-check": not fork or on("binary_artifacts"),
-        "icons-freshness-check": not fork,
-        "case-collision-check": not fork,
-        "lazy-deps-guard": not fork,
-        "lockfile-diff": pr and on("npm_lock"),
-        "prompt-surface-diff": pr and on("python"),
-        "docker-lint": on("docker_meta"),
-        "supply-chain": pr and (on("scan") or on("deps")),
+        # One always-required job contains the repository/runtime/security guards.
+        "repo-guards": True,
         "review-labels": pr and (on("ci_review") or on("mcp_catalog")),
         "osv-scanner": not fork or on("uv_lock") or on("npm_lock") or on("deps"),
         "remote-backends": on("remote_backends"),
-        # Always-on hygiene check. It has no detect if, so a skip is a failure.
-        "blob-size-check": True,
     }
 
 
@@ -142,7 +128,7 @@ def evaluate_needs(
     if not selected or any(type(value) is not bool for value in selected.values()):
         return NeedsSummary(compact=compact, failed=["selected_jobs"])
     applicable = dict(selected)
-    if critical_findings and applicable.get("review-labels") is False:
+    if critical_findings:
         applicable["review-labels"] = True
     failed = [
         name

@@ -59,7 +59,7 @@ async def test_native_profile_batch_filters_before_fifo_and_preserves_human(tmp_
     from gateway.session_authority import initialize_session_authority, SessionAuthority
     from gateway.session_automation import completion_admission, producer_identity
     from gateway.session_context import clear_session_vars, set_session_vars
-    from gateway.session_contract import Principal
+    from gateway.session_contract import SessionActor
     from hermes_constants import get_hermes_home
     from hermes_state_runtime import list_session_admissions
     from plugins.platforms.discord.adapter import DiscordAdapter
@@ -120,7 +120,7 @@ async def test_native_profile_batch_filters_before_fifo_and_preserves_human(tmp_
             assert source.profile == name
             with _profile_runtime_scope(home):
                 seed = await admit_human(authority, MessageEvent(text='seed', source=source, message_id=f'seed-{index}'), name)
-                actor = Principal('42', authority.profile_id, frozenset({'session:read', 'session:submit', 'session:control'}), 'fixture')
+                actor = SessionActor('42', authority.profile_id, frozenset({'session:read', 'session:submit', 'session:control'}), 'fixture')
                 await authority.cancel_queued(actor, seed.ref, seed.admission_id)
                 registry = module.ProcessRegistry()
                 monkeypatch.setattr(module, 'process_registry', registry)
