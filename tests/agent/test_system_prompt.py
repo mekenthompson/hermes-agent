@@ -956,3 +956,11 @@ class TestConversationStartedTwoLine:
         vol = self._volatile(agent)
         assert "Conversation started:" not in vol
         assert "as of the last context rebuild" not in vol
+
+
+def test_kanban_question_guidance_ignores_environment_claims(monkeypatch):
+    from agent.prompt_builder import KANBAN_GUIDANCE, build_kanban_guidance
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "ordinary-worker")
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+    monkeypatch.setenv("HERMES_PROMPT_CONSUMER_ADMISSION_ID", "untrusted-env-value")
+    assert build_kanban_guidance({"kanban_show", "clarify"}) == KANBAN_GUIDANCE
