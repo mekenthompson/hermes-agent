@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from concurrent.futures import Future
 from typing import Any, Coroutine, Optional
 
@@ -78,9 +79,6 @@ def run_blocking_off_running_loop(fn):
     current context. While it runs, callbacks already scheduled on this loop are
     drained so the loop stays responsive to work queued before and during the call.
     """
-    import contextvars
-    import threading
-
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -88,15 +86,18 @@ def run_blocking_off_running_loop(fn):
     if not loop.is_running():
         return fn()
     box: dict[str, Any] = {}
-    ctx = contextvars.copy_context()
 
     def worker() -> None:
         try:
-            box["value"] = ctx.run(fn)
-        except BaseException as exc:  # re-raised in the caller
-            box["error"] = exc
+            box["value"] = fn()
+        except BaseException:
+            # The caller re-raises this. Log here so the thread boundary is not a
+            # silent swallow if the caller is gone.
+            _DEFAULT_LOGGER.exception("off-loop call failed")
+            box["error"] = sys.exc_info()[1]
 
-    thread = threading.Thread(target=worker, name="hermes-off-loop", daemon=True)
+    from agent.memory_provider import spawn_context_thread
+    thread = spawn_context_thread(worker, name="hermes-off-loop", daemon=True)
     thread.start()
     while thread.is_alive():
         _drain_scheduled_callbacks(loop)

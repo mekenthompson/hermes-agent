@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
 
 import pytest
 
@@ -56,10 +55,11 @@ def test_sync_relay_llm_on_running_loop_returns_provider_result_and_lets_loop_ca
     """The historic failure: unguarded sync execute on a live loop raises immediately."""
     ticks: list[str] = []
     provider_threads: list[int] = []
+    loop_moved = threading.Event()
 
     def provider(request):
         provider_threads.append(threading.get_ident())
-        time.sleep(0.05)
+        assert loop_moved.wait(timeout=2), "loop stayed frozen during the aux call"
         return _provider_response("APPROVE")
 
     async def on_loop():
@@ -69,6 +69,8 @@ def test_sync_relay_llm_on_running_loop_returns_provider_result_and_lets_loop_ca
             ticks.append("tick")
             if len(ticks) < 2:
                 loop.call_soon(tick)
+            else:
+                loop_moved.set()
 
         loop.call_soon(tick)
         result = relay_llm.execute(
