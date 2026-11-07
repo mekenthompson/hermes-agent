@@ -48,3 +48,89 @@ def consume_detached_task_result(task: asyncio.Future[Any]) -> None:
         task.exception()
     except (asyncio.CancelledError, Exception):
         pass
+
+
+def _drain_scheduled_callbacks(loop: asyncio.AbstractEventLoop) -> None:
+    """Run callbacks already queued on ``loop`` without waiting for its selector.
+
+    A sync wait on the loop thread otherwise freezes ``call_soon`` / ``create_task``
+    work (the approval prompt write, a same-loop answer) until the wait returns.
+    Socket reads stay with the loop that owns the transport; this only drains the
+    ready queue so a loop that is also the waiter can still settle scheduled work.
+    """
+    ready = getattr(loop, "_ready", None)
+    if not ready:
+        return
+    pending = list(ready)
+    ready.clear()
+    for handle in pending:
+        if getattr(handle, "_cancelled", False):
+            continue
+        run = getattr(handle, "_run", None)
+        if callable(run):
+            run()
+
+
+def run_blocking_off_running_loop(fn):
+    """Run ``fn`` off this thread when it already has a running event loop.
+
+    ``asyncio.run`` cannot start on that thread. The worker gets a copy of the
+    current context. While it runs, callbacks already scheduled on this loop are
+    drained so the loop stays responsive to work queued before and during the call.
+    """
+    import contextvars
+    import threading
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return fn()
+    if not loop.is_running():
+        return fn()
+    box: dict[str, Any] = {}
+    ctx = contextvars.copy_context()
+
+    def worker() -> None:
+        try:
+            box["value"] = ctx.run(fn)
+        except BaseException as exc:  # re-raised in the caller
+            box["error"] = exc
+
+    thread = threading.Thread(target=worker, name="hermes-off-loop", daemon=True)
+    thread.start()
+    while thread.is_alive():
+        _drain_scheduled_callbacks(loop)
+        thread.join(0.01)
+    thread.join()
+    _drain_scheduled_callbacks(loop)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def wait_event_on_running_loop(event, timeout: float) -> bool:
+    """Wait for ``event`` without freezing callbacks already queued on this loop.
+
+    Off the loop this is ``event.wait``. On a running loop, blocking the thread
+    leaves ``call_soon`` answers unrun until timeout, which is a silence the user
+    did not choose.
+    """
+    import time
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return event.wait(timeout)
+    if not loop.is_running():
+        return event.wait(timeout)
+    deadline = time.monotonic() + max(timeout, 0)
+    while not event.is_set() and time.monotonic() < deadline:
+        _drain_scheduled_callbacks(loop)
+        if event.is_set():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        event.wait(min(0.01, remaining))
+    _drain_scheduled_callbacks(loop)
+    return event.is_set()

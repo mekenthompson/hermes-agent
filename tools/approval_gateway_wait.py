@@ -72,7 +72,8 @@ def _poll_event(event: threading.Event, session_key: str, *, interrupt_log: str,
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return "timeout"
-            if event.wait(timeout=min(1.0, remaining)):
+            from agent.async_utils import wait_event_on_running_loop
+            if wait_event_on_running_loop(event, min(1.0, remaining)):
                 return "set"
             heartbeat()
 

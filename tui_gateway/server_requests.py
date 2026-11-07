@@ -177,8 +177,9 @@ def _register(req: ServerRequest) -> None:
     with _lock:
         req.writing = True
         _open[req.id] = req
+    written: bool | None = None
     try:
-        _write(req.frame())
+        written = _write(req.frame())
     finally:
         with _lock:
             req.writing = False
@@ -186,6 +187,15 @@ def _register(req: ServerRequest) -> None:
     if withdrawn is not None:
         # cancel() landed between publish and write: its request.cancel must follow the frame, not precede it.
         _emit_cancel(req, withdrawn)
+        return
+    if written is False:
+        # The peer is gone. Leaving the request open makes the agent wait out
+        # approvals.timeout with no card anywhere — the same silence as a user
+        # who never answered. Settle now so the waiter can withdraw.
+        with _lock:
+            still_open = _open.pop(req.id, None) is req
+        if still_open and req.on_result is not None:
+            req.on_result(None)
 
 
 def send(method: str, sid: str, params: dict, *, timeout: float | None,
