@@ -108,5 +108,7 @@ with a name allows that one name only.
 | `tools.skills_sync` | `dir_hash` | plugins/index.md § Read the skill catalog |
 | `tools.skill_usage` | `read_skill_name` | plugins/index.md § Read the skill catalog |
 | `gateway.session_context` | `get_session_env` | plugins/index.md § platform plugins: read session identity through the task-local context |
+| `hermes_cli.config_backend` | `read_config_doc_readonly` | plugins/index.md § Inspect raw configuration before maintenance |
+| `hermes_cli.managed_scope` | `get_managed_dir` | plugins/index.md § Inspect raw configuration before maintenance |
 | `agent.redact` | `redact_sensitive_text` | plugin-llm-access.md § From the plugin's frontend: a plugin RPC method (`force=True` where secrets must never leave) |
 | `hermes_cli.plugin_session` | `session_client` | user-guide/features/plugins.md § Plugin code inside the gateway: which client created the session |

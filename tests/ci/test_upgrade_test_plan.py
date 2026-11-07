@@ -51,28 +51,37 @@ def test_empty_inventory_fails_closed(tmp_path):
         plan(tmp_path, "mekenthompson/hermes-agent")
 
 
-def test_publication_partitions_keep_runtime_coverage_without_duplicate_tests(tmp_path):
+@pytest.mark.parametrize("repository", ["mekenthompson/hermes-agent", "NousResearch/hermes-agent"])
+def test_publication_partitions_keep_runtime_coverage_without_duplicate_tests(tmp_path, repository):
     inventory = ROOT / "tests/e2e/core/upgrade"
-    files = [path.relative_to(inventory) for path in inventory.rglob("test_*.py")]
-    files += [Path("test_new_runtime.py"), Path("new-suite/test_new_runtime.py")]
+    files = {path.relative_to(inventory).as_posix() for path in inventory.rglob("test_*.py")}
+    files |= {"test_new_runtime.py", "new-suite/test_new_runtime.py"}
     for relative in files:
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
     def selected(partition):
-        return [file for job in plan(tmp_path, "mekenthompson/hermes-agent", partition)["include"] for file in job["files"]]
+        return [file for job in plan(tmp_path, repository, partition)["include"] for file in job["files"]]
     combined, runtime, native = (selected(partition) for partition in ("all", "runtime", "native"))
-    assert sorted(runtime + native) == sorted(combined)
+    expected = {file for file in files if repository != "mekenthompson/hermes-agent" or not file.startswith("handoff/")}
+    assert sorted(combined) == sorted(expected)
+    assert sorted(runtime + native) == sorted(expected)
     assert len(runtime + native) == len(set(runtime + native))
-    assert set(runtime) == {
-        "test_config_roundtrip_properties.py", "test_fresh_process_entrypoints.py",
-        "test_profile_update_cron.py", "test_update_userstate_import.py",
-        "test_new_runtime.py", "new-suite/test_new_runtime.py",
+
+    # Only reviewed installation surfaces leave the image's runtime gate. Keep
+    # this boundary closed while new root files and suites default to runtime.
+    native_roots = {"test_install_fresh.py", "test_upgrade_path.py", "test_update_userstate_realistic.py"}
+    native_suites = {"git", "hosts", "network", "pm", "handoff"}
+    expected_native = {
+        file for file in expected if file in native_roots or file.split("/", 1)[0] in native_suites
     }
-    for repository in ("mekenthompson/hermes-agent", "NousResearch/hermes-agent"):
-        assert plan(tmp_path, repository) == plan(tmp_path, repository, "all")
+    assert set(native) == expected_native
+    assert set(runtime) == expected - expected_native
+    # Release selection needs full Git history, but performs no native install.
+    assert {"test_upgrade_start_versions.py", "test_new_runtime.py", "new-suite/test_new_runtime.py"} <= set(runtime)
+    assert plan(tmp_path, repository) == plan(tmp_path, repository, "all")
     with pytest.raises(ValueError, match="unknown upgrade partition"):
-        plan(tmp_path, "mekenthompson/hermes-agent", "typo")
+        plan(tmp_path, repository, "typo")
 
 
 def test_cli_output_drives_matrix_without_a_second_discovery(tmp_path):

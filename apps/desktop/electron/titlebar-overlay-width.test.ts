@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
+  applyTitleBarOverlay,
   MACOS_TAHOE_DARWIN_MAJOR,
   macTitleBarOverlayHeight,
   nativeOverlayWidth,
@@ -10,6 +11,29 @@ import {
   scaledOverlayHeight,
   titleBarOverlayOptions
 } from './titlebar-overlay-width'
+
+test('overlay refresh preserves platform policy and tolerates unsupported native controls', () => {
+  for (const platform of ['windows', 'linux', 'mac', 'wslg'] as const) {
+    const options = titleBarOverlayOptions({ platform, titlebarHeight: 34, darwinMajor: 25, zoomFactor: 1.2 })
+    const applied = []
+
+    const win = { setTitleBarOverlay: value => applied.push(value) } as unknown as Parameters<
+      typeof applyTitleBarOverlay
+    >[0]
+
+    applyTitleBarOverlay(win, options)
+    assert.deepEqual(applied, platform === 'wslg' ? [] : [options])
+  }
+
+  const unsupported = {
+    setTitleBarOverlay: () => {
+      throw new Error('unsupported overlay')
+    }
+  } as unknown as Parameters<typeof applyTitleBarOverlay>[0]
+
+  assert.doesNotThrow(() => applyTitleBarOverlay(unsupported, titleBarOverlayOptions({ platform: 'windows' })))
+  assert.doesNotThrow(() => applyTitleBarOverlay(undefined, false))
+})
 
 // This static reservation is only the pre-layout FALLBACK. Once laid out the
 // renderer reads the exact width from navigator.windowControlsOverlay

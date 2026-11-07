@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import hermes_yaml as yaml
+import pytest
 
 from hermes_cli.plugin_validate import validate_plugin_dir
 
@@ -192,6 +193,48 @@ def test_private_method_calls_on_core_handles_warn_but_own_helpers_do_not(tmp_pa
     [warning] = [w for w in report.warnings if w.startswith("private core attribute access")]
     sites = warning.split("release): ", 1)[1].split(". Use ctx.*")[0].split("; ")
     assert sites == ["engine.py:5 db._row_to_message_dict", "engine.py:6 runner._evict_cached_agent"], sites
+
+
+def test_strict_config_inspection_is_public_and_preserves_invalid_input(tmp_path, monkeypatch):
+    """Maintenance plugins can reject ambiguous raw policy before using the merged config."""
+    from hermes_cli.config_backend import read_config_doc_readonly
+    from hermes_cli.managed_scope import get_managed_dir
+
+    home, managed = tmp_path / "home", tmp_path / "managed"
+    home.mkdir()
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_CONFIG_BACKEND", "file")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    assert get_managed_dir() == managed
+
+    user_path, managed_path = home / "config.yaml", managed / "config.yaml"
+    with pytest.raises(FileNotFoundError):
+        read_config_doc_readonly(user_path)
+    user_path.write_text("null\n", encoding="utf-8")
+    managed_path.write_text("plugins: null\n", encoding="utf-8")
+    assert read_config_doc_readonly(user_path) is None
+    assert read_config_doc_readonly(managed_path) == {"plugins": None}
+    user_path.write_text("- ambiguous\n", encoding="utf-8")
+    assert read_config_doc_readonly(user_path) == ["ambiguous"]
+    user_path.write_text("plugins: [\n", encoding="utf-8")
+    with pytest.raises(yaml.YAMLError):
+        read_config_doc_readonly(user_path)
+    assert user_path.read_text(encoding="utf-8") == "plugins: [\n"
+
+    missing_scope = tmp_path / "missing-managed"
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(missing_scope))
+    assert get_managed_dir() is None
+    assert not missing_scope.exists()
+
+    plugin = _plugin(tmp_path / "maintenance", {"policy.py": (
+        "from hermes_cli.config_backend import read_config_doc_readonly\n"
+        "from hermes_cli.managed_scope import get_managed_dir\n"
+        "from hermes_cli.config_backend import write_config_document\n"
+    )})
+    [warning] = _private_warnings(validate_plugin_dir(plugin))
+    sites = warning.split("release): ", 1)[1].split(". Use ctx.*")[0].split("; ")
+    assert sites == ["policy.py:3 hermes_cli.config_backend.write_config_document"], sites
 
 
 _ROOT = Path(__file__).resolve().parents[2]

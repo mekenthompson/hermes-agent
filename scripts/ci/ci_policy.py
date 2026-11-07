@@ -19,10 +19,34 @@ _NON_IMAGE_JOBS = frozenset({
 })
 
 _FORK_IMAGE_WORKFLOW = ".github/workflows/fork-agent-image.yml"
+# The final Docker stage copies the build context, including runtime Python and
+# the browser-hosted Desktop. Only known .dockerignore exclusions may skip it;
+# upstream's slow-PR path list deliberately does not cover every image input.
+_FORK_NON_IMAGE_PREFIXES = (
+    ".github/", "tests/", "website/", "nix/", "packaging/", "plans/", ".plans/",
+)
+_FORK_NON_IMAGE_FILES = {
+    "flake.nix", "flake.lock", ".gitignore", ".gitmodules", ".envrc",
+    ".gitattributes", ".hadolint.yaml", ".mailmap",
+}
 _FORK_UPGRADE_UNRELATED_PREFIXES = (
     "gateway/platforms/", "plugins/kanban/", "tests/agent/test_",
     "tests/gateway/platforms/test_", "website/docs/",
 )
+
+
+def _fork_image_input(path: str) -> bool:
+    if path == _FORK_IMAGE_WORKFLOW or path.startswith("tests/docker/"):
+        return True
+    if path.startswith(("skills/", "optional-skills/")):
+        return True  # .dockerignore keeps their Markdown as runtime inputs.
+    if path.startswith("apps/"):
+        return path.startswith(("apps/shared/", "apps/desktop/"))
+    return not (
+        path.startswith(_FORK_NON_IMAGE_PREFIXES)
+        or path in _FORK_NON_IMAGE_FILES
+        or path.endswith(".md")
+    )
 
 
 def is_fork(argv: list[str] | None = None, environ: Mapping[str, str] | None = None) -> bool:
@@ -48,13 +72,7 @@ def apply_fork_classification(files: list[str], lanes: Mapping[str, bool]) -> di
         for lane in result:
             if lane not in {"mcp_catalog", "upgrade"}:
                 result[lane] = True
-    if files and (ci_change or any(path.startswith(".github/") for path in files)):
-        # .github is ignored by the image; its publication workflow is the exception.
-        result["docker"] = any(
-            path == _FORK_IMAGE_WORKFLOW or not path.startswith(".github/") for path in files
-        )
-    if any(path.startswith(("apps/shared/", "web/", "skills/")) for path in files):
-        result["docker"] = True
+    result["docker"] = not files or any(_fork_image_input(path) for path in files)
     return result
 
 

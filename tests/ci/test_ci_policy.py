@@ -89,7 +89,6 @@ def test_selection_uses_boolean_values_and_fork_scope() -> None:
             "docker_meta",
             "rust",
             "site",
-            "binary_artifacts",
         )
     }
     selected = _mod.selected_jobs(lanes, "mekenthompson/hermes-agent", "pull_request")
@@ -320,7 +319,7 @@ def test_aggregate_entrypoint_refuses_skipped_review_for_critical_findings(image
 def test_fork_sync_does_not_select_unshipped_surfaces() -> None:
     lanes = {key: "true" for key in (
         "python", "python_prod", "frontend", "os_tests", "installer", "bootstrap",
-        "rust", "site", "upgrade", "e2e", "e2e_upgrade", "binary_artifacts",
+        "rust", "site", "upgrade", "e2e", "e2e_upgrade",
         "uv_lock", "npm_lock", "scan", "deps", "docker_meta", "ci_review",
     )}
     selected = _mod.selected_jobs(lanes, "mekenthompson/hermes-agent", "push", release=True)
@@ -345,7 +344,7 @@ def test_disabled_upstream_workflows_are_not_fork_selected_calls() -> None:
         if line.split("#", 1)[0].strip()
     }
     jobs = yaml.safe_load((root / ".github/workflows/ci.yaml").read_text())["jobs"]
-    lanes = {key: "true" for key in ("python", "frontend", "uv_lock", "npm_lock", "scan", "deps", "docker_meta", "ci_review", "binary_artifacts")}
+    lanes = {key: "true" for key in ("python", "frontend", "uv_lock", "npm_lock", "scan", "deps", "docker_meta", "ci_review")}
     selected = _mod.selected_jobs(lanes, "mekenthompson/hermes-agent", "pull_request")
     called = set()
     for name, job in jobs.items():

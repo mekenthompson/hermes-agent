@@ -993,6 +993,30 @@ Config and state have different owners: settings are user-visible behavior in
 `config.yaml`, while state is plugin-owned runtime data under
 `<HERMES_HOME>/plugin-data/`. Neither API exposes another plugin's namespace.
 
+### Inspect raw configuration before maintenance
+
+Maintenance plugins such as `disk-cleanup` must distinguish missing policy from malformed policy
+before performing destructive work. The effective config loader can recover defaults or a
+last-known-good document, so its result alone cannot establish that the current input is valid.
+Use these read-only helpers for strict validation:
+
+```python
+from hermes_cli.config_backend import read_config_doc_readonly
+from hermes_cli.managed_scope import get_managed_dir
+```
+
+`read_config_doc_readonly(path)` reads through the selected config backend for a profile's
+`config.yaml`, and through the file backend for other paths. It preserves raw `None` and non-mapping
+values, and raises on missing, unreadable or malformed input. The result is signature-cached and
+shared; never mutate it. `get_managed_dir()` returns the existing administrator-managed scope
+directory, or `None` when none is present, without creating it. This lets a plugin validate its
+policy in that directory's `config.yaml` as well as the current profile's config.
+
+Validate only the policy shapes the plugin consumes, fail closed on ambiguous input, then obtain
+the actual setting through `hermes_cli.config.load_config_readonly()` so managed precedence and
+the canonical merge rules still apply. These helpers neither authorize maintenance nor write
+configuration; ordinary plugin settings and state continue to use `ctx.get_config()` and `ctx.state`.
+
 ### Settings form in the Desktop
 
 Every key you declare in the manifest's `config_schema` renders as a row on the

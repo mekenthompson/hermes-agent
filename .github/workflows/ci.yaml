@@ -96,7 +96,6 @@ jobs:
       ci_review: ${{ steps.classify.outputs.ci_review }}
       ci_review_files: ${{ steps.classify.outputs.ci_review_files }}
       os_tests: ${{ steps.classify.outputs.os_tests }}
-      binary_artifacts: ${{ steps.classify.outputs.binary_artifacts }}
       upgrade: ${{ steps.gate-lanes.outputs.upgrade }}
       selected_jobs: ${{ steps.select-jobs.outputs.selected_jobs }}
       event_name: ${{ github.event_name }}

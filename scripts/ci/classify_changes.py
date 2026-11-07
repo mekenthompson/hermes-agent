@@ -674,7 +674,6 @@ _SHARED_NATIVE_RUNTIME_FILES = {
     "hermes_cli/_launchers.py", "hermes_cli/relaunch.py", "hermes_cli/runtime_paths.py",
     "scripts/build/mint_launchers.py",
 }
-_BINARY_ARTIFACT_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".tar.gz", ".tgz")
 
 
 def _is_installer(p: str) -> bool:
@@ -701,10 +700,6 @@ def _is_os_specific(p: str, root: Path) -> bool:
         return False
     lowered = p.lower()
     return any(fragment in lowered for fragment in _OS_PATH_FRAGMENTS) or _is_os_marked_test(p, root)
-
-
-def _is_binary_artifact(p: str) -> bool:
-    return p.lower().endswith(_BINARY_ARTIFACT_SUFFIXES)
 
 
 def classify(files: list[str], run_e2e: bool = False, *, fork: bool = False, root: Path | None = None) -> dict[str, bool]:
@@ -751,7 +746,6 @@ def classify(files: list[str], run_e2e: bool = False, *, fork: bool = False, roo
         **{lane: run_e2e or on for lane, on in _slow_lanes(files).items()},
         "installer": any(_is_installer(f) for f in files),
         "os_tests": any(_is_os_specific(f, root) for f in files),
-        "binary_artifacts": any(_is_binary_artifact(f) for f in files),
         "upgrade": True,
     }
     consumers = [c for f in files for c in _SHARED_FIXTURE_CONSUMERS.get(f, ())]
@@ -778,7 +772,6 @@ def classify(files: list[str], run_e2e: bool = False, *, fork: bool = False, roo
         ret.update(dict.fromkeys(_slow_lanes([]), True))
         ret["installer"] = True
         ret["os_tests"] = True
-        ret["binary_artifacts"] = True
         # explicitly skip mcp catalog here. it's not needed unless those files are modified.
     return apply_fork_classification(files, ret) if fork else ret
 

@@ -1665,25 +1665,6 @@ function getTitleBarOverlayOptions(win?) {
   })
 }
 
-// Push refreshed overlay options to a live window after a theme/appearance
-// change. No-op only on plain (non-WSL) Linux, where getTitleBarOverlayOptions()
-// returns false; the try/catch additionally guards builds where
-// setTitleBarOverlay isn't supported.
-function applyTitleBarOverlay(win) {
-  const options = getTitleBarOverlayOptions(win)
-
-  if (!options || typeof options !== 'object') {
-    return
-  }
-
-  try {
-    win?.setTitleBarOverlay?.(options)
-  } catch {
-    // Overlay not supported on this platform/build — leave the frameless
-    // titlebar as-is.
-  }
-}
-
 app.setName(APP_NAME)
 
 // No application menu until the first window exists. Electron would otherwise

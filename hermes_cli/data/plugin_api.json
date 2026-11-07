@@ -128,6 +128,13 @@
       ]
     },
     {
+      "source": "plugins/index.md § Inspect raw configuration before maintenance",
+      "entries": [
+        "hermes_cli.config_backend:read_config_doc_readonly",
+        "hermes_cli.managed_scope:get_managed_dir"
+      ]
+    },
+    {
       "source": "plugin-llm-access.md § From the plugin's frontend: a plugin RPC method (`force=True` where secrets must never leave)",
       "entries": [
         "agent.redact:redact_sensitive_text"

@@ -90,9 +90,6 @@ outputs:
   os_tests:
     description: Run the macOS / Windows pytest lanes (fork consumes; upstream gates them on python).
     value: ${{ steps.classify.outputs.os_tests }}
-  binary_artifacts:
-    description: An image or archive file changed (fork gates the infographic / profile-archive tree checks on it).
-    value: ${{ steps.classify.outputs.binary_artifacts }}
   upgrade:
     description: Run real install/upgrade and packaged Desktop update E2E on the fork unless paths are known backend-only.
     value: ${{ steps.classify.outputs.upgrade }}
