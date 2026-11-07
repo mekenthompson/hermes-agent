@@ -16,15 +16,37 @@ _NON_IMAGE_JOBS = frozenset({
     "native-install-tests",
     "tests-os", "installer-tests", "rust-tests", "bootstrap-installer",
     "e2e-desktop", "e2e-desktop-core", "e2e-desktop-update", "docs-site",
-    # Advisory PR summary and always-on blob hygiene are not image runtime.
-    "prompt-surface-diff", "blob-size-check",
 })
 
 _FORK_IMAGE_WORKFLOW = ".github/workflows/fork-agent-image.yml"
+# The final Docker stage copies the build context, including runtime Python and
+# the browser-hosted Desktop. Only known .dockerignore exclusions may skip it;
+# upstream's slow-PR path list deliberately does not cover every image input.
+_FORK_NON_IMAGE_PREFIXES = (
+    ".github/", "tests/", "website/", "nix/", "packaging/", "plans/", ".plans/",
+)
+_FORK_NON_IMAGE_FILES = {
+    "flake.nix", "flake.lock", ".gitignore", ".gitmodules", ".envrc",
+    ".gitattributes", ".hadolint.yaml", ".mailmap",
+}
 _FORK_UPGRADE_UNRELATED_PREFIXES = (
     "gateway/platforms/", "plugins/kanban/", "tests/agent/test_",
     "tests/gateway/platforms/test_", "website/docs/",
 )
+
+
+def _fork_image_input(path: str) -> bool:
+    if path == _FORK_IMAGE_WORKFLOW or path.startswith("tests/docker/"):
+        return True
+    if path.startswith(("skills/", "optional-skills/")):
+        return True  # .dockerignore keeps their Markdown as runtime inputs.
+    if path.startswith("apps/"):
+        return path.startswith(("apps/shared/", "apps/desktop/"))
+    return not (
+        path.startswith(_FORK_NON_IMAGE_PREFIXES)
+        or path in _FORK_NON_IMAGE_FILES
+        or path.endswith(".md")
+    )
 
 
 def is_fork(argv: list[str] | None = None, environ: Mapping[str, str] | None = None) -> bool:
@@ -50,13 +72,7 @@ def apply_fork_classification(files: list[str], lanes: Mapping[str, bool]) -> di
         for lane in result:
             if lane not in {"mcp_catalog", "upgrade"}:
                 result[lane] = True
-    if files and (ci_change or any(path.startswith(".github/") for path in files)):
-        # .github is ignored by the image; its publication workflow is the exception.
-        result["docker"] = any(
-            path == _FORK_IMAGE_WORKFLOW or not path.startswith(".github/") for path in files
-        )
-    if any(path.startswith(("apps/shared/", "web/", "skills/")) for path in files):
-        result["docker"] = True
+    result["docker"] = not files or any(_fork_image_input(path) for path in files)
     return result
 
 
@@ -107,23 +123,11 @@ def selected_jobs(
         "e2e-desktop-core": product and not fork,
         "e2e-desktop-update": product and not fork,
         "docs-site": on("site") and not fork,
-        "history-check": pr,
-        "contributor-check": on("python") and not fork,
-        "uv-lockfile": on("uv_lock"),
-        "infographic-check": not fork,
-        "profile-artifact-check": not fork or on("binary_artifacts"),
-        "icons-freshness-check": not fork,
-        "case-collision-check": not fork,
-        "lazy-deps-guard": not fork,
-        "lockfile-diff": pr and on("npm_lock"),
-        "prompt-surface-diff": pr and on("python"),
-        "docker-lint": on("docker_meta"),
-        "supply-chain": pr and (on("scan") or on("deps")),
+        # One always-required job contains the repository/runtime/security guards.
+        "repo-guards": True,
         "review-labels": pr and (on("ci_review") or on("mcp_catalog")),
         "osv-scanner": not fork or on("uv_lock") or on("npm_lock") or on("deps"),
         "remote-backends": on("remote_backends"),
-        # Always-on hygiene check. It has no detect if, so a skip is a failure.
-        "blob-size-check": True,
     }
 
 
@@ -142,7 +146,7 @@ def evaluate_needs(
     if not selected or any(type(value) is not bool for value in selected.values()):
         return NeedsSummary(compact=compact, failed=["selected_jobs"])
     applicable = dict(selected)
-    if critical_findings and applicable.get("review-labels") is False:
+    if critical_findings:
         applicable["review-labels"] = True
     failed = [
         name

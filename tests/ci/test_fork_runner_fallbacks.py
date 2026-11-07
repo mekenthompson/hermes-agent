@@ -51,14 +51,15 @@ class ForkRunnerFallbackTests(unittest.TestCase):
         self.assertIn("--skip 'apps/desktop :: check:test:ui'", text)
         self.assertIn("npm run --prefix apps/desktop test:ui -- --shard=", text)
         scripts = json.loads((ROOT / "apps/desktop/package.json").read_text(encoding="utf-8"))["scripts"]
-        self.assertEqual(scripts["check:test:ui"], "npm run test:ui")
+        self.assertEqual(scripts["check:test:ui"], "pnpm run test:ui")
         self.assertEqual(scripts["test:ui"], "vitest run --project ui")
 
     def test_fork_skips_upstream_only_packaging_workflows(self) -> None:
-        for relative in (".github/workflows/nix.yml", ".github/workflows/docker.yml"):
+        for relative, entry_job in ((".github/workflows/nix.yml", "detect"),
+                                    (".github/workflows/docker.yml", "mode")):
             with self.subTest(workflow=relative):
                 lines = (ROOT / relative).read_text(encoding="utf-8").splitlines()
-                start = lines.index("  detect:")
+                start = lines.index(f"  {entry_job}:")
                 block = lines[start : start + 12]
                 self.assertTrue(
                     any(

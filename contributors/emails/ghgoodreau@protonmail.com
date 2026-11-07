@@ -1,0 +1,2 @@
+ghgoodreau
+# Verified canonical Nous commits 7b204ed1633fa193fa9129f67bc0c9e4951f7a8f and b5971d048761b4da3b649537ba138394bafa2b9a; GitHub author ID 25194960; PR226 upstream reconciliation

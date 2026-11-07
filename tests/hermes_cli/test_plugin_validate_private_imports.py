@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import hermes_yaml as yaml
+import pytest
 
 from hermes_cli.plugin_validate import validate_plugin_dir
 
@@ -153,6 +154,25 @@ def test_documented_session_helper_and_own_install_path_fallback_are_not_flagged
     assert sites == ["__init__.py:8 hermes_cli.gateway_client._session_ticket"], sites
 
 
+def test_plugin_guide_session_identity_example_validates_clean(tmp_path):
+    """Regression for #148311: the plugin guide's ``get_session_env`` example uses the import spelling
+    ``hermes plugins validate`` accepts, so a plugin that copies it gets no private-import warning."""
+    import ast
+    import re
+
+    guide = Path(__file__).resolve().parents[2] / "website/docs/developer-guide/plugins/index.md"
+    blocks = [b for b in re.findall(r"```python\n(.*?)```", guide.read_text(encoding="utf-8"), re.DOTALL)
+              if "get_session_env" in b]
+    assert blocks, "plugins/index.md shows no code example importing get_session_env"
+    for block in blocks:  # validate sees only imports, and skips code that does not parse
+        assert any(isinstance(node, ast.ImportFrom) and node.module == "gateway.session_context"
+                   and "get_session_env" in {alias.name for alias in node.names}
+                   for node in ast.walk(ast.parse(block))), block
+    plugin = _plugin(tmp_path / "sessid", {f"example_{i}.py": b for i, b in enumerate(blocks)})
+
+    assert _private_warnings(validate_plugin_dir(plugin)) == []
+
+
 def test_private_method_calls_on_core_handles_warn_but_own_helpers_do_not(tmp_path):
     """opencode-sync calls SessionDB / GatewayRunner private methods on the objects it is handed;
     no import names them, so only the attribute pass can see it. The plugin's own ``_helper`` and
@@ -173,3 +193,80 @@ def test_private_method_calls_on_core_handles_warn_but_own_helpers_do_not(tmp_pa
     [warning] = [w for w in report.warnings if w.startswith("private core attribute access")]
     sites = warning.split("release): ", 1)[1].split(". Use ctx.*")[0].split("; ")
     assert sites == ["engine.py:5 db._row_to_message_dict", "engine.py:6 runner._evict_cached_agent"], sites
+
+
+def test_strict_config_inspection_is_public_and_preserves_invalid_input(tmp_path, monkeypatch):
+    """Maintenance plugins can reject ambiguous raw policy before using the merged config."""
+    from hermes_cli.config_backend import read_config_doc_readonly
+    from hermes_cli.managed_scope import get_managed_dir
+
+    home, managed = tmp_path / "home", tmp_path / "managed"
+    home.mkdir()
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_CONFIG_BACKEND", "file")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    assert get_managed_dir() == managed
+
+    user_path, managed_path = home / "config.yaml", managed / "config.yaml"
+    with pytest.raises(FileNotFoundError):
+        read_config_doc_readonly(user_path)
+    user_path.write_text("null\n", encoding="utf-8")
+    managed_path.write_text("plugins: null\n", encoding="utf-8")
+    assert read_config_doc_readonly(user_path) is None
+    assert read_config_doc_readonly(managed_path) == {"plugins": None}
+    user_path.write_text("- ambiguous\n", encoding="utf-8")
+    assert read_config_doc_readonly(user_path) == ["ambiguous"]
+    user_path.write_text("plugins: [\n", encoding="utf-8")
+    with pytest.raises(yaml.YAMLError):
+        read_config_doc_readonly(user_path)
+    assert user_path.read_text(encoding="utf-8") == "plugins: [\n"
+
+    missing_scope = tmp_path / "missing-managed"
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(missing_scope))
+    assert get_managed_dir() is None
+    assert not missing_scope.exists()
+
+    plugin = _plugin(tmp_path / "maintenance", {"policy.py": (
+        "from hermes_cli.config_backend import read_config_doc_readonly\n"
+        "from hermes_cli.managed_scope import get_managed_dir\n"
+        "from hermes_cli.config_backend import write_config_document\n"
+    )})
+    [warning] = _private_warnings(validate_plugin_dir(plugin))
+    sites = warning.split("release): ", 1)[1].split(". Use ctx.*")[0].split("; ")
+    assert sites == ["policy.py:3 hermes_cli.config_backend.write_config_document"], sites
+
+
+_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _published_entries() -> list[str]:
+    import json
+
+    data = json.loads((_ROOT / "hermes_cli" / "data" / "plugin_api.json").read_text(encoding="utf-8-sig"))
+    return [entry for group in data["groups"] for entry in group["entries"]]
+
+
+def test_every_published_plugin_api_entry_passes_validate(tmp_path):
+    """hermes_cli/data/plugin_api.json is the list validate enforces: every entry imports without a
+    warning, while an unlisted name of a listed name-only module still warns."""
+    imports = [f"from {m} import {n}" if n else f"import {m}"
+               for m, _, n in (entry.partition(":") for entry in _published_entries())]
+    imports.append("from hermes_cli.plugins import get_plugin_manager")
+    plugin = _plugin(tmp_path / "api", {"uses_api.py": "\n".join(imports) + "\n"})
+
+    [warning] = _private_warnings(validate_plugin_dir(plugin))
+
+    sites = warning.split("release): ", 1)[1].split(". Use ctx.*")[0].split("; ")
+    assert sites == [f"uses_api.py:{len(imports)} hermes_cli.plugins.get_plugin_manager"], sites
+
+
+def test_public_api_docs_page_is_generated_from_the_data_file():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("gen_plugin_api_docs", _ROOT / "scripts" / "gen_plugin_api_docs.py")
+    assert spec and spec.loader
+    gen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen)
+
+    assert gen.check() == 0, "website/docs/developer-guide/plugins/public-api.md is stale"

@@ -219,7 +219,7 @@ def _ws_gated_access_token(ws, app, token, webapp, reject, stamp):
     view = _ws_request_view(ws, app)
     try:
         session = (_verify_access_token(view, access_token=token, audit=False)
-                   if not webapp or webapp_sign_in.token_works_alone(view, token) else None)
+                   if not webapp or webapp_sign_in.access_token_works_alone(view, token) else None)
     except ProviderError:
         reject("session token verify unavailable")
         return "token_unavailable", "token"
@@ -255,8 +255,8 @@ def _ws_auth_reason(ws: WebSocket, *, allow_internal: bool = False,
     uses — e.g. a token-mode Remote desktop connection). Generated in-process
     tokens are rejected in gated mode; an explicitly configured operator token
     retains its validated compatibility path. On the gateway's Webapp only a
-    token that listener gave a native app's sign-in works alone, as for the
-    bearer header.
+    token that listener gave a native app's sign-in or the registered deployment
+    session token works alone, as for the bearer header.
 
     Either mode: a local Desktop (no static token) presents the private one-use
     ``X-Hermes-Gateway-Ticket`` grant its REST calls use (``authenticate_native_ws``).

@@ -6,7 +6,7 @@ import contextvars
 import json
 import logging
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any
 
 from agent import relay_llm, relay_runtime
 
@@ -18,14 +18,6 @@ def execute(
     session_id: str, tool_call_id: str | None = None, metadata: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Run one tool call through Relay and return its final arguments."""
-    if relay_llm._has_running_event_loop():
-        # A sync tool on a live loop cannot start another asyncio.run, and blocking
-        # that loop freezes any approval answer already scheduled on it.
-        from agent.async_utils import run_blocking_off_running_loop
-        hopped = run_blocking_off_running_loop(lambda: execute(
-            tool_name, args, callback, session_id=session_id, tool_call_id=tool_call_id, metadata=metadata,
-        ))
-        return cast(tuple[Any, dict[str, Any]], hopped)
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
         return callback(args), args
