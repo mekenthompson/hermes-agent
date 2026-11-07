@@ -194,8 +194,13 @@ def _register(req: ServerRequest) -> None:
     with _lock:
         req.writing = True
         _open[req.id] = req
+    written: bool | None = None
     try:
-        (req.transport.write if req.transport is not None else _write)(frame)
+        # One frame, built before non-replayable params are cleared. Calling
+        # frame() again here would send an empty request. Desktop pins a
+        # transport; every other request uses the bound sink.
+        writer = req.transport.write if req.transport is not None else _write
+        written = writer(frame)
     finally:
         with _lock:
             req.writing = False
@@ -203,6 +208,18 @@ def _register(req: ServerRequest) -> None:
     if withdrawn is not None:
         # cancel() landed between publish and write: its request.cancel must follow the frame, not precede it.
         _emit_cancel(req, withdrawn)
+        return
+    if written is False:
+        # The peer is gone. Leaving the request open makes the agent wait out
+        # the deadline with no card anywhere — the same silence as a user who
+        # never answered. Settle now so both the async approval waiter and a
+        # blocking send() return.
+        with _lock:
+            still_open = _open.pop(req.id, None) is req
+        if still_open:
+            if req.on_result is not None:
+                req.on_result(None)
+            req.event.set()
 
 
 def send(method: str, sid: str, params: dict, *, timeout: float | None,
