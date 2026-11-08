@@ -176,7 +176,7 @@ class AssistantThreadTitles:
         try:
             await self._write_session_title(
                 self._get_client(channel_id, team_id=team_id), channel_id, thread_ts, title)
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- best-effort title; _log_title_failure keeps the traceback for non-Slack errors
             if not _log_title_failure("session title set", exc):
                 return
             # Slack will refuse this thread again; stop asking on every turn.
