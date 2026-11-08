@@ -23,7 +23,7 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.bot_peer_notices import automatic_notices_allowed
 from gateway.config import Platform
-from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
+from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome, should_auto_tts_for_source
 from gateway.platforms.event import MessageEvent
 from gateway.platforms.helpers import typing_metadata_for_turn
 from gateway.response_filters import (
@@ -1148,7 +1148,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             message_type is not None
             and str(getattr(message_type, "value", message_type)).lower() == "voice"
         )
-        if _stts_adapter is None or not _is_voice_input or not _stts_adapter._should_auto_tts_for_chat(source.chat_id):
+        if _stts_adapter is None or not _is_voice_input or not should_auto_tts_for_source(_stts_adapter, source):
             return
         try:
             from gateway.streaming_tts_consumer import StreamingTTSConsumer
