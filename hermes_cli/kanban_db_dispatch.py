@@ -1643,16 +1643,16 @@ def check_respawn_guard(
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
-    pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
-                                          cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
-    if pr_times:
+    pr_hits = [(t, _RESPAWN_GUARD_PR_URL_RE.findall(_kb._lossy_text(c["body"]) or "")) for t, c in _rows_since(
+        conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW, cols=", body", unreadable=now)]
+    if pr_times := [t for t, urls in pr_hits if urls]:  # unreadable time: duplicate-PR risk, fail closed
         # Strictly after: a same-second tie stays guarded (fail closed).
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
                 conn, "task_events", task_id, max(pr_times),
                 "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
             return None
-        return None if _guard_wait.unblock_unspent(conn, task_id) else "active_pr"
+        lifted = _guard_wait.pr_wait_lifted(conn, task_id, [u for _, urls in pr_hits for u in urls])
+        return None if lifted else "active_pr"
 
     return None
 

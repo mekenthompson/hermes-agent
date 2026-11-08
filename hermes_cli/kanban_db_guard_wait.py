@@ -10,14 +10,16 @@ must not drop to ``triage``, where ``unblock`` cannot reach it).
 
 The park is marked (``source: respawn_guard``) and the dispatcher releases it
 by itself, exactly when the guard would have let the card go from ``ready``:
-the PR comment ages out of the window, or the card is handed to another
-profile. The release is a ``promoted`` event, never ``unblocked``, so it does
-not count as the explicit one-run consent.
+GitHub reports every linked PR closed (``kanban_db_pr_state``), the PR comment
+ages out of the window, or the card is handed to another profile. It never
+pings or wakes a subscriber (``is_park_event``): nobody has to act. The release
+is a ``promoted`` event, never ``unblocked``, so it does not count as the
+explicit one-run consent.
 """
 from __future__ import annotations
 
 import sqlite3
-from typing import Optional
+from typing import Any, Optional
 
 PARK_SOURCE = "respawn_guard"
 # The block-lifecycle events; the newest one says whether a park still stands.
@@ -33,6 +35,20 @@ def unblock_unspent(conn: sqlite3.Connection, task_id: str) -> bool:
         "SELECT kind FROM task_events WHERE task_id = ? AND kind IN ('unblocked', 'claimed') "
         "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
     return latest is not None and latest["kind"] == "unblocked"
+
+
+def pr_wait_lifted(conn: sqlite3.Connection, task_id: str, pr_urls: list[str]) -> bool:
+    """``active_pr`` does not hold: an unspent explicit unblock, or GitHub reports
+    every PR the recent comments link closed, so a respawn cannot duplicate one."""
+    from hermes_cli import kanban_db_pr_state
+
+    return unblock_unspent(conn, task_id) or kanban_db_pr_state.all_closed(pr_urls)
+
+
+def is_park_event(kind: str, payload: Any) -> bool:
+    """The dispatcher's own park. It clears by itself (merge, window, handoff), so
+    the notifier neither pings nor wakes anyone for it."""
+    return kind == "blocked" and isinstance(payload, dict) and payload.get("source") == PARK_SOURCE
 
 
 def record_respawn_guard(conn: sqlite3.Connection, task_id: str, reason: str, *, lane: str) -> None:

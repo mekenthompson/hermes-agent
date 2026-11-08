@@ -337,7 +337,7 @@ _SPECS = [
         _TASK_IDS,
         _arg("--expected-event-id", type=int,
              help="Only resume this single task if its latest event still matches show --json."),
-    ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    ], help="Return blocked/scheduled tasks (or block-loop triage) to ready, or todo while parents remain open"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
