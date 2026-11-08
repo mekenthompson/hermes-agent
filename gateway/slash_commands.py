@@ -684,12 +684,14 @@ class GatewaySlashCommandsMixin(
     async def _handle_voice_command(self, event: MessageEvent) -> str:
         """Handle /voice [on|off|tts|channel|leave|status] command."""
         args = event.get_command_args().strip().lower()
-        chat_id = event.source.chat_id
         # Voice state belongs to the (bot, chat) pair: resolve the adapter that received the
         # command and key the mode by its owning profile so two multiplexed bots in one chat keep
         # independent /voice state.
         # See #75198.
+        # Telegram topics scope it further: the key and the adapter set entry carry the topic id, and an
+        # unset topic falls back to the chat-level mode (HF-672).
         voice_key = self._voice_key_for_source(event.source)
+        scope_id = self._voice_scope_for_source(event.source)
         adapter = self._delivery_adapter_for(event.source)
 
         def _set_mode(mode: str) -> None:
@@ -700,9 +702,9 @@ class GatewaySlashCommandsMixin(
             if not adapter:
                 return
             if mode == "off":
-                self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
+                self._set_adapter_auto_tts_disabled(adapter, scope_id, disabled=True)
             else:
-                self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
+                self._set_adapter_auto_tts_enabled(adapter, scope_id, enabled=True)
 
         if args in _VOICE_MODE_BY_ARG:
             mode, reply_key = _VOICE_MODE_BY_ARG[args]
@@ -713,7 +715,7 @@ class GatewaySlashCommandsMixin(
         if args == "leave":
             return await self._handle_voice_channel_leave(event)
         if args == "status":
-            mode = self._voice_mode.get(voice_key, "off")
+            mode = self._voice_mode_for_source(event.source) or "off"
             label = t(f"gateway.voice.label_{mode}") if mode in ("off", "voice_only", "all") else mode
             lines = [t("gateway.voice.status_mode", label=label)]
             guild_id = self._get_guild_id(event)  # append voice channel info if connected
@@ -727,7 +729,7 @@ class GatewaySlashCommandsMixin(
             return "\n".join(lines)
 
         # Toggle: off → on, on/all → off
-        turning_on = self._voice_mode.get(voice_key, "off") == "off"
+        turning_on = (self._voice_mode_for_source(event.source) or "off") == "off"
         _set_mode("voice_only" if turning_on else "off")
         toggle_line = t("gateway.voice.enabled_short" if turning_on else "gateway.voice.disabled_short")
         # Bare /voice still toggles, but append an explainer so users discover the on/off/tts/status

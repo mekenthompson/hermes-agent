@@ -59,6 +59,13 @@ class _Runner:
     def _voice_key_for_source(self, source):
         return source.chat_id
 
+    @staticmethod
+    def _voice_scope_for_source(source):
+        return source.chat_id
+
+    def _voice_mode_for_source(self, source):
+        return self._voice_mode.get(source.chat_id)
+
     def _delivery_adapter_for(self, source):
         return None
 

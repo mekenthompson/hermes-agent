@@ -443,7 +443,7 @@ from gateway.platforms.base_streaming_tts import (
     AudioFormat, StreamingTTSHandle, streaming_tts_should_skip_whole_file, streaming_tts_turn_key)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.platforms.base_processing import ProcessingLifecycleMixin
-from gateway.platforms.auto_tts_delivery import run_auto_tts, run_deferred_voice_reply
+from gateway.platforms.auto_tts_delivery import run_auto_tts, run_deferred_voice_reply, should_auto_tts_for_source
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
 from hermes_cli.home_data_layout import SECRET_CACHE_STORES
@@ -4107,7 +4107,7 @@ class BasePlatformAdapter(ProcessingLifecycleMixin, ABC):
         skipped when streaming TTS already delivered audio this turn."""
         generation = getattr(interrupt_event, "_hermes_run_generation", None)
         return bool(
-            self._should_auto_tts_for_chat(event.source.chat_id)
+            should_auto_tts_for_source(self, event.source)
             and event.message_type == MessageType.VOICE and text_content and not media_files
             and not self._streaming_tts_turn_completed(session_key, generation, event=event))
 
