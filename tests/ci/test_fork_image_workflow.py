@@ -17,6 +17,9 @@ PUSH_DIGEST = ROOT / "scripts/extract-image-push-digest.py"
 EVIDENCE_ACTION = ROOT / ".github/actions/image-evidence/action.yml"
 EVIDENCE_SCRIPT = ROOT / ".github/actions/image-evidence/run.sh"
 EVIDENCE_USES = "./.github/actions/image-evidence"
+FETCH_ASSET = ROOT / ".github/actions/image-evidence/fetch-pinned-release-asset.sh"
+SYFT_SHA256 = "8fcb33017a0dc1058298c923c436d19dfa68ae93968e0b423248542e3afb9fc3"
+TRIVY_SHA256 = "8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
 SHA = "1" * 40
 DIGEST = "sha256:" + "2" * 64
 REPOSITORY = "ghcr.io/mekenthompson/hermes-agent"
@@ -181,8 +184,9 @@ class ForkImageWorkflowTests(unittest.TestCase):
         self.assertIn("/etc/hermes/image-provenance.json", text)
         self.assertEqual(text.count(f"uses: {EVIDENCE_USES}\n"), 2)
         action = EVIDENCE_ACTION.read_text(encoding="utf-8")
-        self.assertIn("anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26", action)
-        self.assertIn("aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514", action)
+        self.assertIn("fetch-pinned-release-asset.sh", action)
+        self.assertIn(SYFT_SHA256, action)
+        self.assertIn(TRIVY_SHA256, action)
         script = EVIDENCE_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("--severity CRITICAL", script)
         self.assertIn("--exit-code 1", script)
@@ -624,7 +628,20 @@ class ImageEvidenceStepTests(unittest.TestCase):
         action = yaml.safe_load(EVIDENCE_ACTION.read_text(encoding="utf-8"))
         steps = action["runs"]["steps"]
         by_uses = {str(s.get("uses", "")).split("@")[0]: s for s in steps if s.get("uses")}
-        self.assertEqual(by_uses["aquasecurity/setup-trivy"]["with"]["version"], "v0.70.0")
+        by_name = {s["name"]: s for s in steps}
+        # Same pinned Syft 1.51.1 / Trivy 0.70.0 archives, by published digest.
+        syft = by_name["Install pinned Syft"]
+        self.assertEqual(syft["id"], "syft")
+        self.assertEqual(syft["env"]["SYFT_SHA256"], SYFT_SHA256)
+        self.assertIn("syft_1.51.1_linux_amd64.tar.gz", syft["run"])
+        self.assertIn('echo "cmd=$dir/syft" >> "$GITHUB_OUTPUT"', syft["run"])
+        trivy = by_name["Install pinned Trivy"]
+        self.assertEqual(trivy["env"]["TRIVY_SHA256"], TRIVY_SHA256)
+        self.assertIn("trivy_0.70.0_Linux-64bit.tar.gz", trivy["run"])
+        for step in (syft, trivy):
+            self.assertNotIn("uses", step)
+            self.assertIn("fetch-pinned-release-asset.sh", step["run"])
+            self.assertEqual(step["env"]["GH_TOKEN"], "${{ github.token }}")
         cache = by_uses["actions/cache"]["with"]
         self.assertEqual(cache["path"], "${{ github.workspace }}/.cache/trivy")
         self.assertEqual(cache["key"], "cache-trivy-${{ steps.date.outputs.date }}")
