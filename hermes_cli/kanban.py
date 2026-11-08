@@ -1052,7 +1052,7 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             conn, tid, expected_event_id=expected_event_id, notify_target=target),
             after=expected_event_id is not None)
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+                           lambda tid: f"cannot unblock {tid} (not blocked, scheduled or block-loop triage?)")
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:

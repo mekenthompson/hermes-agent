@@ -169,11 +169,25 @@ def _route_block(
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
 
 
+def _triaged_by_block_loop(conn: sqlite3.Connection, task_id: str) -> bool:
+    """In ``triage`` because the block-loop breaker routed a worker block there.
+
+    ``unblock`` is the operator's answer to that block, like any other. A card
+    filed into triage for specification still goes through ``specify``."""
+    row = conn.execute(
+        "SELECT t.status, (SELECT e.kind FROM task_events e WHERE e.task_id = t.id AND e.kind IN "
+        "('blocked', 'block_loop_detected', 'unblocked', 'promoted', 'specified', 'status') "
+        "ORDER BY e.id DESC LIMIT 1) AS last_kind FROM tasks t WHERE t.id = ?", (task_id,),
+    ).fetchone()
+    return row is not None and row["status"] == "triage" and row["last_kind"] == "block_loop_detected"
+
+
 def unblock_task(
     conn: sqlite3.Connection, task_id: str, *, expected_event_id: Optional[int] = None,
     request_id: Optional[str] = None, notify_target: Optional[dict[str, Any]] = None,
 ) -> bool:
     """Resume blocked/scheduled work, optionally only from its observed event.
+    A card the block-loop breaker sent to ``triage`` resumes the same way.
 
     Callers preparing an activation retain their original event token across
     retries. Reading a fresh token after a newer Stop is a new resume decision,
@@ -193,13 +207,14 @@ def unblock_task(
     with kb.write_txn(conn):
         if not _event_matches(conn, task_id, expected_event_id):
             return False
+        statuses = ("blocked", "scheduled", "triage") if _triaged_by_block_loop(conn, task_id) else ("blocked", "scheduled")
         resume_status = (
             kb._resume_status_from_events(conn, task_id)
-            if kb._task_status(conn, task_id) == "blocked"
+            if kb._task_status(conn, task_id) in ("blocked", "triage")
             else "ready"
         )
         kb._reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
+            conn, task_id, statuses=statuses, now=now,
             note="invariant recovery on unblock",
         )
         landing_status = kb._landing_status_after_parents(conn, task_id)
@@ -208,10 +223,13 @@ def unblock_task(
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
+        # Leaving block-loop triage restarts the loop count: the operator has
+        # answered the loop, so the next distinct block must not re-triage at once.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "block_recurrences = CASE WHEN status = 'triage' THEN 0 ELSE block_recurrences END "
+            f"WHERE id = ? AND status IN ({', '.join('?' for _ in statuses)})", (new_status, task_id, *statuses),
         )
         if cur.rowcount != 1:
             return False

@@ -53,6 +53,12 @@ _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "revie
 _ARTIFACT_KINDS = ("completed", "review_requested")
 
 
+def _dispatcher_park(ev) -> bool:
+    """The respawn guard's park clears by itself, so it is board state, not a decision for anyone."""
+    from hermes_cli.kanban_db_guard_wait import is_park_event
+    return is_park_event(ev.kind, ev.payload)
+
+
 def diagnostic_event(ev) -> bool:
     """Infrastructure attention is distinct from an explicit owner decision."""
     if ev.kind in {"crashed", "timed_out", "gave_up"}:
@@ -580,7 +586,7 @@ class _KanbanNotification:
     def format_event(self, ev: Any) -> Optional[str]:
         """Render one event; accumulates wake handoff/review detail. None → silent kind."""
         formatter = _EVENT_FORMATTERS.get(ev.kind)
-        if formatter is None:
+        if formatter is None or _dispatcher_park(ev):
             return None
         msg, handoff, review_detail = formatter(ev, self)
         if handoff is not None:
@@ -592,8 +598,9 @@ class _KanbanNotification:
     def build_wake_text(self) -> None:
         """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
         task, sub = self.task, self.sub
-        self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
-        self.wake_diagnostic = all(diagnostic_event(ev) for ev in self.d["events"] if ev.kind in self.wake_kinds)
+        waking = [ev for ev in self.d["events"] if ev.kind in _WAKE_KINDS and not _dispatcher_park(ev)]
+        self.wake_kinds = {ev.kind for ev in waking} if self.wake_agent else set()
+        self.wake_diagnostic = all(diagnostic_event(ev) for ev in waking if ev.kind in self.wake_kinds)
         if not self.wake_kinds:
             return
         if self.is_push_adapter:
