@@ -605,7 +605,7 @@ def test_list_refreshes_when_pin_changed_and_browser_is_running(tmp_path, monkey
     def fake_get_browser(key):
         return _FakeRunningBrowser("ws://running") if state["running"] else None
 
-    def fake_stop_browser(key):
+    def fake_stop_browser(key, **_kwargs):  # house passes force=True
         state["running"] = False  # terminate_real_profile_browser's effect
 
     def fake_launch(browser_name):
