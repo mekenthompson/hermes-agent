@@ -273,7 +273,10 @@ def main():
     os.environ.update(OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url)
     Path(os.environ['HERMES_HOME'], 'config.yaml').write_text(
         f'model:\n  default: local-wire-stub\n  provider: custom\n  base_url: {url}\n'
-        'streaming:\n  enabled: false\nauxiliary:\n  title_generation:\n    enabled: false\n')
+        'streaming:\n  enabled: false\nauxiliary:\n  title_generation:\n    enabled: false\n'
+        # House registers the live agent for authority turns, so the default ``interrupt`` mode
+        # redirects a relay follow-up into the running turn. Queue keeps this FIFO scenario.
+        'display:\n  busy_input_mode: queue\n')
     try:
         asyncio.run(probe(peer))
     finally:

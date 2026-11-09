@@ -183,8 +183,10 @@ async def test_a_hung_open_never_wedges_the_turn_or_its_executing_stamp(monkeypa
     try:
         ref, opening, _delivered = await _hung_open(monkeypatch, 'hung-open', release)
         live = LiveSession(SimpleNamespace(chat_id=ref.session_id), 'route')
-        owner = SimpleNamespace(executing={ref.session_id: 7})  # as _stamp_claim left it
-        task = asyncio.ensure_future(SessionAuthority._execute_claimed(owner, ref, live, {'admission_id': 'a'}))
+        # As _stamp_claim left it; house Stop fencing also reads delivered_stops and the row generation.
+        owner = SimpleNamespace(executing={ref.session_id: 7}, delivered_stops={})
+        task = asyncio.ensure_future(SessionAuthority._execute_claimed(
+            owner, ref, live, {'admission_id': 'a', 'generation': 1}))
         if cancel:
             for _ in range(5):  # yields only: the turn runs up to its wait on the open
                 await asyncio.sleep(0)
