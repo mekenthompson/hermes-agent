@@ -25,6 +25,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult,
 )
 from gateway.platforms.event import ProcessingOutcome
+from gateway.platforms.helpers import clarify_text_with_choices
 from agent.i18n import t
 from gateway.relay.adapter_discord_interaction import RelayDiscordInteractionMixin
 from gateway.relay.descriptor import CapabilityDescriptor
@@ -1038,38 +1039,9 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
             logger.debug("slack session-thread stamp failed", exc_info=True)
 
     async def _localize_inbound_media(self, event) -> None:
-        """Download connector re-hosted attachments to local temp paths — every NATIVE
-        adapter presents inbound media as LOCAL FILE PATHS (vision/file tools consume
-        paths). Best-effort per entry: a failed download drops that entry, never the
-        message; with no client only re-host URLs are dropped (they'd 401 downstream)."""
-        try:
-            urls = list(getattr(event, "media_urls", None) or [])
-            if not urls:
-                return
-            # media_types / media_filenames are INDEXED IN PARALLEL with media_urls downstream:
-            # carry (url, mime, name) TRIPLES or survivors inherit a neighbour's type or name.
-            types = list(getattr(event, "media_types", None) or []) + [""] * len(urls)
-            names = list(getattr(event, "media_filenames", None) or []) + [""] * len(urls)
-            client = self._get_media_client()
-            localized: list[tuple[str, str, str]] = []
-            for url, mime, name in zip(urls, types, names):
-                if not isinstance(url, str) or not url:
-                    continue
-                if client is None:
-                    if "/relay/media/" not in url:
-                        localized.append((url, mime, name))
-                    continue
-                # The path is a random temp name; the original name rides beside it.
-                got = await client.download_with_name(url, suggested_name=name or None)
-                if got:
-                    localized.append((got[0], mime, got[1]))
-                elif "/relay/media/" not in url:
-                    # A public URL still has value as a URL; a dead re-host does not.
-                    localized.append((url, mime, name))
-            event.media_urls, event.media_types, event.media_filenames = (
-                [entry[i] for entry in localized] for i in range(3))
-        except Exception:
-            logger.debug("relay inbound media localization failed", exc_info=True)
+        """Download connector attachments, retaining metadata for each surviving file."""
+        from gateway.relay.adapter_inbound_media import localize_inbound_media
+        await localize_inbound_media(event, self._get_media_client)
 
     def prime_routing_cache(self, event) -> None:
         """Warm the per-chat egress routing caches from a SYNTHETIC event: a completion
@@ -1982,20 +1954,15 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
         the 64-byte callback budget. Open-ended clarifies and unavailable lanes fall
         back to base."""
         if choices and self.descriptor.supports_op("prompt"):
-            options = [{"id": f"c{i}", "label": str(choice)[:75]} for i, choice in enumerate(choices)]
+            # Clipped button labels are unreadable (#78115): long options go in full in the text.
+            text, numbered = clarify_text_with_choices(f"❓ {question}", choices, max_label_cols=48,
+                limit=self.max_message_length_for_chat(chat_id), len_fn=self.message_len_fn_for_chat(chat_id))
+            options = [{"id": f"c{i}", "label": str(i + 1) if numbered else str(c)[:75]} for i, c in enumerate(choices)]
             options.append({"id": "other", "label": t("platform.relay.prompt_other")})
             result = await self._mint_and_send_prompt(
-                "clarify",
-                {
-                    "session_key": session_key,
-                    "clarify_id": clarify_id,
-                    "choices": [str(c) for c in choices],
-                },
-                chat_id,
-                prompt_kind="clarify",
-                text=f"❓ {question}",
-                options=options,
-                metadata=metadata,
+                "clarify", {"session_key": session_key, "clarify_id": clarify_id, "choices": [str(c) for c in choices]},
+                chat_id, prompt_kind="clarify", text=text,
+                options=options, metadata=metadata,
             )
             if result is not None:
                 return result

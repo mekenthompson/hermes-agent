@@ -1,6 +1,5 @@
 """Agent-turn execution for GatewayRunner: _handle_message_with_agent, _run_agent*, proxy path,
-MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals
-are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.X")`` still works.
+MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals are imported lazily (cycle).
 """
 
 from __future__ import annotations
@@ -23,7 +22,8 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.bot_peer_notices import automatic_notices_allowed
 from gateway.config import Platform
-from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome, should_auto_tts_for_source
+from gateway.platforms.base import (
+    BasePlatformAdapter, ProcessingOutcome, describe_proxy_error, safe_proxy_url_for_log, should_auto_tts_for_source)
 from gateway.platforms.event import MessageEvent
 from gateway.platforms.helpers import typing_metadata_for_turn
 from gateway.response_filters import (
@@ -765,7 +765,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 async with session.post(f"{proxy_url}/v1/chat/completions", json=body, headers=headers) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
-                        logger.warning("Proxy error (%d) from %s: %s", resp.status, proxy_url, error_text[:500])
+                        logger.warning("Proxy error (%d) from %s: %s", resp.status, safe_proxy_url_for_log(proxy_url), error_text[:500])
                         return self._proxy_error_result(t("gateway.proxy.http_error", status=resp.status, error=error_text[:300]))
 
                     buffer = ""
@@ -793,16 +793,16 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                         # presenting the truncation as a complete answer.
                         logger.warning(
                             "Proxy SSE stream from %s ended without [DONE] — response may be truncated "
-                            "(%d chars received)", proxy_url, len(full_response),
+                            "(%d chars received)", safe_proxy_url_for_log(proxy_url), len(full_response),
                         )
                         if not full_response:
                             return self._proxy_error_result(t("gateway.proxy.closed_early"))
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error("Proxy connection error to %s: %s", proxy_url, e)
+            logger.error("Proxy connection error to %s: %s", safe_proxy_url_for_log(proxy_url), describe_proxy_error(e, proxy_url) or e)
             if not full_response:
-                return self._proxy_error_result(t("gateway.proxy.connection_error", error=e))
+                return self._proxy_error_result(t("gateway.proxy.connection_error", error=describe_proxy_error(e, proxy_url) or e))
             # Partial response — return what we got
         finally:
             if _stream_consumer:
@@ -818,7 +818,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             return _stale_result("result")
         logger.info(
             "proxy response: url=%s session=%s time=%.1fs response=%d chars",
-            proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
+            safe_proxy_url_for_log(proxy_url), (session_id or "")[:20], _elapsed, len(full_response),
         )
         return {
             "final_response": full_response or t("gateway.proxy.no_response"),
