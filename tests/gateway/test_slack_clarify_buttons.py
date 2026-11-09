@@ -291,6 +291,55 @@ class TestSlackSendClarify:
 
 
     @pytest.mark.asyncio
+    async def test_long_choices_render_in_full_with_positional_buttons(self):
+        """#78115: a 51-char option is clipped by the Slack client (below the 75-char API
+        cap) with no tooltip; the full text must be in the body, the button just its number."""
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1.2"})
+        long_choice = "Build a REST API with auth, rate limits & <pagination>"
+        wide_cjk = "가" * 25  # 25 codepoints, 50 display columns
+
+        await adapter.send_clarify(
+            chat_id="C1", question="Scope?", choices=[long_choice, "MVP only"],
+            clarify_id="cid3", session_key="sk3")
+        blocks = mock_client.chat_postMessage.call_args[1]["blocks"]
+        body = blocks[0]["text"]["text"]
+        assert "1. Build a REST API with auth, rate limits &amp; &lt;pagination&gt;" in body
+        assert "2. MVP only" in body
+        labels = [e["text"]["text"] for e in blocks[1]["elements"]]
+        assert labels == ["1", "2", "✏️ Other…"]
+        assert blocks[1]["elements"][0]["value"] == "cid3|0"
+
+        await adapter.send_clarify(
+            chat_id="C1", question="Q", choices=[wide_cjk, "b"], clarify_id="cid4", session_key="sk4")
+        blocks = mock_client.chat_postMessage.call_args[1]["blocks"]
+        assert wide_cjk in blocks[0]["text"]["text"]
+        assert blocks[1]["elements"][0]["text"]["text"] == "1"
+
+        # House KEN-479: over the 3000-char section cap the prompt splits into sections
+        # losslessly (no "…" clipping), so every positional button keeps its full line.
+        huge = ["<&> " * 300 + f"tail {i}" for i in range(4)]
+        await adapter.send_clarify(
+            chat_id="C1", question="Pick", choices=huge, clarify_id="cid5", session_key="sk5")
+        sections = [b["text"]["text"] for b in mock_client.chat_postMessage.call_args[1]["blocks"]
+                    if b["type"] == "section"]
+        assert all(len(text) <= 3000 for text in sections)
+        joined = "".join(sections)
+        assert "…" not in joined
+        assert all(f"{n}. " in joined and f"tail {n - 1}" in joined for n in (1, 2, 3, 4))
+
+        # A question that alone nearly fills the section is kept whole, and so is the list.
+        await adapter.send_clarify(
+            chat_id="C1", question="q" * 2990, choices=[f"{n}" * 60 for n in range(1, 5)],
+            clarify_id="cid6", session_key="sk6")
+        sections = [b["text"]["text"] for b in mock_client.chat_postMessage.call_args[1]["blocks"]
+                    if b["type"] == "section"]
+        joined = "".join(sections)
+        assert "q" * 2990 in joined and joined.endswith(f"\n4. {'4' * 60}")
+        assert all(f"{n}. {str(n) * 60}" in joined for n in (1, 2, 3, 4))
+
+    @pytest.mark.asyncio
     async def test_mrkdwn_escapes_question(self):
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]

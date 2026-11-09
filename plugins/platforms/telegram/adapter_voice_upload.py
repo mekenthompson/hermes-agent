@@ -67,11 +67,19 @@ async def upload_voice_file(
         if ext in {".ogg", ".opus"}:
             msg = await adapter._send_voice_bubble(
                 audio_file, chat_id, reply_to, metadata, caption, duration_secs)
-        elif ext in {".mp3", ".m4a"}:
-            msg = await adapter._send_media(
-                adapter._bot.send_audio, chat_id, reply_to, metadata, "audio",
-                reset_media=lambda: audio_file.seek(0),
-                audio=audio_file, caption=adapter._caption_1024(caption), duration=duration_secs)
+        elif ext in {".mp3", ".m4a"}:  # sendAudio with upstream player fields (title, performer, cover)
+            player = await asyncio.to_thread(telegram_mod.audio_player_fields, audio_path)
+            cover_path = player.pop("thumbnail_path", None)
+            if cover_path:  # a path, not a handle: PTB reads it per attempt, so retries keep the cover
+                player["thumbnail"] = cover_path
+            try:
+                msg = await adapter._send_voice_bubble(
+                    audio_file, chat_id, reply_to, metadata, caption, duration_secs,
+                    send_fn=adapter._bot.send_audio, media_key="audio", **player)
+            finally:
+                if cover_path:
+                    with contextlib.suppress(OSError):
+                        os.unlink(cover_path)
         else:
             return await adapter.send_document(
                 chat_id=chat_id, file_path=audio_path, caption=caption, reply_to=reply_to, metadata=metadata)
@@ -122,6 +130,11 @@ async def deliver_voice(
             break
         raise error or RuntimeError("Telegram voice upload failed")
     except Exception as error:
+        # Flood control refused the request outright, so a re-upload cannot duplicate (upstream path).
+        if (recovered := await adapter._media_flood_recover(error, chat_id, lambda p: adapter.send_voice(
+                chat_id, p or audio_path, caption, reply_to, metadata, **kwargs),
+                f"voice {os.path.basename(audio_path)}", audio_path, metadata)):
+            return recovered
         logger.warning(
             "[%s] Voice delivery failed (%s)", adapter.name, _redact_telegram_error_text(error), exc_info=True)
         if voice_upload_never_sent(adapter, error):

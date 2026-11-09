@@ -45,7 +45,8 @@ class ProviderError(Exception):
 
 
 class InvalidCodeError(Exception):
-    """OAuth callback ``code``/``state`` failed validation. Middleware -> HTTP 400."""
+    """A code, state or token failed validation (not an outage): the OAuth callback answers 400,
+    ``verify_session`` returns ``None``."""
 
 
 class InvalidCredentialsError(Exception):
