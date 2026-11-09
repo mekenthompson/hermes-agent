@@ -367,7 +367,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             media_files = [(path, False) for path in detail.get("refused", ())]
             last_msg = last_msg or (SimpleNamespace(message_id=None) if result.success else None)
         for media_path, is_voice in media_files:
-            if not os.path.exists(media_path):
+            if not await asyncio.to_thread(os.path.exists, media_path):
                 warnings.append(f"Media file not found, skipping: {media_path}")
                 logger.warning(warnings[-1])
                 # Caption mode suppressed the text send; the file is gone, so deliver the words alone.
@@ -378,7 +378,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         _tg_caption = None  # delivered — don't re-caption a later file
                     except Exception as _cap_err:
                         logger.warning("Telegram caption-fallback send failed for missing media: %s",
-                                       _sanitize_error_text(_cap_err))
+                                       _sanitize_error_text(_cap_err), exc_info=True)
                 continue
             try:
                 last_msg = await _telegram_send_one_media(
@@ -386,7 +386,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     has_html=_has_html, thread_kwargs=thread_kwargs, force_document=force_document)
             except Exception as e:
                 warnings.append(_sanitize_error_text(f"Failed to send media {media_path}: {e}"))
-                logger.error(warnings[-1])
+                logger.error(warnings[-1], exc_info=True)
         if last_msg is None:
             return {"error": _NO_DELIVERABLE, **({"warnings": warnings} if warnings else {})}
         return _success(chat_id, warnings, **({"message_id": str(last_msg.message_id)}
@@ -395,6 +395,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return {"error": "python-telegram-bot not installed. Run: "
                 f"{install_hint('telegram')}"}
     except Exception as e:
+        logger.warning("Telegram standalone send failed", exc_info=True)
         return _error(f"Telegram send failed: {e}")
 
 

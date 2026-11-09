@@ -1,6 +1,5 @@
 """Agent-turn execution for GatewayRunner: _handle_message_with_agent, _run_agent*, proxy path,
-MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals
-are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.X")`` still works.
+MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals are imported lazily (cycle).
 """
 
 from __future__ import annotations
