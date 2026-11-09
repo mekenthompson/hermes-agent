@@ -222,13 +222,6 @@ class ClientLifecycleMixin:
         if client is None:
             return
         try:
-            # Process transports own their cancellation mechanism. Do not run TCP
-            # introspection or close live SSL objects for ordinary SDK clients.
-            abort = getattr(type(client), "hermes_abort_request", None)
-            if callable(abort):
-                abort(client)
-                logger.info("Shared OpenAI client retired (%s, transport_owned=True) %s", reason, self._client_log_context())
-                return
             shutdown_count = self._force_close_tcp_sockets(client)
             logger.info(
                 "Shared OpenAI client retired (%s, tcp_shutdown=%d, fd_release=deferred_to_gc) %s",
@@ -427,13 +420,6 @@ class ClientLifecycleMixin:
             if cache["client"] is client:
                 cache["poisoned"] = True
         try:
-            # Process transports own their cancellation mechanism. Do not run TCP
-            # introspection or close live SSL objects for ordinary SDK clients.
-            abort = getattr(type(client), "hermes_abort_request", None)
-            if callable(abort):
-                abort(client)
-                logger.info("%s client aborted (%s, transport_owned=True) %s", label, reason, context)
-                return
             # Non-HTTP providers cancel without closing owner-thread file descriptors.
             if callable(getattr(type(client), "cancel", None)):
                 client.cancel()
