@@ -9,6 +9,7 @@ from dataclasses import asdict, replace
 from datetime import datetime
 import json
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from gateway.config import Platform
 from gateway.session import SessionEntry, SessionSource
@@ -95,6 +96,10 @@ def legacy_launch_params(row):
         # an endpoint left without a provider is a custom route, never one to pair with the
         # profile's provider.
         route.setdefault('provider', 'custom')
+    if 'base_url' in route and urlsplit(route['base_url']).scheme not in {'http', 'https'}:
+        # A process-backed provider stamps a ``process://`` marker, not an endpoint. Its provider
+        # resolves its own transport; carrying the marker makes resume refuse a valid row.
+        route.pop('base_url')
     if row['source'] == 'acp' and 'cwd' not in params and Path(str(saved.get('cwd') or '')).is_absolute():
         params['cwd'] = saved['cwd']
     params.update({key: route[key] for key in ('provider', 'base_url') if key in route})
