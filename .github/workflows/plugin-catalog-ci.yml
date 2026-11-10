@@ -61,7 +61,69 @@ jobs:
 
       - name: Find changed catalog entries
         id: changed
-        run: python3 -I "$GITHUB_WORKSPACE/scripts/ci/catalog_changed_entries.py"
+        env:
+          # Set by Actions, not by the run script, so a PR cannot inject these.
+          CATALOG_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          CATALOG_HEAD_REF: ${{ github.head_ref }}
+          CATALOG_PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # HEAD is the PR merge commit: diffing it against its first parent is
+          # exactly what the PR would land. Refuse anything else rather than
+          # silently diffing a single commit.
+          if ! git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+            echo "::error::expected the pull_request merge commit as HEAD"
+            exit 1
+          fi
+          # Added + modified + renamed + typechanged entry files only; deletions
+          # and removed.yaml have nothing to clone. A rename or file->symlink
+          # change that slipped past this list would skip the supply-chain gate.
+          CHANGED=$(git diff --name-only --diff-filter=AMRT 'HEAD^1' HEAD \
+            -- 'plugin-catalog/*.yaml' 'plugin-catalog/*.yml')
+          # The grep can only shrink the list and runs on its own so a git diff
+          # failure still fails the step instead of looking like "no changes".
+          CHANGED=$(printf '%s' "$CHANGED" | grep -v '/removed\.yaml$' || true)
+
+          if [ -n "$CHANGED" ]; then
+            # Admission PRs must be data-only: the gate's own enforcement code
+            # (this workflow, the validator, the composite actions, the built
+            # hermes) resolves from the PR checkout, so an entry PR that also
+            # touches tooling could neuter the gate vetting it. Contributor
+            # email maps are data the gate never executes; README/policy/CI PRs
+            # with no entry change skip this check.
+            #
+            # House: the one authorized alignment PR carries upstream catalog entries
+            # together with reviewed tooling. Keep the exemption bound to this exact
+            # fork branch/repository and PR number; pinned-source validation below still runs.
+            house_sync=0
+            if [ "${CATALOG_HEAD_REPO:-}" = "mekenthompson/hermes-agent" ] \
+               && [ "${CATALOG_HEAD_REF:-}" = "house/reconcile-nous-7d9fd429d32e82cd4be90cd2fbe995054f43e2e3" ] \
+               && [ "${CATALOG_PR_NUMBER:-}" = "236" ] \
+               && git merge-base --is-ancestor 7d9fd429d32e82cd4be90cd2fbe995054f43e2e3 HEAD^2 \
+               && git merge-base --is-ancestor a0af667c876b0522b9cb6eb684d02f50a40ea7e5 HEAD^2; then
+              house_sync=1
+            fi
+            if [ "$house_sync" -eq 0 ]; then
+              ALL=$(git diff --name-only 'HEAD^1' HEAD)
+              OUTSIDE=$(printf '%s' "$ALL" | grep -vE '^(plugin-catalog|contributors/emails)/' || true)
+              if [ -n "$OUTSIDE" ]; then
+                echo "::error::catalog entry PRs may only touch plugin-catalog/** and contributors/emails/**, found:"
+                # Filenames are PR-controlled; a newline in one could smuggle a
+                # workflow command into the log.
+                printf '%s' "$OUTSIDE" | tr '\0\n' ' '
+                echo
+                exit 1
+              fi
+            fi
+          fi
+
+          echo "Changed catalog entries:"
+          echo "${CHANGED:-<none>}"
+          {
+            echo 'files<<__EOF__'
+            echo "$CHANGED"
+            echo '__EOF__'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prepare Hermes from the PR's own checkout
         if: steps.changed.outputs.files != ''

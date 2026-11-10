@@ -207,7 +207,7 @@ jobs:
         if: ${{ !cancelled() && steps.tools.outcome == 'success' && inputs.event_name == 'pull_request' }}
         env:
           CI_PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-        run: just check --only health --base HEAD^1
+        run: python scripts/check --only health --base HEAD^1
 
       # ── Advisory ruff + ty diff (pull requests, python lane) ──────────────────────────────
 

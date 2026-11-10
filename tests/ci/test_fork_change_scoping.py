@@ -306,7 +306,7 @@ def test_consolidated_hygiene_guards_run_without_a_binary_lane(files):
     ctx["__status__"]["success"] = False
     guards = _yaml(call["uses"][2:])["jobs"]["guards"]
     for name, command in (
-        ("Reject committed PR-infographic images", "git ls-files -z"),
+        ("Reject committed PR-infographic images", "scripts/ci/check_infographic_images.py"),
         ("Reject profile exports in the checkout", "scripts/ci/check_profile_archive_boundary.py"),
         ("Judge files added or modified against the base branch tip", "scripts/ci/check_blob_size.py --base HEAD^1"),
     ):
