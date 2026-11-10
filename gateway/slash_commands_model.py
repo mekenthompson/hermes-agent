@@ -249,6 +249,8 @@ class GatewayModelCommandsMixin:
         self._session_model_overrides[ctx.session_key] = {
             "model": result.new_model, "provider": result.target_provider, "api_key": result.api_key,
             "base_url": result.base_url, "api_mode": result.api_mode,
+            # Catalog alias names carry no credential authority; only a direct alias endpoint does.
+            "owns_credentials": result.alias_endpoint_applied,
             "request_overrides": dict(result.request_overrides or {}),
             "capabilities": dict(result.runtime_capabilities or {}),
         }
@@ -620,6 +622,12 @@ class GatewayModelCommandsMixin:
         ctx.read_config()
         if request.is_reset:
             return await self._handle_model_reset(event, ctx)
+        # Turn precedence: session /model > channel_overrides > config.yaml.
+        # The channel's full route as the turn resolves it, so a config-backed endpoint (custom) survives.
+        from gateway.session_info_route import channel_override_route
+        _ch_model, _ch_route, _ch_forced = await asyncio.to_thread(channel_override_route, getattr(self, "config", None), source)
+        if _ch_model:
+            ctx.apply_override({"model": _ch_model, **(_ch_route or ({"provider": _ch_forced} if _ch_forced else {}))})
         ctx.apply_override(self._session_model_overrides.get(session_key, {}))
         if not request.target and not request.explicit_provider:
             return await self._model_listing_reply(event, ctx, profile_home)

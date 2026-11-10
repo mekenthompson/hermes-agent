@@ -403,8 +403,8 @@ class GatewayAgentCacheMixin:
     def _clear_conversation_scope(self, session_key: str, *, reason: str) -> None:
         """THE single conversation-boundary funnel (/new, /resume, suspension replacement,
         compression-exhausted reset). New conversation-scoped dicts go in _CONVERSATION_SCOPED_STATE
-        so every boundary picks them up. Turn-scoped state (_running_agents/_ts, slot leases, turn-
-        lease tokens) is owned by _release_running_agent_state and NOT cleared. Idle agent-cache
+        so every boundary picks them up. Turn-scoped state (_running_agents/turn.started_ts, slot leases,
+        turn-lease tokens) is owned by _release_running_agent_state and NOT cleared. Idle agent-cache
         eviction is NOT a boundary (a resumed turn rebuilds from these). getattr-guarded.
 
         Why a funnel: these boundaries used to each carry a hand-copied pop-list of the per-session dicts,
@@ -504,6 +504,17 @@ class GatewayAgentCacheMixin:
             snapshot = _otr_state.conversation.one_turn_restore
             _otr_state.conversation.one_turn_restore = None
             self._restore_session_model_override(session_key, snapshot)
+            # The one-turn switch note was persisted with the temporary turn. Add a
+            # one-shot counterpart so the next model does not treat that historical
+            # note as its current identity. The restored model may come from config,
+            # so avoid guessing its display name here.
+            pending_notes = getattr(self, "_pending_model_notes", None)
+            if not isinstance(pending_notes, dict):
+                pending_notes = self._pending_model_notes = {}
+            pending_notes[session_key] = (
+                "[Note: the one-turn model override has ended. The temporary model "
+                "no longer applies; use the current model and provider in your instructions.]"
+            )
         except Exception:
             logger.debug("Failed to restore one-turn model override", exc_info=True)
 

@@ -5,6 +5,7 @@ from datetime import datetime
 import pytest
 
 from gateway.config import GatewayConfig, Platform
+from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionContext, SessionEntry, SessionSource, build_session_context
 from gateway.session_context import (
@@ -205,6 +206,29 @@ def test_set_session_env_does_not_guess_profile_in_multiplex_mode(monkeypatch):
     tokens = runner._set_session_env(context)
     try:
         assert get_session_env("HERMES_SESSION_PROFILE") == ""
+    finally:
+        runner._clear_session_env(tokens)
+
+
+def test_shared_source_uses_current_event_author_for_live_actor_context():
+    """Regression for #140059: shared routing does not erase this turn's actor."""
+    shared_source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group",
+    )
+    event = MessageEvent(
+        text="@bot save this", source=shared_source,
+        user_id="current-author", user_name="Current Author",
+    )
+
+    context = build_session_context(shared_source, GatewayConfig(), event=event)
+    runner = object.__new__(GatewayRunner)
+    tokens = runner._set_session_env(context)
+    try:
+        assert shared_source.user_id is None
+        assert get_session_env("HERMES_SESSION_ACTOR_ID") == "current-author"
+        assert get_session_env("HERMES_SESSION_ACTOR_NAME") == "Current Author"
+        # The route stays the shared, sender-less one (kanban/cron/send_message rebuild it).
+        assert get_session_env("HERMES_SESSION_USER_ID") == ""
     finally:
         runner._clear_session_env(tokens)
 

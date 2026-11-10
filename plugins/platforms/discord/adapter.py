@@ -255,9 +255,7 @@ except ImportError:
     Intents = Any
     commands = None
 
-import sys
 from pathlib import Path as _Path
-sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 
 def _is_discord_transport_error(exc: BaseException) -> bool:
@@ -301,6 +299,7 @@ except ImportError:
     from ffmpeg_utils import resolve_ffmpeg_executable
 
 from gateway.config import Platform, PlatformConfig, discord_channel_id_from_link
+from gateway.approval_actor import clarify_refusal, refusal_text, slash_confirm_refusal
 
 from gateway.platforms.helpers import (
     MessageDeduplicator, ThreadParticipationTracker, convert_table_to_bullets, is_discord_channel_obfuscated,
@@ -5609,7 +5608,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             channel = await self._resolve_channel(_prompt_target_id(chat_id, metadata))
             send_kwargs, view = build(channel)
             if view is not None:
-                view.live_auth = self._component_live_auth
+                view.live_auth, view.answer_extra = self._component_live_auth, getattr(self.config, "extra", None) or {}
             msg = await channel.send(**send_kwargs)
             if view is not None:
                 view._message = msg
@@ -5642,14 +5641,12 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
     # The reason shares the 2000-char content cap with the command; unbounded it would starve
     # the command preview to zero and push the content past the cap.
     _EA_REASON_BUDGET = 300
+    _EA_CARD_CAP = MAX_MESSAGE_LENGTH
 
     def _exec_approval_cmd_budget(self, description: str, smart_denied: bool) -> int:
         # Mentions ride in front of the content and count against the 2000-char message cap too.
-        fixed = (len(self._EA_HEADER) + len(self._EA_CODE_OPEN) + len(self._EA_CODE_CLOSE)
-                 + len(self._EA_REASON_LABEL) + len(description) + len("...") + len(self._ea_deadline_line())
-                 + (len(self._EA_SMART_DENY_LINE) if smart_denied else 0)
-                 + len(self._approval_mention_content() or "") + 1)
-        return max(0, self.MAX_MESSAGE_LENGTH - fixed)
+        mention = len(self._approval_mention_content() or "") + 1
+        return max(0, super()._exec_approval_cmd_budget(description, smart_denied) - mention)
 
     async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
         """Send an approval with content as its canonical payload and an embed for state."""
@@ -5660,7 +5657,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             allowed_role_ids=self._allowed_role_ids, require_admin=require_admin,
             admin_user_ids=admin_user_ids, allow_permanent="always" in choices,
             allow_session="session" in choices, smart_denied=prompt.smart_denied,
-            request_id=prompt.request_id,
+            request_id=prompt.request_id, allow_once="once" in choices, approval_extra=getattr(self.config, "extra", None),
         )
         # Observe BEFORE sending, so a request that settles while the card is in flight still
         # reports its real reason; ``pending_retire`` holds it until the card exists.
@@ -6331,8 +6328,8 @@ def _define_discord_view_classes() -> None:
             super().__init__(timeout=timeout)
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
-            # The adapter's live allowlist check, bound in ``_send_prompt``.
-            self.live_auth = None
+            # The adapter's live allowlist check and platform extra, bound in ``_send_prompt``.
+            self.live_auth, self.answer_extra = None, {}
             self.resolved = False
             self._message = None
 
@@ -6341,13 +6338,17 @@ def _define_discord_view_classes() -> None:
             return _component_check_auth(
                 interaction, self.allowed_user_ids, self.allowed_role_ids, live_auth=self.live_auth)
 
-        async def _gate(self, interaction: discord.Interaction, *, resolved_msg: Optional[str], unauth_msg: str) -> bool:
-            """Reject (ephemerally) an already-resolved or unauthorized click; True when it may proceed."""
+        async def _gate(self, interaction: discord.Interaction, *, resolved_msg: Optional[str], unauth_msg: str, refusal=None) -> bool:
+            """Reject (ephemerally) an already-resolved or unauthorized click, or one ``refusal(user_id)``
+            (``gateway.approval_actor``) names another requester for; True when it may proceed."""
             if resolved_msg is not None and self.resolved:
                 await interaction.response.send_message(resolved_msg, ephemeral=True)
                 return False
             if not self._check_auth(interaction):
                 await interaction.response.send_message(unauth_msg, ephemeral=True)
+                return False
+            if refusal and (requester := refusal(getattr(interaction.user, "id", ""))):
+                await interaction.response.send_message(refusal_text(requester), ephemeral=True)
                 return False
             return True
 
@@ -6428,10 +6429,8 @@ def _define_discord_view_classes() -> None:
                 cancel="platform.discord.slash_confirm.cancel")
 
         async def _resolve(self, interaction: discord.Interaction, choice: str, color: discord.Color, label_key: str):
-            if not await self._gate(
-                interaction, resolved_msg=t("platform.discord.slash_confirm.already_resolved"),
-                unauth_msg=_unauthorized(),
-            ):
+            if not await self._gate(interaction, resolved_msg=t("platform.discord.slash_confirm.already_resolved"), unauth_msg=_unauthorized(),
+                                    refusal=lambda uid: slash_confirm_refusal(self.session_key, self.confirm_id, uid, extra=self.answer_extra)):
                 return
             await self._finalize_embed(
                 interaction, color,
@@ -6819,10 +6818,8 @@ def _define_discord_view_classes() -> None:
 
         async def _resolve_choice(self, interaction: discord.Interaction, index: int, choice: str) -> None:
             """Resolve the clarify with a chosen option."""
-            if not await self._gate(
-                interaction, resolved_msg=t("platform.discord.prompt.clarify_already_answered"),
-                unauth_msg=_unauthorized(),
-            ):
+            if not await self._gate(interaction, resolved_msg=t("platform.discord.prompt.clarify_already_answered"),
+                                    unauth_msg=_unauthorized(), refusal=lambda uid: clarify_refusal(self.clarify_id, uid, extra=self.answer_extra)):
                 return
             display_name = getattr(getattr(interaction, "user", None), "display_name", "user")
             await self._finish(
@@ -6852,10 +6849,8 @@ def _define_discord_view_classes() -> None:
 
         async def _on_other(self, interaction: discord.Interaction) -> None:
             """Flip the clarify entry into text-capture mode."""
-            if not await self._gate(
-                interaction, resolved_msg=t("platform.discord.prompt.clarify_already_answered"),
-                unauth_msg=_unauthorized(),
-            ):
+            if not await self._gate(interaction, resolved_msg=t("platform.discord.prompt.clarify_already_answered"),
+                                    unauth_msg=_unauthorized(), refusal=lambda uid: clarify_refusal(self.clarify_id, uid, extra=self.answer_extra)):
                 return
             # Don't pop: the gateway text-intercept needs the entry until the user types.
             try:
