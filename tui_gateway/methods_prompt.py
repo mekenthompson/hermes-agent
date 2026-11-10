@@ -684,6 +684,11 @@ def _approval_origin_for_direct_submit(session, text, raw_text, *, internal_host
         requester = f"{transport_owner[0]}:{transport_owner[1]}"
     elif submitting_transport is _stdio_transport:
         requester = "local:stdio"
+    elif (principal := _transport_approval_principal(submitting_transport)) is not None \
+            and principal == session.get("approval_principal"):
+        # The login that created this session (HF-683). A distinct requester string from the owner
+        # tuple's "provider:subject", so owner-matched instruction provenance stays as it was.
+        requester = principal
     else:
         return None
     import uuid

@@ -222,6 +222,20 @@ def current_approval_task_context() -> ApprovalTaskContext | None:
             and (bound[0].parent_open() if bound[2] is None else bound[2].active()) else None)
 
 
+STALE_TASK_DENIAL = "The originating task was stopped or completed."
+UNVERIFIED_ORIGIN_DENIAL = ("No verified user authority for this automatic turn: the background work that "
+                            "started it has no verified originating request. A new user message restores it.")
+
+
+def approval_task_denial_message(default: str = STALE_TASK_DENIAL) -> str:
+    """The refusal text for ``approval_task_revoked()``: a completion turn whose producers carried no
+    authenticated origin is not a stopped task, and saying so misleads the agent and user (HF-683)."""
+    bound = _approval_task_context.get()
+    if bound is not None and bound[1].identity == "unverified":
+        return UNVERIFIED_ORIGIN_DENIAL
+    return default
+
+
 def approval_task_revoked() -> bool:
     bound = _approval_task_context.get()
     return bound is not None and (not bound[0].live()

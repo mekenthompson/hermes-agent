@@ -23,13 +23,26 @@ class _LoginSocket:
         pass
 
 
-@pytest.mark.parametrize('human_identity', [True, False], ids=['human-login', 'dashboard-token'])
+# The explicit dashboard session token is an operator-held login that already drives this session
+# interactively, so it verifies as an approval principal (HF-683). The dashboard /api/ws stamps
+# ``profile_scope`` onto every identity, as here. A socket with no server-stamped identity stays
+# unverified and its completion keeps failing closed.
+_IDENTITIES = {
+    'human-login': (LoginSocket.auth_identity, True),
+    'dashboard-token': ({'provider': 'dashboard-session-token', 'user_id': 'dashboard-session-token',
+                         'profile_scope': 'host'}, True),
+    'unverified-socket': (None, False),
+}
+
+
+@pytest.mark.parametrize('identity_name', list(_IDENTITIES))
 @pytest.mark.parametrize('through_executor', [False, True], ids=['producer', 'tool-executor'])
 @pytest.mark.parametrize('stopped', [False, True], ids=['normal-completion', 'human-stop'])
 @pytest.mark.usefixtures('turn_env')
 def test_authenticated_desktop_delegation_completion_authority(
-    tmp_path, monkeypatch, stopped, through_executor, human_identity,
+    tmp_path, monkeypatch, stopped, through_executor, identity_name,
 ):
+    socket_identity, human_identity = _IDENTITIES[identity_name]
     from hermes_state import SessionDB
     from tools import approval_context, async_delegation as delegation
     from tools.delegate_tool_dispatch import _dispatch_unit, _resolve_async_session_key
@@ -102,8 +115,7 @@ def test_authenticated_desktop_delegation_completion_authority(
         return {'final_response': 'done', 'messages': []}
 
     transport = _LoginSocket()
-    if not human_identity:
-        transport.auth_identity = {'provider': 'dashboard-session-token', 'user_id': 'dashboard-session-token'}
+    transport.auth_identity = socket_identity
     token = bind_transport(transport)
     try:
         created = server.handle_request({'id': 'create', 'method': 'session.create',
@@ -164,7 +176,7 @@ def test_authenticated_desktop_delegation_completion_authority(
             evidence, result = decisions[0]
             assert evidence is None
             assert result.get('status') == 'blocked'
-            assert result.get('error') == 'The originating task was stopped or completed.'
+            assert result.get('error') == approval_context.UNVERIFIED_ORIGIN_DENIAL
         if reservation is not None:
             assert not reservation.active()
     finally:
