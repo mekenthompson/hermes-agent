@@ -652,7 +652,9 @@ class ProcessSession:
         """Record an exit unless one is already recorded: the first observer's result (a raced kill,
         an env-close settlement, a reconcile) stands. Returns whether it recorded. Hold ``self._lock``."""
         if self.exited:
-            return False
+            # House: an exit seen without a status (None) takes the collector's later real code.
+            if not (self.exit_code is None and exit_code is not None and self.completion_reason == "exited"):
+                return False
         self.exited, self.exit_code, self.completion_reason = True, exit_code, reason
         self.termination_source = source or self.termination_source
         return True
@@ -1401,9 +1403,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                     timeout=10).get("output", "")
                 reply = parse_log_delta_reply(raw)
                 delta = reply.delta if reply else ""
-                if not reply:
-                    # No usable header: skip this poll rather than act on a half-read value.
-                    output_complete = False
+                output_complete &= reply is not None  # no usable header: nothing half-read is acted on
                 if reply:
                     output_complete &= (0 <= reply.offset <= reply.size
                                         and len(delta.encode('utf-8')) == reply.size - reply.offset)
@@ -1427,9 +1427,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                     self._check_watch_patterns(session, delta)
                     self._emit_output(session, delta)
 
-                # Unreadable reply: separate liveness and exit-code reads, as before the combined read.
                 exit_code = reply.exit_code if reply else fallback_exit_code(env, q(pid_path), q(exit_path))
-                if exit_code is not None:
+                observed_exit = exit_code is not None
+                if exit_code == -1:  # House: unreadable status is unknown, never a numeric exit.
+                    exit_code = None
+                if observed_exit:
                     self._finish_exited(session, exit_code, output_complete=output_complete)
                     return
             except Exception:

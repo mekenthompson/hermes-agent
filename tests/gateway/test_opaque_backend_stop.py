@@ -25,7 +25,7 @@ class Backend(ShellBackend):
 
     def execute(self, command, **kwargs):
         self.commands.append(command)
-        if command.startswith('O='):
+        if 'O=' in command and 'wc -c' in command:
             self.reader_entered.set()
             if not self.reader_release.wait(90):
                 raise TimeoutError('finite fixture reader gate')
