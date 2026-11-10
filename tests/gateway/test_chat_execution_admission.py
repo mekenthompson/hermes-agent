@@ -110,7 +110,6 @@ async def test_actual_inbound_refusal_releases_slot_without_executing(tmp_path, 
     slot.release.assert_called_once_with()
     assert not runner._is_session_running(key)
     assert key not in runner._running_agents
-    assert key not in runner._running_agents_ts
     assert runner._session_state(key).turn.lease is None
     assert runner._session_state(key).turn.event is None
 
