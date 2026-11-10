@@ -1527,8 +1527,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             from tools.process_registry_job import job_exit_result
             exit_code, reason, source = job_exit_result(session, exit_code, reason, source)
             recorded = session.mark_exited(exit_code, reason, source)
-            if recorded:
-                session._result_complete = output_complete and type(session.exit_code) is int and session.completion_reason != 'lost'
+            session._result_complete = output_complete and type(session.exit_code) is int and session.completion_reason != 'lost'
         self._move_to_finished(session)
         return recorded
 
