@@ -31,13 +31,17 @@ except ImportError:
 import sys
 from pathlib import Path as _Path
 
-sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
+_checkout_root = _Path(__file__).resolve().parents[3]
+# Append, never prepend: the checkout must not shadow same-named installed packages.
+if str(_checkout_root) not in sys.path:
+    sys.path.append(str(_checkout_root))
 
 from agent.compression_marker import ELISION_MARKER_MAX_LEN, elide
 from agent.i18n import t
 from agent.retry_utils import parse_retry_after_seconds
 from agent.secret_scope import get_secret
 from gateway.config import Platform, PlatformConfig
+from gateway.approval_actor import approval_refusal, clarify_refusal, refusal_text, slash_confirm_refusal
 from gateway.platforms._shared import (
     apply_yaml_bridge as _apply_yaml_bridge, env_is_connected as _env_is_connected,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
@@ -60,11 +64,13 @@ try:  # sibling modules; support both package and flat plugin-dir import
     from .adapter_slash_lane import SlashHandoffLanes
     from .adapter_slash_payload import slash_command_text, slash_thread_id
     from .adapter_reactions_context import slack_reactions_marker
+    from .adapter_socket_lifecycle import SlackSocketLifecycleMixin
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
     from adapter_slash_lane import SlashHandoffLanes  # type: ignore
     from adapter_slash_payload import slash_command_text, slash_thread_id  # type: ignore
     from adapter_reactions_context import slack_reactions_marker  # type: ignore
+    from adapter_socket_lifecycle import SlackSocketLifecycleMixin  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -930,7 +936,7 @@ except ImportError:  # pragma: no cover
     from adapter_thread_titles import AssistantThreadTitles
 
 
-class SlackAdapter(AssistantThreadTitles, BasePlatformAdapter):
+class SlackAdapter(AssistantThreadTitles, SlackSocketLifecycleMixin, BasePlatformAdapter):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
     mention-gated channels, threads, attachments, slash commands, status text."""
@@ -1299,20 +1305,6 @@ class SlackAdapter(AssistantThreadTitles, BasePlatformAdapter):
             logger.warning("[Slack] Socket Mode watchdog exited; restarting")
         self._socket_watchdog_task = None
         self._ensure_socket_watchdog()
-
-    async def _cancel_socket_watchdog(self, failure_msg: str) -> None:
-        """Cancel and await the watchdog task (if any); exceptions are debug-logged."""
-        watchdog_task = self._socket_watchdog_task
-        self._socket_watchdog_task = None
-        if watchdog_task is None or watchdog_task.done():
-            return
-        watchdog_task.cancel()
-        try:
-            await watchdog_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:  # pragma: no cover - defensive logging
-            logger.debug(failure_msg, exc_info=True)
 
     def _ensure_socket_watchdog(self) -> None:
         if self._socket_watchdog_task is None or self._socket_watchdog_task.done():
@@ -4622,8 +4614,7 @@ class SlackAdapter(AssistantThreadTitles, BasePlatformAdapter):
         msg_type = MessageType.COMMAND if is_command_text else self._media_message_type(media_types)
         user_name = await self._resolve_user_name(user_id, chat_id=channel_id, team_id=team_id)
         channel_name = await self._resolve_channel_name(channel_id, team_id=team_id)
-        # Best-effort: title the DM thread from the prompt for Slack's AI Agent Messages tab.
-        if is_dm and thread_ts and msg_type != MessageType.COMMAND:
+        if is_dm and thread_ts and msg_type != MessageType.COMMAND:  # titles the AI Agent Messages tab
             await self._set_assistant_thread_title(
                 channel_id, thread_ts, original_text or text, team_id=team_id)
         source = self.build_source(
@@ -4638,6 +4629,7 @@ class SlackAdapter(AssistantThreadTitles, BasePlatformAdapter):
             # Workflow/app posts have user=None; flag them so the SLACK_ALLOW_BOTS bypass can
             # authorize them. Same predicate as the drop gate (api_human_users stay human).
             is_bot=self._event_declares_bot_sender(event))
+        source.shared_session = event.get("channel_type") == "mpim"  # a group DM keys "dm" but is shared
         from gateway.platforms.base import resolve_channel_skills
         # Remaining ``<@UID>`` are OTHER participants (own mention stripped
         # above); render as ``@DisplayName`` so the agent knows who is addressed.
@@ -4864,9 +4856,8 @@ class SlackAdapter(AssistantThreadTitles, BasePlatformAdapter):
             logger.error("[Slack] %s failed: %s", label, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
-    _EA_CODE_OPEN = "```"
-    _EA_CODE_CLOSE = "```\n"
-
+    # The fence uses the base's own-line opener/closer: a fence touching the command's own backticks
+    # would merge into one longer run.
     # Resolved per call (not at class-body time) so the active language applies; the budget
     # below measures ``len()`` of these resolved strings against the 3000-char section cap.
     @property
@@ -4880,16 +4871,9 @@ class SlackAdapter(AssistantThreadTitles, BasePlatformAdapter):
         return "\n" + (f"*{label}{sep}*{rest}" if sep else line)
 
     _EA_REASON_BUDGET = 500
-    _EA_SECTION_CAP = 3000  # a longer section text → invalid_blocks → no buttons at all
+    _EA_CARD_CAP = 3000  # section text cap: a longer one → invalid_blocks → no buttons at all
     _EA_ACTION_IDS = {"once": "hermes_approve_once", "session": "hermes_approve_session",
                       "always": "hermes_approve_always", "deny": "hermes_deny"}
-
-    def _exec_approval_cmd_budget(self, description: str, smart_denied: bool) -> int:
-        # execute_code approvals embed the whole script, so budget the preview against the cap.
-        fixed = (len(self._EA_HEADER) + len(self._EA_CODE_OPEN) + len(self._EA_CODE_CLOSE)
-                 + len(self._EA_REASON_LABEL) + len(description) + len("...") + len(self._ea_deadline_line())
-                 + (len(self._EA_SMART_DENY_LINE) if smart_denied else 0))
-        return max(0, self._EA_SECTION_CAP - fixed)
 
     async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
         """Block Kit approval prompt; the buttons call ``resolve_gateway_approval()`` to unblock the
@@ -5559,11 +5543,13 @@ class SlackAdapter(AssistantThreadTitles, BasePlatformAdapter):
         started = await self._begin_interaction(ack, body, action, "slash-confirm")
         if started is None:
             return
-        team_id, action_id, value, message, msg_ts, channel_id, user_name, _user_id = started
+        team_id, action_id, value, message, msg_ts, channel_id, user_name, user_id = started
         if "|" not in value:
             logger.warning("[Slack] Malformed slash-confirm value: %s", value)
             return
         session_key, confirm_id = value.split("|", 1)
+        if await self._refuse_other_requester(slash_confirm_refusal(session_key, confirm_id, user_id, extra=self.config.extra), body):
+            return
         choice = self._CONFIRM_CHOICES.get(action_id, "cancel")
         decision_text = t(self._CONFIRM_DECISION_KEYS[choice], user=user_name)
         await self._finalize_interactive_message(
@@ -5597,26 +5583,34 @@ class SlackAdapter(AssistantThreadTitles, BasePlatformAdapter):
             "[Slack] Feedback button clicked: value=%s user=%s channel=%s ts=%s", value, user_id,
             channel_id, message.get("ts", ""))
 
+    async def _refuse_other_requester(self, requester: Optional[str], body: dict) -> bool:
+        """Tell only the clicker ``gateway.approval_actor`` refused them (the prompt stays pending)."""
+        if requester:
+            channel_id, user_id = (body.get("channel") or {}).get("id", ""), (body.get("user") or {}).get("id", "")
+            await self._get_client(channel_id, team_id=self._event_team_id({}, body) or None).chat_postEphemeral(
+                channel=channel_id, user=user_id, text=refusal_text(requester), thread_ts=(body.get("message") or {}).get("thread_ts"))
+        return bool(requester)
+
     async def _handle_approval_action(self, ack, body, action) -> None:
         """Handle an approval button click from Block Kit."""
-        started = await self._begin_interaction(ack, body, action, "approval")
-        if started is None:
+        if (started := await self._begin_interaction(ack, body, action, "approval")) is None:
             return
-        team_id, action_id, session_key, message, msg_ts, channel_id, user_name, _user_id = started
+        team_id, action_id, session_key, message, msg_ts, channel_id, user_name, user_id = started
         choice = self._APPROVAL_CHOICES.get(action_id, "deny")
-        # Double-click guard (atomic pop). Also accept the bare ts: the approval may
-        # have been stored without a team id while the click carries one.
-        approval_key = self._workspace_message_marker(team_id, msg_ts)
-        if msg_ts in self._approval_resolved:
-            approval_key = msg_ts
-        if self._approval_resolved.pop(approval_key, True):
+        # The bare ts too: stored without a team id, clicked with one.
+        approval_key = msg_ts if msg_ts in self._approval_resolved else self._workspace_message_marker(team_id, msg_ts)
+        if await self._refuse_other_requester(approval_refusal(
+                session_key, user_id, extra=self.config.extra, request_id=self._approval_request_ids.get(approval_key)), body):
+            return
+        if self._approval_resolved.pop(approval_key, True):  # double-click guard (atomic pop)
             return
         request_id = self._approval_request_ids.pop(approval_key, None)
         # Resolve FIRST (unblocks the agent); render after so a click past the
         # timeout (count == 0) shows "expired", not "approved".
         try:
             from tools.approval import resolve_gateway_approval_card
-            count = resolve_gateway_approval_card(session_key, choice, request_id)
+            count = resolve_gateway_approval_card(session_key, choice, request_id, actor_id=user_id,
+                                                  extra=self.config.extra)
             logger.info(
                 "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)", count,
                 session_key, choice, user_name)
@@ -5658,11 +5652,13 @@ class SlackAdapter(AssistantThreadTitles, BasePlatformAdapter):
         started = await self._begin_interaction(ack, body, action, "clarify", team_scoped=False)
         if started is None:
             return
-        _team_id, action_id, value, message, msg_ts, channel_id, user_name, _user_id = started
+        _team_id, action_id, value, message, msg_ts, channel_id, user_name, user_id = started
         if "|" not in value:  # value packs ``clarify_id|<idx|other>``
             logger.warning("[Slack] Malformed clarify value: %s", value)
             return
         clarify_id, token = value.split("|", 1)
+        if await self._refuse_other_requester(clarify_refusal(clarify_id, user_id, extra=self.config.extra), body):
+            return
         # Double-click guard — atomic pop (mirrors approval).
         if self._clarify_resolved.pop(msg_ts, True):
             return

@@ -26,6 +26,7 @@ scripts/run_tests.sh                                    # full suite
 scripts/run_tests.sh tests/gateway/                     # one directory
 scripts/run_tests.sh tests/agent/test_foo.py -k test_x  # runner is file-granular; -k narrows
 scripts/run_tests.sh -v --tb=long                       # pytest flags pass through
+just test tests/agent/test_foo.py -k test_x             # same runner; refuses to start with no path
 ```
 
 For restricted environments, pass `--scratch-root /short/disk/path` to select a
@@ -35,6 +36,7 @@ The default remains `/var/tmp` where available. Keep the selected path short,
 non-hidden and outside `HERMES_HOME`: hidden directories affect search tests,
 and long paths can exceed Unix socket limits. Nested runner probes must pass
 the option explicitly too; it is not a new environment variable.
+`just test-all` is the explicit full-suite form.
 
 - **Flake policy:** a failing FILE is retried once in a fresh subprocess (`--file-retries`;
   `HERMES_TEST_FILE_RETRIES=0` disables); a worker killed by signal or the file timeout is never

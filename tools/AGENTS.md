@@ -94,12 +94,9 @@ parent-first and recorded in a private 0700 dir (a throwaway profile's in
 `<HERMES_HOME>/cache/browser/chromium-records`; a persistent profile's per OS user under the host lock dir,
 one for every home pinning it) so a later process reaps a crashed owner's browser after checking pid + start
 time + its `--user-data-dir` argv token; the reaper walks every served home and every shared profile.
-Short-lived clients call `browser_session.detach_shared_browsers(profile_home)` to retain persistent
-local browsers (including direct real-profile routes), closing only their own connections.
-Verified records preserve retention across exit/reaping; `stop_browser(key, force=True)` overrides it.
-Teardown and copied-profile retirement hold the native profile lock and owning display's human lease;
-consent withdrawal defers deletion while another holder uses the copy. Vault page I/O re-admits on its
-captured CDP connection after prompts, including named/direct routes and replaced connections.
+`browser_session.detach_shared_browsers(profile_home)` retains persistent local browsers, closing only the
+client's connections; `stop_browser(key, force=True)` overrides. Teardown and copied-profile retirement hold the
+profile lock and display human lease; vault page I/O re-admits on its captured CDP connection.
 `browser_tool.py` and `browser_tool_install.py` are frozen old-updater stubs only (see their
 docstrings); never grow them.
 
@@ -157,7 +154,8 @@ completion queue. Shapes: single (`goal` + optional `context`, `toolsets`) or ba
 concurrency capped by `delegation.max_concurrent_children`, default 3). A background batch returns as ONE
 completion by default; with `delegation.independent_completions` it is split into completion **units**
 (`delegate_tool_dispatch._units_of`): tasks sharing a `group` join and report together; each ungrouped
-task reports alone as it finishes. Units of one call share ONE pool slot (`slot_key` in
+task reports alone as it finishes. That variant's schema marks `group` required per task (`_build_dynamic_schema_overrides`)
+so the model states the delivery choice in every call; the handler never enforces it. Units of one call share ONE pool slot (`slot_key` in
 `async_delegation._dispatch`) — never count units against capacity; the executor is sized by live UNITS
 and the stall clock arms when the runner starts, so a queued unit is never judged stalled. Roles: `leaf` (default;
 no `delegate_task`, `clarify`, `memory`, `send_message`, `cronjob`; keeps `execute_code`) and

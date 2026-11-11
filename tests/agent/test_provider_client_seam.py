@@ -82,6 +82,23 @@ def test_a_broken_plugin_preserves_its_error_instead_of_switching_transport(regi
         _build("seam-boom", "acp://seam-boom")
 
 
+def test_a_broken_process_profile_preserves_its_client_error(registered):
+    """Regression for #139807: launch kwargs must not reach OpenAI after hook failure."""
+    from agent.agent_runtime_helpers import create_openai_client
+
+    registered(_ExplodingProfile(
+        name="seam-process-boom", auth_type="external_process", base_url="process://seam-process-boom",
+    ))
+
+    with pytest.raises(RuntimeError, match="plugin is broken"):
+        create_openai_client(
+            _agent("seam-process-boom"),
+            {"api_key": "***", "base_url": "process://seam-process-boom", "command": "provider-cli"},
+            reason="test",
+            shared=False,
+        )
+
+
 def test_skip_flags_replace_the_isinstance_checks_for_in_and_out_of_tree_clients():
     from agent.auxiliary_client import _maybe_wrap_anthropic, _to_async_client
     from agent.gemini_native_adapter import GeminiNativeClient
