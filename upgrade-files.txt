@@ -1,7 +1,0 @@
-tests/e2e/core/upgrade/pm/test_configured_features.py
-tests/e2e/core/upgrade/pm/test_gateway_install_force.py
-tests/e2e/core/upgrade/pm/test_generation_gc.py
-tests/e2e/core/upgrade/pm/test_interpreter_hygiene.py
-tests/e2e/core/upgrade/pm/test_interrupted_update.py
-tests/e2e/core/upgrade/pm/test_restart_generations.py
-tests/e2e/core/upgrade/pm/test_stamps_and_doctor.py
