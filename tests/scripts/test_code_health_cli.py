@@ -30,7 +30,7 @@ _GUARD_SCRIPTS = (
     "scripts/check_config_yaml_writers.py", "scripts/check_config_yaml_readers.py",
     "scripts/check_profile_create_entry.py", "scripts/ci/check_os_marker_fakes.py", "scripts/check-case-collisions.py",
     "scripts/ci/check_lazy_deps_imports.py", "scripts/ci/check_profile_archive_boundary.py",
-    "scripts/ci/check_agents_md_size.py", "scripts/ci/check_blob_size.py",
+    "scripts/ci/check_agents_md_size.py", "scripts/ci/check_blob_size.py", "scripts/ci/check_line_endings.py",
 )
 _SUPPORT = ("scripts/ci/profile_scope_patterns.json", "scripts/install_root_lint_baseline.json", "agent/subdirectory_hints.py", *_GUARD_SCRIPTS)
 # The config guards fail when a tree they scan is missing, so the fixture carries an empty stand-in.
@@ -150,14 +150,14 @@ def test_alignment_baselines_require_same_repository_head(tmp_path, monkeypatch)
     repo = _engine_repo(tmp_path)
     parent = _git(repo, "rev-parse", "HEAD")
     _git(repo, "remote", "add", "origin", "https://github.com/mekenthompson/hermes-agent.git")
-    _git(repo, "checkout", "-b", "house/hf576-nous-6bb377a51d")
+    _git(repo, "checkout", "-b", "house/reconcile-nous-c9b20d7bc08dec1e10779a06d7d9073bc6e7e418")
     resolve = runpy.run_path(str(repo / "scripts/check"))["_alignment_parents"]
     monkeypatch.setitem(resolve.__globals__, "_ALIGNMENT_PARENTS", (parent,))
     monkeypatch.delenv("GITHUB_HEAD_REF", raising=False)
     monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
     assert resolve(None) == (parent,)
     monkeypatch.setenv("GITHUB_REPOSITORY", "mekenthompson/hermes-agent")
-    monkeypatch.setenv("GITHUB_HEAD_REF", "house/hf576-nous-6bb377a51d")
+    monkeypatch.setenv("GITHUB_HEAD_REF", "house/reconcile-nous-c9b20d7bc08dec1e10779a06d7d9073bc6e7e418")
     monkeypatch.delenv("CI_PR_HEAD_REPOSITORY", raising=False)
     assert resolve(None) == ()
     monkeypatch.setenv("CI_PR_HEAD_REPOSITORY", "other/hermes-agent")
@@ -443,6 +443,7 @@ def test_hooks_run_with_msys_path_conversion_disabled(tmp_path):
     ("lazy-deps", {"pkg/uses.py": "import tools.lazy_deps\n"}),
     ("profile-archives", {"pkg/export.tar.gz": "not really\n"}),
     ("blob-size", {"pkg/shot.png": "\0" * (600 * 1024)}),
+    ("line-endings", {"pkg/entry.yaml": "name: x\r\nsha: y\r\n"}),
 ])
 def test_ci_only_guards_run_in_scripts_check(tmp_path, job, files):
     repo = _engine_repo(tmp_path)

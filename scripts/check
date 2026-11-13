@@ -113,6 +113,7 @@ _GUARDS = {
     "os-marker-fakes": ["scripts/ci/check_os_marker_fakes.py"],
     "agents-md": ["scripts/ci/check_agents_md_size.py"],
     "case-collisions": ["scripts/check-case-collisions.py"],
+    "line-endings": ["scripts/ci/check_line_endings.py"],
     "lazy-deps": ["scripts/ci/check_lazy_deps_imports.py"],
     "profile-archives": ["scripts/ci/check_profile_archive_boundary.py"],
 }
@@ -123,9 +124,9 @@ _CHECKS = (*_GUARDS, *_DIFF_GUARDS, "ruff", "health")
 
 # Narrow exception for this authorized reconciliation only. Both commits must be
 # ancestors of the tested head; callers cannot supply alternative exemption refs.
-_ALIGNMENT_BRANCH = "house/hf576-nous-6bb377a51d"
-_ALIGNMENT_PARENTS = ("3361ff32ad2849d156b44142e4ded9a3b2157728",
-                     "6bb377a51d5c8e279a7a5e34d717d653d421d064")
+_ALIGNMENT_BRANCH = "house/reconcile-nous-c9b20d7bc08dec1e10779a06d7d9073bc6e7e418"
+_ALIGNMENT_PARENTS = ("f6ac86b0ef3d5e86654132b8aba1ce6f1de45b5e",
+                     "c9b20d7bc08dec1e10779a06d7d9073bc6e7e418")
 
 
 def _alignment_parents(head: str | None) -> tuple[str, ...]:

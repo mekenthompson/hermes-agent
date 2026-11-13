@@ -1,7 +1,7 @@
 """Telegram voice upload with duplicate-safe transport recovery.
 
-A voice upload is retried (and then sent as a document) only when the request provably never
-reached Telegram: a connect or pool timeout. A read/write timeout, wall-clock deadline or other
+A voice upload is sent as a document (after the upload layer's own same-request retries) only when
+the request provably never reached Telegram: a connect or pool timeout. A read/write timeout, wall-clock deadline or other
 mid-request network failure leaves the outcome unknown; Telegram has usually accepted the upload
 already, so resending produced two or three copies of one reply (HF-672). Those fail without a
 resend.
@@ -39,6 +39,9 @@ def voice_upload_outcome_unknown(adapter, error: Exception) -> bool:
     if adapter._is_bad_request_error(error) or adapter._looks_like_auth_error(error):
         return False
     if voice_upload_never_sent(adapter, error):
+        return False
+    from plugins.platforms.telegram import telegram_send_errors as kinds
+    if kinds.send_error_kind(error) == kinds.SERVER_ERROR:  # Telegram's own 5xx answer: nothing was posted
         return False
     markers = ("readerror", "writeerror", "readtimeout", "writetimeout", "networkerror", "timedout",
                "timeouterror")
@@ -89,7 +92,7 @@ async def upload_voice_file(
 async def deliver_voice(
     adapter, chat_id: str, audio_path: str, caption: Optional[str] = None,
     reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None, **kwargs):
-    """Send a voice bubble. Retry once, then fall back to a document, only when nothing was sent;
+    """Send a voice bubble. Fall back to a document, only when nothing was sent (the upload layer retries first);
     an unconfirmed upload fails without a resend so the user gets at most one copy."""
     from gateway.platforms.base import SendResult
     from plugins.platforms.telegram.adapter import TelegramAdapter, _redact_telegram_error_text
@@ -112,23 +115,9 @@ async def deliver_voice(
                 logger.warning(
                     "[%s] voice transcode unavailable for %s — sending original format (install ffmpeg for voice bubbles)",
                     adapter.name, os.path.basename(audio_path))
-        # Each attempt's failure is classified on its own. The retry runs outside the ``except``
-        # block so its error does not chain the first one as ``__context__``: a landed-but-timed-out
-        # retry must not read as "never sent" because the first attempt's connect timed out.
-        error: Optional[Exception] = None
-        for attempt in (1, 2):
-            try:
-                return await upload_voice_file(adapter, chat_id, upload_path, caption, reply_to, metadata)
-            except Exception as exc:  # health: allow BLE001 -- classified here; the final one is re-raised
-                error = exc
-            logger.warning(
-                "[%s] Voice upload attempt %d failed (%s)",
-                adapter.name, attempt, _redact_telegram_error_text(error))
-            if attempt == 1 and voice_upload_never_sent(adapter, error):
-                logger.warning("[%s] Voice upload never reached Telegram; retrying once", adapter.name)
-                continue
-            break
-        raise error or RuntimeError("Telegram voice upload failed")
+        # The upload layer already repeats the SAME request while Telegram provably never posted it
+        # (``telegram_media_retry``), so a failure here has spent that budget: no second loop.
+        return await upload_voice_file(adapter, chat_id, upload_path, caption, reply_to, metadata)
     except Exception as error:
         # Flood control refused the request outright, so a re-upload cannot duplicate (upstream path).
         if (recovered := await adapter._media_flood_recover(error, chat_id, lambda p: adapter.send_voice(

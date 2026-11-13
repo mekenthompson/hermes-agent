@@ -168,11 +168,13 @@ class _ForegroundJob:
     def __init__(self, registry, session, ownership):
         from contextvars import copy_context
         from hermes_constants import get_hermes_home, set_hermes_home_override
+        from tools.environments.sandbox_scope import hosted_scope
         self.registry = registry
         self._hermes_job_session = session
         self._ownership = ownership
         self._context = copy_context()
-        self._context.run(set_hermes_home_override, get_hermes_home().absolute())
+        if hosted_scope() is None:  # a hosted scope has no home to bind, and its setters refuse
+            self._context.run(set_hermes_home_override, get_hermes_home().absolute())
         self.stdout = _ForegroundOutput(self)
 
     def __getattr__(self, name):

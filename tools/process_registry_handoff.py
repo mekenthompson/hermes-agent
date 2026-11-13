@@ -165,7 +165,7 @@ def refresh_ownership(registry):
     from tools.process_registry_results import completed_ownership
     with registry._lock:
         entries = [dict(session_id=p.id, **dict(zip((*OWNERSHIP_FIELDS, 'pid', 'host_start_time'), ownership_identity(p))))
-                   for p in (*registry._running.values(), *registry._finished.values())]
+                   for p in (*registry._running.values(), *registry._finished.values()) if not p.sandbox_key]  # hosted: never persisted
     if not entries:
         return True
     try:

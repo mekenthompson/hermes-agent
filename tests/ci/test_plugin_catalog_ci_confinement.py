@@ -467,19 +467,19 @@ def test_pr130_catalog_guard_predicate_matrix(tmp_path):
     base_only = _commit(repo, "base only")
     _git(repo, "merge", "-q", "--no-ff", "-m", "synthetic PR merge", "pr")
     script = _step("Find changed catalog")
-    first = "git merge-base --is-ancestor 7d9fd429d32e82cd4be90cd2fbe995054f43e2e3 HEAD^2"
-    second = "git merge-base --is-ancestor a0af667c876b0522b9cb6eb684d02f50a40ea7e5 HEAD^2"
+    first = "git merge-base --is-ancestor c9b20d7bc08dec1e10779a06d7d9073bc6e7e418 HEAD^2"
+    second = "git merge-base --is-ancestor f6ac86b0ef3d5e86654132b8aba1ce6f1de45b5e HEAD^2"
     assert first in script and second in script
     # Replace only the ancestor pins. The branch name contains the upstream SHA,
     # so a raw SHA replace would also rewrite the allowlisted ref.
     script = script.replace(first, f"git merge-base --is-ancestor {upstream} HEAD^2")
     script = script.replace(second, f"git merge-base --is-ancestor {base} HEAD^2")
     correct = {"CATALOG_HEAD_REPO": "mekenthompson/hermes-agent",
-               "CATALOG_HEAD_REF": "house/reconcile-nous-7d9fd429d32e82cd4be90cd2fbe995054f43e2e3",
-               "CATALOG_PR_NUMBER": "236"}
+               "CATALOG_HEAD_REF": "house/reconcile-nous-c9b20d7bc08dec1e10779a06d7d9073bc6e7e418",
+               "CATALOG_PR_NUMBER": "237"}
     cases = [("authorized", correct, script, 0)]
     for key, bad in (("CATALOG_HEAD_REPO", "attacker/hermes-agent"),
-                     ("CATALOG_HEAD_REF", "hf457/other"), ("CATALOG_PR_NUMBER", "235")):
+                     ("CATALOG_HEAD_REF", "hf457/other"), ("CATALOG_PR_NUMBER", "236")):
         cases.append((key, {**correct, key: bad}, script, 1))
         cases.append(("missing " + key, {k: v for k, v in correct.items() if k != key}, script, 1))
     cases.append(("upstream not on head", correct, script.replace(upstream, base_only), 1))

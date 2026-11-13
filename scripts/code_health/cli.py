@@ -34,8 +34,8 @@ on every push: python scripts/check --install-hook pre-push)."""
 _SWITCH_FILE = "scripts/code_health/config.py"
 _MODES = ("blocking", "advisory", "off")
 _TRUSTED_ALIGNMENT_PARENTS = frozenset((
-    "3361ff32ad2849d156b44142e4ded9a3b2157728",
-    "6bb377a51d5c8e279a7a5e34d717d653d421d064",
+    "f6ac86b0ef3d5e86654132b8aba1ce6f1de45b5e",
+    "c9b20d7bc08dec1e10779a06d7d9073bc6e7e418",
 ))
 
 
