@@ -46,7 +46,8 @@ def main() -> int:
         portal = f"http://127.0.0.1:{server.server_port}"
         now = int(time.time())
         claims = {"sub": "image-user", "iat": now, "exp": now + 300,
-                  "iss": portal, "aud": "agent:image", "oauth_contract_version": 1}
+                  "iss": portal, "aud": "agent:image", "oauth_contract_version": 1,
+                  "scope": "agent_dashboard:access"}  # contract C3
         results = {}
 
         def provider():
@@ -67,6 +68,9 @@ def main() -> int:
                 results["valid_signature_and_claims"] = provider()._verify_jwt(valid)["sub"] == "image-user"
             except Exception:
                 results["valid_signature_and_claims"] = False
+            no_scope = jwt.encode({k: v for k, v in claims.items() if k != "scope"}, private_key,
+                                  algorithm="RS256", headers={"kid": "image-key"})
+            results["scopeless_token_rejected"] = rejected(no_scope, InvalidCodeError)
             unknown = jwt.encode(claims, private_key, algorithm="RS256", headers={"kid": "foreign-key"})
             missing = jwt.encode(claims, private_key, algorithm="RS256")
             results["unknown_key_rejected_as_credential"] = rejected(unknown, InvalidCodeError)
