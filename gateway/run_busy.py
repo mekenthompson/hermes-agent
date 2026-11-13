@@ -584,12 +584,13 @@ class GatewayBusySessionMixin:
         if not text.strip():
             return text
         import json
-        from gateway.session import label_shared_sender
+        from gateway.session import is_system_injection, label_shared_sender
 
         source = event.source
-        text = label_shared_sender(
-            source, text, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False))
+        if not is_system_injection(event):  # self-injected text keeps its system header, never a human label
+            text = label_shared_sender(
+                source, text, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
+                thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False))
         origin = {
             "platform": source.platform.value,
             **{key: getattr(source, key) for key in (
