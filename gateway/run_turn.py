@@ -1745,16 +1745,13 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                     source=next_source, session_id=session_id, session_key=next_session_key,
                     run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
-                    _queued_execution_reservation=queued_reservation,
-                    event_message_id=next_message_id, inbound_message_id=next_inbound_id,
-                    channel_prompt=next_channel_prompt, message_type=next_message_type,
+                    _queued_execution_reservation=queued_reservation, event_message_id=next_message_id,
+                    inbound_message_id=next_inbound_id, channel_prompt=next_channel_prompt,
+                    message_type=next_message_type, scheduled_heartbeat=bool(getattr(pending_event, "_heartbeat_session_id", None)),
                     persist_user_message=next_persist_message, persist_user_display_kind=next_display_kind,
                     reply_expected=next_reply_expected, persist_user_display_metadata={
                         **display_metadata_for_event(pending_event),
                         **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
-                    # A heartbeat drained behind a running turn is still a scheduled heartbeat: without
-                    # the flag its interim commentary, drafts and progress post before [SILENT] is known.
-                    scheduled_heartbeat=bool(getattr(pending_event, "_heartbeat_session_id", None)),
                 )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(

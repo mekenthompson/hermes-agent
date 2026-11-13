@@ -1526,9 +1526,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
 
     def _prefix_inbound_sender_context(self, event: MessageEvent, source: SessionSource, message_text: str) -> str:
         """Attribute the sender in shared multi-user sessions and prepend history-backfill channel context."""
-        # Self-injected events (heartbeat, async-delegation completion, process notices) carry their own
-        # system header; the originating human's label would attribute them to that person's authority.
-        if not getattr(event, "internal", False):
+        if not getattr(event, "internal", False):  # self-injected turns keep their system header, no human label
             message_text = label_shared_sender(
                 source, message_text, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
                 thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False))
