@@ -120,7 +120,7 @@ _SYSTEMD_SCOPE_PROBE_TTL_SECONDS = 60.0
 # systemd >= 254 expands ``$$``/``${X}`` in a ``--scope`` command line itself unless told not to;
 # older systemd-run rejects the option (and never expanded there), so the probe drops it on rejection.
 _SYSTEMD_RUN_NO_EXPAND = True
-from tools.process_registry_memory_limit import (  # noqa: F401 -- re-exported: tests patch this module's names
+from tools.process_registry_memory_limit import (  # tests patch these names here
     _DEFAULT_WORKER_MEMORY_MAX_BYTES, _MIN_WORKER_MEMORY_MAX_BYTES, _WORKER_MEMORY_MAX_CAP_BYTES, _worker_memory_max_bytes)
 
 
