@@ -56,7 +56,7 @@ async def run_auto_tts(
     text reply is unaffected.
     """
     caption_delivered, played = False, []
-    paths, requested = await adapter._synthesize_auto_tts(text_content)
+    paths, requested = await adapter._synthesize_auto_tts(text_content, event.source)
     try:
         for index, path in enumerate(paths):
             try:

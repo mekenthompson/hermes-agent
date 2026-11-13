@@ -75,7 +75,10 @@ def _refresh_complete_payload(session, record):
 
 
 def save_completed_result(session) -> bool:
-    """Retain the snapshot; return true only for a complete original result."""
+    """Retain the snapshot; return true only for a complete original result. A hosted agent's process
+    has no receipt on this host: its command and output are the tenant's, kept in the live registry only."""
+    if session.sandbox_key:
+        return False
     from agent.redact import redact_sensitive_text, redact_terminal_output
     from tools.process_registry import MAX_OUTPUT_CHARS
 
@@ -238,9 +241,11 @@ def load_completed_results(prefix: str = "", *, owns_entry=None, strict=False) -
     from tools.process_registry import ProcessSession, _checkpoint_path
 
     from gateway.session_context import get_session_env
+    from tools.environments.sandbox_scope import hosted_scope
 
     owner = get_session_env("HERMES_SESSION_ID", "")
-    if not owner and owns_entry is None:
+    # A hosted agent's processes leave no receipt here and it sees no local one: never read or prune them.
+    if (not owner and owns_entry is None) or hosted_scope() is not None:
         return {}
     results = {}
     try:
@@ -270,7 +275,8 @@ def load_completed_results(prefix: str = "", *, owns_entry=None, strict=False) -
                 continue
             session = ProcessSession(
                 **{key: record[key] for key in _RESULT_FIELDS},
-                exited=True, output_buffer=record["output"], completion_consumed=record.get('completion_consumed', False),
+                # Receipts written before processes carried a sandbox are a local activity's.
+                sandbox_key=record.get("sandbox_key", ""), exited=True, output_buffer=record["output"], completion_consumed=record.get('completion_consumed', False),
                 pid=record.get('pid'), host_start_time=record.get('host_start_time'),
                 pid_scope=scopes.get(record['id'], record.get('pid_scope', 'host')),
                 native_job_scope=native_jobs.get(record['id'], record.get('native_job_scope', False)),

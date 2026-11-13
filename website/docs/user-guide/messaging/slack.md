@@ -680,9 +680,6 @@ slack:
   mention_patterns:
     - "hey hermes"
     - "hermes,"
-
-  # Text prepended to every outgoing message
-  reply_prefix: ""
 ```
 
 :::tip When to use `strict_mention`

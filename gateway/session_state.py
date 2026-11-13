@@ -34,6 +34,8 @@ class TurnState:
     lease: Any = None  # cross-process active-session slot lease
     worker_done: Any = None  # physical worker Event; an asyncio wrapper is not completion proof
     busy_ack_ts: float = 0.0  # debounce; 0.0 = never acked
+    # Ends the turn while it is still in pre-agent setup (``run_turn_setup_guard``); None otherwise.
+    setup_stop: Optional[Callable[[], bool]] = None
     # Held turn-lease tokens keyed by acquiring run generation: release/rebind resolve the
     # token for their own generation, so a displaced turn's unwind frees only its own lease and
     # never a successor's (an evicted turn and its replacement may both hold one briefly).
@@ -60,7 +62,7 @@ class TurnState:
 
     def clear(self) -> None:
         """Reset the per-turn slot.  The caller pops ``lease`` first to release it."""
-        self.agent = self.lease = self.event = self.ctx = self.worker_done = self.follow_up_event = None
+        self.agent = self.lease = self.event = self.ctx = self.worker_done = self.follow_up_event = self.setup_stop = None
         self.started_ts = self.busy_ack_ts = 0.0
 
 
@@ -113,6 +115,9 @@ class PersistentState:
     # not). gateway.run mirrors this value to the DB keyed by session_key so the same semantics also survive
     # gateway restarts.
     hygiene_failure_streak: int = 0
+    # Identity of the request last re-run after a compression-exhaustion reset (#137565): the same
+    # request exhausting the fresh session too is not re-run again. Process-local.
+    exhaustion_replayed: Optional[str] = None
 
 
 @dataclass
