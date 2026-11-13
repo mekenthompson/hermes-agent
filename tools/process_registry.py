@@ -2092,6 +2092,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         from tools.process_registry_handoff import check_control_ownership
         if changed := check_control_ownership(self, session, expected_ownership, consume_output):
             return changed
+        if session.sandbox_key:
+            return self._kill_hosted(session, source, consume_output)
         from tools.process_registry_job import job_quiescent
         if session.pid_scope != 'host' or session.wsl_chain or not (
                 session.native_job_scope or session.systemd_unit or job_quiescent(session)):
