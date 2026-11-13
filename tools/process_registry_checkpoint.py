@@ -254,9 +254,8 @@ class ProcessCheckpointMixin:
             return 0
         recovered = 0
         unresolved_scope_entries: list[dict[str, Any]] = []
-        for entry in entries:
-            if entry.get("sandbox_key"):
-                continue  # an older build's hosted entry: its pid is the sandbox's, never adopted or signalled here
+        # An older build's hosted entry: its pid is the sandbox's, never adopted or signalled here.
+        for entry in [e for e in entries if not e.get("sandbox_key")]:
             if owns_entry is not None and not owns_entry(entry):
                 unresolved_scope_entries.append(entry)
                 continue
