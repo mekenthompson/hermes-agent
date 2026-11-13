@@ -4095,6 +4095,26 @@ class SlackAdapter(AssistantThreadTitles, SlackSocketLifecycleMixin, BasePlatfor
                 chat_type="dm" if is_dm else "group")
         return True
 
+    @staticmethod
+    def _is_thread_parent_bookkeeping_change(event: dict, updated_message: dict, edited_ts: str) -> bool:
+        """True for a ``message_changed`` of a thread root that is NOT a genuine human edit."""
+        ts = str(updated_message.get("ts") or "")
+        is_parent = bool(ts) and (
+            str(updated_message.get("thread_ts") or "") == ts
+            or any(updated_message.get(k) for k in ("reply_count", "latest_reply", "reply_users")))
+        if not is_parent:
+            return False
+        if not edited_ts:
+            return True
+        previous = event.get("previous_message")
+        if isinstance(previous, dict) and "text" in previous:
+            return previous.get("text") == updated_message.get("text")
+        # No previous_message: an edit stamp that is not fresh predates this event.
+        try:
+            return abs(float(event.get("event_ts") or event.get("ts") or 0) - float(edited_ts)) > 120
+        except (TypeError, ValueError):
+            return True
+
     def _normalize_changed_message(self, event: dict) -> Optional[dict]:
         """Turn a ``message_changed`` envelope into a plain message event.
         None if malformed or the original was already routed to the agent. The edit's own ts rides
@@ -4108,6 +4128,13 @@ class SlackAdapter(AssistantThreadTitles, SlackSocketLifecycleMixin, BasePlatfor
         edited = updated_message.get("edited")
         edited_ts = str(edited.get("ts") or "") if isinstance(edited, dict) else ""
         outer_event_ts = str(event.get("ts") or "")
+        # Slack re-emits ``message_changed`` for a thread PARENT whenever a reply lands (reply_count /
+        # latest_reply / reply_users bookkeeping) with the root's unchanged text. The in-memory
+        # ``_processed_message_ts`` guard above forgets after a restart or LRU eviction, so a weeks-old root
+        # would be re-admitted as a fresh user turn and re-answered. Only a real human edit may re-admit one.
+        if self._is_thread_parent_bookkeeping_change(event, updated_message, edited_ts):
+            logger.debug("[Slack] Dropping thread-parent message_changed bookkeeping ts=%s", original_message_ts)
+            return None
         changed_event_ts = (
             str(event.get("event_ts") or edited_ts or "")
             or (outer_event_ts if outer_event_ts != original_message_ts else "")
