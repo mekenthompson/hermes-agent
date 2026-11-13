@@ -29,14 +29,27 @@ def _slack_source() -> SessionSource:
                          user_id="U0BSW2AS8LQ", user_name="Lisa")
 
 
+def _heartbeat_poller_event(source):
+    """The run_goals poller shape: non-internal (auth and Stop still apply), marked by session id."""
+    event = MessageEvent(text=HEARTBEAT, source=source)
+    event._heartbeat_session_id = "20261104_174758_065d707d"
+    return event
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("text", [HEARTBEAT, ASYNC_DONE])
-async def test_internal_injection_has_no_human_sender_prefix(text):
+@pytest.mark.parametrize("make_event", [
+    pytest.param(lambda src: MessageEvent(text=HEARTBEAT, source=src, internal=True), id="heartbeat-admission"),
+    pytest.param(_heartbeat_poller_event, id="heartbeat-poller-noninternal"),
+    pytest.param(lambda src: MessageEvent(text=ASYNC_DONE, source=src, internal=True), id="async-delegation"),
+])
+async def test_system_injection_has_no_human_sender_prefix(make_event):
     runner, source = _runner(), _slack_source()
-    event = MessageEvent(text=text, source=source, internal=True)
+    event = make_event(source)
     model_text = await runner._prepare_inbound_message_text(event=event, source=source, history=[])
-    assert "Slack user" not in model_text and "Lisa" not in model_text
-    assert model_text.startswith("[Heartbeat") or model_text.startswith("[ASYNC DELEGATION")
+    _, persisted, _ = runner._hmwa_apply_message_timestamp(event, model_text)
+    for text in (model_text, persisted):
+        assert "Slack user" not in text and "Lisa" not in text
+        assert text.startswith(("[Heartbeat", "[ASYNC DELEGATION"))
 
 
 @pytest.mark.asyncio
