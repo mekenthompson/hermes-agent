@@ -1780,6 +1780,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                     channel_prompt=next_channel_prompt, message_type=next_message_type,
+                    scheduled_heartbeat=bool(getattr(pending_event, "_heartbeat_session_id", None)),
                     persist_user_message=next_persist_message, persist_user_display_kind=next_display_kind,
                     reply_expected=next_reply_expected, persist_user_display_metadata={
                         **display_metadata_for_event(pending_event),

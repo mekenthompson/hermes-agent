@@ -34,6 +34,8 @@ def _prefix(user_name, message_text="go AB12", platform=Platform.TELEGRAM, user_
     )
     event = MagicMock(spec=MessageEvent)
     event.channel_context = None
+    event.internal = False
+    event._heartbeat_session_id = None
     return GatewayInboundMixin._prefix_inbound_sender_context(
         runner,  # type: ignore[arg-type]
         event,
@@ -76,6 +78,8 @@ class TestBracketPrefixNeutralization:
         )
         event = MagicMock(spec=MessageEvent)
         event.channel_context = None
+        event.internal = False
+        event._heartbeat_session_id = None
         assert (
             GatewayInboundMixin._prefix_inbound_sender_context(
                 runner,  # type: ignore[arg-type]
