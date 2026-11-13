@@ -452,6 +452,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     bot, int_chat_id, media_path, is_voice, caption=_tg_caption, parse_mode=send_parse_mode,
                     has_html=_has_html, thread_kwargs=thread_kwargs, force_document=force_document)
             except Exception as e:
+                logger.debug("Telegram media upload failed", exc_info=True)
                 last_msg = _record_media_failure(e, media_path, warnings, last_msg)
         if last_msg is None:
             return {"error": _NO_DELIVERABLE, **({"warnings": warnings} if warnings else {})}
@@ -462,6 +463,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return {"error": "python-telegram-bot not installed. Run: "
                 f"{install_hint('telegram')}", "retryable": True}
     except Exception as e:
+        logger.warning("Telegram standalone send failed", exc_info=True)
         from plugins.platforms.telegram import telegram_send_errors as kinds
         # Nothing sent (cron may replay it) only when this request never left or was refused, no
         # receipt came back (``last_msg``: a chunk or the album) and ``outcome`` saw no earlier try

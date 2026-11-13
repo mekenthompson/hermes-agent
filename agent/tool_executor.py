@@ -686,9 +686,7 @@ def _dispatch_authorized_once(
         elif callback is not None:
             callback()
 
-    # Deny-by-default for a hosted scope, before plugin hooks, guardrails or any executor: every
-    # sequential, concurrent and batched call reaches its executor (inline, memory provider, context
-    # engine, registry) only through here.
+    # Hosted scope: deny-by-default before plugin hooks, guardrails or any executor (every call passes here).
     from tools.hosted_tool_policy import hosted_tool_refusal
     block_message, block_error_type = hosted_tool_refusal(ref.name), "hosted_tool_refused"
     if block_message is None:
@@ -770,8 +768,7 @@ def _run_agent_tool_execution_middleware(
     state = _ManagedToolResult(result=None, args=function_args, middleware_trace=trace, blocked=False, dispatched=False)
     from tools.hosted_tool_policy import hosted_tool_refusal
     if hosted_tool_refusal(function_name) is not None:
-        # Refused in a hosted scope before Relay and every request/execution middleware: no
-        # host-side callback sees, rewrites or acts on a call that will not run.
+        # Refused in a hosted scope before Relay and all middleware: no callback sees a call that will not run.
         state.dispatched = True
         state.result = _dispatch_authorized_once(
             agent, state, _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, trace),
@@ -1725,10 +1722,8 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
         agent._delegate_spinner = spinner
         from tools.arg_validation import call_with_arg_checks
         from tools.registry import registry
-        return _SequentialDispatch(
-            _observed(lambda next_args: call_with_arg_checks(
-                registry.get_entry(function_name), next_args, agent._dispatch_delegate_task)),
-            spinner=spinner, is_delegate=True)
+        checked = lambda next_args: call_with_arg_checks(registry.get_entry(function_name), next_args, agent._dispatch_delegate_task)
+        return _SequentialDispatch(_observed(checked), spinner=spinner, is_delegate=True)
     if agent._context_engine_tool_names and function_name in agent._context_engine_tool_names:
         return _SequentialDispatch(
             execute=_observed(lambda next_args: agent.context_compressor.handle_tool_call(function_name, next_args, messages=messages)),

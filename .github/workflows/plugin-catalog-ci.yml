@@ -97,10 +97,10 @@ jobs:
             # fork branch/repository and PR number; pinned-source validation below still runs.
             house_sync=0
             if [ "${CATALOG_HEAD_REPO:-}" = "mekenthompson/hermes-agent" ] \
-               && [ "${CATALOG_HEAD_REF:-}" = "house/reconcile-nous-7d9fd429d32e82cd4be90cd2fbe995054f43e2e3" ] \
-               && [ "${CATALOG_PR_NUMBER:-}" = "236" ] \
-               && git merge-base --is-ancestor 7d9fd429d32e82cd4be90cd2fbe995054f43e2e3 HEAD^2 \
-               && git merge-base --is-ancestor a0af667c876b0522b9cb6eb684d02f50a40ea7e5 HEAD^2; then
+               && [ "${CATALOG_HEAD_REF:-}" = "house/reconcile-nous-c9b20d7bc08dec1e10779a06d7d9073bc6e7e418" ] \
+               && [ "${CATALOG_PR_NUMBER:-}" = "237" ] \
+               && git merge-base --is-ancestor c9b20d7bc08dec1e10779a06d7d9073bc6e7e418 HEAD^2 \
+               && git merge-base --is-ancestor f6ac86b0ef3d5e86654132b8aba1ce6f1de45b5e HEAD^2; then
               house_sync=1
             fi
             if [ "$house_sync" -eq 0 ]; then
