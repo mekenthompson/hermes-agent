@@ -177,14 +177,16 @@ def pending_setup_busy_notice(runner, session_key: str, source) -> Optional[str]
     import os
     import time
     from gateway.bot_peer_notices import automatic_notices_allowed
-    from gateway.run import _AGENT_PENDING_SENTINEL, _float_env
     if (os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() != "true"
             or not automatic_notices_allowed(source)):
         return None
-    timeout = _float_env("HERMES_SESSION_STALL_TIMEOUT", 300)
     state = runner._peek_session_state(session_key)
     started = float(getattr(getattr(state, "turn", None), "started_ts", 0.0) or 0.0)
-    if timeout <= 0 or state is None or not started or state.turn.agent is not _AGENT_PENDING_SENTINEL:
+    if state is None or not started:
+        return None  # no turn in setup: the native admission path must not import gateway.run for this
+    from gateway.run import _AGENT_PENDING_SENTINEL, _float_env
+    timeout = _float_env("HERMES_SESSION_STALL_TIMEOUT", 300)
+    if timeout <= 0 or state.turn.agent is not _AGENT_PENDING_SENTINEL:
         return None
     now = time.time()
     age = now - started

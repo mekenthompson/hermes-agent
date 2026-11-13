@@ -81,7 +81,9 @@ def test_cancelled_queued_worker_releases_transport(monkeypatch):
         assert not lease.active
         assert lease.callback is None
         assert current(key) is None
-        assert ad._records[result["delegation_id"]]["status"] == "interrupted"
+        # House: a unit cancelled before it ever started is unscheduled (record and journal row removed),
+        # not finalized with a synthetic completion event.
+        assert result["delegation_id"] not in ad._records
         lease.release()  # Finalization, interruption and Future completion can all release it.
         assert not lease.active
     finally:

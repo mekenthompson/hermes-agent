@@ -1089,7 +1089,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         # A copied context with no override still follows mutable process ENV.
         # Bind this producer's home before its original reader can outlive the turn.
         reader_context = copy_context()
-        reader_context.run(set_hermes_home_override, get_hermes_home().absolute())
+        if hosted_scope() is None:  # a hosted scope has no home to bind, and its setters refuse
+            reader_context.run(set_hermes_home_override, get_hermes_home().absolute())
         reader = threading.Thread(target=reader_context.run, args=(reader_target, session, *extra_args),
                                   daemon=True, name=reader_name)
         session._reader_thread = reader

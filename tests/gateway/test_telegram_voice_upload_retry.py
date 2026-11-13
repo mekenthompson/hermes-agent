@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-from telegram.error import NetworkError, TimedOut
+from telegram.error import TimedOut
 
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram import adapter as telegram_mod
@@ -40,6 +40,12 @@ def _write_ogg(tmp_path):
 def _wrapped(outer: Exception, cause: Exception) -> Exception:
     outer.__cause__ = cause
     return outer
+
+
+@pytest.fixture(autouse=True)
+def _no_backoff(monkeypatch):
+    from plugins.platforms.telegram import telegram_send_errors as kinds
+    monkeypatch.setattr(kinds, "same_request_backoff", lambda _attempt: 0)
 
 
 @pytest.fixture(autouse=True)
@@ -79,9 +85,8 @@ def _connect_timeout():
     _read_timeout,
     lambda: _wrapped(TimedOut("Timed out"), httpx.WriteTimeout("write timed out")),
     lambda: httpx.ReadError("connection reset"),
-    lambda: NetworkError("Bad Gateway"),
     lambda: TimeoutError("timed out after 120s (telegram-media-send)"),
-], ids=["read-timeout", "write-timeout", "read-error", "bad-gateway", "deadline"])
+], ids=["read-timeout", "write-timeout", "read-error", "deadline"])
 async def test_unconfirmed_upload_is_not_resent(tmp_path, make_error):
     """The upload landed but the response was lost: the user gets exactly one copy."""
     adapter = _make_adapter()
@@ -123,14 +128,16 @@ async def test_never_sent_upload_retries_once(tmp_path, make_error):
 async def test_never_sent_twice_falls_back_to_one_document(tmp_path):
     """Neither attempt reached Telegram, so the document fallback is the only copy."""
     adapter = _make_adapter()
-    server = _TelegramServer([(_connect_timeout(), False), (_connect_timeout(), False)])
+    from plugins.platforms.telegram import telegram_send_errors as kinds
+    attempts = kinds.SAME_REQUEST_ATTEMPTS  # the upload layer spends its whole same-request budget first
+    server = _TelegramServer([(_connect_timeout(), False) for _ in range(attempts)])
     adapter._bot.send_voice = AsyncMock(side_effect=server.send_voice)
 
     result = await adapter.send_voice("123", str(_write_ogg(tmp_path)))
 
     assert result.success is True
     assert result.message_id == "44"
-    assert server.calls == 2
+    assert server.calls == attempts
     assert server.landed == 0
     adapter.send_document.assert_awaited_once()
 

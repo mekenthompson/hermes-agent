@@ -324,8 +324,9 @@ def test_a_tui_poller_leaves_another_agents_event_for_it():
 
 def test_a_hosted_process_is_never_checkpointed_and_a_recovered_one_stays_its_agents(tmp_path, monkeypatch):
     """The host crash-recovery checkpoint carries no hosted process (its command and cwd are the
-    tenant's). An entry that names a sandbox anyway (written by an older build) is still recovered
-    as that agent's only, invisible to every other activity."""
+    tenant's). An entry that names a sandbox anyway (written by an older build) is never adopted:
+    its pid is the sandbox's, not this host's, so it is dropped from the host file and no activity
+    sees it (house: native recovery only adopts host jobs with proven birth identity)."""
     import json
     import os
     from unittest.mock import patch
@@ -348,13 +349,12 @@ def test_a_hosted_process_is_never_checkpointed_and_a_recovered_one_stays_its_ag
         monkeypatch.setattr(restarted, "_host_pid_is_ours", lambda *_a: True)
         monkeypatch.setattr(restarted, "_is_host_pid_alive", lambda *_a: True)
         monkeypatch.setattr(restarted, "_refresh_detached_session", lambda s: s)
-        assert restarted.recover_from_checkpoint() == 1
+        assert restarted.recover_from_checkpoint() == 0
         assert "sleep 600" not in checkpoint.read_text()  # and the rewrite drops it from the host file
     assert restarted.get("proc_hosted_ckpt") is None
-    with bind_state(B):
-        assert restarted.get("proc_hosted_ckpt") is None
-    with bind_state(A):
-        assert restarted.get("proc_hosted_ckpt") is not None
+    for scope in (A, B):
+        with bind_state(scope):
+            assert restarted.get("proc_hosted_ckpt") is None
 
 
 def test_media_is_never_read_on_host_with_a_host_backend_configured(provider, monkeypatch, host_dir):

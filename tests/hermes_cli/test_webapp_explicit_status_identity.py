@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth.middleware import gated_auth_middleware
-from hermes_cli.web_routers.status import _webapp_caller_signed_out
+from hermes_cli.web_routers.status import _status_caller_verified, _webapp_caller_signed_out
 
 
 @pytest.mark.parametrize("credential,explicit,signed_out", [
@@ -28,7 +28,7 @@ def test_public_status_explicit_token_identity(monkeypatch, credential, explicit
 
     @app.get("/api/status")
     async def status(request: Request):
-        return {"signed_out": await _webapp_caller_signed_out(request)}
+        return {"signed_out": _webapp_caller_signed_out(request, await _status_caller_verified(request))}
 
     headers = {}
     if credential != "missing":

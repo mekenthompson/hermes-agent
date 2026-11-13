@@ -89,7 +89,7 @@ def _token(
         {
             "iss": issuer, "aud": audience, "sub": "user-1", "iat": now,
             "exp": now - 1 if expired else now + 300,
-            "agent_instance_id": "ken333", "oauth_contract_version": 1,
+            "agent_instance_id": "ken333", "oauth_contract_version": 1, "scope": "agent_dashboard:access",
         },
         material["private_pem"], algorithm="RS256", headers=headers,
     )
