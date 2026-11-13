@@ -686,8 +686,7 @@ def _dispatch_authorized_once(
         elif callback is not None:
             callback()
 
-    # Hosted scope: deny-by-default before plugin hooks, guardrails or any executor (every call passes here).
-    from tools.hosted_tool_policy import hosted_tool_refusal
+    from tools.hosted_tool_policy import hosted_tool_refusal  # hosted scope: deny-by-default before hooks/executors
     block_message, block_error_type = hosted_tool_refusal(ref.name), "hosted_tool_refused"
     if block_message is None:
         block_message, block_error_type = scope_block, "tool_scope_block"
