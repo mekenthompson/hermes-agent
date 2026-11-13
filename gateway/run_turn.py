@@ -1752,6 +1752,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     reply_expected=next_reply_expected, persist_user_display_metadata={
                         **display_metadata_for_event(pending_event),
                         **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
+                    # A heartbeat drained behind a running turn is still a scheduled heartbeat: without
+                    # the flag its interim commentary, drafts and progress post before [SILENT] is known.
+                    scheduled_heartbeat=bool(getattr(pending_event, "_heartbeat_session_id", None)),
                 )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
