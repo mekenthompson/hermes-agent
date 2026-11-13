@@ -160,7 +160,8 @@ def test_literal_hash_fences_close_like_commonmark(content, expected):
 
 def test_rich_payload_is_linear_in_unclosed_backtick_runs():
     """A full rich-cap reply of unclosed backtick runs of distinct lengths (`a``a```a...) builds its
-    payload well inside one second; a per-run rescan blocked the event loop for seconds."""
+    payload in under two seconds (the tests/AGENTS.md floor for wall-clock bounds on a loaded runner);
+    a per-run rescan blocked the event loop for seconds."""
     adapter = _make_adapter()
     runs, k = [], 1
     while sum(map(len, runs)) < adapter.RICH_MESSAGE_MAX_CHARS:
@@ -171,7 +172,7 @@ def test_rich_payload_is_linear_in_unclosed_backtick_runs():
     started = time.perf_counter()
     payload = adapter._rich_message_payload(content)
 
-    assert time.perf_counter() - started < 1.0
+    assert time.perf_counter() - started < 2.0
     assert payload["markdown"].startswith("\\#89")
 
     # Fence-like lines that never close, and backtick runs split by paragraphs.
@@ -179,7 +180,7 @@ def test_rich_payload_is_linear_in_unclosed_backtick_runs():
     content = (unit * (adapter.RICH_MESSAGE_MAX_CHARS // len(unit)))[: adapter.RICH_MESSAGE_MAX_CHARS]
     started = time.perf_counter()
     adapter._rich_message_payload(content)
-    assert time.perf_counter() - started < 1.0
+    assert time.perf_counter() - started < 2.0
 
 
 @pytest.mark.asyncio
