@@ -3,6 +3,7 @@
 Only the native codec supplies a control callback. Payloads submitted through
 ordinary APIs cannot create this descriptor or exempt work from FIFO capacity.
 """
+import asyncio
 from functools import partial
 
 from gateway.session_contract import SessionRef
@@ -78,10 +79,11 @@ async def reconcile(authority, ref):
     if live is None:
         raise RuntimeStoreError('not_found')
     async with live.claim_gate:
-        rows = list_session_admissions(authority.db, session_id=ref.session_id)
+        # Off the owner loop, like the claim reads (tests/gateway/test_sessiondb_loop_guard.py).
+        rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=ref.session_id)
         for row in rows:
             if row['status'] != 'queued' or 'native_stop_v1' not in row['payload']:
                 continue
-            current = get_session_admission(authority.db, admission_id=row['admission_id'])
+            current = await asyncio.to_thread(get_session_admission, authority.db, admission_id=row['admission_id'])
             if current is not None and current['status'] == 'queued':
                 await _apply(authority, SessionRef(authority.profile_id, ref.session_id), current)

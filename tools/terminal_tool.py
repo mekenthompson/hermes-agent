@@ -1486,7 +1486,7 @@ def _run_foreground(
     for retry_count in range(max_retries + 1):
         try:
             command_cwd = _resolve_command_cwd(
-                workdir=workdir, default_cwd=plan.cwd, session_key=cwd_key, env_type=env_type,
+                workdir=workdir, default_cwd=plan.cwd, session_key=cwd_key, env_type=env_type, task_id=task_id,
                 mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
                 env=env,
             )

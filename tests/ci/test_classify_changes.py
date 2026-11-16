@@ -652,9 +652,15 @@ def test_every_lane_reaches_the_composite_action():
 
 
 def test_classifier_runs_in_the_detect_jobs_sparse_checkout(tmp_path):
-    """The detect job checks out only its sparse list; an import outside it fails CI on every PR."""
+    """The classifier runs from its sparse list alone; an import outside it fails CI on every PR.
+
+    The fork's detect job shares a full checkout with its guards, so without a sparse list the
+    classifier must still run from upstream's minimal set."""
     steps = _yaml(".github/workflows/ci.yaml")["jobs"]["detect"]["steps"]
-    sparse = next(s["with"]["sparse-checkout"] for s in steps if "sparse-checkout" in s.get("with", {}))
+    sparse = next((s["with"]["sparse-checkout"] for s in steps if "sparse-checkout" in s.get("with", {})),
+                  ".github/actions/detect-changes scripts/ci/classify_changes.py hermes_agent/__init__.py "
+                  "hermes_agent/compat/ scripts/ci/list_os_marked_tests.py scripts/ci/fork_review_files.py "
+                  "scripts/ci/affected_test_plan.py scripts/ci/ci_policy.py")
     for rel in sparse.split():
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
         if (_REPO / rel).is_dir():

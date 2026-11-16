@@ -33,7 +33,7 @@ def outer(command, env, root):
     plan = terminal._ExecPlan(config={}, env_type='local', effective_task_id='boundary', image='',
                              cwd=str(root), host_cwd=None, effective_timeout=15)
     return json.loads(terminal._run_foreground(command, env, plan, task_id='boundary', session_id='boundary',
-        session_key='route', workdir=str(root), approval_note=None, clear_interrupt=False, metered=False))
+        session_key='route', cwd_key='route', workdir=str(root), approval_note=None, clear_interrupt=False, metered=False))
 
 
 @pytest.mark.parametrize('phase', ['record', 'registration', 'descriptor-close', 'handle', 'stdin',
