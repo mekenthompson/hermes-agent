@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 from typing import Optional
 
+from gateway.run_profile_home import completion_event_scope_or_refuse
+
 
 class GatewayCompletionBatchMixin:
     """Admission of policy-checked process completions into their route's coalescing batch."""
@@ -37,7 +39,10 @@ class GatewayCompletionBatchMixin:
         try:
             # Filter each event before it can contaminate (or suppress) a foreground batch.
             # The shared queue may be drained outside the owning profile's runtime scope.
-            async with self._completion_event_scope(evt):
+            scope = await completion_event_scope_or_refuse(self, evt, "process completion")
+            if scope is None:
+                return None
+            async with scope:
                 from tools.process_registry_notifications import should_surface_notification
                 if not should_surface_notification(evt):
                     return None
