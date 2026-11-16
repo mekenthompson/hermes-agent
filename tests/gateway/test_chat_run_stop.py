@@ -227,7 +227,7 @@ async def test_chat_stop_before_promotion_fences_model_launch_and_observes_late_
     runner._provider_routing = {}
     runner._resolve_session_reasoning_config = lambda **_kw: {}
     runner._resolve_session_service_tier = lambda **_kw: None
-    runner._resolve_turn_agent_config = lambda *_args: {}
+    runner._resolve_turn_agent_config = lambda *_args, **_kw: {}
     started, release = threading.Event(), threading.Event()
 
     def run_stopped_worker():

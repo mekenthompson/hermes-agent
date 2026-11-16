@@ -42,6 +42,8 @@ from agent.inline_tool_executors import (
     InlineToolContext,
     apply_transform_tool_result,
     emit_terminal_post_tool_call,
+    is_context_engine_tool,
+    is_memory_provider_tool,
     tool_hook_ids,
 )
 from agent.message_metadata import stamp_data_use
@@ -735,7 +737,9 @@ def _dispatch_authorized_once(
     _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
     from agent.tool_progress_relay import bound_tool_progress
     from tools.connectors.data_use import collect_data_use
-    with bound_tool_progress(agent.tool_progress_callback, ref.name, ref.call_id), collect_data_use() as data_use:
+    from tools.mcp_elicitation_form import bound_form_asker  # MCP elicitation asks on this turn's clarify surface
+    with bound_tool_progress(agent.tool_progress_callback, ref.name, ref.call_id), collect_data_use() as data_use, \
+            bound_form_asker(getattr(agent, "clarify_callback", None)):
         try:
             return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
         finally:
@@ -848,14 +852,10 @@ def _resolve_sequential_tool_timeout() -> float | None:
     return resolve_timeout("tools.sequential_call", default=_resolve_concurrent_tool_timeout())
 
 
-# Tools whose call blocks on a long-running operation that supervises its own liveness: no generic
-# sequential deadline. ``delegate_task`` in a nested orchestrator blocks for the whole batch by design
-# (children carry heartbeats, the stale monitor, and ``delegation.child_timeout_seconds``); under the
-# 420 s deadline every real batch "timed out" while its children ran on as orphans, and the orchestrator
-# spent the following hours polling transcripts (measured: 332 timeouts, ~$4k of orchestrator turns in
-# one run).
-# ``manage_connections`` waits on the connection operation's own deadline; the generic deadline
-# would return tool_timeout while its approval card is still open.
+# Tools that supervise their own liveness get no generic sequential deadline. ``delegate_task`` blocks
+# for the whole batch (children have heartbeats, the stale monitor, ``delegation.child_timeout_seconds``);
+# a 420 s deadline orphaned every real batch (332 timeouts, ~$4k of polling turns in one run).
+# ``manage_connections`` waits on its own deadline; ours would fire while its approval card is open.
 _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS = frozenset({"delegate_task", "manage_connections"})
 
 
@@ -912,8 +912,10 @@ def _run_sequential_tool_execution_middleware(
     are ``_NEVER_PARALLEL_TOOLS`` and run inline below, before any deadline is armed, so
     they need no ``_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS`` entry."""
     from agent.tool_dispatch_helpers import _extend_tool_timeout
+    from agent.tool_executor_deadline import deadline_with_floor, declared_deadline_floor
 
-    timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else _resolve_sequential_tool_timeout()
+    timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else deadline_with_floor(
+        _resolve_sequential_tool_timeout(), declared_deadline_floor(function_name, function_args))
     timeout_s = _extend_tool_timeout(function_name, timeout_s)
     ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, middleware_trace)
     kwargs = dict(ref.middleware_kwargs(), execute=execute, scope_block=scope_block, display_index=display_index)
@@ -1626,8 +1628,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     if _tool_progress_enabled(agent):
         print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
 
-    # Resolved before the batch is built so the start-order gate can clamp under the deadline.
-    timeout_s = _resolve_concurrent_tool_timeout()
+    from agent.tool_executor_deadline import batch_deadline  # before the batch: the start-order gate clamps under it
+    timeout_s = batch_deadline(_resolve_concurrent_tool_timeout(), parsed_calls)
     batch = _ConcurrentBatch(agent, messages, effective_task_id, parsed_calls, timeout_s)
     agent._current_tool = tool_names_str
     agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
@@ -1699,8 +1701,7 @@ class _SequentialDispatch:
 
 def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _SequentialDispatch:
     """Pick the execute callable for one sequential call and start its spinner. Precedence:
-    inline agent-level tools, delegate_task, context-engine tools, memory-provider tools,
-    then the registry."""
+    inline agent-level tools, delegate_task, context-engine tools, memory-provider tools, registry."""
     function_name, function_args, effective_task_id, tool_call_id, middleware_trace = (
         ref.name, ref.args, ref.task_id, ref.call_id, ref.trace,
     )
@@ -1723,14 +1724,14 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
         from tools.registry import registry
         checked = lambda next_args: call_with_arg_checks(registry.get_entry(function_name), next_args, agent._dispatch_delegate_task)
         return _SequentialDispatch(_observed(checked), spinner=spinner, is_delegate=True)
-    if agent._context_engine_tool_names and function_name in agent._context_engine_tool_names:
+    if is_context_engine_tool(agent, function_name):
         return _SequentialDispatch(
             execute=_observed(lambda next_args: agent.context_compressor.handle_tool_call(function_name, next_args, messages=messages)),
             spinner=_start_quiet_tool_spinner(agent, function_name, function_args, gate=False),
             error_result=lambda e: json.dumps({"error": f"Context engine tool '{function_name}' failed: {e}"}),
             error_log="context_engine.handle_tool_call raised for %s: %s",
         )
-    if agent._memory_manager and agent._memory_manager.has_tool(function_name):
+    if is_memory_provider_tool(agent, function_name):
         # Memory-provider tools (hindsight_retain, honcho_search, ...) are not in the registry.
         return _SequentialDispatch(
             execute=_observed(lambda next_args: agent._memory_manager.handle_tool_call(
@@ -1910,8 +1911,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
 def _execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls sequentially (single calls or interactive tools). ``finalize=False``
-    skips end-of-batch budget enforcement and /steer injection (the segmented dispatcher
-    owns turn-end work)."""
+    skips end-of-batch budget enforcement and /steer injection (segmented dispatch owns turn end)."""
     _tool_budget = _budget_for_agent(agent)  # once per turn, not per result
     tool_calls = assistant_message.tool_calls
 

@@ -114,7 +114,7 @@ def run(repo: Path, base: str, head: str | None, as_json: bool = False,
             _skipped("code health: no merge-only files outside the trusted parents", as_json)
             return 0
         scoped = sorted(scope)
-    changes = gitio.changed_files(repo, base, head, scoped)
+    changes = gitio.changed_files(repo, base, head, paths=scoped)
     head_paths = sorted({c.new for c in changes if c.new and in_scope(c.new)})
     base_paths = sorted({c.old for c in changes if c.old and in_scope(c.old)})
     if not head_paths:
@@ -126,7 +126,8 @@ def run(repo: Path, base: str, head: str | None, as_json: bool = False,
     measurer = Measurer(repo, ruff, known_env=gitio.known_env_names(repo, base))
     base_m = measurer.measure(base, base_paths)
     head_m = measurer.measure(head, head_paths)
-    findings = compare(base_m, head_m, changes)
+    moves = gitio.tree_moves(repo, head)
+    findings = compare(base_m, head_m, changes, moves)
     if inherited_bases:
         # Each trusted parent independently evaluates the exact head. The finding
         # remains only when every parent also reports that same occurrence;
@@ -134,14 +135,14 @@ def run(repo: Path, base: str, head: str | None, as_json: bool = False,
         # copies cannot consume one occurrence.
         identities: set[tuple[str, str, str, int]] | None = None
         for parent in inherited_bases:
-            parent_changes = gitio.changed_files(repo, parent, head, scoped)
+            parent_changes = gitio.changed_files(repo, parent, head, paths=scoped)
             parent_head_paths = sorted({c.new for c in parent_changes if c.new and in_scope(c.new)})
             parent_base_paths = sorted({c.old for c in parent_changes if c.old and in_scope(c.old)})
             parent_measurer = Measurer(repo, ruff, known_env=gitio.known_env_names(repo, parent))
             parent_m = parent_measurer.measure(parent, parent_base_paths)
             parent_head_m = parent_measurer.measure(head, parent_head_paths)
             parent_findings = {(f.path, f.rule, f.scope, f.line)
-                               for f in compare(parent_m, parent_head_m, parent_changes)}
+                               for f in compare(parent_m, parent_head_m, parent_changes, moves)}
             identities = parent_findings if identities is None else identities & parent_findings
         if identities is not None:
             findings = [f for f in findings if (f.path, f.rule, f.scope, f.line) in identities]
