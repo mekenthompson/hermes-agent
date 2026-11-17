@@ -379,6 +379,13 @@ Xauthority, launcher log, per-profile xfconf).
   next successful hand-off rewrites it. Xvnc never pushes the screen's clipboard
   to viewers (`-SendCutText=0`), so watchers do not receive what the person in
   control copies; pasting into the screen still works.
+- **Copy from screen.** The person in control gets a *Copy from screen* button
+  that pulls the screen's text clipboard (the X `CLIPBOARD` selection, up to
+  256 KiB) onto their own clipboard. It is a request from the holder
+  (`display.clipboard.read`), answered only to the viewer the lease names;
+  watchers and a bot-held screen are refused, and nothing is ever pushed. Text
+  that has to be copied from inside a sandbox is read there with the sandbox's
+  own `python3`; the desktop package list gains nothing (no `xclip`/`xsel`).
 - **Display binding.** The launcher publishes `DISPLAY`, `XAUTHORITY` and the
   D-Bus address; every cua-driver and headed-browser spawn for that profile
   inherits them, so the bot never acts on a display a human is sitting at.

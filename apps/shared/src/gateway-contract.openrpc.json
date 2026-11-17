@@ -781,6 +781,24 @@
       }
     },
     {
+      "name": "display.clipboard.read",
+      "summary": "Copy out: the screen's text clipboard, to the viewer holding the lease only (5300, code viewer_mismatch / not_in_control / not_running / unavailable / timeout / too_large). Never broadcast.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/DisplayClipboardReadParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/DisplayClipboardReadResult"
+        }
+      }
+    },
+    {
       "name": "display.install",
       "summary": "Run the distro package install on the gateway host; progress streams as display.install.log/.done.",
       "params": [
@@ -17398,6 +17416,46 @@
         ],
         "title": "DispatchType",
         "type": "string"
+      },
+      "DisplayClipboardReadParams": {
+        "additionalProperties": false,
+        "properties": {
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "viewer_id": {
+            "title": "Viewer Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "viewer_id"
+        ],
+        "title": "DisplayClipboardReadParams",
+        "type": "object"
+      },
+      "DisplayClipboardReadResult": {
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "DisplayClipboardReadResult",
+        "type": "object"
       },
       "DisplayImageSwitch": {
         "additionalProperties": false,

@@ -189,6 +189,24 @@ def grab_jpeg(env: Any, published: dict[str, str], max_size: tuple[int, int], qu
     return proc.stdout
 
 
+def read_clipboard(env: Any, display: str, xauthority: str) -> str:
+    """The sandbox screen's CLIPBOARD text, read INSIDE the sandbox (the X socket and its cookie live there)
+    by running ``x11_selection`` with the sandbox's python3. Raises ``ClipboardError``."""
+    from tools.bot_desktop import x11_selection
+    source = Path(x11_selection.__file__).read_text(encoding="utf-8-sig")
+    try:
+        proc = streams.run_in(env, ["python3", "-c", source, display, xauthority], user=_user_for(env), timeout=15)
+        out = json.loads(proc.stdout.decode("utf-8")) if proc.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        logger.debug("sandbox clipboard read failed: %s", exc)
+        out = None
+    if not isinstance(out, dict):
+        raise x11_selection.ClipboardError("unavailable", "could not read the clipboard inside the sandbox")
+    if "error" in out:
+        raise x11_selection.ClipboardError(str(out["error"]), str(out.get("message") or out["error"]))
+    return str(out.get("text", ""))
+
+
 def _user_for(env: Any) -> Optional[str]:
     """DESKTOP_USER when the sandbox has it, else None (exec default). Cached on the env object."""
     cached = getattr(env, "_bd_desktop_user", "unset")
