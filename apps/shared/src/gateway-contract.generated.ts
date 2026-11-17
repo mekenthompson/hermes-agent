@@ -1482,6 +1482,13 @@ export interface DisplayObserveResult {
   path: string
   viewer_id: string
 }
+export interface DisplayClipboardReadParams {
+  profile?: string | null
+  viewer_id: string
+}
+export interface DisplayClipboardReadResult {
+  text: string
+}
 export interface DisplaySwitchSandboxImageParams {
   profile?: string | null
   approve?: boolean
@@ -6456,6 +6463,8 @@ export interface RpcMethods {
   'delegation.status': { params: ProfileParams; result: DelegationStatusResult }
   /** Upload a force-redacted debug bundle to Nous-internal diagnostics storage. */
   'diagnostics.share_nous': { params: DiagnosticsShareNousParams; result: DiagnosticsShareNousResult }
+  /** Copy out: the screen's text clipboard, to the viewer holding the lease only (5300, code viewer_mismatch / not_in_control / not_running / unavailable / timeout / too_large). Never broadcast. */
+  'display.clipboard.read': { params: DisplayClipboardReadParams; result: DisplayClipboardReadResult }
   /** Run the distro package install on the gateway host; progress streams as display.install.log/.done. */
   'display.install': { params: ProfileParams; result: DisplayInstallResult }
   /** Take over: the human named by a viewer id this connection minted controls the screen. */
@@ -6940,6 +6949,7 @@ export const RPC_METHODS = [
   'delegation.pause',
   'delegation.status',
   'diagnostics.share_nous',
+  'display.clipboard.read',
   'display.install',
   'display.lease.acquire',
   'display.lease.release',

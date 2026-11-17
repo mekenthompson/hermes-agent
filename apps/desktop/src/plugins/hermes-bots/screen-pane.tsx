@@ -30,6 +30,7 @@ import {
   retainBotScreen,
   viewerHash
 } from './screen-connection'
+import { ScreenCopyOut } from './screen-copy-out'
 import { ScreenNotInstalled } from './screen-install'
 import {
   $screenState,
@@ -526,9 +527,12 @@ export function BotScreenPane({ bot }: { bot: RosterRow }) {
           <span className="rounded bg-muted px-2 py-0.5 text-muted-foreground">{t.screen.agentControls}</span>
         )}
         {iHold ? (
-          <Button disabled={busy} onClick={() => void handBack()} size="sm" variant="secondary">
-            <Codicon name="debug-continue" /> {t.screen.handBack}
-          </Button>
+          <>
+            <ScreenCopyOut bot={bot} busy={busy} live={conn === 'live'} viewerId={viewer?.id} />
+            <Button disabled={busy} onClick={() => void handBack()} size="sm" variant="secondary">
+              <Codicon name="debug-continue" /> {t.screen.handBack}
+            </Button>
+          </>
         ) : (
           <>
             {humanOther ? (

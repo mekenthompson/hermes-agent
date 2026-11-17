@@ -200,6 +200,7 @@ _LONG_HANDLERS = frozenset({
     "wake.status", "session.active_list", "session.branch", "session.compress", "session.list",
     "session.resume", "session.save", "session.workspace.move", "shell.exec", "skills.manage", "slash.exec",
     "onboarding.start", "onboarding.state", "subagent.roster",
+    "display.clipboard.read",  # a blocking X selection round-trip, up to 15 s inside a sandbox
     "command.dispatch",  # /goal draft invokes the auxiliary model; never block the RPC reader
     "shared_metrics.set",  # consent reconcile waits on the metrics store's write lock
 })
