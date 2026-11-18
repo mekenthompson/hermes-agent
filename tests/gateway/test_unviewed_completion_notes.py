@@ -60,7 +60,7 @@ def _process_event(authority, ref, target, name='proc_busy'):
 @pytest.mark.parametrize('unavailable', ['adapter', 'admission'])
 async def test_owned_local_notification_refusal_is_retryable(tmp_path, monkeypatch, unavailable):
     from gateway.config import Platform
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal
 
     runner, authority, ref, _actor = await _local(tmp_path, monkeypatch)
     try:
@@ -69,12 +69,12 @@ async def test_owned_local_notification_refusal_is_retryable(tmp_path, monkeypat
             runner.adapters.pop(Platform.LOCAL)
         else:
             async def refuse(*args):
-                raise RuntimeStoreError('storage_unavailable')
+                raise AuthorityRefusal('storage_unavailable')
             monkeypatch.setattr(authority, 'admit_automation', refuse)
         assert await runner._deliver_completion_notification('[finished] RESULT_retry', evt) is False
         assert _admissions(authority, ref) == []
     finally:
-        authority.db.close()
+        close_stores_under(authority.persistence.scope.profile_dir)
 
 
 @pytest.mark.asyncio
@@ -87,7 +87,7 @@ async def test_orphan_local_watch_with_an_active_authority_is_terminal(tmp_path,
         assert await runner._inject_watch_notification('orphan watch', evt) is None
         assert _admissions(authority, ref) == []
     finally:
-        authority.db.close()
+        close_stores_under(authority.persistence.scope.profile_dir)
 
 
 @pytest.mark.asyncio
@@ -103,7 +103,7 @@ async def test_local_notification_never_uses_classic_admission_without_authority
         assert await runner._inject_watch_notification('[finished] RESULT_orphan', evt) is None
         assert _admissions(authority, ref) == []
     finally:
-        authority.db.close()
+        close_stores_under(authority.persistence.scope.profile_dir)
 
 
 @pytest.mark.asyncio

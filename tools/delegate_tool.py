@@ -31,7 +31,7 @@ from tools.delegate_tool_child_run import (
 )
 from tools.delegate_tool_config import (
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_max_concurrent_children,
-    _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled,
+    _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_worktree_isolation,
     _inherit_parent_capabilities, _merge_request_overrides, _resolve_child_credential_pool,
     _resolve_child_runtime,
     _subagent_auto_approve, _subagent_auto_deny,
