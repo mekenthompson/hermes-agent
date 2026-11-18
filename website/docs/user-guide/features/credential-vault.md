@@ -78,7 +78,42 @@ CLI through its non-interactive channel (`op signin` on stdin, `bw unlock
 memory. The agent never sees the master password, the token, or any login.
 A manager item that lists several websites (say `amazon.co.uk`,
 `www.amazon.co.uk` and `eu.account.amazon.com`) fills on each of those exact
-origins; nothing is inferred beyond the URLs saved on the item.
+origins; nothing is inferred beyond the URLs saved on the item. A website saved
+without a scheme counts as `https` when it is a plain domain name
+(`github.com/login` fills on `https://github.com`, the way 1Password itself opens
+it); anything else without a scheme (`localhost:8080`, an email address) is not a
+fill target.
+
+### 1Password Connect
+
+If the profile's secrets hold `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` (a
+self-hosted [1Password Connect](https://developer.1password.com/docs/connect/)
+server), Hermes reads logins from Connect directly. There is nothing to unlock and
+no `op` binary is needed, so it works in cron jobs, gateways and other headless
+sessions. Hermes only reads from Connect, sends the token in the request header and
+nowhere else (never through a proxy), and refuses a redirect rather than re-sending
+the token. With an `http://` Connect address the token crosses the network
+unencrypted, so keep such a server on a private network or give it `https://`.
+
+Listing reads item summaries only; the password is read at fill time, and only if
+the login is still saved for the websites it was listed with. 2FA codes are generated
+from a one-time-password field saved on the login. A login without one asks the user
+for the code, which a headless session cannot do (`prompt_unavailable`).
+
+### Choosing which vaults the agent may use
+
+A Connect token or service account often sees more than one vault. List the vaults
+the browser may fill from, by name or id:
+
+```yaml
+vault:
+  onepassword:
+    vaults: [agent-logins]
+```
+
+Empty (the default) means every vault the identity can see. A name or id that
+matches no visible vault is reported as an error; it never falls back to listing
+every vault.
 
 Prefer not to use a detected manager? `hermes vault sources --disable bitwarden`,
 or the switch in **Settings → Passwords & Logins**.
@@ -180,7 +215,8 @@ Cron jobs, webhooks, the API server and `hermes chat -q` have nobody to answer a
 prompt. Saved local logins keep working there; a locked password manager reports
 `unavailable_in_this_session` and a missing login reports `prompt_unavailable`.
 Unlock or save from an interactive session first, or give 1Password a service
-account token (`OP_SERVICE_ACCOUNT_TOKEN`).
+account token (`OP_SERVICE_ACCOUNT_TOKEN`) or a 1Password Connect server
+(`OP_CONNECT_HOST` + `OP_CONNECT_TOKEN`).
 
 ```yaml
 vault:
@@ -188,6 +224,7 @@ vault:
     enabled: false          # opt OUT of a detected manager (default: on when installed)
     account: ""             # `op --account` shorthand; empty = default
     service_account_token_env: OP_SERVICE_ACCOUNT_TOKEN
+    vaults: []              # vault names or ids to fill from; empty = every visible vault
   bitwarden:
     enabled: false
 ```
