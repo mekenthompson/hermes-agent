@@ -219,16 +219,26 @@ class TestPowerShellPositionalScriptAndAbbreviatedSwitches:
         assert not _is_dangerous(cmd), cmd
 
 
-    @pytest.mark.parametrize("command", [
-        'echo "' + "wmic shadowcopy " * 2000 + 'list"; echo ok',
-        'echo "' + "ssh -x " * 2000 + 'cat"; echo ok',
-        "; ssh -x" * 3000,
-        "\n ssh -x" * 3000,
+    @pytest.mark.parametrize(("prefix", "unit", "suffix", "reps"), [
+        ('echo "', "wmic shadowcopy ", 'list"; echo ok', 2000),
+        ('echo "', "ssh -x ", 'cat"; echo ok', 2000),
+        ("", "; ssh -x", "", 3000),
+        ("", "\n ssh -x", "", 3000),
     ])
-    def test_repeated_launcher_words_scan_in_linear_time(self, command):
-        start = time.perf_counter()
-        assert not _is_dangerous(command)
-        assert time.perf_counter() - start < 2, command[:30]
+    def test_repeated_launcher_words_scan_in_linear_time(self, prefix, unit, suffix, reps):
+        # Compare CPU time at a quarter of the input with the full input:
+        # linear growth is ~4x, a quadratic scan is ~16x. An absolute
+        # wall-clock cap is not portable: the full inputs take 2-3 s of CPU on
+        # a 4-core hosted runner while scaling linearly.
+        def cpu_seconds(count: int) -> float:
+            command = prefix + unit * count + suffix
+            start = time.process_time()
+            assert not _is_dangerous(command), command[:30]
+            return time.process_time() - start
+
+        small = cpu_seconds(reps // 4)
+        large = cpu_seconds(reps)
+        assert large < 8 * max(small, 0.05), (unit, small, large)
 
 
 class TestDriveLetterRoots:
