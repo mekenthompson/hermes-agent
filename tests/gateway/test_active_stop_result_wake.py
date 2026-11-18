@@ -6,7 +6,8 @@ import sys
 import threading
 import pytest
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit
-from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+from persistence.core.errors import AuthorityRefusal
+from gateway.session_authority import admission_row
 
 @pytest.mark.platforms('linux')
 @pytest.mark.asyncio
@@ -59,19 +60,18 @@ async def test_active_stop_result_then_cleanup_wakes_human(tmp_path, monkeypatch
         await _submit(authority,'original-human')
         await asyncio.wait_for(started.wait(),5)
         await _submit(authority,'queued-human')
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR,REF,authority._handle(REF).execution_generation)
         if boundary == 'failed-settlement':
             import sqlite3
-            from gateway import session_results
-            settle = session_results.settle_session_input
+            settle = authority.persistence.admissions.settle
             def refuse(*args, **kwargs):
                 raise sqlite3.OperationalError('finite original settlement store refusal')
-            monkeypatch.setattr(session_results, 'settle_session_input', refuse)
+            monkeypatch.setattr(authority.persistence.admissions, 'settle', refuse)
         finish_turn.set()
         await asyncio.wait_for(authority.sessions['s'].task,10)
-        print('AFTER_TURN',[(r['request_id'],r['status']) for r in list_session_admissions(db,session_id='s',pending_only=False)])
-        original = next(row for row in list_session_admissions(db, session_id='s', pending_only=False)
+        print('AFTER_TURN',[(r['request_id'],r['status']) for r in [admission_row(r) for r in db.admissions.list(session_id='s',pending_only=False)]])
+        original = next(row for row in [admission_row(r) for r in db.admissions.list(session_id='s', pending_only=False)]
                         if row['request_id'] == 'original-human')
         if boundary in {'unknown-execution', 'failed-settlement'}:
             assert original['status'] == 'unknown'
@@ -84,11 +84,10 @@ async def test_active_stop_result_then_cleanup_wakes_human(tmp_path, monkeypatch
             assert original['admission_id'] not in authority.pending_results
         if boundary == 'restart':
             from gateway.session_authority import SessionAuthority, LiveSession
-            from hermes_state_runtime import begin_runtime_epoch, recover_session_inputs
-            epoch = begin_runtime_epoch(db, instance_id='after-known-result')
-            recover_session_inputs(db, epoch=epoch)
+            epoch = db.runtime.begin_epoch(instance_id='after-known-result')
+            db.admissions.recover(epoch=epoch)
             old = authority
-            authority = SessionAuthority(old.runner, profile_id='owned', instance_id='after-known-result', db=db, epoch=epoch)
+            authority = SessionAuthority(old.runner, profile_id='owned', instance_id='after-known-result', epoch=epoch, persistence=db)
             authority.sessions['s'] = LiveSession(old.sessions['s'].source, 'route')
             recovered = module.ProcessRegistry()
             monkeypatch.setattr(module, 'process_registry', recovered)
@@ -112,12 +111,12 @@ async def test_active_stop_result_then_cleanup_wakes_human(tmp_path, monkeypatch
         await async_wait_until(lambda: authority.sessions['s'].task.done(), timeout=5)
         if boundary in {'unknown-execution', 'failed-settlement'}:
             assert executed == ['original-human']
-            original = next(row for row in list_session_admissions(db, session_id='s', pending_only=False)
+            original = next(row for row in [admission_row(r) for r in db.admissions.list(session_id='s', pending_only=False)]
                             if row['request_id'] == 'original-human')
             assert original['status'] == 'unknown'
             if boundary == 'failed-settlement':
                 assert original['admission_id'] in authority.pending_results
-                monkeypatch.setattr(session_results, 'settle_session_input', settle)
+                monkeypatch.setattr(authority.persistence.admissions, 'settle', settle)
                 await authority.resolve_unknown(ACTOR, REF, original['admission_id'], original['generation'])
                 await async_wait_until(lambda: executed == ['original-human', 'queued-human'], timeout=5)
             return
@@ -136,7 +135,7 @@ async def test_active_stop_result_then_cleanup_wakes_human(tmp_path, monkeypatch
 async def test_partial_writer_cannot_wake_human_before_complete_result_is_durable(tmp_path, monkeypatch, cached_writer):
     from gateway.session_ancillary import process_stop_pending
     from gateway.session_context import set_session_vars, clear_session_vars
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal
     from tools import process_registry as module
     from tools import process_registry_results as results
     from tools import process_registry_handoff as handoff
@@ -185,7 +184,7 @@ async def test_partial_writer_cannot_wake_human_before_complete_result_is_durabl
         assert await asyncio.to_thread(entered.wait, 5)
         await asyncio.to_thread(own.process.wait, 5)
         registry.poll(own.id)
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, 0)
         await _submit(authority, 'queued-human')
         await asyncio.wait_for(authority.sessions['s'].task,10)

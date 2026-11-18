@@ -11,7 +11,9 @@ from gateway.session_producer_lifecycle import (
     close_observed_turn, close_producer_turn, close_settled_turn, producer_turn)
 from hermes_cli.observability.shared_metrics_busy import (
     busy_turn_started, note_busy_admitted, note_busy_parked, settle_busy_arrival)
-from hermes_state_runtime import ADMITTED_REQUEST_CONFLICT, RuntimeStoreError
+from gateway.session_persistence import authority_persistence
+from persistence.authority.vocabulary import ADMITTED_REQUEST_CONFLICT
+from persistence.core.errors import AuthorityRefusal
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +46,7 @@ ALREADY_ADMITTED_REPLY = ('⚠️ Hermes already received a different message un
 
 
 def _store_refusal_reply(authority, event, exc):
-    """The chat reply for a native admission ``RuntimeStoreError`` refused before commit, or raise it."""
+    """The chat reply for a native admission ``AuthorityRefusal`` refused before commit, or raise it."""
     if exc.reason == 'stale_generation' and exc.field == 'route':
         return None  # a later /stop or /new of the chat fenced it, as main cancels a queued row
     if exc.reason == 'invalid_params' and exc.field:
@@ -89,7 +91,7 @@ async def admit_message(authority, event, *, busy=False):
         receipt = await authority.admit_native(event, before_schedule=before_schedule)
         if committed is not None and not committed.done():
             committed.set_result(None)  # the row is durable (any status): a barrier may go on
-    except RuntimeStoreError as exc:
+    except AuthorityRefusal as exc:
         return _store_refusal_reply(authority, event, exc)
     finally:
         messaging_admission.reset(ingress)
@@ -114,10 +116,10 @@ async def admit_message(authority, event, *, busy=False):
         adopters[receipt.admission_id] = event
     # A drain already running can claim, run and settle the row before this caller resumes; one
     # that settled it already sent (or owes) the reply itself and resolves no waiter registered now.
-    from hermes_state_runtime import get_session_admission
-    row = get_session_admission(authority.db, admission_id=receipt.admission_id)
-    status = 'terminal' if row is None else row['status']  # None: deleted with its chat, nothing owed
-    note_busy_admitted(event, receipt.admission_id, status, None if row is None else row.get('outcome'))
+    admissions = authority_persistence(authority).admissions
+    row = admissions.get(admission_id=receipt.admission_id)
+    status = 'terminal' if row is None else row.status  # None: deleted with its chat, nothing owed
+    note_busy_admitted(event, receipt.admission_id, status, None if row is None else row.outcome)
     if status in ('terminal', 'unknown'):
         authority.native_waiters.discard(receipt.admission_id)
         if authority.waiters.get(receipt.admission_id) is waiter:
@@ -129,9 +131,9 @@ async def admit_message(authority, event, *, busy=False):
         accepted.set_result(None)
     try:
         return await asyncio.shield(waiter)
-    except RuntimeStoreError as exc:
-        row = get_session_admission(authority.db, admission_id=receipt.admission_id)
-        if row is not None and row['status'] == 'terminal':
+    except AuthorityRefusal as exc:
+        row = admissions.get(admission_id=receipt.admission_id)
+        if row is not None and row.status == 'terminal':
             # The drain refused this head (``_refuse_head``): cancelled, not saved behind a pause.
             return (f'⚠️ Hermes did not answer this message ({exc.reason}): the conversation it was '
                     'queued for moved, so it was dropped. Send it again to continue.')
@@ -484,12 +486,14 @@ def _approval_task_scope(authority, ref, row, live, event, *, is_api):
         if row['principal_id'] != 'messaging:' + principal:
             return nullcontext()
     from tools.approval_context import approval_task_context
-    from hermes_state_runtime import get_session_admission
+    from gateway.session_authority import admission_row
+    store = authority_persistence(authority)
 
     def is_current():
         if authority.sessions.get(ref.session_id) is not live:
             return False
-        committed = get_session_admission(authority.db, admission_id=row['admission_id'])
+        record = store.admissions.get(admission_id=row['admission_id'])
+        committed = admission_row(record) if record is not None else None
         if (committed is None or committed['owner_epoch'] != authority.epoch
                 or committed['generation'] != row['generation']
                 or committed['target_session_id'] != ref.session_id):
@@ -508,7 +512,7 @@ def _approval_task_scope(authority, ref, row, live, event, *, is_api):
         entry = authority.runner.session_store.lookup_by_session_key(live.route)
         return (entry is not None and not entry.suspended
                 and (entry.session_id == ref.session_id
-                     or authority.db.get_compression_tip(ref.session_id) == entry.session_id))
+                     or store.lineage.tip(ref.session_id) == entry.session_id))
 
     def own(lease):
         from weakref import WeakSet

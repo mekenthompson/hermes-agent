@@ -9,7 +9,8 @@ import uuid
 import pytest
 
 from gateway.session_authority import LiveSession, SessionAuthority
-from hermes_state_runtime import RuntimeStoreError, admit_session_input, begin_runtime_epoch, list_session_admissions, recover_session_inputs
+from persistence.core.errors import AuthorityRefusal
+from gateway.session_authority import admission_row
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit, _wire_turn_agent
 from tests.gateway.test_session_authority_preadopt_stop import Agent
 from tests.waiting import async_wait_until, wait_until
@@ -50,7 +51,8 @@ async def test_failed_stop_fences_later_inputs_until_actual_cleanup(tmp_path, mo
     from gateway.session_unattended_unknown import settle_recovered_unattended
     from tools import process_registry as module
     db, authority = _authority(tmp_path, monkeypatch)
-    db.append_message('s', 'user', 'retained completed history')
+    from tests.fixtures.storage_seed import seed_messages
+    seed_messages(db, 's', {'role': 'user', 'content': 'retained completed history'})
     process = _spawn(registry, tmp_path)
     neighbor = _spawn(registry, tmp_path, owner='neighbor', route='other-route')
     started, finish = asyncio.Event(), asyncio.Event()
@@ -76,22 +78,22 @@ async def test_failed_stop_fences_later_inputs_until_actual_cleanup(tmp_path, mo
     monkeypatch.setattr(registry, 'kill_process', refusal)
     try:
         if automation:
-            admit_session_input(db, epoch=authority.epoch, principal_id='automation:route', session_id='s',
+            db.admissions.admit(epoch=authority.epoch, principal_id='automation:route', session_id='s',
                                 request_id='automation-head', payload={'text': 'work'})
             authority._schedule(REF)
             await asyncio.wait_for(started.wait(), 10)
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
         await _submit(authority, 'follower')
         finish.set()
         await asyncio.wait_for(authority.sessions['s'].task, 15)
         assert process_stop_pending(db, 's') is not None and not process.exited
         if reload_owner:
-            epoch = begin_runtime_epoch(db, instance_id='reloaded')
-            recover_session_inputs(db, epoch=epoch)
+            epoch = db.runtime.begin_epoch(instance_id='reloaded')
+            db.admissions.recover(epoch=epoch)
             assert settle_recovered_unattended(db, epoch) == 0
             old = authority
-            authority = SessionAuthority(old.runner, profile_id='owned', instance_id='reloaded', db=db, epoch=epoch)
+            authority = SessionAuthority(old.runner, profile_id='owned', instance_id='reloaded', epoch=epoch, persistence=db)
             authority.sessions['s'] = LiveSession(old.sessions['s'].source, 'route')
             registry = module.ProcessRegistry()  # simulate a fresh interpreter's process table
             monkeypatch.setattr(module, 'process_registry', registry)
@@ -100,7 +102,7 @@ async def test_failed_stop_fences_later_inputs_until_actual_cleanup(tmp_path, mo
         await _submit(authority, 'later-input')
         await asyncio.wait_for(authority.sessions['s'].task, 15)
         assert executed == (['automation-head'] if automation else [])
-        statuses = {r['request_id']: r['status'] for r in list_session_admissions(db, session_id='s')}
+        statuses = {r['request_id']: r['status'] for r in [admission_row(r) for r in db.admissions.list(session_id='s')]}
         assert statuses['follower'] == statuses['later-input'] == 'queued'
         if automation:
             assert statuses['automation-head'] == 'unknown'
@@ -119,7 +121,8 @@ async def test_failed_stop_fences_later_inputs_until_actual_cleanup(tmp_path, mo
             registry.recover_from_checkpoint()
             assert registry.get(neighbor.id) is not None, 'neighbor stopped being manageable after cleanup'
         assert executed == (['automation-head'] if automation else []) + ['follower', 'later-input', 'verified-successor']
-        assert db.get_messages('s')[0]['content'] == 'retained completed history'
+        from tests.fixtures.storage_read import transcript_rows
+        assert transcript_rows(db, 's')[0]['content'] == 'retained completed history'
     finally:
         monkeypatch.setattr(registry, 'kill_process', kill)
         monkeypatch.setattr(initial_registry, 'kill_process', initial_kill)
@@ -159,7 +162,7 @@ async def test_stop_consumes_ready_own_completion_but_delivers_neighbor(tmp_path
     else:
         try:
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
-        except RuntimeStoreError as error:
+        except AuthorityRefusal as error:
             state = {p.id: {"receipt": read_job_receipt(p), "exited": p.exited,
                            "pending": p._scope_stop_pending, "completion": p._completion_event.is_set(),
                            "complete_result": p._result_complete, "persisted_generation": p._result_persisted_generation,
@@ -202,7 +205,7 @@ async def test_idle_stop_recovers_previous_worker_before_clearing_status(tmp_pat
     try:
         assert not registry._running, 'the gateway starts without the previous worker process table'
         if refuse:
-            with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+            with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
                 await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
         else:
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)

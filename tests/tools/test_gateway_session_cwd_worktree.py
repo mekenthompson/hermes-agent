@@ -85,7 +85,7 @@ def test_worktree_creation_reads_gateway_session_key_not_session_id(
     record_session_cwd(session_key, str(repo))
     monkeypatch.setenv("TERMINAL_CWD", str(fallback))
     monkeypatch.setattr(
-        "tools.delegate_tool._get_worktree_isolation", lambda: True
+        "tools.delegate_tool_child_run._get_worktree_isolation", lambda: True
     )
     monkeypatch.setattr(
         "tools.subagent_worktree.local_backend_active", lambda: True
@@ -115,7 +115,7 @@ def test_session_that_never_entered_a_repo_fails_closed(tmp_path, monkeypatch):
     fallback.mkdir()
     monkeypatch.setenv("TERMINAL_CWD", str(fallback))
     monkeypatch.setattr(
-        "tools.delegate_tool._get_worktree_isolation", lambda: True
+        "tools.delegate_tool_child_run._get_worktree_isolation", lambda: True
     )
     monkeypatch.setattr(
         "tools.subagent_worktree.local_backend_active", lambda: True
@@ -143,7 +143,7 @@ def test_task_id_record_still_works_without_a_gateway_session_key(
     record_session_cwd(session_id, str(repo))
     monkeypatch.setenv("TERMINAL_CWD", str(fallback))
     monkeypatch.setattr(
-        "tools.delegate_tool._get_worktree_isolation", lambda: True
+        "tools.delegate_tool_child_run._get_worktree_isolation", lambda: True
     )
     monkeypatch.setattr(
         "tools.subagent_worktree.local_backend_active", lambda: True
@@ -166,7 +166,7 @@ def test_admitted_writer_worktree_is_the_cd_repo(
     monkeypatch.setenv("TERMINAL_CWD", str(fallback))
     monkeypatch.setenv("HERMES_ADMISSION_LEDGER", str(ledger))
     monkeypatch.setattr(
-        "tools.delegate_tool._get_worktree_isolation", lambda: True
+        "tools.delegate_tool_child_run._get_worktree_isolation", lambda: True
     )
     monkeypatch.setattr(
         "tools.subagent_worktree.local_backend_active", lambda: True

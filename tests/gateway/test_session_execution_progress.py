@@ -68,7 +68,7 @@ async def test_progress_tracks_real_generation_and_hides_waits_stops_and_complet
 async def test_execution_only_info_is_authorized_typed_and_avoids_inventory_or_attach(tmp_path, monkeypatch):
     from gateway import session_local, session_local_inventory
     from gateway.session_controls import AuthorityConnection
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
     from tui_gateway.contracts.registry import CANONICAL_METHODS
 
     db, authority = _authority(tmp_path, monkeypatch)

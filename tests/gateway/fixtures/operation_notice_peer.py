@@ -8,9 +8,9 @@ from tests.gateway.fixtures.local_recovery_probe import rpc
 async def notice(authority, ws, reader, sid, marker, receipt):
     events = []
     authority.sessions[sid].event_stream.observers.add(lambda frame: events.append(frame['params']))
-    session = authority.db.get_session(sid)
-    params = dict(session_id=sid, request_id='operation-final', expected_revision=session['runtime_revision'],
-                  expected_generation=session['runtime_generation'], operation='notice',
+    session = authority.persistence.sessions.get(sid)
+    params = dict(session_id=sid, request_id='operation-final', expected_revision=session.runtime_revision,
+                  expected_generation=session.runtime_generation, operation='notice',
                   payload={'text': '[Delivery test] operation passed'})
     denied = await peer._call(reader, 'session.mutate', **params)
     assert peer._error(denied) == 'permission_denied', denied

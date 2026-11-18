@@ -7,7 +7,8 @@ import sys
 
 import pytest
 
-from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+from persistence.core.errors import AuthorityRefusal
+from gateway.session_authority import admission_row
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit
 from tests.waiting import async_wait_until
 
@@ -65,22 +66,21 @@ async def test_known_answer_survives_actual_unreadable_process_ownership(tmp_pat
         await _submit(authority, 'queued-human')
         finish.set()
         await asyncio.wait_for(authority.sessions['s'].task, 10)
-        rows = {r['request_id']: r for r in list_session_admissions(db, session_id='s', pending_only=False)}
+        rows = {r['request_id']: r for r in [admission_row(r) for r in db.admissions.list(session_id='s', pending_only=False)]}
         assert (rows['original']['status'], rows['original']['outcome']) == ('terminal', 'completed')
         answer = admission_result(db, receipt.admission_id)['result']
         assert answer['final_response'] == 'KNOWN_COMPLETED_ANSWER' and answer['completed'] is True
         assert answer.get('failed') is not True
         assert rows['queued-human']['status'] == 'queued' and executed == ['original']
         assert process_stop_pending(db, 's') and neighbor.process.poll() is None
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
         if restart:
             from gateway.session_authority import SessionAuthority, LiveSession
-            from hermes_state_runtime import begin_runtime_epoch, recover_session_inputs
             old = authority
-            epoch = begin_runtime_epoch(db, instance_id='after-known-result')
-            recover_session_inputs(db, epoch=epoch)
-            authority = SessionAuthority(old.runner, profile_id='owned', instance_id='after-known-result', db=db, epoch=epoch)
+            epoch = db.runtime.begin_epoch(instance_id='after-known-result')
+            db.admissions.recover(epoch=epoch)
+            authority = SessionAuthority(old.runner, profile_id='owned', instance_id='after-known-result', epoch=epoch, persistence=db)
             authority.sessions['s'] = LiveSession(old.sessions['s'].source, 'route')
             cold = module.ProcessRegistry()
             monkeypatch.setattr(module, 'process_registry', cold)
@@ -109,12 +109,12 @@ async def test_retry_normalizes_only_typed_physical_cleanup_unknown(tmp_path, mo
     from gateway import session_ancillary as ancillary
     db, authority = _authority(tmp_path, monkeypatch)
     ancillary.record_process_stop(authority, REF, 0)
-    error = {'cleanup-unknown': RuntimeStoreError('process_stop_unknown'),
-             'storage-unavailable': RuntimeStoreError('storage_unavailable'),
-             'stale-generation': RuntimeStoreError('stale_generation'),
+    error = {'cleanup-unknown': AuthorityRefusal('process_stop_unknown'),
+             'storage-unavailable': AuthorityRefusal('storage_unavailable'),
+             'stale-generation': AuthorityRefusal('stale_generation'),
              'sqlite': sqlite3.OperationalError('native store unavailable'),
              'os-error': OSError('native store unavailable'),
-             'clear-write': RuntimeStoreError('process_stop_unknown')}[fault]
+             'clear-write': AuthorityRefusal('process_stop_unknown')}[fault]
     async def interrupt(*args):
         if fault == 'clear-write':
             return True
@@ -194,7 +194,7 @@ async def test_real_owned_resource_readiness_wake_during_refused_claim(tmp_path,
         if wake != 'owned':
             assert attempts == [False] and executed == []
             assert ancillary.process_stop_pending(db, 's')
-            rows = list_session_admissions(db, session_id='s', pending_only=False)
+            rows = [admission_row(r) for r in db.admissions.list(session_id='s', pending_only=False)]
             assert [(r['request_id'], r['status']) for r in rows] == [('only-human', 'queued')]
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
         await async_wait_until(lambda: executed == ['only-human'] and authority.sessions['s'].task.done(), timeout=10)

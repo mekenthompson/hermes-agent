@@ -11,7 +11,6 @@ import weakref
 import pytest
 
 from gateway.session_authority import LiveSession, SessionAuthority
-from hermes_state_runtime import begin_runtime_epoch
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority
 from tests.waiting import wait_until
 
@@ -156,8 +155,8 @@ async def test_handoff_after_child_retirement_survives_stale_writers_and_stop(tm
             if mode == 'cold':
                 monkeypatch.setattr(module, 'process_registry', module.ProcessRegistry())
                 source = authority.sessions['s'].source
-                epoch = begin_runtime_epoch(db, instance_id='cold-handoff')
-                authority = SessionAuthority(authority.runner, profile_id='owned', instance_id='cold-handoff', db=db, epoch=epoch)
+                epoch = db.runtime.begin_epoch(instance_id='cold-handoff')
+                authority = SessionAuthority(authority.runner, profile_id='owned', instance_id='cold-handoff', epoch=epoch, persistence=db)
                 authority.sessions['s'] = LiveSession(source, 'route')
             authority.runner._cached_agent_for = lambda route: None
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)

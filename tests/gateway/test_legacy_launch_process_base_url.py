@@ -1,23 +1,24 @@
 """A process-backed provider's ``process://`` billing stamp is not a resumable endpoint."""
 
-import json
+from dataclasses import fields
 
 import pytest
 
 from gateway.session_local_migration import legacy_launch_params
+from persistence.conversation.sessions import SessionRecord
 
 
 def _row(**overrides):
     row = {
-        'id': '20261110_172401_4b2de2', 'source': 'desktop', 'cwd': None, 'chat_id': None,
+        'session_id': '20261110_172401_4b2de2', 'source': 'desktop', 'cwd': None, 'chat_id': None,
         'model': 'claude-opus-5-5[1m]',
-        'model_config': json.dumps({'reasoning_config': {'enabled': True, 'effort': 'medium'},
-                                    'service_tier': 'normal'}),
+        'model_config': {'reasoning_config': {'enabled': True, 'effort': 'medium'},
+                         'service_tier': 'normal'},
         'billing_provider': 'claude-subscription-directsdk-experimental',
         'billing_base_url': 'process://claude-subscription-directsdk-experimental',
     }
     row.update(overrides)
-    return row
+    return SessionRecord(**{**{f.name: None for f in fields(SessionRecord)}, **row})
 
 
 def test_process_marker_is_not_carried_as_a_launch_base_url():

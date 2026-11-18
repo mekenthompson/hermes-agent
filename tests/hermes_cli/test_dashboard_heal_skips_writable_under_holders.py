@@ -8,7 +8,7 @@ import pytest
 from fastapi import HTTPException
 
 from hermes_cli.web_server_sessions import _open_session_db_at_path
-from hermes_state_common import DEFERRED_INDEX_SQL, SCHEMA_SQL
+from persistence.sqlite._schema_ddl import DEFERRED_INDEX_SQL, SCHEMA_SQL
 
 
 def _store(path: Path, *, stale: bool) -> None:
@@ -29,11 +29,11 @@ def test_dashboard_heal_skips_writable_open_when_gateway_holds_store(tmp_path, s
     db_path = tmp_path / "state.db"
     _store(db_path, stale=stale)
     before = db_path.read_bytes()
-    with patch("hermes_state_registry.acquire") as acquire, patch(
-        "hermes_state_holders.foreign_state_db_holders",
+    with patch("persistence.sqlite._registry.acquire") as acquire, patch(
+        "persistence.sqlite._state.holders.foreign_state_db_holders",
         return_value=[(99, "hermes gateway run --replace")],
     ), patch(
-        "hermes_state_holders._read_proc_argv",
+        "persistence.sqlite._state.holders._read_proc_argv",
         return_value=["/usr/bin/hermes", "gateway", "run", "--replace"],
     ):
         if stale:

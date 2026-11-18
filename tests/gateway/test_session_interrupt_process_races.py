@@ -8,7 +8,7 @@ import uuid
 
 import pytest
 
-from hermes_state_runtime import RuntimeStoreError
+from persistence.core.errors import AuthorityRefusal
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit, _wire_turn_agent
 from tests.gateway.test_session_authority_preadopt_stop import Agent
 from tests.waiting import wait_until
@@ -67,7 +67,7 @@ async def test_stop_reaps_a_spawn_that_crossed_initial_snapshot_before_successor
         await asyncio.wait_for(authority.sessions['s'].task, 20)
         assert children[0].completion_reason == 'killed'
         assert not children[1].exited, 'the previous generation Stop reached its successor'
-        with pytest.raises(RuntimeStoreError, match='stale_generation'):
+        with pytest.raises(AuthorityRefusal, match='stale_generation'):
             await authority.interrupt(ACTOR, REF, generation)
         assert not children[1].exited
 
@@ -108,7 +108,7 @@ async def test_unauthorized_or_stale_stop_does_not_signal_processes(tmp_path, mo
         (replace(ACTOR, capabilities=frozenset()), 0, 'permission_denied'),
         (ACTOR, -1, 'stale_generation'),
     ]:
-        with pytest.raises(RuntimeStoreError, match=reason):
+        with pytest.raises(AuthorityRefusal, match=reason):
             await authority.interrupt(actor, REF, generation)
         assert not process.exited
     db.close()
@@ -121,7 +121,7 @@ async def test_failed_process_stop_keeps_process_tracked_for_retry(tmp_path, mon
     kill = registry.kill_process
     monkeypatch.setattr(registry, 'kill_process', lambda pid, **kwargs: {'status': 'error', 'error': 'fixture refusal'})
     try:
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
         assert not process.exited
         assert registry.poll(process.id)['status'] == 'running'
@@ -135,7 +135,7 @@ async def test_failed_process_stop_keeps_process_tracked_for_retry(tmp_path, mon
 @pytest.mark.asyncio
 async def test_failed_boundary_stop_fences_followers_as_unknown(tmp_path, monkeypatch, registry):
     from gateway import session_finite
-    from hermes_state_runtime import list_session_admissions
+    from gateway.session_authority import admission_row
     db, authority = _authority(tmp_path, monkeypatch)
     agent = Agent()
     agent.session_id = 's'
@@ -157,13 +157,13 @@ async def test_failed_boundary_stop_fences_followers_as_unknown(tmp_path, monkey
         await _submit(authority, 'stopped')
         await asyncio.wait_for(started.wait(), 10)
         await _submit(authority, 'follower')
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
         handle = authority._handle(REF)
         assert handle.execution_state == 'running' and not process.exited
         finish.set()
         await asyncio.wait_for(authority.sessions['s'].task, 15)
-        rows = {r['request_id']: r['status'] for r in list_session_admissions(db, session_id='s')}
+        rows = {r['request_id']: r['status'] for r in [admission_row(r) for r in db.admissions.list(session_id='s')]}
         assert rows == {'stopped': 'unknown', 'follower': 'queued'}
         assert registry.poll(process.id)['status'] == 'running'
     finally:

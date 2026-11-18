@@ -57,13 +57,13 @@ def test_native_managed_stop_frame_sets_deadline_and_decodes_process_cleanup(tmp
     from gateway.session_managed_worker import ManagedWorker, interrupt_managed
     worker = ManagedWorker(None)  # production command queue and deadline latch, without a pipe writer
     from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority
-    from hermes_state_runtime import admit_session_input, claim_session_input
+    from gateway.session_authority import admission_row
     db, authority = _authority(tmp_path, monkeypatch)
     process = _spawn(registry, tmp_path, 's', 'route', True)
     authority._managed_workers = {'s': worker}
-    admit_session_input(db, epoch=authority.epoch, principal_id=ACTOR.subject, session_id='s',
+    db.admissions.admit(epoch=authority.epoch, principal_id=ACTOR.subject, session_id='s',
                         request_id='stopped', payload={'text': 'work'})
-    row = claim_session_input(db, epoch=authority.epoch, session_id='s')
+    row = admission_row(db.admissions.claim(epoch=authority.epoch, session_id='s'))
     authority._stamp_claim(REF, authority.sessions['s'], row)
     assert interrupt_managed(authority, ACTOR, REF, row['generation'])
     assert worker.stop.is_set() and worker.stopped_at is not None

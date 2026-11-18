@@ -11,7 +11,7 @@ import pytest
 
 from gateway.platforms.event import MessageEvent
 from gateway.session_authority import initialize_session_authority, SessionAuthority
-from hermes_state_runtime import list_session_admissions
+from gateway.session_authority import admission_row
 from tests.gateway.test_automation_compression_media import _admit_human
 from tests.gateway.test_native_stop_completion_delivery import owner_with_completion
 from tests.gateway.test_native_stop_reconciliation import caller, stop
@@ -54,14 +54,14 @@ async def test_stop_stays_cancelled_after_output_expiry_and_native_owner_reload(
         monkeypatch.setattr(module, 'process_registry', registry)
         previous_epoch = authority.epoch
         authority = await initialize_session_authority(runner, profile_id=authority.profile_id,
-            instance_id='retention-reloaded', db=authority.db)
+            instance_id='retention-reloaded', persistence=authority.persistence)
         assert authority.epoch > previous_epoch
         await authority.resolve(actor, ref)
         assert not registry.is_completion_consumed(own.id), 'bounded output cache must actually have expired'
         deliver = (runner._enqueue_process_completion_notification if delivery == 'batch'
                    else runner._deliver_completion_notification)
         assert await deliver(own.output_buffer, event) is None
-        rows = list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)
+        rows = [admission_row(r) for r in authority.persistence.admissions.list(session_id=ref.session_id, pending_only=False)]
         controls = [row for row in rows if row['principal_id'] == 'native-process-stop']
         assert len(controls) == 1
         assert (controls[0]['status'], controls[0]['outcome']) == ('terminal', 'cancelled')
@@ -95,23 +95,22 @@ async def test_stop_stays_cancelled_after_output_expiry_and_native_owner_reload(
         assert all(row['principal_id'] != 'native-process-stop' for row in executed)
     finally:
         await runner._cancel_process_completion_batch_tasks()
-        authority.db.close()
+        authority.persistence.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('mode', ['cap', 'age'])
 async def test_native_cancel_guards_a_held_admission_write_after_result_expiry(tmp_path, monkeypatch, mode):
-    from gateway import session_automation
     from tools import process_registry as module, process_registry_results as results
     runner, _adapter, authority, _source, ref, actor, _registry, own, event = await owner_with_completion(tmp_path, monkeypatch)
     entered, release = threading.Event(), threading.Event()
-    admit = session_automation.admit_session_input
+    admit = authority.persistence.admissions.admit
     def held(*args, **kwargs):
         if kwargs['principal_id'].startswith('automation:'):
             entered.set()
             assert release.wait(15)
         return admit(*args, **kwargs)
-    monkeypatch.setattr(session_automation, 'admit_session_input', held)
+    monkeypatch.setattr(authority.persistence.admissions, 'admit', held)
     task = asyncio.create_task(runner._deliver_completion_notification(own.output_buffer, event))
     try:
         assert await asyncio.to_thread(entered.wait, 10)
@@ -122,50 +121,51 @@ async def test_native_cancel_guards_a_held_admission_write_after_result_expiry(t
         assert not registry.is_completion_consumed(own.id)
         release.set()
         assert await asyncio.wait_for(task, 15) is False
-        rows = list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)
+        rows = [admission_row(r) for r in authority.persistence.admissions.list(session_id=ref.session_id, pending_only=False)]
         assert not any(row['principal_id'].startswith('automation:') for row in rows)
         assert any(row['principal_id'] == 'native-process-stop' and row['status'] == 'terminal' for row in rows)
     finally:
         release.set()
         await task
         await runner._cancel_process_completion_batch_tasks()
-        authority.db.close()
+        authority.persistence.close()
 
 
 @pytest.mark.asyncio
 async def test_cancel_receipt_write_failure_keeps_native_stop_fenced_until_retry(tmp_path, monkeypatch):
     from gateway.session_ancillary import process_stop_pending
     runner, _adapter, authority, _source, ref, actor, _registry, own, _event = await owner_with_completion(tmp_path, monkeypatch)
-    from hermes_state_runtime import _json
+    from persistence.sqlite.authority import _runtime
+    _json = _runtime._json
     def refused(payload):
         if 'process_completion' in payload:
             raise PermissionError('native control receipt write refused')
         return _json(payload)
-    monkeypatch.setattr('hermes_state_runtime._json', refused)
+    monkeypatch.setattr(_runtime, '_json', refused)
     try:
         response = await stop(caller(authority, actor), ref)
         assert response['error']['data']['reason'] == 'process_stop_unknown'
-        assert process_stop_pending(authority.db, ref.session_id)
+        assert process_stop_pending(authority.persistence, ref.session_id)
         assert not any(row['principal_id'] == 'native-process-stop' for row in
-            list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False))
-        monkeypatch.setattr('hermes_state_runtime._json', _json)
+            [admission_row(r) for r in authority.persistence.admissions.list(session_id=ref.session_id, pending_only=False)])
+        monkeypatch.setattr(_runtime, '_json', _json)
         assert 'result' in await stop(caller(authority, actor), ref)
-        assert process_stop_pending(authority.db, ref.session_id) is None
+        assert process_stop_pending(authority.persistence, ref.session_id) is None
         assert own.exited
     finally:
-        monkeypatch.setattr('hermes_state_runtime._json', _json)
+        monkeypatch.setattr(_runtime, '_json', _json)
         await runner._cancel_process_completion_batch_tasks()
-        authority.db.close()
+        authority.persistence.close()
 
 
 @pytest.mark.asyncio
 async def test_native_cancel_receipt_survives_later_terminal_inputs_in_active_session(tmp_path, monkeypatch):
     from tools import process_registry as module, process_registry_results as results
-    from hermes_state_runtime import get_session_admission
+    from gateway.session_authority import admission_row
     runner, _adapter, authority, source, ref, actor, _registry, own, event = await owner_with_completion(tmp_path, monkeypatch)
     try:
         assert 'result' in await stop(caller(authority, actor), ref)
-        rows = list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)
+        rows = [admission_row(r) for r in authority.persistence.admissions.list(session_id=ref.session_id, pending_only=False)]
         control = next(row for row in rows if row['principal_id'] == 'native-process-stop')
         for index in range(results.MAX_RETAINED_RESULTS + 1):
             receipt = await _admit_human(runner, authority, MessageEvent(text='later native input',
@@ -174,17 +174,17 @@ async def test_native_cancel_receipt_survives_later_terminal_inputs_in_active_se
         expire_result(results, own, 'cap')
         monkeypatch.setattr(module, 'process_registry', module.ProcessRegistry())
         authority = await initialize_session_authority(runner, profile_id=authority.profile_id,
-            instance_id='terminal-input-pressure-reload', db=authority.db)
+            instance_id='terminal-input-pressure-reload', persistence=authority.persistence)
         await authority.resolve(actor, ref)
-        retained = get_session_admission(authority.db, admission_id=control['admission_id'])
+        retained = admission_row(authority.persistence.admissions.get(admission_id=control['admission_id']))
         assert (retained['status'], retained['outcome']) == ('terminal', 'cancelled')
         assert await runner._enqueue_process_completion_notification(own.output_buffer, event) is None
-        rows = list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)
+        rows = [admission_row(r) for r in authority.persistence.admissions.list(session_id=ref.session_id, pending_only=False)]
         assert len(rows) == results.MAX_RETAINED_RESULTS + 3
         assert not any(row['principal_id'].startswith('automation:') for row in rows)
     finally:
         await runner._cancel_process_completion_batch_tasks()
-        authority.db.close()
+        authority.persistence.close()
 
 
 @pytest.mark.asyncio
@@ -196,7 +196,7 @@ async def test_expired_cancelled_completion_cannot_bypass_native_stop_with_unkno
         expire_result(results, own, 'cap')
         monkeypatch.setattr(module, 'process_registry', module.ProcessRegistry())
         authority = await initialize_session_authority(runner, profile_id=authority.profile_id,
-            instance_id='unknown-incarnation-reload', db=authority.db)
+            instance_id='unknown-incarnation-reload', persistence=authority.persistence)
         await authority.resolve(actor, ref)
         for incarnation in (None, True, 'unknown', {}, [], float('nan'), float('inf'), 0, 0.0, -1):
             uncertain = {**event, 'started_at': incarnation}
@@ -205,7 +205,7 @@ async def test_expired_cancelled_completion_cannot_bypass_native_stop_with_unkno
         missing.pop('started_at')
         assert await runner._enqueue_process_completion_notification(own.output_buffer, missing) is None
         assert not any(row['principal_id'].startswith('automation:') for row in
-            list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False))
+            [admission_row(r) for r in authority.persistence.admissions.list(session_id=ref.session_id, pending_only=False)])
     finally:
         await runner._cancel_process_completion_batch_tasks()
-        authority.db.close()
+        authority.persistence.close()

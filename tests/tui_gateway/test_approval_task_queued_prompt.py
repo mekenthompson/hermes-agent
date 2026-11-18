@@ -1,13 +1,13 @@
 """Busy local prompts keep their server-stamped submitter through the drain."""
 from types import SimpleNamespace
 
-from hermes_state import SessionDB
+from persistence_assembly import open_persistence, profile_scope
 from tui_gateway import server
 from tui_gateway.transport import bind_transport, reset_transport
 
 
 def test_authenticated_busy_submit_keeps_distinct_origins(tmp_path, monkeypatch):
-    db = SessionDB(db_path=tmp_path / 'state.db')
+    db = open_persistence(profile_scope(home=tmp_path))
     monkeypatch.setattr(server, '_get_db', lambda: db)
     monkeypatch.setattr(server, '_schedule_agent_build', lambda _sid: None)
     monkeypatch.setattr(server, '_schedule_session_cap_enforcement', lambda: None)

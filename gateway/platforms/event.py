@@ -82,8 +82,8 @@ def valid_structured_stop(event, adapter):
 def require_structured_control(event, adapter):
     """Refuse malformed typed carriers before they can enter ordinary command paths."""
     if event.structured_control is not None and not valid_structured_stop(event, adapter):
-        from hermes_state_runtime import RuntimeStoreError
-        raise RuntimeStoreError('invalid_params', field='structured_control')
+        from persistence.core.errors import AuthorityRefusal
+        raise AuthorityRefusal('invalid_params', field='structured_control')
 
 
 @dataclass

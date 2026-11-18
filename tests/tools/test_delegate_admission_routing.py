@@ -31,9 +31,9 @@ def test_public_delegate_route_rejects_before_child_construction(monkeypatch):
     }
 
     monkeypatch.setattr(delegate_tool, "_get_max_spawn_depth", lambda: 1)
-    monkeypatch.setattr(delegate_tool, "_load_config", dict)
+    monkeypatch.setattr(delegate_tool.delegate_tool_config, "_load_config", dict)
     monkeypatch.setattr(delegate_tool, "_get_max_concurrent_children", lambda: 1)
-    monkeypatch.setattr(delegate_tool, "_resolve_delegation_credentials", lambda *_args: credentials)
+    monkeypatch.setattr(delegate_tool.delegate_tool_config, "_resolve_delegation_credentials", lambda *_args: credentials)
     monkeypatch.setattr(
         delegate_tool,
         "_build_children",
@@ -65,8 +65,8 @@ def test_direct_child_helper_rejects_before_child_execution(monkeypatch):
     )
     monkeypatch.setattr(
         delegate_tool,
-        "_start_heartbeat",
-        lambda *_args: (_ for _ in ()).throw(AssertionError("heartbeat must follow admission")),
+        "_Heartbeat",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("heartbeat must follow admission")),
     )
     monkeypatch.setattr(
         delegate_tool,

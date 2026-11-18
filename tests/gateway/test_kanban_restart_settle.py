@@ -37,10 +37,9 @@ def _absent_pid(base):
 
 
 def _admission(db, sid):
-    from hermes_state_runtime import list_session_admissions
-    [row] = [row for row in list_session_admissions(db, session_id=sid, pending_only=False)
-             if row['request_id'].startswith('kanban:')]
-    return row['status'], row['outcome']
+    [row] = [row for row in db.admissions.list(session_id=sid, pending_only=False)
+             if row.request_id.startswith('kanban:')]
+    return row.status, row.outcome
 
 
 def _checkpoint_ids():
@@ -62,7 +61,6 @@ class _Restart:
         from hermes_cli import kanban_db as kb
         from hermes_cli.kanban_db_connect import connect
         from hermes_cli.kanban_db_dispatch import _process_fingerprint
-        from hermes_state_runtime import claim_session_input
         from tools.process_registry import _checkpoint_path, process_registry
         owner, authority = self.owner, self.owner.authority
         self.sid = (await run_kanban(owner.connection, owner.params))['session_id']
@@ -108,8 +106,8 @@ class _Restart:
                     'task_id': 'other-session', 'owner_task_id': 'other-session', 'session_key': 'other-route'}
         _checkpoint_path().write_text(json.dumps([own, neighbor]))
         # The interpreter dies first: the owner fences its Stop, then dies with the turn ``started``.
-        claimed = claim_session_input(authority.db, epoch=authority.epoch, session_id=self.sid)
-        record_process_stop(authority, self.ref, claimed['generation'])
+        claimed = authority.persistence.admissions.claim(epoch=authority.epoch, session_id=self.sid)
+        record_process_stop(authority, self.ref, claimed.generation)
         return self.restart()
 
     def child(self):
@@ -124,17 +122,16 @@ class _Restart:
         from gateway.session_authority import SessionAuthority
         from gateway.session_controls import AuthorityConnection
         from gateway.session_unattended_unknown import settle_recovered_unattended
-        from hermes_state_runtime import begin_runtime_epoch, recover_session_inputs
         from tools import process_registry as module
         old = self.owner.authority
-        db = old.db
-        epoch = begin_runtime_epoch(db, instance_id='owner-2')
-        assert recover_session_inputs(db, epoch=epoch) == 1
+        db = old.persistence
+        epoch = db.runtime.begin_epoch(instance_id='owner-2')
+        assert db.admissions.recover(epoch=epoch) == 1
         settle_recovered_unattended(db, epoch)
         assert _admission(db, self.sid) == ('unknown', None), 'boot recovery skips a fenced row'
         old.runner.adapters.pop(Platform.LOCAL, None)
         self.monkeypatch.setattr(module, 'process_registry', module.ProcessRegistry())
-        authority = SessionAuthority(old.runner, profile_id=old.profile_id, instance_id='owner-2', db=db, epoch=epoch)
+        authority = SessionAuthority(old.runner, profile_id=old.profile_id, instance_id='owner-2', persistence=db, epoch=epoch)
         self.monkeypatch.setattr(authority, '_schedule', lambda ref: None)
         old.runner.session_authority = authority
         self.authority = authority
@@ -189,8 +186,8 @@ def test_restart_mid_run_settles_the_lost_attempt_and_its_respawn_completes(card
             authority = await restart.admit_and_lose()
             if at_startup:
                 await settle_replaced_card_attempts(authority)
-                assert _admission(authority.db, restart.sid) == ('terminal', 'interrupted')
-                assert process_stop_pending(authority.db, restart.sid) is None
+                assert _admission(authority.persistence, restart.sid) == ('terminal', 'interrupted')
+                assert process_stop_pending(authority.persistence, restart.sid) is None
                 assert restart.record not in _checkpoint_ids()
             params = restart.respawn()
             status, kinds = _task(params['task_id'])
@@ -198,8 +195,8 @@ def test_restart_mid_run_settles_the_lost_attempt_and_its_respawn_completes(card
             # The respawn is admitted by the previous-execution fence.
             accepted = await run_kanban(restart.connection, params)
             assert accepted['session_id'] != restart.sid and accepted['receipt']['status'] == 'queued'
-            assert _admission(authority.db, restart.sid) == ('terminal', 'interrupted')
-            assert process_stop_pending(authority.db, restart.sid) is None
+            assert _admission(authority.persistence, restart.sid) == ('terminal', 'interrupted')
+            assert process_stop_pending(authority.persistence, restart.sid) is None
             assert restart.record not in _checkpoint_ids() and 'proc_neighborjob' in _checkpoint_ids()
             with closing(connect(board='owned')) as conn:
                 assert kb.complete_task(conn, params['task_id'], summary='done', expected_run_id=params['run_id'])
@@ -225,7 +222,7 @@ def test_an_attempt_that_might_still_run_keeps_its_fence(card_owner, monkeypatch
     from gateway.session_kanban_stop import settle_replaced_card_attempts
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
     owner = card_owner
     restart = _Restart(owner, monkeypatch, tmp_path)
 
@@ -233,8 +230,8 @@ def test_an_attempt_that_might_still_run_keeps_its_fence(card_owner, monkeypatch
         try:
             authority = await restart.admit_and_lose(**shape)
             await settle_replaced_card_attempts(authority)
-            assert _admission(authority.db, restart.sid) == ('unknown', None)
-            assert process_stop_pending(authority.db, restart.sid) is not None
+            assert _admission(authority.persistence, restart.sid) == ('unknown', None)
+            assert process_stop_pending(authority.persistence, restart.sid) is not None
             assert restart.record in _checkpoint_ids()
             tid = owner.params['task_id']
             with closing(connect(board='owned')) as conn:  # an operator re-queues the card regardless
@@ -247,8 +244,8 @@ def test_an_attempt_that_might_still_run_keeps_its_fence(card_owner, monkeypatch
             params = dict(owner.params, run_id=task.current_run_id, claim_lock=task.claim_lock)
             with pytest.raises(RuntimeStoreError, match='kanban_previous_execution_unknown'):
                 await run_kanban(restart.connection, params)
-            assert _admission(authority.db, restart.sid) == ('unknown', None)
-            assert process_stop_pending(authority.db, restart.sid) is not None
+            assert _admission(authority.persistence, restart.sid) == ('unknown', None)
+            assert process_stop_pending(authority.persistence, restart.sid) is not None
             await restart.connection.close()
         finally:
             restart.close()
@@ -259,17 +256,18 @@ def test_an_attempt_that_might_still_run_keeps_its_fence(card_owner, monkeypatch
 
 def test_a_stop_this_owner_recorded_is_never_discharged(card_owner, monkeypatch, tmp_path):
     """Only an earlier epoch's fence qualifies: this owner's own Stop goes through native cleanup."""
-    from gateway.session_ancillary import _PROCESS_STOP_PREFIX, process_stop_pending
+    from gateway.session_ancillary import clear_process_stop, process_stop_pending, record_process_stop
     from gateway.session_kanban_stop import settle_replaced_card_attempts
     restart = _Restart(card_owner, monkeypatch, tmp_path)
 
     async def scenario():
         try:
             authority = await restart.admit_and_lose()
-            authority.db.set_meta(_PROCESS_STOP_PREFIX + restart.sid, f'{authority.epoch}:1')
+            clear_process_stop(authority, restart.ref, process_stop_pending(authority.persistence, restart.sid))
+            record_process_stop(authority, restart.ref, 1)
             await settle_replaced_card_attempts(authority)
-            assert _admission(authority.db, restart.sid) == ('unknown', None)
-            assert process_stop_pending(authority.db, restart.sid) == f'{authority.epoch}:1'
+            assert _admission(authority.persistence, restart.sid) == ('unknown', None)
+            assert process_stop_pending(authority.persistence, restart.sid) == f'{authority.epoch}:1'
             assert restart.record in _checkpoint_ids()
             await restart.connection.close()
         finally:

@@ -150,7 +150,7 @@ def terminate_pids(pids: Sequence[int], *, force: bool = False) -> None:
 
 def _deleted_sidecar_holder_iter() -> Callable | None:
     try:
-        from hermes_state_dbfile import iter_deleted_sqlite_sidecar_holders
+        from persistence.sqlite._state.dbfile import iter_deleted_sqlite_sidecar_holders
     except ImportError:
         logger.error("iter_deleted_sqlite_sidecar_holders unavailable; aborting replace")
         return None

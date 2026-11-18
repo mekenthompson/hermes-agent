@@ -1,6 +1,10 @@
 """Durable provider IDs retain their native receipts across real route transitions."""
 import unittest
 
+from gateway.session_ingress_media import native_inputs_root
+from persistence.conversation.lineage import CompressionChild
+from persistence.conversation.messages import NewMessage
+
 from tests.gateway import test_native_inbound_retry as fixtures
 
 no_bootstrap = fixtures.no_bootstrap
@@ -30,7 +34,8 @@ class NativeDeliveryResetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, ['legacy-activity'])
 
     async def test_terminal_delivery_after_reset_reuses_original_receipt_and_preserves_new_turn(self):
-        from hermes_state_runtime import list_session_admissions, RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal
+        from tests.gateway.test_native_inbound_retry import list_session_admissions
         await self.start('provider-activity')
         old, old_ref = self.running, self.ref
         self.settle()
@@ -40,40 +45,41 @@ class NativeDeliveryResetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.agent.effects, [])
         self.assertEqual(self.receipts[-1][1].admission_id, old['admission_id'])
         self.assertEqual(self.receipts[-1][1].ref, old_ref)
-        self.assertEqual(len(list_session_admissions(self.authority.db,
+        self.assertEqual(len(list_session_admissions(self.authority,
             session_id=self.ref.session_id, pending_only=False)), 1)
-        with self.assertRaises(RuntimeStoreError) as changed:
+        with self.assertRaises(AuthorityRefusal) as changed:
             await self.receive(self.event('provider-activity', 'changed content'))
         self.assertEqual(changed.exception.reason, 'admission_conflict')
         self.allowed.clear()
-        with self.assertRaises(RuntimeStoreError) as revoked:
+        with self.assertRaises(AuthorityRefusal) as revoked:
             await self.receive(self.event('provider-activity'))
         self.assertEqual(revoked.exception.reason, 'permission_denied')
         self.assertEqual(self.agent.effects, [])
 
     async def test_deleted_original_target_returns_only_its_terminal_receipt(self):
-        from hermes_state_runtime import get_session_admission
+        from tests.gateway.test_native_inbound_retry import get_session_admission
         await self.start('retired-provider-activity')
         old, old_ref = self.running, self.ref
         self.settle()
         self.store.reset_session(self.route)
-        self.assertTrue(self.authority.db.delete_session(old_ref.session_id))
+        self.assertEqual(self.authority.persistence.sessions.delete(old_ref.session_id, media_root=str(native_inputs_root())),
+            (old_ref.session_id,))
         self.authority.sessions.pop(old_ref.session_id)
         await self.start('new-provider-activity')
         await self.receive(self.event('retired-provider-activity'))
         self.assertEqual(self.receipts[-1][1].admission_id, old['admission_id'])
-        self.assertEqual(get_session_admission(self.authority.db,
+        self.assertEqual(get_session_admission(self.authority,
             admission_id=old['admission_id'])['payload'], {})
         self.assertNotIn(old_ref.session_id, self.authority.sessions)
         self.assertEqual(self.agent.effects, [])
 
     async def test_pending_original_target_cannot_retarget_after_reset(self):
-        from hermes_state_runtime import RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal
         await self.start('pending-provider-activity')
         old_ref = self.ref
         self.store.reset_session(self.route)
         await self.start('new-provider-activity')
-        with self.assertRaises(RuntimeStoreError) as held:
+        with self.assertRaises(AuthorityRefusal) as held:
             await self.receive(self.event('pending-provider-activity'))
         self.assertEqual(held.exception.reason, 'session_superseded')
         self.assertNotEqual(old_ref, self.ref)
@@ -83,10 +89,10 @@ class NativeDeliveryResetTests(unittest.IsolatedAsyncioTestCase):
         await self.start('compressed-provider-activity')
         old, old_ref = self.running, self.ref
         self.settle()
-        self.authority.db.end_session(old_ref.session_id, 'compression')
         tip = 'finite-compression-continuation'
-        self.authority.db.create_session(tip, source=self.source.platform.value,
-            session_key=self.route, parent_session_id=old_ref.session_id)
+        self.authority.persistence.lineage.publish_compression_child(old_ref.session_id,
+            CompressionChild(session_id=tip, source=self.source.platform.value),
+            [NewMessage.from_live({'role': 'assistant', 'content': 'summary'})], require_compression_lease=False)
         self.assertIsNotNone(self.store.switch_session(self.route, tip))
         await self.receive(self.event('compressed-provider-activity'))
         self.assertEqual(self.receipts[-1][1].admission_id, old['admission_id'])
@@ -96,7 +102,7 @@ class NativeDeliveryResetTests(unittest.IsolatedAsyncioTestCase):
     async def test_ambiguous_legacy_delivery_is_refused_before_new_route_reservation(self):
         from gateway.session_envelope import snapshot_native
         from gateway.session_native_delivery import identity
-        from hermes_state_runtime import admit_session_input, RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal
         event = self.event('ambiguous-provider-activity')
         await self.start(event.message_id)
         self.settle()
@@ -104,9 +110,9 @@ class NativeDeliveryResetTests(unittest.IsolatedAsyncioTestCase):
         next_ref = self.authority.register(self.source)
         payload = snapshot_native(self.runner, event)
         principal, request = identity(self.source, payload)
-        admit_session_input(self.authority.db, epoch=self.authority.epoch,
+        self.authority.persistence.admissions.admit(epoch=self.authority.epoch,
             principal_id=principal, session_id=next_ref.session_id, request_id=request, payload=payload)
-        with self.assertRaises(RuntimeStoreError) as held:
+        with self.assertRaises(AuthorityRefusal) as held:
             await self.receive(event)
         self.assertEqual(held.exception.reason, 'admission_conflict')
         self.assertEqual(self.agent.effects, [])

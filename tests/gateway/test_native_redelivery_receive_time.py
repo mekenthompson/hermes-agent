@@ -58,14 +58,14 @@ class NativeRedeliveryReceiveTimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.row('answered')['status'], 'terminal')
 
     async def test_redelivery_with_changed_text_still_conflicts(self):
-        from hermes_state_runtime import RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal
         self.adapter.requires_durable_input_ack = False
         await self.admit('edited-in-place', received=datetime(2026, 11, 2, 8, tzinfo=UTC))
-        with pytest.raises(RuntimeStoreError) as refused:
+        with pytest.raises(AuthorityRefusal) as refused:
             await self.admit('edited-in-place', received=datetime(2026, 11, 2, 8, 1, tzinfo=UTC), text='other words')
         self.assertEqual(refused.value.reason, 'admission_conflict')
 
 
 def base_rows(authority, session_id):
-    from hermes_state_runtime import list_session_admissions
-    return list_session_admissions(authority.db, session_id=session_id, pending_only=False)
+    from tests.gateway.test_native_inbound_retry import list_session_admissions
+    return list_session_admissions(authority, session_id=session_id, pending_only=False)

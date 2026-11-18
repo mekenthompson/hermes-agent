@@ -8,7 +8,6 @@ import sys
 import pytest
 
 from gateway.session_controls import AuthorityConnection
-from hermes_state_runtime import admit_session_input, list_session_admissions
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit
 from tests.waiting import async_wait_until
 
@@ -74,7 +73,7 @@ async def test_managed_stop_refusal_keeps_automation_unknown_and_followers_queue
 
     monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
     try:
-        admit_session_input(db, epoch=authority.epoch, principal_id='automation:route', session_id='s',
+        db.admissions.admit(epoch=authority.epoch, principal_id='automation:route', session_id='s',
                             request_id='managed-automation', payload={'text': 'work', 'local_automation_v1': {}})
         authority._schedule(REF)
         await async_wait_until(lambda: (tmp_path / 'spawned.json').exists(), timeout=30, what='real managed background job')
@@ -85,7 +84,7 @@ async def test_managed_stop_refusal_keeps_automation_unknown_and_followers_queue
         await asyncio.wait_for(authority.sessions['s'].task, 20)
         await _submit(authority, 'later-input')
         await asyncio.wait_for(authority.sessions['s'].task, 20)
-        statuses = {r['request_id']: r['status'] for r in list_session_admissions(db, session_id='s')}
+        statuses = {r.request_id: r.status for r in db.admissions.list(session_id='s')}
         assert statuses == {'managed-automation': 'unknown', 'follower': 'queued', 'later-input': 'queued'}
         assert executed == ['managed-automation']
         assert process_stop_pending(db, 's') is not None

@@ -4,7 +4,7 @@ from dataclasses import replace
 import json
 import pytest
 from gateway.session_ancillary import process_stop_pending, retry_process_stop
-from hermes_state_runtime import list_session_admissions
+from gateway.session_authority import admission_row
 from tests.gateway.test_native_stop_completion_delivery import owner_with_completion
 from tests.gateway.test_native_stop_reconciliation import caller, stop
 
@@ -27,18 +27,18 @@ async def test_withdrawal_refusal_survives_owner_reload(tmp_path, monkeypatch):
         monkeypatch.setattr(session_automation, '_withdraw', refused)
         response = await stop(caller(authority, actor), ref)
         assert response['error']['data']['reason'] == 'process_stop_unknown'
-        assert process_stop_pending(authority.db, ref.session_id) is not None
+        assert process_stop_pending(authority.persistence, ref.session_id) is not None
         assert registry.is_completion_consumed(own.id)
         monkeypatch.setattr(session_automation, '_withdraw', withdraw)
         # Recreate the native process-local registry and initialize a new authority epoch.
         monkeypatch.setattr(module, 'process_registry', module.ProcessRegistry())
         old_epoch = authority.epoch
         authority = await initialize_session_authority(runner, profile_id=authority.profile_id,
-                                                       instance_id='review-restarted-owner', db=authority.db)
+                                                       instance_id='review-restarted-owner', persistence=authority.persistence)
         assert authority.epoch != old_epoch
         await authority.resolve(actor, ref)
         assert await retry_process_stop(authority, ref)
-        assert process_stop_pending(authority.db, ref.session_id) is None
+        assert process_stop_pending(authority.persistence, ref.session_id) is None
         executed = []
         async def execute(owner, target, row):
             executed.append(row['request_id'])
@@ -47,17 +47,17 @@ async def test_withdrawal_refusal_survives_owner_reload(tmp_path, monkeypatch):
         monkeypatch.setattr(SessionAuthority, '_schedule', schedule)
         authority._schedule(ref)
         await asyncio.wait_for(authority.sessions[ref.session_id].task, 10)
-        rows = list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)
+        rows = [admission_row(r) for r in authority.persistence.admissions.list(session_id=ref.session_id, pending_only=False)]
         completion = next(row for row in rows if row['principal_id'].startswith('automation:'))
         evidence = {'old_epoch': old_epoch, 'new_epoch': authority.epoch, 'executed': executed,
                     'completion_status': completion['status'], 'completion_outcome': completion['outcome'],
-                    'stop_fence': process_stop_pending(authority.db, ref.session_id)}
+                    'stop_fence': process_stop_pending(authority.persistence, ref.session_id)}
         print(json.dumps(evidence))
         assert executed == ['human-follower'], evidence
         assert (completion['status'], completion['outcome']) == ('terminal', 'cancelled'), completion
     finally:
         await runner._cancel_process_completion_batch_tasks()
-        authority.db.close()
+        authority.persistence.close()
 
 
 @pytest.mark.asyncio
@@ -80,14 +80,14 @@ async def test_ready_completion_stays_consumed_after_owner_reload(tmp_path, monk
             monkeypatch.setattr(results, 'atomic_json_write', refused)
             response = await stop(caller(authority, actor), ref)
             assert response['error']['data']['reason'] == 'process_stop_unknown'
-            assert process_stop_pending(authority.db, ref.session_id) is not None
+            assert process_stop_pending(authority.persistence, ref.session_id) is not None
             monkeypatch.setattr(results, 'atomic_json_write', write)
         else:
             assert 'result' in await stop(caller(authority, actor), ref)
         monkeypatch.setattr(module, 'process_registry', module.ProcessRegistry())
         previous_epoch = authority.epoch
         authority = await initialize_session_authority(runner, profile_id=authority.profile_id,
-            instance_id='reloaded-ready-completion', db=authority.db)
+            instance_id='reloaded-ready-completion', persistence=authority.persistence)
         assert authority.epoch != previous_epoch
         await authority.resolve(actor, ref)
         # Recovery can still be collecting the original output after the old
@@ -100,7 +100,7 @@ async def test_ready_completion_stays_consumed_after_owner_reload(tmp_path, monk
             assert restored._result_complete
             assert restored._result_persisted_generation == restored.ownership_generation
         assert await retry_process_stop(authority, ref)
-        assert process_stop_pending(authority.db, ref.session_id) is None
+        assert process_stop_pending(authority.persistence, ref.session_id) is None
         assert module.process_registry.is_completion_consumed(own.id)
         # A retiring reader may publish a snapshot captured before Stop. Its
         # normal native result write cannot unconsume the committed completion.
@@ -108,7 +108,7 @@ async def test_ready_completion_stays_consumed_after_owner_reload(tmp_path, monk
         assert module.process_registry.is_completion_consumed(own.id)
         assert await runner._enqueue_process_completion_notification(original_output, event) is None
         assert not any(row['principal_id'].startswith('automation:') for row in
-            list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False))
+            [admission_row(r) for r in authority.persistence.admissions.list(session_id=ref.session_id, pending_only=False)])
         retained = results.load_completed_results(owns_entry=lambda row: row['id'] == own.id, strict=True)[own.id]
         assert retained.output_buffer == original_output and retained.exit_code == original_exit
         executed = []
@@ -122,4 +122,4 @@ async def test_ready_completion_stays_consumed_after_owner_reload(tmp_path, monk
         assert executed == ['human-follower']
     finally:
         await runner._cancel_process_completion_batch_tasks()
-        authority.db.close()
+        authority.persistence.close()

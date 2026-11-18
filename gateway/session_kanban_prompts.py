@@ -10,7 +10,8 @@ import logging
 from pathlib import Path
 import sqlite3
 
-from hermes_state_runtime import RuntimeStoreError, get_session_admission
+from gateway.session_persistence import authority_persistence
+from persistence.core.errors import AuthorityRefusal
 
 
 async def consumer(authority, context, admission_id=None):
@@ -32,16 +33,17 @@ async def consumer(authority, context, admission_id=None):
         candidate = await asyncio.to_thread(callback, card)
         if candidate is None or admission_id is not None and candidate != admission_id:
             continue
-        row = get_session_admission(authority.db, admission_id=candidate)
+        from gateway.session_authority import admission_row
+        row = admission_row(await asyncio.to_thread(authority_persistence(authority).admissions.get, admission_id=candidate))
         if (row is None or row['status'] == 'unknown' or not row['payload'].get('native_text_v1')):
-            raise RuntimeStoreError('invalid_kanban_prompt_consumer')
+            raise AuthorityRefusal('invalid_kanban_prompt_consumer')
         sid = authority.logical_owner(row['target_session_id'])
         source = restore_native_source(row['payload'], authority.runner)
         if authority.runner._adapter_for_source(source) is not adapter:
-            raise RuntimeStoreError('invalid_kanban_prompt_consumer')
+            raise AuthorityRefusal('invalid_kanban_prompt_consumer')
         envelope = row['payload']['native_text_v1']
         if envelope['event'].get('structured_control') or not envelope['source'].get('user_id') or envelope['source'].get('is_bot'):
-            raise RuntimeStoreError('invalid_kanban_prompt_consumer')
+            raise AuthorityRefusal('invalid_kanban_prompt_consumer')
         await check_native_route(authority.runner, row['payload'],
                                  authority.physical_target(SessionRef(authority.profile_id, sid)), source, adapter)
         await asyncio.to_thread(current)  # Stop during provider/route reauthorization wins.
@@ -63,7 +65,7 @@ async def require_consumer(authority, policy):
     admission_id = context.get('prompt_consumer_admission_id')
     bound = await consumer(authority, context, admission_id) if admission_id else None
     if bound is None or bound[0] != admission_id:
-        raise RuntimeStoreError('kanban_prompt_consumer_unavailable')
+        raise AuthorityRefusal('kanban_prompt_consumer_unavailable')
     return bound
 
 
@@ -91,10 +93,10 @@ async def deliver(authority, ref, row, policy, worker, frame):
     with authority.sessions[ref.session_id].event_stream.lock:
         authority.check_approval_generation(ref.session_id, row['generation'])
         if len(controls.remote_responders) >= 16 or frame['prompt_id'] in controls.pending:
-            raise RuntimeStoreError('worker_control_backpressure')
+            raise AuthorityRefusal('worker_control_backpressure')
         with clarify._lock:
             if frame['prompt_id'] in clarify._entries:
-                raise RuntimeStoreError('invalid_worker_frame')
+                raise AuthorityRefusal('invalid_worker_frame')
             entry = clarify.register(frame['prompt_id'], route, frame['question'], frame['choices'], frame['multi_select'])
         entry.producer = {'session_id': ref.session_id, 'generation': row['generation'],
                           'admission_id': row['admission_id'], 'consumer_admission_id': consumer_id}
@@ -162,7 +164,7 @@ def validate_frame(frame):
             or not isinstance(frame['prompt_id'], str) or not frame['prompt_id']
             or not isinstance(frame['question'], str) or not isinstance(frame['choices'], list)
             or any(not isinstance(c, str) for c in frame['choices']) or type(frame['multi_select']) is not bool):
-        raise RuntimeStoreError('invalid_worker_frame')
+        raise AuthorityRefusal('invalid_worker_frame')
 
 
 async def dispatch_prompt_frame(authority, ref, row, policy, worker, frame):

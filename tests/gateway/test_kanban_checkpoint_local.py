@@ -12,10 +12,12 @@ from gateway.session_local import LocalSessionAdapter
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
-from hermes_state import SessionDB
 from hermes_cli.web_routers.sessions import _project_for_display
 from gateway.session_controls import display_projection
-from hermes_state_checkpoint import persist_local_checkpoint
+from persistence.conversation.messages import ConversationRequest, TranscriptRead
+from tests.fixtures.storage_read import conversation, transcript_rows
+from tests.fixtures.storage_seed import seed_session
+from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 
 def test_canonical_desktop_stream_gets_exact_checkpoint_without_model(tmp_path, monkeypatch):
@@ -37,9 +39,9 @@ def test_canonical_desktop_stream_gets_exact_checkpoint_without_model(tmp_path, 
     live = SimpleNamespace(source=source, event_stream=SessionEvents())
     seen = []
     live.event_stream.observers.add(lambda frame: seen.append(frame))
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.create_session("local-session", "local")
-    authority = SimpleNamespace(sessions={"local-session": live}, runner=None, db=db)
+    db = storage_handle(tmp_path)
+    seed_session(db, "local-session", "local")
+    authority = SimpleNamespace(sessions={"local-session": live}, runner=None, persistence=db)
     adapter = LocalSessionAdapter(authority)
     adapter.register_source(source)
     runner = SimpleNamespace(_kanban_sub_op=Mock(return_value=True),
@@ -61,16 +63,15 @@ def test_canonical_desktop_stream_gets_exact_checkpoint_without_model(tmp_path, 
     # must remain in the originating conversation's stored display history.
     live.event_stream = SessionEvents()
     db.close()
-    reopened = SessionDB(db_path=tmp_path / "state.db")
-    stored = display_projection(reopened.get_messages("local-session"), None)
+    reopened = storage_handle(tmp_path)
+    stored = display_projection(transcript_rows(reopened, "local-session"), None)
     assert [row["text"] for row in stored if row.get("display_kind") == "kanban_checkpoint"] == [body]
-    desktop = _project_for_display(reopened.get_messages("local-session"))
+    desktop = _project_for_display(transcript_rows(reopened, "local-session"))
     assert [(row["role"], row["content"]) for row in desktop
             if row.get("display_kind") == "kanban_checkpoint"] == [("system", body)]
-    model_history, _ = reopened.get_resume_conversations("local-session")
+    model_history = [m.as_openai_message() for m in reopened.messages.read_resume_conversations("local-session").model]
     assert all(body not in str(row.get("content")) for row in model_history)
-    assert all(body not in str(row.get("content")) for row in
-               reopened.get_messages_as_conversation("local-session"))
+    assert all(body not in str(row.get("content")) for row in conversation(reopened, "local-session"))
     reopened.close()
 
 
@@ -86,9 +87,9 @@ def test_canonical_desktop_without_viewer_retries_when_viewer_attaches(tmp_path,
 
     source = SessionSource(platform=Platform.LOCAL, chat_id="local-later", user_id="person")
     live = SimpleNamespace(source=source, event_stream=SessionEvents())
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.create_session("local-later", "local")
-    adapter = LocalSessionAdapter(SimpleNamespace(sessions={"local-later": live}, runner=None, db=db))
+    db = storage_handle(tmp_path)
+    seed_session(db, "local-later", "local")
+    adapter = LocalSessionAdapter(SimpleNamespace(sessions={"local-later": live}, runner=None, persistence=db))
     adapter.register_source(source)
 
     def sub_op(_board, action, sub, **kwargs):
@@ -120,7 +121,7 @@ def test_canonical_desktop_without_viewer_retries_when_viewer_attaches(tmp_path,
     live.event_stream.observers.add(lambda frame: seen.append(frame))
     assert attempt() is True
     assert len(seen) == 1
-    assert len([row for row in db.get_messages("local-later")
+    assert len([row for row in transcript_rows(db, "local-later")
                 if row.get("display_kind") == "kanban_checkpoint"]) == 1
     replay = live.event_stream.since(live.event_stream.epoch, 0)
     checkpoints = [frame for frame in replay["events"] if frame["type"] == "notification.show"]
@@ -128,33 +129,33 @@ def test_canonical_desktop_without_viewer_retries_when_viewer_attaches(tmp_path,
 
 
 def test_checkpoint_retry_after_compression_keeps_one_display_row(tmp_path):
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.create_session("origin", "local")
+    db = storage_handle(tmp_path)
+    seed_session(db, "origin", "local")
     key = "kanban-checkpoint:default:task:9"
-    first = persist_local_checkpoint(db, "origin", key, "## Progress\n\nVerified.",
-                                     board="default", task_id="task")
-    db.end_session("origin", "compression")
-    db.create_session("continuation", "local", parent_session_id="origin")
-    assert db.resolve_resume_session_id("origin") == "continuation"
-    assert persist_local_checkpoint(db, "origin", key, "## Progress\n\nVerified.",
-                                    board="default", task_id="task") == first
-    assert len([row for row in db.get_messages("continuation", include_ancestors=True)
+    first = db.messages.append_display_checkpoint("origin", key, "## Progress\n\nVerified.",
+                                                  board="default", task_id="task")
+    db.sessions.end("origin", "compression")
+    seed_session(db, "continuation", "local", parent_session_id="origin")
+    assert db.lineage.resolve_resume_target("origin") == "continuation"
+    assert db.messages.append_display_checkpoint("origin", key, "## Progress\n\nVerified.",
+                                                 board="default", task_id="task") == first
+    assert len([row for row in transcript_rows(db, "continuation", TranscriptRead(include_lineage=True))
                 if row.get("display_kind") == "kanban_checkpoint"]) == 1
 
 
 def test_local_checkpoint_storage_failure_is_known_unsent(tmp_path):
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.create_session("origin", "local")
+    db = storage_handle(tmp_path)
+    seed_session(db, "origin", "local")
     source = SessionSource(platform=Platform.LOCAL, chat_id="origin", user_id="person")
     live = SimpleNamespace(source=source, event_stream=SessionEvents())
     live.event_stream.observers.add(lambda _frame: None)
-    adapter = LocalSessionAdapter(SimpleNamespace(sessions={"origin": live}, runner=None, db=db))
+    adapter = LocalSessionAdapter(SimpleNamespace(sessions={"origin": live}, runner=None, persistence=db))
     adapter.register_source(source)
     metadata = {"kanban_checkpoint_event_id": 7, "kanban_checkpoint_task_id": "task",
                 "kanban_checkpoint_board": "default"}
-    with patch("hermes_state_checkpoint.persist_local_checkpoint", side_effect=OSError("scratch disk refused")):
+    with patch.object(type(db.messages), "append_display_checkpoint", side_effect=OSError("scratch disk refused")):
         result = asyncio.run(adapter.send("origin", "Visible progress", metadata=metadata))
     assert result.success is False
     assert live.event_stream.sequence == 0
-    assert db.get_messages("origin") == []
+    assert transcript_rows(db, "origin") == []
     assert asyncio.run(adapter.send("origin", "Visible progress", metadata=metadata)).success is True

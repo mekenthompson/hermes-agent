@@ -7,7 +7,8 @@ import sys
 import psutil
 import pytest
 
-from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+from persistence.core.errors import AuthorityRefusal
+from gateway.session_authority import admission_row
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit
 from tests.waiting import async_wait_until, wait_until
 
@@ -89,7 +90,7 @@ async def test_native_job_scope_quiesces_detached_children_before_fifo(
         try:
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
             first_stop = 'quiescent'
-        except RuntimeStoreError as error:
+        except AuthorityRefusal as error:
             assert error.reason == 'process_stop_unknown'
             first_stop = 'unknown_pending'
             assert process_stop_pending(db, 's') and executed == []
@@ -154,13 +155,13 @@ async def test_old_unscoped_local_job_remains_unknown(tmp_path, monkeypatch, pri
         assert not own.native_job_scope and not own.systemd_unit and live(child)
         if reload_registry:
             monkeypatch.setattr(module, 'process_registry', module.ProcessRegistry())
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
         await _submit(authority, 'held human')
         await asyncio.wait_for(authority.sessions['s'].task, 10)
         assert not executed and live(child) and process_stop_pending(db, 's')
         assert own.id in {row['session_id'] for row in json.loads(module._checkpoint_path().read_text())}
-        assert list_session_admissions(db, session_id='s')[0]['status'] == 'queued'
+        assert admission_row(db.admissions.list(session_id='s')[0])['status'] == 'queued'
     finally:
         release.touch()
         if child is not None and live(child):
@@ -206,7 +207,7 @@ async def test_default_grace_unknown_reconciles_on_next_human_input_without_repl
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
             outcome = 'quiescent'
             assert job_quiescent(own) and process_stop_pending(db, 's') is None
-        except RuntimeStoreError as error:
+        except AuthorityRefusal as error:
             assert error.reason == 'process_stop_unknown'
             outcome = 'unknown_pending'
             assert process_stop_pending(db, 's')

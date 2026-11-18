@@ -11,7 +11,8 @@ from pathlib import Path
 import sys
 
 from gateway.session_busy_controls import authorize
-from hermes_state_runtime import RuntimeStoreError
+from gateway.session_persistence import authority_persistence
+from persistence.core.errors import AuthorityRefusal
 
 
 _SUBAGENT_FIELDS = (
@@ -20,40 +21,25 @@ _SUBAGENT_FIELDS = (
 )
 _TAIL_BYTES = 16384
 _PROCESS_TAIL_CHARS = 32768  # main's dock tail view (cli_process_dock.process_tail)
-_PROCESS_STOP_PREFIX = 'gateway.process_stop.v1:'
-
-
-def process_stop_pending(db, session_id):
+def process_stop_pending(store, session_id):
     """Native cleanup status only; process ownership remains in the existing registry."""
-    return db.get_meta(_PROCESS_STOP_PREFIX + session_id)
+    return store.admissions.process_stop_pending(session_id)
 
 
-def record_process_stop(authority, ref, generation, *, cursor=None):
-    from hermes_state_runtime import _epoch
-    token = f'{authority.epoch}:{generation}'
-    def write(conn):
-        _epoch(conn, authority.epoch)
-        pending = conn.execute('SELECT value FROM state_meta WHERE key=?',
-                               (_PROCESS_STOP_PREFIX + ref.session_id,)).fetchone()
-        if pending is not None:
-            return pending[0]
-        authority.db.set_meta(_PROCESS_STOP_PREFIX + ref.session_id, token, cursor=conn)
-        return token
-    return write(cursor) if cursor is not None else authority.db._execute_write(write)
+def record_process_stop(authority, ref, generation):
+    """Persist the session's process-Stop fence (first writer wins); returns the pending token."""
+    return authority_persistence(authority).admissions.record_process_stop(
+        epoch=authority.epoch, session_id=ref.session_id, generation=generation)
 
 
 def clear_process_stop(authority, ref, token):
-    from hermes_state_runtime import _epoch
-    def write(conn):
-        _epoch(conn, authority.epoch)
-        conn.execute('DELETE FROM state_meta WHERE key=? AND value=?',
-                     (_PROCESS_STOP_PREFIX + ref.session_id, token))
-    authority.db._execute_write(write)
+    authority_persistence(authority).admissions.clear_process_stop(
+        epoch=authority.epoch, session_id=ref.session_id, token=token)
 
 
 async def retry_process_stop(authority, ref, agent=None):
     """Reconcile a failed/unfinished Stop before any FIFO handoff, including after reload."""
-    token = process_stop_pending(authority.db, ref.session_id)
+    token = await asyncio.to_thread(process_stop_pending, authority_persistence(authority), ref.session_id)
     if token is None:
         return True
     from gateway.session_authorities import owner_scope
@@ -68,7 +54,7 @@ async def retry_process_stop(authority, ref, agent=None):
         try:
             if not await interrupt_processes(authority, ref, agent):
                 return False
-        except RuntimeStoreError as exc:
+        except AuthorityRefusal as exc:
             if exc.reason != 'process_stop_unknown':
                 raise
             # Unproved process ownership is the same cleanup refusal as False,
@@ -83,7 +69,7 @@ def _observe_process_stop_completion(authority, ref, agent=None):
     from contextvars import copy_context
     from hermes_constants import get_hermes_home, hermes_home_key
     from tools.process_registry_handoff import observe_completion
-    token = process_stop_pending(authority.db, ref.session_id)
+    token = process_stop_pending(authority_persistence(authority), ref.session_id)
     live = authority.sessions.get(ref.session_id)
     if token is None or live is None:
         return
@@ -93,7 +79,7 @@ def _observe_process_stop_completion(authority, ref, agent=None):
         # Existing per-control dedup handles that immediate-ready observation.
         registry, scopes = _process_targets(authority, ref, agent, subagent_records(agent), select=lambda p: True)
         generation = authority._handle(ref).execution_generation
-    except (RuntimeStoreError, OSError):
+    except (AuthorityRefusal, OSError):
         return  # The durable fence remains; a later native control can recover.
     loop, context = asyncio.get_running_loop(), copy_context()
     home = hermes_home_key(get_hermes_home())
@@ -115,7 +101,6 @@ def _wake_process_stop_completion(authority, ref, live, registry, process_id, ex
     import sqlite3
     from gateway.session_authorities import owner_scope
     from hermes_constants import get_hermes_home, hermes_home_key
-    from hermes_state_runtime import _epoch
     from tools.process_registry_handoff import ownership_identity
     from tools.process_registry_job import job_quiescent
     epoch, generation, token, _instance = observation
@@ -125,9 +110,9 @@ def _wake_process_stop_completion(authority, ref, live, registry, process_id, ex
                     or authority.retiring or authority.runner._draining or authority.sessions.get(ref.session_id) is not live
                     or hermes_home_key(get_hermes_home()) != home):
                 return
-            with authority.db._read_ctx(reopen=False) as conn:
-                _epoch(conn, epoch)
-            if (process_stop_pending(authority.db, ref.session_id) != token
+            store = authority_persistence(authority)
+            store.admissions.check_epoch(epoch=epoch, reopen=False)
+            if (process_stop_pending(store, ref.session_id) != token
                     or authority._handle(ref).execution_generation != generation
                     or getattr(sys.modules.get('tools.process_registry'), 'process_registry', None) is not registry):
                 return
@@ -144,7 +129,7 @@ def _wake_process_stop_completion(authority, ref, live, registry, process_id, ex
                     authority, ref, live, registry, process_id, expected, observation, home))
             else:
                 authority._schedule(ref)
-    except (RuntimeStoreError, OSError, sqlite3.Error):
+    except (AuthorityRefusal, OSError, sqlite3.Error):
         return  # Unknown ownership/storage cannot release the fence or execute queued work.
 
 
@@ -213,9 +198,9 @@ async def subagent_control(connection, ref, params, *, steer):
     fields = {'session_id', 'profile', 'subagent_id'} | ({'text'} if steer else set())
     if (set(params) - fields or not ref.session_id or any(not isinstance(params.get(k), str) or not params[k]
                                                            for k in fields - {'profile'})):
-        raise RuntimeStoreError('invalid_params')
+        raise AuthorityRefusal('invalid_params')
     if ref.session_id not in connection.authority.sessions:
-        raise RuntimeStoreError('not_found')
+        raise AuthorityRefusal('not_found')
     authorize(connection, ref, params, 'session:control')
     live, sub = connection.authority.sessions[ref.session_id], params['subagent_id']
     with live.event_stream.lock:
@@ -238,10 +223,10 @@ async def show_tools(connection, ref, params):
     session's toolsets, pre tool_search assembly), resolved in the owner, where the MCP and plugin
     tools live. Rows carry the first description sentence, grouped by toolset."""
     if set(params) - {'session_id', 'profile'} or not isinstance(ref.session_id, str) or not ref.session_id:
-        raise RuntimeStoreError('invalid_params')
+        raise AuthorityRefusal('invalid_params')
     authority = connection.authority
     if ref.session_id not in authority.sessions:
-        raise RuntimeStoreError('not_found')
+        raise AuthorityRefusal('not_found')
     authorize(connection, ref, params, 'session:read')
     from gateway.session_authorities import owner_scope
     from gateway.session_policy import policy_for_source
@@ -282,10 +267,10 @@ async def reload_skills(connection, ref, params):
     whose skill-command map serves this session's skill and bundle invocations. The CLI renders
     main's lines from ``result`` and queues main's next-turn note itself."""
     if set(params) - {'session_id', 'profile'} or not isinstance(ref.session_id, str) or not ref.session_id:
-        raise RuntimeStoreError('invalid_params')
+        raise AuthorityRefusal('invalid_params')
     authority = connection.authority
     if ref.session_id not in authority.sessions:
-        raise RuntimeStoreError('not_found')
+        raise AuthorityRefusal('not_found')
     authorize(connection, ref, params, 'session:control')
     from gateway.session_authorities import owner_scope
     from gateway.session_policy import policy_for_source, policy_scope
@@ -319,17 +304,17 @@ async def attach_file(connection, ref, params):
     if (set(params) - {'session_id', 'profile', 'path', 'data_url', 'name', 'staged_upload'} or not ref.session_id
             or any(not isinstance(value, str) for key, value in params.items() if key != 'staged_upload')
             or (staged_upload is not None and not isinstance(staged_upload, dict))):
-        raise RuntimeStoreError('invalid_params')
+        raise AuthorityRefusal('invalid_params')
     if ref.session_id not in connection.subscriptions:
-        raise RuntimeStoreError('permission_denied')
+        raise AuthorityRefusal('permission_denied')
     authorize(connection, ref, params, 'session:submit')
     if staged_upload is not None and not _reachable_upload_home(connection, staged_upload.get('profile_home')):
-        raise RuntimeStoreError('permission_denied')
+        raise AuthorityRefusal('permission_denied')
     from gateway.session_policy import policy_for_source
     authority = connection.authority
     policy = policy_for_source(authority.runner, authority.sessions[ref.session_id].source)
     if policy is None:
-        raise RuntimeStoreError('permission_denied')
+        raise AuthorityRefusal('permission_denied')
     # The staging helpers are bound onto the sidecar module's globals (method_ctx.bind_module).
     from tui_gateway import server
     session = {'cwd': policy.cwd, 'profile_home': authority.profile_id}
@@ -344,9 +329,9 @@ async def attach_file(connection, ref, params):
     try:
         stored, uploaded = await asyncio.to_thread(stage)
     except (ValueError, OverflowError) as exc:
-        raise RuntimeStoreError('invalid_params') from exc
+        raise AuthorityRefusal('invalid_params') from exc
     except OSError as exc:
-        raise RuntimeStoreError('storage_unavailable') from exc
+        raise AuthorityRefusal('storage_unavailable') from exc
     ref_path = server._attachment_ref_path(session, stored)
     return {'attached': True, 'name': stored.name, 'path': str(stored), 'ref_path': ref_path,
             'ref_text': f'@file:{server._format_ref_value(ref_path)}', 'uploaded': uploaded}
@@ -378,10 +363,10 @@ async def approvals(connection, ref, params, *, ack=False):
     fields = {'session_id', 'profile'} | ({'request_id'} if ack else set())
     if (set(params) - fields or not isinstance(ref.session_id, str) or not ref.session_id
             or (ack and (not isinstance(params.get('request_id'), str) or not params['request_id']))):
-        raise RuntimeStoreError('invalid_params')
+        raise AuthorityRefusal('invalid_params')
     authority = connection.authority
     if ref.session_id not in authority.sessions:
-        raise RuntimeStoreError('not_found')
+        raise AuthorityRefusal('not_found')
     authorize(connection, ref, params, 'session:read')
     live = authority.sessions[ref.session_id]
     with live.event_stream.lock:
@@ -400,11 +385,11 @@ async def read(connection, ref, params, *, kind):
     if (set(params) - fields or not isinstance(ref.session_id, str) or not ref.session_id
             or (kind == 'tail' and (not isinstance(params.get('subagent_id'), str)
                                    or not params['subagent_id']))):
-        raise RuntimeStoreError('invalid_params')
+        raise AuthorityRefusal('invalid_params')
     authority = connection.authority
     # Cold adoption belongs to session.resume, never an ancillary poll.
     if ref.session_id not in authority.sessions:
-        raise RuntimeStoreError('not_found')
+        raise AuthorityRefusal('not_found')
     authorize(connection, ref, params, 'session:read')
     # In a worker thread (it inherits the dispatch's owner scope): the projection takes the session's
     # event lock, which every streamed token takes too, reads state.db (compression lineage, local
@@ -425,7 +410,7 @@ def locked_projection(authority, live, ref, project):
             # on the loop without this lock): the projection re-indexes the map, and a popped session is
             # not_found.
             if authority.sessions.get(ref.session_id) is not live:
-                raise RuntimeStoreError('not_found') from None
+                raise AuthorityRefusal('not_found') from None
             raise
 
 
@@ -448,7 +433,7 @@ def _owned_targets(connection, ref, params, *, select):
     ``select(process)`` keeps; ``(None, [])`` when no process was ever registered here."""
     authority = connection.authority
     if ref.session_id not in authority.sessions:
-        raise RuntimeStoreError('not_found')
+        raise AuthorityRefusal('not_found')
     authorize(connection, ref, params, 'session:control')
     live = authority.sessions[ref.session_id]
     with live.event_stream.lock:
@@ -464,7 +449,7 @@ def _process_targets(authority, ref, agent, records, *, select):
     registry = module.process_registry
     from tools.process_registry_handoff import ownership_identity
     if not registry.refresh_ownership():
-        raise RuntimeStoreError('process_stop_unknown')
+        raise AuthorityRefusal('process_stop_unknown')
     keys, owners, parents = _ownership(authority, ref, agent, records)
     with registry._lock:
         return registry, {p.id: ownership_identity(p) for p in _owned_locked(registry, keys, owners, parents) if select(p)}
@@ -539,15 +524,15 @@ async def kill_process(connection, ref, params):
     session up in its own table, which never holds an authority session."""
     if (set(params) - {'session_id', 'process_id', 'profile'} or not ref.session_id
             or not isinstance(params.get('process_id'), str) or not params['process_id']):
-        raise RuntimeStoreError('invalid_params')
+        raise AuthorityRefusal('invalid_params')
     registry, ids = _owned_targets(connection, ref, params, select=lambda p: p.id == params['process_id'])
     if not ids:
         # Never ``not_found``: Desktop reads that reason as "this chat is gone" (dokterdok N64).
-        raise RuntimeStoreError('process_not_found')
+        raise AuthorityRefusal('process_not_found')
     pid = next(iter(ids))
     result = await asyncio.to_thread(registry.kill_process, pid, expected_ownership=ids[pid])
     if result.get('status') == 'ownership_changed':
-        raise RuntimeStoreError('process_not_found')
+        raise AuthorityRefusal('process_not_found')
     return result
 
 
@@ -561,9 +546,9 @@ async def reload_mcp(connection, ref, params):
     generation), else ``unavailable`` beside the success. A call naming ``rev``, the revision the session
     already holds, is that same nothing-left-to-load, answered as success with ``loaded_rev``."""
     if set(params) - {'session_id', 'confirm', 'rev', 'profile'}:
-        raise RuntimeStoreError('invalid_params')
+        raise AuthorityRefusal('invalid_params')
     if 'session:control' not in connection.actor.capabilities:
-        raise RuntimeStoreError('permission_denied')
+        raise AuthorityRefusal('permission_denied')
     if params.get('confirm') is not True:
         return {'status': 'confirm_required', 'message': 'Reloading MCP refreshes every chat of this profile.'}
     from tools.mcp_oauth import suppress_interactive_oauth
@@ -587,8 +572,8 @@ async def reload_mcp(connection, ref, params):
     # ``reloaded`` retrying a parked server at poll rate with no way to close the handshake (#141769).
     if (failed and session != 'applied' and not (result.get('removed') or result['added'])
             and params.get('rev') != held_rev):
-        raise RuntimeStoreError('mcp_servers_unavailable', field='mcp_servers',
-                                detail=f'did not connect: {", ".join(failed)}')
+        raise AuthorityRefusal('mcp_servers_unavailable', field='mcp_servers',
+                               detail=f'did not connect: {", ".join(failed)}')
     changed = ', '.join(f'{k}: {", ".join(v)}' for k, v in result.items() if v) or 'no server changes'
     note = {'applied': '; this chat\'s tools changed for its next turn',
             'busy': '; this chat is busy: its new tools apply once the turn finishes and reload runs again '
@@ -629,9 +614,9 @@ def _session_servers(authority, sid, ready):
     a platform allowlist enabled, and one the policy names but that parked serves the chat nothing."""
     import json
     from gateway.session_policy import restore_policy
+    from gateway.session_persistence import authority_persistence
     from hermes_cli.tools_config import enabled_mcp_server_names
-    from hermes_state_local import local_receipt
-    policy = restore_policy(local_receipt(authority.db, sid)['policy'])
+    policy = restore_policy(authority_persistence(authority).bindings.receipt(sid).policy)
     return sorted(set(policy.toolsets) & enabled_mcp_server_names(json.loads(policy.config_json)) & set(ready))
 
 
@@ -647,7 +632,7 @@ async def _commit_session_mcp(connection, ref, params):
     from gateway.session_policy_refresh import commit_refresh
     try:
         return 'applied' if await commit_refresh(authority, ref, mcp_only=True) else 'unchanged'
-    except RuntimeStoreError as exc:
+    except AuthorityRefusal as exc:
         if exc.reason not in {'session_busy', 'unknown_execution', 'revision_conflict'}:
             raise
         return 'busy'
@@ -659,7 +644,7 @@ async def stop_processes(connection, ref, params):
     reached every chat, Desktop window and served profile (dokterdok N2). An explicit stop, so a
     ``persist_on_release`` job of THIS session is still reached (#41225)."""
     if set(params) - {'session_id', 'profile'} or not isinstance(ref.session_id, str) or not ref.session_id:
-        raise RuntimeStoreError('invalid_params')
+        raise AuthorityRefusal('invalid_params')
     registry, targets = _owned_targets(connection, ref, params,
                                        select=lambda p: not p.exited or p._scope_stop_pending)
 
@@ -690,7 +675,7 @@ def _require_current_route(authority, ref):
     with store._lock:
         entry = store._entries.get(live.route)
         if entry is None or entry.session_id != target:
-            raise RuntimeStoreError('stale_generation')
+            raise AuthorityRefusal('stale_generation')
 
 
 def _owner_objects(authority, ref, *, include_fallback_evicted=False):
@@ -699,11 +684,11 @@ def _owner_objects(authority, ref, *, include_fallback_evicted=False):
     answered with an empty success."""
     from gateway.session_managed_worker import managed_policy
     if managed_policy(authority, ref) is not None:
-        raise RuntimeStoreError('unsupported_projection')
+        raise AuthorityRefusal('unsupported_projection')
     agent = authority.agent(ref)
     session_id = physical_target(authority, ref) if include_fallback_evicted else None
     route = authority.sessions[ref.session_id].route if include_fallback_evicted else None
-    session_db = getattr(authority, 'db', None) if include_fallback_evicted else None
+    session_db = getattr(authority, 'persistence', None) if include_fallback_evicted else None
     return agent, subagent_records(
         agent, session_id=session_id, session_db=session_db, route=route,
         include_fallback_evicted=include_fallback_evicted)
@@ -713,8 +698,8 @@ def physical_target(authority, ref):
     from gateway.config import Platform
     source = authority.sessions[ref.session_id].source  # None: a history mount
     if source is not None and source.platform == Platform.LOCAL:
-        from hermes_state_local import local_receipt
-        return local_receipt(authority.db, ref.session_id)['entry']['session_id']
+        from gateway.session_persistence import authority_persistence
+        return authority_persistence(authority).bindings.receipt(ref.session_id).current_target
     return ref.session_id
 
 
@@ -728,16 +713,17 @@ def control_snapshot(authority, ref):
         _safe_goal_snapshot, _safe_loop_snapshot, _safe_heartbeat_snapshot,
         _snapshot_revision, _snapshot_updated_at,
     )
+    from gateway.session_persistence import authority_persistence
+    store = authority_persistence(authority)
     # Compression carries goal/loop/heartbeat to the continuation: read the current segment.
-    target = physical_target(authority, ref)
-    target = authority.db.get_compression_tip(target) or target
+    target = store.lineage.tip(physical_target(authority, ref))
     states = []
     for kind, cls in [('goal', GoalState), ('loop', LoopState), ('heartbeat', HeartbeatState)]:
-        raw = authority.db.get_meta(kind + ':' + target)
+        raw = store.state_meta.get(kind + ':' + target)
         try:
             states.append(cls.from_json(raw) if raw else None)
         except (ValueError, TypeError, AttributeError) as exc:
-            raise RuntimeStoreError('storage_unavailable') from exc
+            raise AuthorityRefusal('storage_unavailable') from exc
     goal_state, loop_state, heartbeat_state = states
     goal = _safe_goal_snapshot(goal_state)
     # Project the persisted barrier, not GoalManager.is_waiting(), which clears
@@ -795,12 +781,11 @@ def subagent_records(parent, session_id=None, *, session_db=None, route=None, in
 
 
 def _below_owned(record, owned, expected_db, registry):
-    """A worker of a child this roster already owns, in the same session database file. After a parent
+    """A worker of a child this roster already owns, in the same profile's store. After a parent
     rebuild or eviction the orchestrator is found by its durable owner id, but its worker's owner id names the
     orchestrator and its spawn ancestry runs through the old parent, so only the orchestrator links it."""
-    expected_path = getattr(expected_db, 'db_path', None)
-    child_path = getattr(getattr(record.get('agent'), '_session_db', None), 'db_path', None)
-    if expected_path is None or child_path is None or str(child_path) != str(expected_path):
+    expected = _store_key(expected_db)
+    if expected is None or _store_key(getattr(record.get('agent'), '_session_db', None)) != expected:
         return False
     return any(registry._is_descendant_of(record.get('agent'), r.get('agent')) for r in owned)
 
@@ -808,21 +793,40 @@ def _below_owned(record, owned, expected_db, registry):
 def _owned_by_lineage(record, target_sids, expected_db):
     """The read-only roster follows the conversation, as ``delegate_task(action="list")`` does: a
     child whose durable owner id is in this session's compression lineage, written to the same
-    session database file. Without it every cached-agent rebuild (``/reasoning``, ``/model``, a
+    profile's store. Without it every cached-agent rebuild (``/reasoning``, ``/model``, a
     policy refresh, idle eviction) hid still-running children from the dock while the status bar
     kept counting them. Control and tail stay pinned to the resident parent."""
     if not target_sids or record.get('owner_agent_session_id') not in target_sids:
         return False
-    expected_path = getattr(expected_db, 'db_path', None)
-    child_path = getattr(getattr(record.get('agent'), '_session_db', None), 'db_path', None)
-    return expected_path is not None and child_path is not None and str(child_path) == str(expected_path)
+    expected = _store_key(expected_db)
+    return expected is not None and _store_key(getattr(record.get('agent'), '_session_db', None)) == expected
+
+
+def _store_key(store):
+    """Which profile's store *store* (a storage interface handle or a SessionDB) writes, or None."""
+    from persistence_assembly import Persistence
+    if isinstance(store, Persistence):
+        return store.scope.hermes_home_key
+    path = getattr(store, 'db_path', None)
+    if path is None:
+        return None
+    from hermes_constants import hermes_home_key
+    return hermes_home_key(Path(path).parent)
 
 
 def _compression_lineage(db, session_id):
     """*session_id* plus the sessions it continues by compression, walked backward so a closed sibling under a compressed parent cannot divert the walk."""
     if not session_id:
         return frozenset()
+    from persistence_assembly import Persistence
     ids, current = {session_id}, session_id
+    if isinstance(db, Persistence):
+        row = db.sessions.get(current)
+        while row and db.lineage.is_compression_child(row) and row.parent_session_id not in ids and len(ids) < 200:
+            current = row.parent_session_id
+            ids.add(current)
+            row = db.sessions.get(current)
+        return frozenset(ids)
     is_child, get = getattr(db, '_is_compression_child_row', None), getattr(db, 'get_session', None)
     if callable(is_child) and callable(get):
         row = get(current)
@@ -864,7 +868,8 @@ def _ownership(authority, ref, agent, records):
     """Exact route plus native parent lineage; legacy unparented jobs retain raw-owner matching."""
     target = physical_target(authority, ref)
     keys, owners = {authority.sessions[ref.session_id].route, target}, {target, ref.session_id}
-    owners.update(_compression_lineage(authority.db, authority.db.get_compression_tip(target) or target))
+    store = authority_persistence(authority)
+    owners.update(_compression_lineage(store, store.lineage.tip(target) or target))
     parents = set(owners)
     if agent is not None:
         owners.add(getattr(agent, 'session_id', None))
@@ -892,7 +897,7 @@ def process_snapshot(authority, ref, agent, records):
     registry = module.process_registry
     keys, owners, parents = _ownership(authority, ref, agent, records)
     if not registry.refresh_ownership():
-        raise RuntimeStoreError('process_stop_unknown')
+        raise AuthorityRefusal('process_stop_unknown')
     # Keep ownership and output together.
     with registry._lock:
         return [{'session_id': p.id, 'command': p.command[:200],

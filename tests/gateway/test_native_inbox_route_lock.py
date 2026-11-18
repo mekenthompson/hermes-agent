@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from tests.gateway import test_native_inbound_retry as fixtures
+from tests.fixtures.storage_holder import raw_holder
 from tests.gateway import test_native_structured_stop as stop_fixtures
 
 no_bootstrap = fixtures.no_bootstrap
@@ -20,16 +21,16 @@ class NativeInboxRouteLockTests(unittest.IsolatedAsyncioTestCase):
     stop = stop_fixtures.NativeStructuredStopTests.stop
 
     async def asyncSetUp(self):
-        with patch('hermes_state_wal.resolve_journal_mode', return_value='delete'):
+        with patch('sqlite_support.resolve_journal_mode', return_value='delete'):
             await fixtures.NativeInboundRetryTests.asyncSetUp(self)
 
     async def test_base_input_commits_while_route_metadata_waits_for_database_writer(self):
         from tests.waiting import async_wait_until
 
         self.store.get_or_create_session(self.source)
-        self.assertIs(self.store._routing_db, self.authority.db)
+        self.assertIs(self.store._routing_persistence, self.authority.persistence)
         adapter, _phases, completed = self.base_adapter()
-        db = self.authority.db
+        db = raw_holder(self.authority.persistence)
         writer = threading.local()
         entered, metadata_locked = threading.Event(), threading.Event()
         violations, metadata_errors = [], []
@@ -39,7 +40,7 @@ class NativeInboxRouteLockTests(unittest.IsolatedAsyncioTestCase):
 
         def metadata():
             try:
-                self.assertIs(self.store._routing_db, db)
+                self.assertIs(self.store._routing_persistence, self.authority.persistence)
                 self.store.set_session_metadata(self.route, 'concurrent-marker', 'preserved')
             except BaseException as error:
                 metadata_errors.append(error)
@@ -97,29 +98,29 @@ class NativeInboxRouteLockTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.to_thread(concurrent.join, 5)
 
     async def test_route_stop_fence_survives_reset_and_excludes_other_routes(self):
-        from hermes_state_runtime import native_stop_watermark
+        
 
         await self.receive(self.stop('before-reset'))
         first = self.receipts[-1][1]
-        before = native_stop_watermark(self.authority.db, route=self.route)
+        before = self.authority.persistence.admissions.native_stop_watermark(route=self.route)
         self.assertGreater(before, 0)
         other = self.stop('other-route-stop')
         other.source = replace(self.source, chat_id='independent-chat')
         await self.receive(other)
-        self.assertEqual(native_stop_watermark(self.authority.db, route=self.route), before)
+        self.assertEqual(self.authority.persistence.admissions.native_stop_watermark(route=self.route), before)
         self.store.reset_session(self.route)
         await self.receive(self.stop('after-reset'))
         after = self.receipts[-1][1]
         self.assertNotEqual(after.ref.session_id, first.ref.session_id)
-        mark = native_stop_watermark(self.authority.db, route=self.route)
+        mark = self.authority.persistence.admissions.native_stop_watermark(route=self.route)
         self.assertGreater(mark, before)
-        self.assertEqual(native_stop_watermark(self.authority.db, first.ref.session_id), before)
+        self.assertEqual(self.authority.persistence.admissions.native_stop_watermark(session_id=first.ref.session_id), before)
         await self.receive(self.stop('before-reset'))
-        self.assertEqual(native_stop_watermark(self.authority.db, route=self.route), mark)
+        self.assertEqual(self.authority.persistence.admissions.native_stop_watermark(route=self.route), mark)
 
     async def test_first_capture_is_fenced_by_stop_before_any_route_existed(self):
         import gateway.session_envelope as envelope
-        from hermes_state_runtime import list_session_admissions
+        from tests.gateway.test_native_inbound_retry import list_session_admissions
 
         self.assertIsNone(self.store.lookup_by_session_key(self.route))
         entered, release = threading.Event(), threading.Event()
@@ -144,12 +145,12 @@ class NativeInboxRouteLockTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 release.set()
             self.assertEqual(await asyncio.wait_for(first, 5), (True, None))
-        rows = list_session_admissions(self.authority.db, session_id=ref.session_id, pending_only=False)
+        rows = list_session_admissions(self.authority, session_id=ref.session_id, pending_only=False)
         self.assertNotIn('before-first-stop', [row['request_id'] for row in rows])
         later = asyncio.create_task(self.receive(self.event('after-first-stop', 'Current status?')))
         try:
             await asyncio.wait_for(self.receipt_events.setdefault('after-first-stop', asyncio.Event()).wait(), 5)
-            rows = list_session_admissions(self.authority.db, session_id=ref.session_id, pending_only=False)
+            rows = list_session_admissions(self.authority, session_id=ref.session_id, pending_only=False)
             self.assertEqual(next(row for row in rows if row['request_id'] == 'after-first-stop')['status'], 'queued')
         finally:
             later.cancel()

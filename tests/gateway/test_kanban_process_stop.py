@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.session_kanban_stop import retire_previous_attempts
-from hermes_state_runtime import RuntimeStoreError
+from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit, _wire_turn_agent
 from tests.gateway.test_session_authority_preadopt_stop import Agent
 
@@ -18,15 +18,15 @@ from tests.gateway.test_session_authority_preadopt_stop import Agent
 @pytest.fixture
 def native_attempt(tmp_path, monkeypatch):
     from gateway import session_kanban_stop, session_policy
-    from hermes_state_local import local_receipt
+    from persistence_assembly import store_location
     from tools import process_registry as module
     db, authority = _authority(tmp_path, monkeypatch)
     context = {'db': str(tmp_path / 'board.db'), 'board': 'work', 'task_id': 'task', 'run_id': 2}
     prior = {**context, 'run_id': 1}
     monkeypatch.setattr(session_kanban_stop, 'previous_attempts', lambda _: [
-        {'db': str(db.db_path), 'session_id': 's', 'run_id': 1}])
+        {'db': str(store_location(db.scope)), 'session_id': 's', 'run_id': 1}])
     monkeypatch.setattr(session_kanban_stop, 'previous_workers_gone', lambda *a: True)
-    monkeypatch.setattr(sys.modules[local_receipt.__module__], 'local_receipt', lambda *a: {'policy': {}})
+    monkeypatch.setattr(authority.persistence.bindings, 'receipt', lambda *a: SimpleNamespace(policy={}))
     monkeypatch.setattr(session_policy, 'restore_policy', lambda _: SimpleNamespace(source='kanban', kanban_json=json.dumps(prior)))
     registry = module.ProcessRegistry()
     monkeypatch.setattr(module, 'process_registry', registry)

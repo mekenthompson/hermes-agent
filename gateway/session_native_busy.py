@@ -8,7 +8,12 @@ from functools import partial
 from types import SimpleNamespace
 
 from gateway.platforms.event import MessageType
-from hermes_state_runtime import RuntimeStoreError, cancel_session_input
+from gateway.session_persistence import authority_persistence
+from persistence.core.errors import AuthorityRefusal
+
+
+def _cancel(authority, admission_id):
+    return authority_persistence(authority).admissions.cancel(epoch=authority.epoch, admission_id=admission_id)
 
 
 @dataclass(frozen=True)
@@ -36,8 +41,9 @@ def prepare(authority, event):
     if generation is None or generation != adopted_generation or agent is None:
         return None
     from gateway.session_ancillary import process_stop_pending
+    store = authority_persistence(authority)
     if (authority.delivered_stops.get(session_id) == generation
-            or process_stop_pending(authority.db, session_id) is not None):
+            or process_stop_pending(store, session_id) is not None):
         return None  # later input stays queued; it must not steer the stopped generation
     approval = None
     if event.allow_gateway_control:
@@ -54,18 +60,17 @@ def prepare(authority, event):
                 approval = (verb, choice, ids)
             elif pending:
                 approval = ('unbound', '', ())  # no bare-route fallback
-    from hermes_state_runtime import native_stop_watermark
     return Prepared(session_id, route, generation, agent, authority.route_epoch(route),
-                    native_stop_watermark(authority.db, session_id), approval, event.text if approval else None)
+                    store.admissions.native_stop_watermark(session_id=session_id), approval,
+                    event.text if approval else None)
 
 
 def _current(authority, event, prepared):
-    from hermes_state_runtime import _epoch, native_stop_watermark
     authority._require_admission_open()
-    with authority.db._read_ctx() as conn:
-        _epoch(conn, authority.epoch)
+    store = authority_persistence(authority)
+    store.admissions.check_epoch(epoch=authority.epoch)
     return (authority.route_epoch(prepared.route) == prepared.stop_epoch
-            and native_stop_watermark(authority.db, prepared.session_id) == prepared.stop_sequence
+            and store.admissions.native_stop_watermark(session_id=prepared.session_id) == prepared.stop_sequence
             and authority.runner._is_user_authorized_for_source(event.source)
             and authority.delivered_stops.get(prepared.session_id) != prepared.generation)
 
@@ -75,22 +80,20 @@ async def apply(authority, event, receipt, prepared, fence):
     if prepared is None or receipt.ref.session_id != prepared.session_id:
         return
     from gateway.session_envelope import check_native_route, restore_native
-    from hermes_state_runtime import get_session_admission
-    row = get_session_admission(authority.db, admission_id=receipt.admission_id)
+    from gateway.session_authority import admission_row
+    row = admission_row(authority_persistence(authority).admissions.get(admission_id=receipt.admission_id))
     if row['payload']['native_text_v1']['route'] != prepared.route:
         return  # a changed admission route cannot borrow the captured running target
     event = restore_native(row['payload'], authority.runner)
     from gateway.session_runtime_workers import tracked_write
     if not _current(authority, event, prepared):
-        await tracked_write(authority, partial(cancel_session_input, authority.db,
-            epoch=authority.epoch, admission_id=receipt.admission_id))
+        await tracked_write(authority, partial(_cancel, authority, receipt.admission_id))
         return
     if fence is not None:
         try:
             fence()
-        except RuntimeStoreError:
-            await tracked_write(authority, partial(cancel_session_input, authority.db,
-                epoch=authority.epoch, admission_id=receipt.admission_id))
+        except AuthorityRefusal:
+            await tracked_write(authority, partial(_cancel, authority, receipt.admission_id))
             return
     # Recheck the committed sender's connector/route and current roles. The
     # caller may have changed any part of its event while the write was pending.

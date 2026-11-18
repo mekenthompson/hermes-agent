@@ -24,7 +24,7 @@ class NativeControlFrontdoorTests(unittest.IsolatedAsyncioTestCase):
     stop = stop_fixtures.NativeStructuredStopTests.stop
 
     async def test_base_rejects_malformed_control_before_any_inline_command_handler(self):
-        from hermes_state_runtime import RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal
         from gateway.platforms.event import MessageType
         adapter, _, _ = self.base_adapter()
         called = []
@@ -41,17 +41,17 @@ class NativeControlFrontdoorTests(unittest.IsolatedAsyncioTestCase):
                 event = self.stop()
                 for name, value in changes.items():
                     setattr(event, name, value)
-                with self.assertRaises(RuntimeStoreError) as refused:
+                with self.assertRaises(AuthorityRefusal) as refused:
                     await adapter.handle_message(event)
                 self.assertEqual(refused.exception.reason, 'invalid_params')
         self.assertEqual(called, [])
         self.assertEqual(self.receipts, [])
 
     async def test_authority_frontdoor_refuses_malformed_control_instead_of_command_fallback(self):
-        from hermes_state_runtime import RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal
         event = self.stop()
         event.text, event.allow_gateway_control = '/stop', True
-        with self.assertRaises(RuntimeStoreError) as refused:
+        with self.assertRaises(AuthorityRefusal) as refused:
             await self.receive(event)
         self.assertEqual(refused.exception.reason, 'invalid_params')
         self.assertEqual(self.old_callbacks, [])
@@ -64,7 +64,7 @@ class NativeControlFrontdoorTests(unittest.IsolatedAsyncioTestCase):
         await self.receive(self.stop('initial-stop'))
         self.settle('interrupted')
         self.authority.executing.pop(self.ref.session_id, None)
-        self.assertIsNotNone(process_stop_pending(self.authority.db, self.ref.session_id))
+        self.assertIsNotNone(process_stop_pending(self.authority.persistence, self.ref.session_id))
         self.runner._session_key_for_source = lambda source: self.route
         self.runner._is_session_running = lambda route: False
         self.runner._hm_estop_turn_allowed = MethodType(GatewayInboundMixin._hm_estop_turn_allowed, self.runner)

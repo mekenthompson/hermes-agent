@@ -1,9 +1,5 @@
-"""A managed worker's agent gets a RuntimeSessionStore as its session_db. Every SessionDB method
-the agent core calls must exist on the store, accept the same keywords, and answer like the
-owner's SessionDB (Adolanium reg-1 was one missing keyword; the sweep found two missing reads:
-the failed-turn boundary's tail role and in-place compaction's held-row liveness)."""
+"""A managed worker's agent gets a RuntimeSessionStore as its session_db. Every store method the agent core calls must exist on it, and its tail reads (the failed-turn boundary's tail role and a row's role in its own transcript) answer like the owner's store."""
 import ast
-import inspect
 from pathlib import Path
 import re
 
@@ -11,8 +7,9 @@ import pytest
 
 from hermes_agent.compat.paths import current_path
 from agent.runtime_session_store import RuntimeSessionStore
-from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch, mutate_worker_execution, register_worker_execution
+from persistence_assembly import open_persistence, profile_scope
+from tests.fixtures.storage_read import transcript_rows
+from tests.fixtures.storage_seed import seed_messages, seed_session
 
 ROOT = Path(__file__).resolve().parents[2]
 # The agent core: everything a worker's AIAgent runs (tools open their own handles, or refuse).
@@ -32,38 +29,39 @@ def _core_session_db_calls():
                 if ((isinstance(owner, ast.Attribute) and owner.attr in ('_session_db', 'db'))
                         or (isinstance(owner, ast.Name) and (owner.id == 'session_db' or (owner.id == 'db' and local_db)))):
                     names.add(node.func.attr)
-    return sorted(n for n in names if hasattr(SessionDB, n))
+    return sorted(names)
 
 
 @pytest.mark.parametrize('name', _core_session_db_calls())
-def test_store_offers_every_core_session_db_call_with_its_keywords(name):
+def test_store_offers_every_core_session_db_call(name):
     assert hasattr(RuntimeSessionStore, name), f'RuntimeSessionStore lacks {name}'
-    store = inspect.signature(getattr(RuntimeSessionStore, name)).parameters
-    if any(p.kind is p.VAR_KEYWORD for p in store.values()):
-        return
-    owner = inspect.signature(getattr(SessionDB, name)).parameters
-    missing = [k for k, p in owner.items() if k not in store and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)]
-    assert missing == [], f'RuntimeSessionStore.{name} rejects {missing}'
 
 
 def test_checkpoint_display_reads_match_owner_and_legacy_payload(tmp_path):
-    from hermes_state_checkpoint import persist_local_checkpoint
+    from persistence.conversation.messages import ConversationRequest
 
-    db = SessionDB(tmp_path / 'state.db')
+    db = open_persistence(profile_scope(home=tmp_path))
     try:
-        db.create_session('s', 'cli')
-        db.append_messages_batch('s', [{'role': 'user', 'content': 'q'}])
-        persist_local_checkpoint(db, 's', 'checkpoint-1', '# Update\n\nEvidence.', board='default', task_id='t_1')
-        epoch = begin_runtime_epoch(db, instance_id='fixture')
+        seed_session(db, 's', 'cli')
+        seed_messages(db, 's', {'role': 'user', 'content': 'q'})
+        db.messages.append_display_checkpoint('s', 'checkpoint-1', '# Update\n\nEvidence.', board='default', task_id='t_1')
+        epoch = db.runtime.begin_epoch(instance_id='fixture')
         scope = dict(epoch=epoch, execution_id='w', session_id='s', generation=0)
-        register_worker_execution(db, **scope, kind='compute', adoption_secret='secret')
-        store = RuntimeSessionStore(lambda method, **p: mutate_worker_execution(db, **p), scope, tmp_path / 'outbox')
+        db.worker_executions.register(**scope, kind='compute', adoption_secret='secret')
+        store = RuntimeSessionStore(lambda method, **p: db.worker_executions.persist_operation(**p), scope,
+                                    tmp_path / 'outbox')
+
+        def owner(display):
+            return [(m['role'], m['content']) for m in (r.as_openai_message() for r in db.messages.read_conversation(
+                's', ConversationRequest(include_display_only=display)))]
         try:
             for display in (False, True):
-                assert store.get_messages_as_conversation('s', include_display_only=display) == db.get_messages_as_conversation('s', include_display_only=display)
+                worker = store.get_messages_as_conversation('s', include_display_only=display)
+                assert [(m['role'], m['content']) for m in worker] == owner(display)
+            assert len(owner(True)) == 2 and owner(False) == [('user', 'q')]
+            # A worker built before the display flag sends five flags: checkpoints stay out of history.
             legacy = store._apply('compression.history', dict(target='s', include_ancestors=False,
                 include_inactive=False, repair_alternation=False, include_row_ids=False, include_compacted=False))
-            assert legacy['messages'] == db.get_messages_as_conversation('s')
             assert [(row['role'], row['content']) for row in legacy['messages']] == [('user', 'q')]
         finally:
             store.close()
@@ -72,22 +70,23 @@ def test_checkpoint_display_reads_match_owner_and_legacy_payload(tmp_path):
 
 
 def test_tail_reads_answer_like_the_owner(tmp_path):
-    db = SessionDB(tmp_path / 'state.db')
+    db = open_persistence(profile_scope(home=tmp_path))
     try:
-        db.create_session('s', 'cli')
-        db.append_messages_batch('s', [{'role': 'user', 'content': 'q'}, {'role': 'assistant', 'content': 'a'},
-                                       {'role': 'user', 'content': 'failed turn'}])
-        db.create_session('other', 'cli')
-        db.append_messages_batch('other', [{'role': 'assistant', 'content': 'x'}])
-        rows = [r[0] for r in db._read_all('SELECT id FROM messages ORDER BY id')]
-        epoch = begin_runtime_epoch(db, instance_id='fixture')
+        seed_session(db, 's', 'cli')
+        seed_messages(db, 's', {'role': 'user', 'content': 'q'}, {'role': 'assistant', 'content': 'a'},
+                      {'role': 'user', 'content': 'failed turn'})
+        seed_session(db, 'other', 'cli')
+        seed_messages(db, 'other', {'role': 'assistant', 'content': 'x'})
+        rows = [r['id'] for session_id in ('s', 'other') for r in transcript_rows(db, session_id)]
+        epoch = db.runtime.begin_epoch(instance_id='fixture')
         scope = dict(epoch=epoch, execution_id='w', session_id='s', generation=0)
-        register_worker_execution(db, **scope, kind='compute', adoption_secret='secret')
-        store = RuntimeSessionStore(lambda method, **p: mutate_worker_execution(db, **p), scope, tmp_path / 'outbox')
+        db.worker_executions.register(**scope, kind='compute', adoption_secret='secret')
+        store = RuntimeSessionStore(lambda method, **p: db.worker_executions.persist_operation(**p), scope,
+                                    tmp_path / 'outbox')
         try:
-            assert store.latest_conversation_role('s') == db.latest_conversation_role('s') == 'user'
+            assert store.latest_conversation_role('s') == db.messages.latest_conversation_role('s') == 'user'
             for row_id in [*rows, 10**6]:  # another transcript's row is not this session's
-                assert store.get_message_role('s', row_id) == db.get_message_role('s', row_id)
+                assert store.get_message_role('s', row_id) == db.messages.message_role('s', row_id)
         finally:
             store.close()
     finally:

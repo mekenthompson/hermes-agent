@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from hermes_state_runtime import list_session_admissions
+from gateway.session_authority import admission_row
 from tests.gateway.test_session_authority_cancel_settlement import REF, _authority, _submit
 
 
@@ -65,7 +65,7 @@ async def test_missing_birth_survives_ordinary_recovery_and_keeps_fifo_fenced(tm
         await _submit(authority, 'held human continuation')
         await asyncio.wait_for(authority.sessions['s'].task, 10)
         assert executed == [] and neighbor.poll() is None
-        assert list_session_admissions(db, session_id='s')[0]['status'] == 'queued'
+        assert admission_row(db.admissions.list(session_id='s')[0])['status'] == 'queued'
         assert json.loads(checkpoint.read_text()) == [entry]
         assert process_stop_pending(db, 's') == token
     finally:

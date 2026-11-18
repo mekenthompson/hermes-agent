@@ -190,7 +190,7 @@ async def test_authenticated_run_never_executes_when_worker_admission_refuses(tm
 async def test_native_api_transfer_provenance_revoked_after_key_rotation(api, owner):
     from gateway.session_api_turn import prepare_api_execution
     from gateway.session_contract import SessionRef
-    from hermes_state_runtime import list_session_admissions
+    from tests.gateway.test_native_inbound_retry import list_session_admissions
 
     async def handle(event):
         from gateway.session_results import execution_result
@@ -207,7 +207,7 @@ async def test_native_api_transfer_provenance_revoked_after_key_rotation(api, ow
                 "Authorization": "Bearer first-secret-long-enough",
                 "X-Hermes-Session-Id": "selected-conversation"})
         assert response.status == 200, await response.text()
-    saved = list_session_admissions(owner.db, session_id="selected-conversation", pending_only=False)[0]["payload"]
+    saved = list_session_admissions(owner, session_id="selected-conversation", pending_only=False)[0]["payload"]
     assert saved["api_turn_v1"]["transfer_auth"]["principal"].startswith("principal:")
     foreign = copy.deepcopy(saved)
     foreign["api_turn_v1"]["transfer_auth"]["principal"] = api._derive_browser_control_principal("foreign")

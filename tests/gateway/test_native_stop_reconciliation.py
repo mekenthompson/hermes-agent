@@ -7,7 +7,7 @@ import pytest
 
 from gateway.session_ancillary import process_stop_pending, record_process_stop
 from gateway.session_controls import AuthorityConnection
-from hermes_state_runtime import begin_runtime_epoch, list_session_admissions
+from gateway.session_authority import admission_row
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit
 from tests.waiting import async_wait_until
 
@@ -104,13 +104,13 @@ async def test_fresh_native_managed_session_without_checkpoint_accepts_first_inp
     monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute)
     try:
         assert 'result' in await stop(connection, ref)
-        assert process_stop_pending(authority.db, ref.session_id) is None
+        assert process_stop_pending(authority.persistence, ref.session_id) is None
         await authority.submit(connection.actor, Submission('first-input', ref, {'text': 'hello'}, 'queue'))
         await asyncio.wait_for(authority.sessions[ref.session_id].task, 10)
         assert executed == ['first-input']
     finally:
         await connection.close()
-        authority.db.close()
+        authority.persistence.close()
 
 
 @pytest.mark.asyncio
@@ -122,7 +122,7 @@ async def test_repeated_native_stop_preserves_unresolved_evidence(tmp_path, monk
     token = record_process_stop(authority, REF, 0)
     checkpoint = module._checkpoint_path()
     if evidence == 'old-missing':
-        authority.epoch = begin_runtime_epoch(db, instance_id='reloaded')
+        authority.epoch = db.runtime.begin_epoch(instance_id='reloaded')
         assert not checkpoint.exists()
     else:
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -142,6 +142,6 @@ async def test_repeated_native_stop_preserves_unresolved_evidence(tmp_path, monk
             response = await stop(caller(authority))
             assert response['error']['data']['reason'] == 'process_stop_unknown'
             assert process_stop_pending(db, 's') == token
-        assert list_session_admissions(db, session_id='s') == []
+        assert [admission_row(r) for r in db.admissions.list(session_id='s')] == []
     finally:
         db.close()

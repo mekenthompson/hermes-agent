@@ -28,7 +28,7 @@ async def _check_withdrawal(tmp_path, monkeypatch, failure, fixture):
     from gateway.session_managed_worker import ManagedWorker
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
-    from hermes_state_runtime import claim_session_input
+    from gateway.session_authority import admission_row
     from tools import clarify_gateway as clarify
 
     process = worker = None
@@ -57,7 +57,8 @@ async def _check_withdrawal(tmp_path, monkeypatch, failure, fixture):
                                    trusted_policy=policy, trusted_secrets=secrets)
         await fixture.authority.submit(actor, Submission(request_id, ref,
             {'text': 'Ask the bounded question', 'finite': True}, 'queue'))
-        row = claim_session_input(fixture.authority.db, epoch=fixture.authority.epoch, session_id=ref.session_id)
+        row = admission_row(fixture.authority.persistence.admissions.claim(
+            epoch=fixture.authority.epoch, session_id=ref.session_id))
         fixture.authority.executing[ref.session_id] = row['generation']
 
         source = Path(__file__).resolve().parents[2]

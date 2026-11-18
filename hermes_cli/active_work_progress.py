@@ -96,11 +96,11 @@ def _managed_session_ids() -> list[str]:
     from hermes_cli.heartbeat import _META_PREFIX, _get_session_db
 
     db = _get_session_db()
-    if db is None or not hasattr(db, "list_meta_prefix"):
+    if db is None or not hasattr(db, "state_meta"):
         return []
     found = []
     try:
-        rows = db.list_meta_prefix(_META_PREFIX)
+        rows = [(entry.key, entry.value) for entry in db.state_meta.list_prefix(_META_PREFIX)]
     except Exception:
         logger.debug("active-work progress: heartbeat list failed", exc_info=True)
         return []

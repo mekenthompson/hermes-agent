@@ -15,7 +15,6 @@ async def test_process_spawn_completion_reviewer_uses_live_origin(tmp_path, monk
     from gateway.session_authority import initialize_session_authority
     from gateway.session_contract import SessionActor, Submission
     from gateway.session_local import create_local_session
-    from hermes_state import AsyncSessionDB, SessionDB
     from tools import approval_context
     from tools.approval_context import current_approval_task_context
     from tools.approval_smart import _smart_approve
@@ -32,10 +31,8 @@ async def test_process_spawn_completion_reviewer_uses_live_origin(tmp_path, monk
 
     monkeypatch.setattr('agent.auxiliary_client.call_llm', guardian)
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
-    db = SessionDB(tmp_path / 'state.db')
-    runner.session_store._db = db
-    runner._session_db = AsyncSessionDB(db)
-    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner', db=db)
+    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    store = authority.persistence
     viewer = SessionActor('test-owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}), 'viewer')
     ref = create_local_session(authority, viewer, dict(request_id='cli', source='cli', model='fixture', toolsets=[]))
     await authority.attach(viewer, ref)
@@ -70,15 +67,13 @@ async def test_process_spawn_completion_reviewer_uses_live_origin(tmp_path, monk
         await authority.submit(viewer, Submission('typed', ref, {'text': 'Build only src/cli.py'}, 'queue'))
         await async_wait_until(lambda: getattr(proc, 'approval_task_reservation', None) is not None,
                                timeout=10, what='process reservation')
-        from hermes_state_runtime import get_session_admission
         origin = proc.approval_task_reservation.evidence
-        await async_wait_until(lambda: get_session_admission(db, admission_id=origin.task_id)['status'] == 'terminal',
+        await async_wait_until(lambda: store.admissions.get(admission_id=origin.task_id).status == 'terminal',
                                timeout=10, what='original turn settlement')
         await authority.submit(viewer, Submission('status', ref, {'text': 'Check status'}, 'queue'))
-        from hermes_state_runtime import list_session_admissions
-        await async_wait_until(lambda: any(row['request_id'] == 'status' and row['status'] == 'terminal'
-                                           for row in list_session_admissions(db, session_id=ref.session_id,
-                                                                              pending_only=False)),
+        await async_wait_until(lambda: any(row.request_id == 'status' and row.status == 'terminal'
+                                           for row in store.admissions.list(session_id=ref.session_id,
+                                                                            pending_only=False)),
                                timeout=10, what='newer ordinary turn settlement')
         assert proc.approval_task_reservation.lease.live()
         proc.exited = True
@@ -102,7 +97,6 @@ async def test_process_spawn_completion_reviewer_uses_live_origin(tmp_path, monk
     finally:
         with process_registry._lock:
             process_registry._running.pop(proc.id, None)
-        db.close()
 
 
 @pytest.mark.asyncio
@@ -112,7 +106,6 @@ async def test_delegation_dispatch_completion_reviewer_uses_origin(tmp_path, mon
     from gateway.session_authority import initialize_session_authority
     from gateway.session_contract import SessionActor, Submission
     from gateway.session_local import create_local_session
-    from hermes_state import AsyncSessionDB, SessionDB
     from tools import async_delegation as delegation
     from tools.approval_context import current_approval_task_context
     from tools.approval_smart import _smart_approve
@@ -126,10 +119,8 @@ async def test_delegation_dispatch_completion_reviewer_uses_origin(tmp_path, mon
     monkeypatch.setattr('tools.delegate_tool_dispatch._execute_and_aggregate',
                         lambda *_a, **_k: {'results': [{'status': 'completed', 'summary': 'done'}]})
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
-    db = SessionDB(tmp_path / 'state.db')
-    runner.session_store._db = db
-    runner._session_db = AsyncSessionDB(db)
-    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner', db=db)
+    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    store = authority.persistence
     viewer = SessionActor('test-owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}), 'viewer')
     ref = create_local_session(authority, viewer, dict(request_id='cli', source='cli', model='fixture', toolsets=[]))
     await authority.attach(viewer, ref)
@@ -155,9 +146,8 @@ async def test_delegation_dispatch_completion_reviewer_uses_origin(tmp_path, mon
         await authority.submit(viewer, Submission('typed', ref, {'text': 'Implement only src/cli.py'}, 'queue'))
         await async_wait_until(lambda: bool(handle), timeout=10, what='delegation dispatch')
         assert handle[0]['status'] == 'dispatched', handle[0]
-        from hermes_state_runtime import list_session_admissions
-        await async_wait_until(lambda: list_session_admissions(db, session_id=ref.session_id,
-                              pending_only=False)[0]['status'] == 'terminal', timeout=10,
+        await async_wait_until(lambda: store.admissions.list(session_id=ref.session_id,
+                              pending_only=False)[0].status == 'terminal', timeout=10,
                               what='origin settlement')
         event = await asyncio.to_thread(process_registry.completion_queue.get, True, 10)
         assert event['delegation_id'] == 'deleg_approval_origin'
@@ -171,4 +161,3 @@ async def test_delegation_dispatch_completion_reviewer_uses_origin(tmp_path, mon
             'deleg_approval_origin')[1] is None, timeout=10, what='delegation reservation settlement')
     finally:
         delegation._reset_for_tests()
-        db.close()

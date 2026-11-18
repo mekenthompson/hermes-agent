@@ -43,7 +43,7 @@ def test_authenticated_desktop_delegation_completion_authority(
     tmp_path, monkeypatch, stopped, through_executor, identity_name,
 ):
     socket_identity, human_identity = _IDENTITIES[identity_name]
-    from hermes_state import SessionDB
+    from persistence_assembly import open_persistence, profile_scope
     from tools import approval_context, async_delegation as delegation
     from tools.delegate_tool_dispatch import _dispatch_unit, _resolve_async_session_key
     from tools.process_registry import process_registry
@@ -57,7 +57,7 @@ def test_authenticated_desktop_delegation_completion_authority(
             process_registry.completion_queue.get_nowait()
         except Empty:
             break
-    db = SessionDB(tmp_path / 'state.db')
+    db = open_persistence(profile_scope(home=tmp_path))
     monkeypatch.setattr(server, '_get_db', lambda: db)
     monkeypatch.setattr(server, '_schedule_agent_build', lambda _sid: None)
     monkeypatch.setattr(server, '_schedule_session_cap_enforcement', lambda: None)

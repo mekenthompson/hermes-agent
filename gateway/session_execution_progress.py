@@ -4,10 +4,10 @@
 def execution_info(authority, ref):
     """Keep the session.info envelope while skipping tool/skill/MCP inventory."""
     from gateway.session_local import local_session_info
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal
 
     if ref.session_id not in authority.sessions:
-        raise RuntimeStoreError('not_found')
+        raise AuthorityRefusal('not_found')
     info = local_session_info(authority, ref)
     keys = ('source', 'lazy', 'profile_id', 'desktop_protocol', 'profile_name')
     return {**{key: info[key] for key in keys},
@@ -21,6 +21,7 @@ def execution_progress(authority, ref):
     stopped or replaced execution cannot lend its last tool to another turn.
     """
     from gateway.session_ancillary import process_stop_pending
+    from gateway.session_persistence import authority_persistence
 
     live = authority.sessions.get(ref.session_id)
     if live is None:
@@ -29,7 +30,7 @@ def execution_progress(authority, ref):
     generation = handle.execution_generation
     if (handle.execution_state != 'running'
             or authority.pending_stops.get(ref.session_id) == generation
-            or process_stop_pending(authority.db, ref.session_id) is not None):
+            or process_stop_pending(authority_persistence(authority), ref.session_id) is not None):
         return None
     with live.event_stream.lock:
         if (authority.executing.get(ref.session_id) != generation
