@@ -171,12 +171,15 @@ def test_completion(backend, scope_a, monkeypatch, delegation_id):
     result = {"status": "error", "summary": "Bearer abcdefghijklmnopqrstuvwxyz0123", "error": "boom"}
 
     def verb(c):
-        # House stop fence: the verb returns the stored (event, result), as ``_persist_completion`` does.
-        return c.record_delegation_completion(delegation_id=delegation_id, state=event.get("status", "completed"),
+        c.record_delegation_completion(delegation_id=delegation_id, state=event.get("status", "completed"),
                                        completed_at=event.get("completed_at", NOW), event=redact_completion_event(event),
                                        result=redact_child_result(result))
+
+    def legacy():
+        # House stop fence: the tool hands its caller back its own (event, result); the rows are what must agree.
+        ad._persist_completion(event, result)
     before, after = run_ledger_both(backend, scope_a, monkeypatch, [row("d-1", state="running", event_json=None)],
-                                    lambda: ad._persist_completion(event, result), verb)
+                                    legacy, verb)
     assert_same(before, after)
 
 

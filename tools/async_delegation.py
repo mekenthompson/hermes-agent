@@ -200,7 +200,8 @@ def _persist_completion(
     *delivery* ``delivered``: a unit whose every child waits on a promised automatic resume is recorded but never
     offered (restart recovery must not resurrect it). A committed stop always reports, so it forces ``pending``."""
     if remote := worker_ledger():
-        return remote.complete(redact_completion_event(event), redact_child_result(result), delivery)
+        remote.complete(redact_completion_event(event), redact_child_result(result), delivery)
+        return event, result  # the caller unpacks ``(persisted, result)`` and checks ``persisted is evt``
     cancelled: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
     def _cancelled():
@@ -215,6 +216,7 @@ def _persist_completion(
             completed_at=event.get("completed_at", time.time()), event=redact_completion_event(event),
             result=redact_child_result(result), delivery=delivery,
             on_cancel=_cancelled if on_cancel is not None else None)
+    # The caller's own objects (``persisted is evt`` tells it no stop replaced them); only storage is redacted.
     return cancelled[-1] if cancelled else (event, result)
 
 
