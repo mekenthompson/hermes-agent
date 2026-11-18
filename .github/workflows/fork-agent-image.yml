@@ -62,7 +62,9 @@ jobs:
       github.repository == 'switchroom/hermes-agent' &&
       github.event_name == 'workflow_dispatch' &&
       github.event.inputs.publish != 'true'
-    runs-on: ubuntu-latest
+    # ubuntu-latest (26.04) uses the containerd image store, so the exported
+    # image ID no longer equals the pushed config digest the handoff binds to.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: read
@@ -171,7 +173,9 @@ jobs:
       github.ref == 'refs/heads/main' &&
       github.event_name == 'workflow_dispatch' &&
       github.event.inputs.publish == 'true'
-    runs-on: ubuntu-latest
+    # ubuntu-latest (26.04) uses the containerd image store, so the exported
+    # image ID no longer equals the pushed config digest the handoff binds to.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     environment: agent-image-publish
     permissions:

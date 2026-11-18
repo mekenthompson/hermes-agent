@@ -84,6 +84,16 @@ class ForkImageWorkflowTests(unittest.TestCase):
         for path in (WORKFLOW, DOC, MANIFEST):
             self.assertTrue(path.is_file(), path)
 
+    def test_image_jobs_run_on_the_docker_image_store_runner(self) -> None:
+        # ubuntu-latest moved to 26.04, whose containerd image store gives an
+        # exported image ID that differs from the pushed config digest, so the
+        # publish job's scanned-image binding fails on it.
+        import yaml
+
+        jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+        for name in ("preflight", "publish"):
+            self.assertEqual(jobs[name]["runs-on"], "ubuntu-24.04", name)
+
     def test_workflow_publishes_only_on_explicit_main_dispatch(self) -> None:
         import yaml
 
