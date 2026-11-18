@@ -738,10 +738,10 @@ def test_real_update_suites_gate_the_merge_when_their_lane_fires(caller, job, ca
     caller_jobs = _yaml(f".github/workflows/{caller}")["jobs"]
     assert caller_jobs[job]["uses"] == f"./.github/workflows/{called}"
     gate = caller_jobs[job].get("if", "") + json.dumps(caller_jobs[job].get("with") or {})
-    if job == "install-update-e2e" and "mekenthompson/hermes-agent" in gate:
+    if job == "install-update-e2e" and "switchroom/hermes-agent" in gate:
         # This fork does not run the Windows install journey. Upstream still
         # gates that job on e2e_upgrade; do not add that lane to turn it on.
-        assert "github.repository != 'mekenthompson/hermes-agent'" in gate
+        assert "github.repository != 'switchroom/hermes-agent'" in gate
     elif lane not in gate and f"['{job}']" in gate:
         # Fork detect output is the lane gate. Do not also require the raw
         # upstream lane name in the job if.

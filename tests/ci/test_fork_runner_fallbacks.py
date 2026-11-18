@@ -22,7 +22,7 @@ class ForkRunnerFallbackTests(unittest.TestCase):
         line = next(x for x in text.splitlines() if x.strip().startswith("matrix:"))
         choices = [json.loads(x) for x in re.findall(r"'(\{.*?\})'", line)]
         self.assertEqual(choices, [{"slice": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], "slices": [16]}, {"slice": [1], "slices": [1]}])
-        self.assertIn("github.repository == 'mekenthompson/hermes-agent'", line)
+        self.assertIn("github.repository == 'switchroom/hermes-agent'", line)
         runner = runpy.run_path(str(ROOT / "scripts/run_tests_parallel.py"))
         files = runner["_discover_files"]([ROOT / "tests"])
         self.assertGreater(len(files), 100)
@@ -35,7 +35,7 @@ class ForkRunnerFallbackTests(unittest.TestCase):
     def test_js_matrix_shards_ui_project_for_fork_only(self) -> None:
         text = (ROOT / ".github/workflows/js-tests.yml").read_text(encoding="utf-8")
         line = next(x for x in text.splitlines() if x.strip().startswith("matrix:"))
-        self.assertIn("github.repository == 'mekenthompson/hermes-agent'", line)
+        self.assertIn("github.repository == 'switchroom/hermes-agent'", line)
         fork, upstream = [json.loads(x) for x in re.findall(r"'(\{.*?\})'", line)]
         self.assertEqual(upstream, {"unit": ["all"]})
         units = fork["unit"]
@@ -177,7 +177,7 @@ class ForkRunnerFallbackTests(unittest.TestCase):
         lines = (ROOT / ".github/workflows/tests-os.yml").read_text(encoding="utf-8").splitlines()
         start = lines.index("  install-update-e2e:")
         block = "\n".join(lines[start : start + 16])
-        self.assertIn("if: github.repository != 'mekenthompson/hermes-agent'", block)
+        self.assertIn("if: github.repository != 'switchroom/hermes-agent'", block)
         self.assertIn("uses: ./.github/workflows/windows-install-update-e2e.yml", block)
         standalone = (ROOT / ".github/workflows/windows-install-update-e2e.yml").read_text(encoding="utf-8")
         self.assertIn("wine2e-install/**", standalone)

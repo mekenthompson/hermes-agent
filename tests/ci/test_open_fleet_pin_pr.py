@@ -18,7 +18,7 @@ mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod
 spec.loader.exec_module(mod)
 
-REPO = "mekenthompson/hermes-fleet"
+REPO = "switchroom/switchroom"
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
 DIGEST = "sha256:" + "1" * 64
@@ -26,8 +26,8 @@ OLD_DIGEST = "sha256:" + "0" * 64
 MAIN_SHA = "c" * 40
 BRANCH_SHA = "d" * 40
 BRANCH = f"release/pin-agent-{SHA[:8]}"
-PR_URL = "https://github.com/mekenthompson/hermes-fleet/pull/77"
-RUN_URL = "https://github.com/mekenthompson/hermes-agent/actions/runs/123"
+PR_URL = "https://github.com/switchroom/switchroom/pull/77"
+RUN_URL = "https://github.com/switchroom/hermes-agent/actions/runs/123"
 
 
 def manifest(**overrides: Any) -> dict[str, Any]:

@@ -474,7 +474,7 @@ def test_pr130_catalog_guard_predicate_matrix(tmp_path):
     # so a raw SHA replace would also rewrite the allowlisted ref.
     script = script.replace(first, f"git merge-base --is-ancestor {upstream} HEAD^2")
     script = script.replace(second, f"git merge-base --is-ancestor {base} HEAD^2")
-    correct = {"CATALOG_HEAD_REPO": "mekenthompson/hermes-agent",
+    correct = {"CATALOG_HEAD_REPO": "switchroom/hermes-agent",
                "CATALOG_HEAD_REF": "house/reconcile-nous-c9b20d7bc08dec1e10779a06d7d9073bc6e7e418",
                "CATALOG_PR_NUMBER": "237"}
     cases = [("authorized", correct, script, 0)]

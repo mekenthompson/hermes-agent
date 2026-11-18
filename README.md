@@ -1,3 +1,5 @@
+> **This is the [Switchroom](https://switchroom.ai) fork of [Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research.** It builds the agent image, with Switchroom's add-ons, that the [switchroom/switchroom](https://github.com/switchroom/switchroom) distribution is built on. Not affiliated with or endorsed by Nous Research. How this fork fits in: [SWITCHROOM.md](SWITCHROOM.md). The upstream README follows unchanged.
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>

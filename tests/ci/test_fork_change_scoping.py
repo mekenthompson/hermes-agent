@@ -1,4 +1,4 @@
-"""Fork change-scoping contract (mekenthompson/hermes-agent).
+"""Fork change-scoping contract (switchroom/hermes-agent).
 
 Covers what upstream's tests do not: the push-range helper, fork-mode
 classification, the fork-only gates in ci.yaml, the image workflow's detect
@@ -24,7 +24,7 @@ from tests.ci import workflow_steps
 yaml = pytest.importorskip("yaml")
 
 ROOT = Path(__file__).resolve().parents[2]
-FORK = "mekenthompson/hermes-agent"
+FORK = "switchroom/hermes-agent"
 UPSTREAM = "NousResearch/hermes-agent"
 
 
@@ -344,7 +344,7 @@ def test_detect_changes_scopes_fork_pushes_only():
     assert run["env"]["PUSH_AFTER"] == "${{ github.sha }}"
     assert run["env"]["PUSH_FORCED"] == "${{ github.event.forced }}"
     script = run["run"]
-    assert 'elif [ "$EVENT_NAME" = "push" ] && [ "$REPO" = "mekenthompson/hermes-agent" ]; then' in script
+    assert 'elif [ "$EVENT_NAME" = "push" ] && [ "$REPO" = "switchroom/hermes-agent" ]; then' in script
     assert 'CHANGED="$(python3 scripts/ci/push_changed_files.py)"' in script
     # The PR branch is untouched.
     assert 'if [ "$EVENT_NAME" = "pull_request" ]; then' in script
@@ -355,7 +355,7 @@ def test_detect_changes_scopes_fork_pushes_only():
 def test_fork_image_workflow_gates_build_and_publish_on_the_docker_lane():
     wf = _yaml(".github/workflows/fork-agent-image.yml")
     detect = wf["jobs"]["detect"]
-    assert detect["if"] == "github.repository == 'mekenthompson/hermes-agent'"
+    assert detect["if"] == "github.repository == 'switchroom/hermes-agent'"
     assert detect["outputs"] == {"docker": "${{ steps.classify.outputs.docker }}"}
     assert detect["permissions"] == {"contents": "read"}
     assert [s.get("uses") for s in detect["steps"]][1] == "./.github/actions/detect-changes"
