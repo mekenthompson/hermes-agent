@@ -124,14 +124,30 @@ class DelegationLedger:
             for row in pending[:len(pending) - DELEGATION_MAX_DURABLE_PENDING]:
                 del ledger[row["delegation_id"]]
 
-    def record_delegation_completion(self, *, delegation_id: DelegationId, state: str, completed_at: float, event: JsonValue, result: JsonValue, delivery: Literal["pending", "delivered"] = "pending") -> None:
+    def record_delegation_completion(self, *, delegation_id: DelegationId, state: str, completed_at: float, event: JsonValue, result: JsonValue, delivery: Literal["pending", "delivered"] = "pending", on_cancel=None):
         if delivery not in COMPLETION_DELIVERIES:
             raise AuthorityRefusal("invalid_params", field="delivery")
-        stored_event, stored_result = _json_value(event), _json_value(result)
         row = self._ledger().get(str(delegation_id))
+        if row is not None and row.get("stop_state") == "cancel_requested" and on_cancel is not None:
+            state, event, result = on_cancel()
+            delivery = "pending"
+        stored_event, stored_result = _json_value(event), _json_value(result)
         if row is not None:
-            row.update(state=state, completed_at=completed_at, updated_at=time.time(), event=stored_event,
+            now = time.time()
+            row.update(state=state, completed_at=completed_at, updated_at=now, event=stored_event,
                        result=stored_result, delivery_state=delivery)
+            if row.get("stop_state") == "cancel_requested":
+                row.update(stop_state="acknowledged", stop_acknowledged_at=now)
+        return stored_event, stored_result
+
+    def record_delegation_stop_intents(self, *, delegation_ids: Sequence[DelegationId], reason: str) -> frozenset:
+        ledger, now, accepted = self._ledger(), time.time(), set()
+        for delegation_id in delegation_ids:
+            row = ledger.get(str(delegation_id))
+            if row is not None and row["state"] in ("running", "stalling", "finalizing") and not row.get("stop_state"):
+                row.update(stop_state="cancel_requested", stop_reason=reason, stop_requested_at=now, updated_at=now)
+                accepted.add(delegation_id)
+        return frozenset(accepted)
 
     def record_unit_child(self, *, delegation_id: DelegationId, entry: JsonValue) -> None:
         stored_entry = _json_value(entry)
@@ -215,7 +231,8 @@ class DelegationLedger:
             origin_ui_session_id=row["origin_ui_session_id"], parent_session_id=row["parent_session_id"],
             dispatched_at=row["dispatched_at"], owner_pid=row.get("owner_pid"), owner_started_at=row.get("owner_birth"),
             task=copy.deepcopy(row["task"]), origin_session_id=row["origin_session_id"], result=copy.deepcopy(row["result"]),
-            state=row["state"], updated_at=row["updated_at"]) for row in self._ledger().values() if row["state"] in _IN_FLIGHT)
+            state=row["state"], updated_at=row["updated_at"], stop_state=row.get("stop_state") or "",
+            stop_reason=row.get("stop_reason")) for row in self._ledger().values() if row["state"] in _IN_FLIGHT)
 
     # ── delivery claims ──────────────────────────────────────────────────
 
@@ -316,7 +333,9 @@ class DelegationLedger:
             delegation_id=DelegationId(row["delegation_id"]), origin_session=row["origin_session"], state=row["state"],
             dispatched_at=row["dispatched_at"], completed_at=row["completed_at"], result=copy.deepcopy(row["result"]),
             delivery_state=DeliveryState(row["delivery_state"]), delivery_attempts=row["delivery_attempts"],
-            origin_session_id=row["origin_session_id"] or "")
+            origin_session_id=row["origin_session_id"] or "", stop_state=row.get("stop_state") or "",
+            stop_reason=row.get("stop_reason"), stop_requested_at=row.get("stop_requested_at"),
+            stop_acknowledged_at=row.get("stop_acknowledged_at"))
 
     def list_finished_delegations(self, *, origin_ui_session_id: str = '', parent_session_id: str = '', limit: int = 20, now: Optional[float] = None) -> tuple[FinishedDelegationRow, ...]:
         selectors = [(column, value) for column, value in (("origin_ui_session_id", origin_ui_session_id), ("parent_session_id", parent_session_id)) if value]

@@ -51,6 +51,7 @@ def _dispatch_row(delegation_id: str, origin_session: str, origin_session_id: Op
         "state": "running", "dispatched_at": dispatched_at, "completed_at": None, "updated_at": time.time(),
         "event": None, "result": None, "children": None, "delivery_state": "pending", "delivery_attempts": 0,
         "delivery_claim": None, "delivery_claimed_at": None, "delivered_at": None,
+        "stop_state": "", "stop_reason": None, "stop_requested_at": None, "stop_acknowledged_at": None,
     }
 
 

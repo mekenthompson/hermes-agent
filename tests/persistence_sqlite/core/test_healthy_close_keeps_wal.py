@@ -1,4 +1,4 @@
-"""Healthy SessionDB.close must disable SQLite's last-connection WAL reset.
+"""Healthy StoreHolder.close must disable SQLite's last-connection WAL reset.
 
 Python 3.12+ can arm SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE. Fleet gateways and
 dashboards are separate processes on one state.db; a short-lived closer must
@@ -12,7 +12,8 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.hermes_state._wal_generation_harness import make_db, pin_wal, require_wal
+from persistence.sqlite.conversation._store.messages import append_message
+from tests.persistence_sqlite.core._wal_generation_harness import make_db, pin_wal, require_wal
 
 
 def test_healthy_close_arms_no_ckpt_on_close(tmp_path, monkeypatch):
@@ -46,7 +47,7 @@ def test_close_preserves_sidecars_until_last_in_process_holder(tmp_path, monkeyp
     try:
         first.close()
         assert (wal.stat().st_ino, shm.stat().st_ino) == generation
-        second.append_message("s", role="user", content="after-first-close")
+        append_message(second, "s", role="user", content="after-first-close")
     finally:
         first.close()
         second.close()

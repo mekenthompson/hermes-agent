@@ -26,6 +26,8 @@ VALID = [
     ("rename", {"title": "t"}, rt.Rename("t")),
     ("archive", {"archived": True}, rt.Archive(True)),
     ("sidebar", {"pinned": True, "unread": False}, rt.Sidebar(pinned=True, unread=False)),
+    # House: the durable operator operation notice.
+    ("notice", {"text": "Restarting for an update."}, rt.Notice("Restarting for an update.")),
 ]
 
 INVALID = [
@@ -49,8 +51,9 @@ def test_parse_mutation_refuses_what_validate_action_refuses(operation, payload)
         rt.parse_mutation(operation, payload)
 
 
-def test_the_union_is_closed_over_fourteen_operations():
-    assert len({command.operation for _op, _payload, command in VALID}) == 14
+def test_the_union_is_closed_over_fifteen_operations():
+    # Upstream's fourteen plus the house ``notice``.
+    assert len({command.operation for _op, _payload, command in VALID}) == 15
     assert {cls.operation for cls in rt.MutationCommand.__args__} == {command.operation for _op, _payload, command in VALID}
 
 

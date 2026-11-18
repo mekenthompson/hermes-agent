@@ -539,8 +539,14 @@ class CoordinationRepository(SubagentLedger, Protocol):
         """Delete delivered rows not updated for :data:`DELEGATION_RETENTION_SECONDS`, then cap terminal rows at :data:`DELEGATION_MAX_RETAINED_TERMINAL` (delivered, then oldest first) and terminal pending rows at :data:`DELEGATION_MAX_DURABLE_PENDING` (oldest first), in one write. A unit still owed a resume (the ``unit_id`` of a ``resumable`` or ``expired`` subagent record owed its report) is neither deleted by the retention nor counted or deleted by the terminal cap, because its child's give-up is routed through it; the pending cap counts and deletes it like any row."""
         ...
 
-    def record_delegation_completion(self, *, delegation_id: DelegationId, state: str, completed_at: float, event: JsonValue, result: JsonValue, delivery: Literal["pending", "delivered"] = "pending") -> None:
-        """Store the state, completion time, ``updated_at`` now, the caller-redacted event and result, and ``delivery`` (``delivered``: recorded, never offered); a missing row writes nothing. A delivery outside :data:`COMPLETION_DELIVERIES` is refused ``invalid_params`` with nothing written."""
+    def record_delegation_completion(self, *, delegation_id: DelegationId, state: str, completed_at: float, event: JsonValue, result: JsonValue, delivery: Literal["pending", "delivered"] = "pending", on_cancel: Optional[Callable[[], tuple[str, JsonValue, JsonValue]]] = None) -> Optional[tuple[JsonValue, JsonValue]]:
+        """Store the state, completion time, ``updated_at`` now, the caller-redacted event and result, and ``delivery`` (``delivered``: recorded, never offered); a missing row writes nothing. A delivery outside :data:`COMPLETION_DELIVERIES` is refused ``invalid_params`` with nothing written.
+
+        House stop fence: when the row's ``stop_state`` is ``cancel_requested`` and ``on_cancel`` is given, its ``(state, event, result)`` replaces the late completion (always ``pending``); a committed intent is acknowledged (``stop_state`` ``acknowledged``, ``stop_acknowledged_at`` now) in the same write. Returns the stored ``(event, result)``."""
+        ...
+
+    def record_delegation_stop_intents(self, *, delegation_ids: Sequence[DelegationId], reason: str) -> frozenset[DelegationId]:
+        """House stop fence: in one write, mark each live (``running``/``stalling``/``finalizing``) row with no stop yet ``cancel_requested`` with ``reason`` and ``stop_requested_at`` now, BEFORE any descendant is signalled. Returns the ids that accepted the intent (the only children a caller may signal)."""
         ...
 
     def record_unit_child(self, *, delegation_id: DelegationId, entry: JsonValue) -> None:

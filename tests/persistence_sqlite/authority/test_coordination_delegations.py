@@ -171,7 +171,8 @@ def test_completion(backend, scope_a, monkeypatch, delegation_id):
     result = {"status": "error", "summary": "Bearer abcdefghijklmnopqrstuvwxyz0123", "error": "boom"}
 
     def verb(c):
-        c.record_delegation_completion(delegation_id=delegation_id, state=event.get("status", "completed"),
+        # House stop fence: the verb returns the stored (event, result), as ``_persist_completion`` does.
+        return c.record_delegation_completion(delegation_id=delegation_id, state=event.get("status", "completed"),
                                        completed_at=event.get("completed_at", NOW), event=redact_completion_event(event),
                                        result=redact_child_result(result))
     before, after = run_ledger_both(backend, scope_a, monkeypatch, [row("d-1", state="running", event_json=None)],
@@ -364,7 +365,9 @@ def test_get_delegation(backend, scope_a, monkeypatch, delegation_id):
                 "dispatched_at": record.dispatched_at, "completed_at": record.completed_at,
                 "result": redact_child_result(record.result) if record.result is not None else None,
                 "delivery_state": record.delivery_state.value, "delivery_attempts": record.delivery_attempts,
-                "origin_session_id": record.origin_session_id}
+                "origin_session_id": record.origin_session_id, "stop_state": record.stop_state,
+                "stop_reason": record.stop_reason, "stop_requested_at": record.stop_requested_at,
+                "stop_acknowledged_at": record.stop_acknowledged_at}
     before, after = run_ledger_both(backend, scope_a, monkeypatch, rows, lambda: ad.get_durable_delegation(delegation_id),
                                     lambda c: c.get_delegation(delegation_id=delegation_id))
     assert_same(before, after, project)

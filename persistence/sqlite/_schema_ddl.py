@@ -398,10 +398,6 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     owner_pid INTEGER,
     owner_started_at INTEGER,
     task_json TEXT,
-    -- Owner-side execution fence (unified runtime).
-    owner_execution_id TEXT,
-    delivery_claim TEXT,
-    delivery_claimed_at REAL,
     -- House: a stop request is a durable intent, written before signalling children.
     -- It closes the crash-after-action-before-ack gap: a late successful child
     -- return must not resurrect cancelled work after restart or cleanup.
@@ -409,6 +405,10 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     stop_reason TEXT,
     stop_requested_at REAL,
     stop_acknowledged_at REAL,
+    -- Owner-side execution fence (unified runtime).
+    owner_execution_id TEXT,
+    delivery_claim TEXT,
+    delivery_claimed_at REAL,
     -- Mirrors the delegation tool's own CREATE TABLE (tools/async_delegation.py
     -- _initialize_schema). Keeping the canonical fresh-install shape identical
     -- to the tool's avoids a silent schema drift: the tool's lazy
