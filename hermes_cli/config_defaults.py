@@ -2341,8 +2341,8 @@ DEFAULT_CONFIG = {
             "enabled": True,        # `op` CLI: Login items with a website URL become fillable handles.
             "account": "",          # account shorthand for `op --account`; empty = default account.
             "binary_path": "",      # absolute path to op; empty = PATH.
-            # Env var holding a service-account token (headless auth, no unlock prompt). Unset = prompt.
-            "service_account_token_env": "OP_SERVICE_ACCOUNT_TOKEN",
+            "service_account_token_env": "OP_SERVICE_ACCOUNT_TOKEN",  # headless token env, no prompt; unset = prompt
+            "vaults": [],  # vault names/ids logins come from; [] = every visible vault; no match = error
         },
         "bitwarden": {
             "enabled": True,        # `bw` CLI (Password Manager, not Secrets Manager); run `bw login` once first.

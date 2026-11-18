@@ -107,8 +107,13 @@ def external_backend_classes():
 
 
 def is_installed(name: str) -> bool:
-    """Is the manager CLI reachable — honouring a configured ``binary_path`` over PATH."""
+    """Is the manager reachable — its CLI (a configured ``binary_path`` over PATH), or for 1Password
+    a Connect server in the profile's secrets, which needs no ``op`` binary at all."""
     import shutil
+    if name == "onepassword":
+        from agent.vault_backends.onepassword import connect_configured
+        if connect_configured():
+            return True
     section = _cfg().get(name) or {}
     explicit = str(section.get("binary_path") or "") if isinstance(section, dict) else ""
     if explicit:
