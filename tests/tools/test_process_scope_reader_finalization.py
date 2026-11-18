@@ -14,7 +14,7 @@ def test_unit_stop_waits_for_original_reader(tmp_path, monkeypatch, transport, p
     from tools.process_registry_job import job_quiescent
     from tools.process_registry_results import load_completed_results
 
-    monkeypatch.setattr(module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    monkeypatch.setattr(module, "_checkpoint_path", lambda: tmp_path / "processes.json")
     registry = module.ProcessRegistry()
 
     def unit_transport(session, command, suffix, label):

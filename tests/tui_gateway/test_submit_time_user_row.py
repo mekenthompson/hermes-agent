@@ -8,6 +8,7 @@ from persistence.conversation.messages import ConversationRequest, TranscriptRea
 from persistence_assembly import open_persistence, profile_scope
 from run_agent import AIAgent
 from tests.fixtures.storage_read import conversation, transcript_rows
+from tests.fixtures.storage_seed import seed_messages, seed_session
 from tui_gateway import server
 
 
@@ -55,12 +56,12 @@ def test_user_message_is_durable_at_submit_before_any_agent_turn(monkeypatch, tm
 def test_retired_desktop_predecessor_refuses_registered_submit_before_transcript_write(monkeypatch, tmp_path):
     from gateway.chat_execution_recovery import ChatExecutionStore
 
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = open_persistence(profile_scope(home=tmp_path))
     sid, key = _desktop_session(monkeypatch, db)
     session = server._sessions[sid]
     session["profile_home"] = str(tmp_path)
-    db.create_session(key, "desktop")
-    db.append_message(key, "user", content="original")
+    seed_session(db, key, "desktop")
+    seed_messages(db, key, {"role": "user", "content": "original"})
     store = ChatExecutionStore(tmp_path)
     assert store.start_local_worker(key, key) == 1
     assert store.worker_finished(key, 1)
@@ -69,14 +70,14 @@ def test_retired_desktop_predecessor_refuses_registered_submit_before_transcript
         response = server.handle_request({"id": "p", "method": "prompt.submit", "params": {
             "session_id": sid, "text": "continue the old work"}})
         assert response["error"]["code"] == 4090
-        assert [(row["role"], row["content"]) for row in db.get_messages_as_conversation(key)] == [
+        assert [(row["role"], row["content"]) for row in conversation(db, key)] == [
             ("user", "original")]
         assert session["running"] is False
         response = server.handle_request({"id": "rewind", "method": "prompt.submit", "params": {
             "session_id": sid, "text": "rewrite", "truncate_before_user_ordinal": 0,
             "confirm_truncate": True}})
         assert response["error"]["code"] == 4090
-        assert [(row["role"], row["content"]) for row in db.get_messages_as_conversation(key)] == [
+        assert [(row["role"], row["content"]) for row in conversation(db, key)] == [
             ("user", "original")]
     finally:
         server._sessions.pop(sid, None)
@@ -86,7 +87,7 @@ def test_retired_desktop_predecessor_refuses_registered_submit_before_transcript
 def test_queued_desktop_submit_blocks_handoff_then_registered_stop_cancels_claim(monkeypatch, tmp_path):
     from gateway.chat_execution_recovery import ChatExecutionStore
 
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = open_persistence(profile_scope(home=tmp_path))
     sid, key = _desktop_session(monkeypatch, db)
     session = server._sessions[sid]
     session["profile_home"] = str(tmp_path)
@@ -113,7 +114,7 @@ def test_queued_desktop_submit_blocks_handoff_then_registered_stop_cancels_claim
 def test_accepted_desktop_steer_keeps_claim_through_worker_settlement(monkeypatch, tmp_path):
     from gateway.chat_execution_recovery import ChatExecutionStore
 
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = open_persistence(profile_scope(home=tmp_path))
     sid, key = _desktop_session(monkeypatch, db)
     session = server._sessions[sid]
     session["profile_home"] = str(tmp_path)

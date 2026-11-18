@@ -82,7 +82,7 @@ async def test_lost_backend_handle_keeps_fifo_fenced_through_foreign_writes_afte
         await _submit(authority, 'first human continuation')
         await asyncio.wait_for(authority.sessions['s'].task, 10)
         assert not executed and alive() and process_stop_pending(db, 's') == token
-        assert [admission_row(r) for r in db.admissions.list(session_id='s')][0]['status'] == 'queued'
+        assert admission_row(db.admissions.list(session_id='s')[0])['status'] == 'queued'
         # The original backend still has the real resource/exit producer.
         # Its wrapper result is history; it cannot prove descendant cleanup.
         release.touch()

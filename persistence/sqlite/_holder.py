@@ -292,6 +292,22 @@ class StoreHolder:
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
+    def _retire_failed_init_wal(self, conn: Optional[sqlite3.Connection]) -> None:
+        """House: a failed first open must not strand the -wal/-shm it just created.
+
+        The failed handle closes with close-time reset disabled (another process may hold the
+        generation), so its sidecars would outlive it. Leaving WAL is SQLite's exclusive,
+        lock-aware last-holder check: it fails while anyone else holds the generation and removes
+        the sidecars when none does. The next opener re-applies the configured journal mode.
+        """
+        if conn is None:
+            return
+        try:
+            if _stat_sqlite_sidecar_identity(self.db_path):
+                conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+        except sqlite3.Error as exc:
+            logger.debug("WAL sidecar retirement after a failed open deferred for %s: %s", self.db_path, exc)
+
     def _close_connection_cleanly(self, conn: Optional[sqlite3.Connection]) -> bool:
         """House: protect close-time reset, then retire an empty WAL generation through SQLite.
 
@@ -447,6 +463,7 @@ class StoreHolder:
         finally:
             if not initialization_complete:
                 conn, self._conn = self._conn, None
+                self._retire_failed_init_wal(conn)
                 self._close_connection_quietly(conn)
             else:
                 # Only a successfully opened handle owns a writer connection. Failed

@@ -1,6 +1,8 @@
 """An aligned stop decision preserves live policy and scrubs the durable payload."""
 import json
+import sqlite3
 import time
+from contextlib import closing
 
 import pytest
 
@@ -20,7 +22,7 @@ def test_completion_scrubs_after_stop_decision_without_replacing_live_copy(tmp_p
     }
     ad._persist_dispatch(record)
     if stopped:
-        with ad._DB_LOCK, ad._transaction() as conn:
+        with ad._DB_LOCK, closing(sqlite3.connect(tmp_path / "state.db")) as conn, conn:
             conn.execute("UPDATE async_delegations SET stop_state='cancel_requested' WHERE delegation_id=?",
                          (record["delegation_id"],))
     monkeypatch.setattr(ad, "redact_completion_event", lambda value: {**value, "summary": "scrubbed"})
@@ -35,7 +37,7 @@ def test_completion_scrubs_after_stop_decision_without_replacing_live_copy(tmp_p
         expected_event, expected_result = (cancelled_event, cancelled_result) if stopped else (event, result)
         assert actual_event == expected_event
         assert actual_result == expected_result
-        with ad._DB_LOCK, ad._transaction() as conn:
+        with ad._DB_LOCK, closing(sqlite3.connect(tmp_path / "state.db")) as conn, conn:
             state, event_json, result_json, stop_state = conn.execute(
                 "SELECT state,event_json,result_json,stop_state FROM async_delegations WHERE delegation_id=?",
                 (record["delegation_id"],)).fetchone()

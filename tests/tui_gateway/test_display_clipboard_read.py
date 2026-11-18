@@ -7,15 +7,16 @@ from __future__ import annotations
 
 import pytest
 
+from tests.bot_desktop_lease import reset_lease
 from tools.bot_desktop import clipboard as bd_clipboard
 
 
 @pytest.fixture
 def lease_mod():
     from tools.bot_desktop import lease
-    lease._reset_for_tests()
+    reset_lease()
     yield lease
-    lease._reset_for_tests()
+    reset_lease()
 
 
 @pytest.fixture

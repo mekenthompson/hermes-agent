@@ -161,7 +161,7 @@ async def test_old_unscoped_local_job_remains_unknown(tmp_path, monkeypatch, pri
         await asyncio.wait_for(authority.sessions['s'].task, 10)
         assert not executed and live(child) and process_stop_pending(db, 's')
         assert own.id in {row['session_id'] for row in json.loads(module._checkpoint_path().read_text())}
-        assert [admission_row(r) for r in db.admissions.list(session_id='s')][0]['status'] == 'queued'
+        assert admission_row(db.admissions.list(session_id='s')[0])['status'] == 'queued'
     finally:
         release.touch()
         if child is not None and live(child):

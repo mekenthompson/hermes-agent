@@ -17,7 +17,7 @@ from gateway.session_controls import display_projection
 from persistence.conversation.messages import ConversationRequest, TranscriptRead
 from tests.fixtures.storage_read import conversation, transcript_rows
 from tests.fixtures.storage_seed import seed_session
-from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle  # noqa: F401  (autouse closer)
+from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 
 def test_canonical_desktop_stream_gets_exact_checkpoint_without_model(tmp_path, monkeypatch):

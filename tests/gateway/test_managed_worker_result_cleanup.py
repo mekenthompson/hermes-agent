@@ -109,7 +109,7 @@ def test_known_worker_result_survives_cleanup_unknown_and_native_retry(tmp_path,
                 if jobs is not None:
                     from tools import process_registry as module
                     monkeypatch.setenv('HERMES_HOME', str(home))
-                    monkeypatch.setattr(module, 'CHECKPOINT_PATH', home / 'processes.json')
+                    monkeypatch.setattr(module, '_checkpoint_path', lambda: home / 'processes.json')
                     cleanup = module.ProcessRegistry()
                     cleanup.recover_from_checkpoint(owns_entry=lambda row: row['session_id'] == jobs['foreign']['id'])
                     result = cleanup.kill_process(jobs['foreign']['id'])

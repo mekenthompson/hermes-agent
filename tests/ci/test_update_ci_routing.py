@@ -919,8 +919,12 @@ def test_a_canary_e2e_run_reaches_every_e2e_suite():
                         detect=_detect_outputs(cc.classify([]), "workflow_run", inputs), event_name="workflow_run")
     for lane in ("e2e", "e2e_upgrade", "e2e_desktop_update"):
         reached = _consumers_reached(run, lane)
-        assert reached and all(reached.values()), f"{lane}: {reached}"
-    assert "e2e-desktop-core" in run
+        if _fork_leaves_unshipped(lane):
+            assert not any(reached.values()), f"fork scheduled unshipped {lane}: {reached}"
+        else:
+            assert reached and all(reached.values()), f"{lane}: {reached}"
+    if not _fork_leaves_unshipped("e2e_desktop_core"):
+        assert "e2e-desktop-core" in run
 
 
 def test_windows_install_update_dispatch_alone_sets_strict():

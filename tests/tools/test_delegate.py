@@ -1514,7 +1514,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
 
-    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool_config._load_config")
     @patch("run_agent.AIAgent")
     def test_luna_max_child_effort_beats_parent_model_reasoning(self, MockAgent, mock_cfg):
         """An explicit child effort must win even when the parent model has another override."""

@@ -301,7 +301,7 @@ def test_durable_stop_commit_wins_over_stale_in_memory_finalize(tmp_path, monkey
         ad._records[record["delegation_id"]] = record
     # This is the exact durable state after _persist_stop_intents commits but
     # before it acquires _records_lock to copy stop_state into `record`.
-    with ad._DB_LOCK, ad._transaction() as conn:
+    with ad._DB_LOCK, closing(sqlite3.connect(tmp_path / "state.db")) as conn, conn:
         conn.execute("""UPDATE async_delegations SET stop_state='cancel_requested',
                      stop_reason='review_race', stop_requested_at=? WHERE delegation_id=?""",
                      (time.time(), record["delegation_id"]))
@@ -387,7 +387,7 @@ def test_recovery_blocks_unacknowledged_stop_from_resurrection(tmp_path, monkeyp
     }
     ad._persist_dispatch(record)
     assert ad._persist_stop_intents([record], "shutdown") == {"deleg_crash_stop"}
-    with ad._DB_LOCK, ad._transaction() as conn:
+    with ad._DB_LOCK, closing(sqlite3.connect(tmp_path / "state.db")) as conn, conn:
         conn.execute("UPDATE async_delegations SET owner_pid=? WHERE delegation_id=?", (999999, "deleg_crash_stop"))
 
     assert ad.recover_abandoned_delegations() == 1

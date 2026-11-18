@@ -69,7 +69,6 @@ class _Board:
         self.conn = kbc.connect(self.path)
         self.ledger = root / "state.db"
         self.store = open_persistence(profile_scope(home=root), eager=True)
-        seed_session(self.store, "sess-1", "cli")
 
     def close(self) -> None:
         self.conn.close()
@@ -111,7 +110,10 @@ class _Board:
         else:
             spawned = {}
         self.event(tid, run, "spawned", spawned, started)
-        payload = {"db": str(self.ledger), "session_id": "sess-1", "pid": owner_pid,
+        # One session per attempt: an admission seeder needs a session with no other open admission.
+        session = f"sess-{tid}-{run}"
+        seed_session(self.store, session, "cli")
+        payload = {"db": str(self.ledger), "session_id": session, "pid": owner_pid,
                    "request_id": f'kanban:["default","{tid}",1]'}
         if owner_birth is not None:
             payload["birth"] = owner_birth
@@ -121,7 +123,7 @@ class _Board:
                        {"pid": worker_pid, "claim_lock": lock, "started_at": worker_fingerprint},
                        started + 60)
         if admission:
-            seed_admission(self.store, "sess-1", payload["request_id"], *admission)
+            seed_admission(self.store, session, payload["request_id"], *admission)
         self.conn.commit()
         return run
 

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _submit
-from tests.gateway.fixtures.storage_handles import close_storage_handles  # noqa: F401  (autouse closer)
+from tests.gateway.fixtures.storage_handles import close_storage_handles
 from tests.waiting import async_wait_until
 
 pytestmark = pytest.mark.platforms('linux')

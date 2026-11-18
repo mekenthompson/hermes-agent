@@ -17,8 +17,8 @@ from ._runtime import _CANCEL_QUEUED, _admission, _epoch, _row
 __all__ = [
     "NATIVE_STOP_KEY",
     "PROCESS_STOP_PREFIX",
-    "check_native_stop_fence",
     "check_epoch",
+    "check_native_stop_fence",
     "clear_process_stop",
     "consume_native_stop",
     "has_native_stop",

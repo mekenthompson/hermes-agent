@@ -17,7 +17,6 @@ async def test_viewer_request_reaches_reviewer_but_internal_notice_does_not(tmp_
     from gateway.session_automation import admit_route_wake
     from gateway.session_contract import SessionActor, Submission
     from gateway.session_local import create_local_session
-    from hermes_state import SessionDB
     from tools import approval as A, approval_context
     from tools.approval_context import current_approval_task_context
     from tools.approval_smart import _smart_approve
@@ -38,9 +37,7 @@ async def test_viewer_request_reaches_reviewer_but_internal_notice_does_not(tmp_
 
     monkeypatch.setattr("agent.auxiliary_client.call_llm", guardian)
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
-    db = SessionDB(tmp_path / "state.db")
-    runner.session_store._db = runner._session_db = db
-    authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner", db=db)
+    authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner")
     results = {}
     copied = []
 
@@ -82,13 +79,13 @@ async def test_viewer_request_reaches_reviewer_but_internal_notice_does_not(tmp_
         adapter = runner._adapter_for_source(live.source)
         assert await admit_route_wake(runner, adapter, live.source, "synthetic notice", "tick") is True
         await async_wait_until(lambda: "synthetic notice" in results, timeout=10, what="internal notice")
-        from hermes_state_runtime import get_session_admission
         await async_wait_until(
-            lambda: get_session_admission(db, admission_id=results["Edit only src/cli.py"][0].task_id)["status"] == "terminal",
+            lambda: authority.persistence.admissions.get(
+                admission_id=results["Edit only src/cli.py"][0].task_id).status == "terminal",
             timeout=10, what="settled viewer admission")
         assert copied[0].run(current_approval_task_context) is None
     finally:
-        db.close()
+        authority.persistence.close()
 
     evidence, child, verdict, gate = results["Edit only src/cli.py"]
     assert evidence.text == "Edit only src/cli.py"
@@ -108,7 +105,6 @@ async def test_stop_during_smart_review_rejects_late_approve(tmp_path, monkeypat
     from gateway.session_authority import initialize_session_authority
     from gateway.session_contract import SessionActor, Submission
     from gateway.session_local import create_local_session
-    from hermes_state import SessionDB
     from tools import approval as A, approval_context
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -125,9 +121,7 @@ async def test_stop_during_smart_review_rejects_late_approve(tmp_path, monkeypat
 
     monkeypatch.setattr("agent.auxiliary_client.call_llm", guardian)
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
-    db = SessionDB(tmp_path / "state.db")
-    runner.session_store._db = runner._session_db = db
-    authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner", db=db)
+    authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner")
 
     async def answer(event):
         live = authority.sessions[ref.session_id]
@@ -148,7 +142,7 @@ async def test_stop_during_smart_review_rejects_late_approve(tmp_path, monkeypat
         await async_wait_until(lambda: bool(results), timeout=10, what="late smart verdict")
     finally:
         release.set()
-        db.close()
+        authority.persistence.close()
     assert results[0]["approved"] is False
     assert results[0]["outcome"] == "stale_task"
 
@@ -157,7 +151,7 @@ def test_foreign_and_synthetic_rows_cannot_supply_human_request():
     from contextlib import nullcontext
     from gateway.config import Platform
     from gateway.session_ingress import _approval_task_scope
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal
     from tools.approval_context import current_approval_task_context
 
     source = SimpleNamespace(user_id="owner", platform=Platform.LOCAL, profile=None,
@@ -168,7 +162,7 @@ def test_foreign_and_synthetic_rows_cannot_supply_human_request():
     row = {"admission_id": "a", "generation": 2, "request_id": "r", "principal_id": "intruder",
            "payload": {"text": "Edit src/cli.py"}}
     event = SimpleNamespace(internal=False, source=source, text=row["payload"]["text"])
-    with pytest.raises(RuntimeStoreError, match="permission_denied"):
+    with pytest.raises(AuthorityRefusal, match="permission_denied"):
         _approval_task_scope(authority, ref, row, live, event, is_api=False)
     event.internal = True
     with _approval_task_scope(authority, ref, row, live, event, is_api=False):
@@ -189,9 +183,9 @@ async def test_native_messaging_fifo_binds_authenticated_request_to_smart_review
     from gateway.run import GatewayRunner
     from gateway.session_authority import SessionAuthority, initialize_session_authority
     from gateway.session_ingress_context import native_callback, register_transport_home
-    from hermes_state_runtime import get_session_admission
     from plugins.platforms.slack.adapter import SlackAdapter
     from plugins.platforms.telegram.adapter import TelegramAdapter
+    from tests.fixtures.storage_holder import raw_holder
     from tools import approval as A, approval_context
     from tools.approval_context import current_approval_task_context
     from tools.approval_smart import _smart_approve
@@ -222,7 +216,7 @@ async def test_native_messaging_fifo_binds_authenticated_request_to_smart_review
     authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner")
     runner._wire_adapter_handlers(adapter)
     from pathlib import Path
-    authority_home = Path(authority.db.db_path).resolve().parent
+    authority_home = Path(authority.persistence.scope.profile_dir)
     register_transport_home(runner, None, authority_home)
     source = adapter.build_source(chat_id="C-42", chat_type="dm", user_id="U-42", thread_id="T-9",
                                   message_id="native-1")
@@ -246,15 +240,15 @@ async def test_native_messaging_fifo_binds_authenticated_request_to_smart_review
         if foreign_principal:
             # Fault injection into the real committed row: a mismatched identity
             # must never lend its request to the actual executing native turn.
-            authority.db._execute_write(lambda conn: conn.execute(
+            raw_holder(authority.persistence)._execute_write(lambda conn: conn.execute(
                 'UPDATE session_admissions SET principal_id=? WHERE admission_id=?',
                 ('foreign', receipt.admission_id)))
         await SessionAuthority._drain(authority, receipt.ref)
-        row = get_session_admission(authority.db, admission_id=receipt.admission_id)
-        assert row is not None
-        assert row["status"] == "terminal"
+        record = authority.persistence.admissions.get(admission_id=receipt.admission_id)
+        assert record is not None
+        assert record.status == "terminal"
     finally:
-        authority.db.close()
+        authority.persistence.close()
 
     evidence, verdict = reviewed[0]
     if foreign_principal:
@@ -263,7 +257,7 @@ async def test_native_messaging_fifo_binds_authenticated_request_to_smart_review
         assert text not in prompts[0]
     else:
         assert evidence.text == text
-        assert evidence.identity == row["principal_id"]
+        assert evidence.identity == record.principal_id
         assert evidence.identity.startswith('messaging:')
         assert verdict == "approve"
         assert text in prompts[0]
@@ -276,15 +270,11 @@ async def test_stop_revokes_older_detached_task_after_new_admission(tmp_path, mo
     from gateway.session_authority import initialize_session_authority
     from gateway.session_contract import SessionActor, Submission
     from gateway.session_local import create_local_session
-    from hermes_state import SessionDB
-    from hermes_state_runtime import list_session_admissions
     from tools.approval_context import reserve_background_approval_task
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
-    db = SessionDB(tmp_path / 'state.db')
-    runner.session_store._db = runner._session_db = db
-    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner', db=db)
+    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
     viewer = SessionActor('test-owner', 'default', frozenset(
         {'session:create', 'session:submit', 'session:read', 'session:control'}), 'viewer')
     ref = create_local_session(authority, viewer, dict(request_id='cli', source='cli', model='fixture', toolsets=[]))
@@ -302,8 +292,8 @@ async def test_stop_revokes_older_detached_task_after_new_admission(tmp_path, mo
     try:
         await authority.submit(viewer, Submission('first', ref, {'text': 'First task'}, 'queue'))
         await async_wait_until(lambda: len(reservations) == 1 and
-                               list_session_admissions(db, session_id=ref.session_id,
-                                                       pending_only=False)[0]['status'] == 'terminal',
+                               authority.persistence.admissions.list(
+                                   session_id=ref.session_id, pending_only=False)[0].status == 'terminal',
                                timeout=10, what='first task detached')
         assert reservations[0].lease.live()
         await authority.submit(viewer, Submission('second', ref, {'text': 'Second task'}, 'queue'))
@@ -316,4 +306,4 @@ async def test_stop_revokes_older_detached_task_after_new_admission(tmp_path, mo
         release.set()
         for reservation in reservations:
             reservation.release()
-        db.close()
+        authority.persistence.close()
