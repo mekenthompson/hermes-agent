@@ -36,6 +36,7 @@ _BACKEND = "persistence.sqlite"
 _OWNERS = ("persistence/", "persistence_assembly.py")
 _SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "tests"}
 _ALLOWED: dict[str, str] = {
+    "gateway/session_db_writers.py": "the --replace quiesce waits for processes still holding the backend's deleted WAL/SHM inodes",
     "hermes_state_loop_guard.py": "the debug loop guard wraps the backend holder's two choke points",
     "tools/session_search_tool.py": "the browse-preview redactor recognises the backend's preview cut by its length",
 }

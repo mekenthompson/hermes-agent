@@ -1,10 +1,8 @@
 """Deliver an accepted Kanban Stop through the existing authenticated owner protocol."""
 import asyncio
-from contextlib import closing
 import json
 import logging
 from pathlib import Path
-import sqlite3
 
 logger = logging.getLogger(__name__)
 
@@ -16,17 +14,19 @@ def _bindings(conn, task_id, event_id):
 
 
 def _checked_session(home, task_id, board_db, binding):
-    from persistence.sqlite.conversation._store.local import POLICY_PREFIX
+    from persistence.core.errors import AuthorityRefusal
+    from persistence_assembly import open_persistence_reader
     path = home / 'state.db'
     if Path(binding['db']).resolve() != path.resolve():
         raise RuntimeError('previous task owner belongs to another profile')
-    with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as conn:
-        conn.execute('PRAGMA query_only=ON')
-        row = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + binding['session_id'],)).fetchone()
-    saved = json.loads(row[0]) if row else {}
-    policy = saved.get('policy') or {}
+    try:
+        with open_persistence_reader(path) as store:
+            receipt = store.bindings.receipt(binding['session_id'])
+    except AuthorityRefusal as exc:
+        raise RuntimeError('previous task execution identity is unverified') from exc
+    policy = receipt.policy or {}
     context = json.loads(policy.get('kanban_json') or '{}')
-    if (Path(saved.get('profile_id', '')).resolve() != home.resolve() or policy.get('source') != 'kanban'
+    if (Path(receipt.profile_id or '').resolve() != home.resolve() or policy.get('source') != 'kanban'
             or context.get('task_id') != task_id or context.get('run_id') != binding['run_id']
             or Path(context.get('db', '')).resolve() != board_db.resolve()):
         raise RuntimeError('previous task execution identity is unverified')
