@@ -224,10 +224,16 @@ def test_a_worker_block_still_pings(kanban_home):
 class _GitHubStub(BaseHTTPRequestHandler):
     answers: dict[str, tuple[int, bytes]] = {}
     hits: list[str] = []
+    tokens: list = []
+    refuse_tokens = False
 
     def do_GET(self):
-        type(self).hits.append(self.path)
-        status, body = type(self).answers.get(self.path, (404, b'{"message": "Not Found"}'))
+        cls = type(self)
+        cls.hits.append(self.path)
+        cls.tokens.append(self.headers.get("Authorization"))
+        status, body = cls.answers.get(self.path, (404, b'{"message": "Not Found"}'))
+        if cls.refuse_tokens and self.headers.get("Authorization"):
+            status, body = 403, b'{"message": "forbids access via a fine-grained personal access token"}'
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -242,7 +248,7 @@ def github_http(monkeypatch: pytest.MonkeyPatch):
     server = HTTPServer(("127.0.0.1", 0), _GitHubStub)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    _GitHubStub.answers, _GitHubStub.hits = {}, []
+    _GitHubStub.answers, _GitHubStub.hits, _GitHubStub.tokens, _GitHubStub.refuse_tokens = {}, [], [], False
     monkeypatch.setattr(prs, "_API_URL", f"http://127.0.0.1:{server.server_port}/repos/{{owner}}/{{repo}}/pulls/{{number}}")
     monkeypatch.setattr("hermes_cli.github_api.github_token", lambda: None)
     prs.clear_cache()
@@ -264,3 +270,32 @@ def test_pr_state_reads_githubs_answer_and_caches_it(github_http):
     assert prs.all_closed([PR_44, PR_45]) is False
     assert prs.all_closed([]) is False
     assert github_http.hits.count("/repos/example/repo/pulls/44") == 1
+
+
+def test_a_merged_pr_the_token_cannot_read_does_not_hold_the_card(github_http, kanban_home, monkeypatch):
+    """HF-740: the ``switchroom`` org refuses fine-grained tokens that live over 366 days,
+    so every lookup of its PRs answered 403 and a card that linked the already-merged
+    switchroom/hermes-agent#248 parked as "waiting for PR #248 to merge". The public repo
+    answers an anonymous caller, so the merged PR no longer holds the card."""
+    monkeypatch.setattr("hermes_cli.github_api.github_token", lambda: "refused-token")
+    github_http.refuse_tokens = True
+    github_http.answers = {"/repos/switchroom/hermes-agent/pulls/248": (200, b'{"state": "closed", "merged": true}')}
+    calls, spawn = _spawned()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="repoint the fork", assignee="dev")
+        kb.add_comment(conn, tid, author="dev",
+                       body="Merged https://github.com/switchroom/hermes-agent/pull/248.")
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert calls == [tid]
+        assert _events(conn, tid, "blocked") == []
+    assert github_http.tokens == ["Bearer refused-token", None]
+
+
+def test_the_park_names_the_pr_that_holds_it_not_a_newer_merged_one(kanban_home, github):
+    github.update({44: False, 45: True})
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="one open, one merged", assignee="dev")
+        kb.add_comment(conn, tid, author="dev", body=f"Opened {PR_44}")
+        kb.add_comment(conn, tid, author="dev", body=f"Dependency merged: {PR_45}")
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+        assert [e["reason"] for e in _events(conn, tid, "blocked")] == ["waiting for PR #44 to merge"]

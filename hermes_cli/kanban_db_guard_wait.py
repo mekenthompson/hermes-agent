@@ -38,11 +38,36 @@ def unblock_unspent(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def pr_wait_lifted(conn: sqlite3.Connection, task_id: str, pr_urls: list[str]) -> bool:
-    """``active_pr`` does not hold: an unspent explicit unblock, or GitHub reports
-    every PR the recent comments link closed, so a respawn cannot duplicate one."""
+    """``active_pr`` does not hold: an unspent explicit unblock, a gateway stop that
+    interrupted the last run, or GitHub reports every PR the recent comments link
+    closed, so a respawn cannot duplicate one."""
     from hermes_cli import kanban_db_pr_state
 
-    return unblock_unspent(conn, task_id) or kanban_db_pr_state.all_closed(pr_urls)
+    return (unblock_unspent(conn, task_id) or interrupted_by_gateway_stop(conn, task_id)
+            or kanban_db_pr_state.all_closed(pr_urls))
+
+
+def interrupted_by_gateway_stop(conn: sqlite3.Connection, task_id: str) -> bool:
+    """The card's last worker run was cut short by a planned gateway stop or restart
+    (``owner_stopped``, HF-740), not by anything the card did.
+
+    The requeue hands the PR back to the same assignee, whose next run reads the
+    thread and carries on with it; holding the card would make it wait on its own
+    PR. The dispatcher's own park runs are skipped: they end in the same second as
+    the crash they follow. Past ``RESTART_REQUEUE_LIMIT`` restarts in a row the sweep
+    stops marking a replaced instance ``owner_stopped``, so the guard holds again
+    for a card that keeps taking its gateway down."""
+    from hermes_cli import kanban_db as kb
+
+    parks = {row["run_id"] for row in conn.execute(
+        "SELECT run_id, payload FROM task_events WHERE task_id = ? AND kind = 'blocked' AND run_id IS NOT NULL",
+        (task_id,)) if is_park_event("blocked", kb._json_dict(row["payload"]))}
+    for run in conn.execute(
+            "SELECT id, outcome, metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+            "ORDER BY id DESC", (task_id,)):
+        if run["id"] not in parks:
+            return run["outcome"] == "crashed" and kb._json_dict(run["metadata"]).get("owner_stopped") is True
+    return False
 
 
 def is_park_event(kind: str, payload: Any) -> bool:
@@ -124,13 +149,15 @@ def _standing_park(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
 
 
 def _newest_pr_number(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """PR number from the newest comment carrying a GitHub PR URL, if any."""
+    """Number of the newest linked PR GitHub does not report closed, if any: the
+    park names the PR that holds the card, not a merged one beside it (HF-740)."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_pr_state
     from hermes_cli.kanban_db_dispatch import _RESPAWN_GUARD_PR_URL_RE
 
     for row in conn.execute(
             "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC", (task_id,)):
-        urls = _RESPAWN_GUARD_PR_URL_RE.findall(kb._lossy_text(row["body"]) or "")
-        if urls:
-            return urls[-1].rsplit("/", 1)[-1]
+        for url in reversed(_RESPAWN_GUARD_PR_URL_RE.findall(kb._lossy_text(row["body"]) or "")):
+            if kanban_db_pr_state.pr_closed(url) is not True:
+                return url.rsplit("/", 1)[-1]
     return None
