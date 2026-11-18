@@ -16,7 +16,7 @@ def _bindings(conn, task_id, event_id):
 
 
 def _checked_session(home, task_id, board_db, binding):
-    from hermes_state_local import POLICY_PREFIX
+    from persistence.sqlite.conversation._store.local import POLICY_PREFIX
     path = home / 'state.db'
     if Path(binding['db']).resolve() != path.resolve():
         raise RuntimeError('previous task owner belongs to another profile')

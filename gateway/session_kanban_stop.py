@@ -6,7 +6,8 @@ import json
 from pathlib import Path
 import sqlite3
 
-from hermes_state_runtime import RuntimeStoreError
+from gateway.session_persistence import authority_persistence
+from persistence.core.errors import STORE_FAILURES, AuthorityRefusal
 
 
 async def worker_control_frame(authority, ref, row, policy, worker, scope, frame):
@@ -40,7 +41,7 @@ def require_current_claim(conn, context):
         'FROM tasks t JOIN task_runs r ON r.task_id=t.id WHERE t.id=? AND r.id=?',
         (context['task_id'], context['run_id'])).fetchone()
     if row is None or tuple(row) != ('running', context['run_id'], context['claim_lock'], 'running', context['claim_lock']):
-        raise RuntimeStoreError('stale_kanban_claim')
+        raise AuthorityRefusal('stale_kanban_claim')
 
 
 def previous_attempts(context):
@@ -58,16 +59,16 @@ def previous_attempts(context):
 
 def check_previous(authority, context, binding):
     from gateway.session_policy import restore_policy
-    from hermes_state_local import local_receipt
-    if Path(binding['db']).resolve() != Path(authority.db.db_path).resolve():
-        raise RuntimeStoreError('kanban_previous_owner_unavailable')
-    saved = local_receipt(authority.db, binding['session_id'])
-    policy = restore_policy(saved['policy'])
+    from persistence_assembly import store_location
+    store = authority_persistence(authority)
+    if Path(binding['db']).resolve() != (store_location(store.scope) or store.scope.profile_dir).resolve():
+        raise AuthorityRefusal('kanban_previous_owner_unavailable')
+    policy = restore_policy(store.bindings.receipt(binding['session_id']).policy)
     old = json.loads(policy.kanban_json or '{}')
     if (policy.source != 'kanban' or old.get('run_id') != binding['run_id']
             or old.get('task_id') != context['task_id'] or old.get('board') != context['board']
             or Path(old.get('db', '')).resolve() != Path(context['db']).resolve()):
-        raise RuntimeStoreError('invalid_kanban_claim')
+        raise AuthorityRefusal('invalid_kanban_claim')
 
 
 def previous_workers_gone(context, binding):
@@ -149,12 +150,12 @@ async def discharge_replaced_instance(authority, ref, context, run_id):
     """
     from gateway.session_ancillary import process_stop_pending
     from gateway.session_authorities import owner_scope
-    from hermes_state_runtime import list_session_admissions
-    token = process_stop_pending(authority.db, ref.session_id)
+    store = authority_persistence(authority)
+    token = await asyncio.to_thread(process_stop_pending, store, ref.session_id)
     if token is not None and token.partition(':')[0] == str(authority.epoch):
         return False
-    rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=ref.session_id)
-    if any(row['status'] != 'unknown' or row['owner_epoch'] >= authority.epoch for row in rows):
+    rows = await asyncio.to_thread(store.admissions.list, session_id=ref.session_id)
+    if any(row.status != 'unknown' or row.owner_epoch >= authority.epoch for row in rows):
         return False
     if not await asyncio.to_thread(replaced_attempt, context, run_id, ref.session_id):
         return False
@@ -175,22 +176,21 @@ async def settle_replaced_card_attempts(authority):
     from gateway.session_local_recovery import restore_local_session
     from gateway.session_policy import restore_policy
     from gateway.session_unattended_unknown import is_unattended, settle_unattended_unknown
-    from hermes_state_local import local_receipt
-    from hermes_state_runtime import _row
+    from gateway.session_authority import admission_row
     logger = logging.getLogger(__name__)
+    store = authority_persistence(authority)
     try:
-        rows = [_row(row) for row in authority.db._read_all(
-            "SELECT * FROM session_admissions WHERE status='unknown' ORDER BY seq")]
-    except (RuntimeStoreError, sqlite3.Error) as exc:
+        rows = [admission_row(row) for row in await asyncio.to_thread(store.admissions.list_unknown)]
+    except (AuthorityRefusal, sqlite3.Error, *STORE_FAILURES) as exc:
         logger.warning('Card attempts from an earlier instance left for their respawns: %s', type(exc).__name__)
         return
     for row in rows:
         sid, card = row['target_session_id'], (row.get('payload') or {}).get('kanban_card_v1')
         if (not card or row['owner_epoch'] >= authority.epoch or not is_unattended(row)
-                or process_stop_pending(authority.db, sid) is None):
+                or process_stop_pending(store, sid) is None):
             continue  # an unfenced card row already settled in boot recovery
         try:
-            policy = restore_policy(local_receipt(authority.db, sid)['policy'])
+            policy = restore_policy(store.bindings.receipt(sid).policy)
             context = json.loads(policy.kanban_json or '{}')
             if policy.source != 'kanban' or any(context.get(key) != card.get(key) for key in ('board', 'task_id', 'run_id')):
                 continue
@@ -205,7 +205,7 @@ async def settle_replaced_card_attempts(authority):
             if await settle_unattended_unknown(authority, ref):
                 logger.info('Card attempt %s (%s run %s) ended with an earlier instance: settled interrupted',
                             sid, card['task_id'], card['run_id'])
-        except (RuntimeStoreError, OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
+        except (AuthorityRefusal, OSError, ValueError, KeyError, TypeError, sqlite3.Error, *STORE_FAILURES) as exc:
             logger.warning('Card attempt %s left for its respawn: %s', sid, getattr(exc, 'reason', type(exc).__name__))
 
 
@@ -236,7 +236,7 @@ async def retire_previous_attempts(connection, context):
         if sid in authority.executing:
             try:
                 await connection.interrupt(ref, {'execution_generation': handle.execution_generation})
-            except RuntimeStoreError as exc:
+            except AuthorityRefusal as exc:
                 if exc.reason != 'managed_worker_lost':
                     raise
         task = authority.sessions[sid].task
@@ -244,12 +244,12 @@ async def retire_previous_attempts(connection, context):
             try:
                 await asyncio.wait_for(asyncio.shield(task), STOP_ACK_SECONDS + 10)
             except TimeoutError as exc:
-                raise RuntimeStoreError('kanban_previous_execution_unknown') from exc
+                raise AuthorityRefusal('kanban_previous_execution_unknown') from exc
             except ManagedExecutionUnknown:
                 pass  # retain its unknown result; physical cleanup below does not replay that turn
         async with authority.sessions[sid].claim_gate:
             if sid in authority.executing:
-                raise RuntimeStoreError('kanban_previous_execution_unknown')
+                raise AuthorityRefusal('kanban_previous_execution_unknown')
             gone = await asyncio.to_thread(previous_workers_gone, context, binding)
             # Before this owner records its own Stop: only an earlier epoch's fence can qualify.
             replaced = gone and await discharge_replaced_instance(authority, ref, context, binding['run_id'])
@@ -257,8 +257,8 @@ async def retire_previous_attempts(connection, context):
             await tracked_write(authority, partial(record_process_stop, authority, ref, handle.execution_generation))
             if (not gone
                     or not await retry_process_stop(authority, ref)
-                    or process_stop_pending(authority.db, sid) is not None):
-                raise RuntimeStoreError('kanban_previous_execution_unknown')
+                    or await asyncio.to_thread(process_stop_pending, authority_persistence(authority), sid) is not None):
+                raise AuthorityRefusal('kanban_previous_execution_unknown')
         if replaced:
             # Its fence is gone, so its ``unknown`` card row settles interrupted (GW-10), as boot
             # recovery would have: a takeover's cleanup check then reads the attempt as settled.
