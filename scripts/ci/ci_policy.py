@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass
 from typing import Mapping
 
-FORK = "mekenthompson/hermes-agent"
+FORK = "switchroom/hermes-agent"
 
 # These products are not shipped in the fork's Linux runtime image. All other
 # selected lanes, including Python/runtime E2E and bundled web/TUI JS, still gate it.
@@ -88,7 +88,7 @@ def should_cancel_in_progress(event_name: str, repository: str, ref: str) -> boo
     """Supersede PRs everywhere and only main pushes in the maintained fork."""
     return event_name == "pull_request" or (
         event_name == "push"
-        and repository == "mekenthompson/hermes-agent"
+        and repository == "switchroom/hermes-agent"
         and ref == "refs/heads/main"
     )
 

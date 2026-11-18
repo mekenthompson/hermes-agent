@@ -131,7 +131,7 @@ runs:
           # Exact event SHAs, status-bearing local git diff when available;
           # capped or incomplete compare data deliberately selects all lanes.
           CHANGED="$(python3 -m scripts.ci.pr_changed_files)"
-        elif [ "$EVENT_NAME" = "push" ] && [ "$REPO" = "mekenthompson/hermes-agent" ]; then
+        elif [ "$EVENT_NAME" = "push" ] && [ "$REPO" = "switchroom/hermes-agent" ]; then
           # Fork only: scope a main push to the pushed range
           # (github.event.before...github.sha). The helper prints nothing —
           # so the classifier fails open — on a first or forced push, a

@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO = "mekenthompson/hermes-agent"
+REPO = "switchroom/hermes-agent"
 LIST = Path(__file__).with_name("fork_disabled_workflows.txt")
 
 

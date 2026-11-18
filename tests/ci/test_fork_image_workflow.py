@@ -22,7 +22,7 @@ SYFT_SHA256 = "8fcb33017a0dc1058298c923c436d19dfa68ae93968e0b423248542e3afb9fc3"
 TRIVY_SHA256 = "8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
 SHA = "1" * 40
 DIGEST = "sha256:" + "2" * 64
-REPOSITORY = "ghcr.io/mekenthompson/hermes-agent"
+REPOSITORY = "ghcr.io/switchroom/hermes-agent"
 
 
 class ForkImageWorkflowTests(unittest.TestCase):
@@ -102,7 +102,7 @@ class ForkImageWorkflowTests(unittest.TestCase):
         self.assertEqual(
             publish,
             "needs.detect.outputs.docker == 'true' && "
-            "github.repository == 'mekenthompson/hermes-agent' && "
+            "github.repository == 'switchroom/hermes-agent' && "
             "github.ref == 'refs/heads/main' && "
             "github.event_name == 'workflow_dispatch' && "
             "github.event.inputs.publish == 'true'",
@@ -110,7 +110,7 @@ class ForkImageWorkflowTests(unittest.TestCase):
         self.assertEqual(
             preflight,
             "needs.detect.outputs.docker == 'true' && "
-            "github.repository == 'mekenthompson/hermes-agent' && "
+            "github.repository == 'switchroom/hermes-agent' && "
             "github.event_name == 'workflow_dispatch' && "
             "github.event.inputs.publish != 'true'",
         )
@@ -230,7 +230,7 @@ class ForkImageWorkflowTests(unittest.TestCase):
         self.assertNotIn("docker push", preflight)
 
     def test_push_digest_extractor_accepts_actual_docker_push_summary(self) -> None:
-        output = """The push refers to repository [ghcr.io/mekenthompson/hermes-agent]
+        output = """The push refers to repository [ghcr.io/switchroom/hermes-agent]
 abc123: Pushed
 candidate-123-1: digest: sha256:2222222222222222222222222222222222222222222222222222222222222222 size: 1234
 """
@@ -247,7 +247,7 @@ candidate-123-1: digest: sha256:222222222222222222222222222222222222222222222222
 
     def test_push_digest_extractor_rejects_missing_or_ambiguous_summaries(self) -> None:
         for output in (
-            "The push refers to repository [ghcr.io/mekenthompson/hermes-agent]\n",
+            "The push refers to repository [ghcr.io/switchroom/hermes-agent]\n",
             f"tag-a: digest: {DIGEST} size: 1\ntag-b: digest: {DIGEST} size: 2\n",
         ):
             with self.subTest(output=output):
@@ -309,7 +309,7 @@ candidate-123-1: digest: sha256:222222222222222222222222222222222222222222222222
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn('docker push "$CANDIDATE_IMAGE"', text)
         self.assertIn('docker buildx imagetools create --prefer-index=false --tag "$TEST_IMAGE" "$immutable_ref"', text)
-        self.assertIn("ghcr.io/mekenthompson/hermes-agent:sha-${{ github.sha }}", text)
+        self.assertIn("ghcr.io/switchroom/hermes-agent:sha-${{ github.sha }}", text)
         self.assertIn("actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8", text)
         self.assertIn("actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e", text)
         self.assertIn("steps.publish.outputs.digest", text)

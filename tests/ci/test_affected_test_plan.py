@@ -18,7 +18,7 @@ def test_standalone_test_selects_one_file_and_one_shard(tmp_path, monkeypatch, c
     target.parent.mkdir()
     target.write_text("def test_example():\n    assert True\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("REPO", "mekenthompson/hermes-agent")
+    monkeypatch.setenv("REPO", "switchroom/hermes-agent")
     monkeypatch.setenv("EVENT_NAME", "pull_request")
     monkeypatch.setattr(classify_changes.sys, "stdin", io.StringIO("tests/test_example.py\n"))
     monkeypatch.setattr(classify_changes, "pull_request_labels", list)
@@ -140,7 +140,7 @@ def test_imported_test_retains_full_suite(tmp_path):
     (["package-lock.json"], ["checks", "ui-1/3", "ui-2/3", "ui-3/3"]),
 ])
 def test_js_selection_isolated_sources_and_shared_fallback(paths, units, monkeypatch, capsys):
-    monkeypatch.setenv("REPO", "mekenthompson/hermes-agent")
+    monkeypatch.setenv("REPO", "switchroom/hermes-agent")
     monkeypatch.setenv("EVENT_NAME", "pull_request")
     monkeypatch.setattr(classify_changes.sys, "stdin", io.StringIO("\n".join(paths)))
     monkeypatch.setattr(classify_changes, "pull_request_labels", list)
@@ -151,7 +151,7 @@ def test_js_selection_isolated_sources_and_shared_fallback(paths, units, monkeyp
 
 
 def test_fork_empty_exact_diff_cannot_be_narrowed_by_live_pr_files(monkeypatch, capsys):
-    monkeypatch.setenv("REPO", "mekenthompson/hermes-agent")
+    monkeypatch.setenv("REPO", "switchroom/hermes-agent")
     monkeypatch.setenv("EVENT_NAME", "pull_request")
     monkeypatch.setattr(classify_changes.sys, "stdin", io.StringIO(""))
     monkeypatch.setattr(classify_changes, "pull_request_changed_files", lambda: ["README.md"])
@@ -168,7 +168,7 @@ def test_non_pull_request_events_always_plan_the_full_suite(event, changed, tmp_
     target.parent.mkdir()
     target.write_text("def test_example():\n    assert True\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("REPO", "mekenthompson/hermes-agent")
+    monkeypatch.setenv("REPO", "switchroom/hermes-agent")
     monkeypatch.setenv("EVENT_NAME", event)
     monkeypatch.setattr(classify_changes.sys, "stdin", io.StringIO(changed + "\n"))
     monkeypatch.setattr(classify_changes, "pull_request_labels", list)

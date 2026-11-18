@@ -24,8 +24,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE_REPOSITORY: ghcr.io/mekenthompson/hermes-agent
-  TEST_IMAGE: ghcr.io/mekenthompson/hermes-agent:sha-${{ github.sha }}
+  IMAGE_REPOSITORY: ghcr.io/switchroom/hermes-agent
+  TEST_IMAGE: ghcr.io/switchroom/hermes-agent:sha-${{ github.sha }}
 
 jobs:
   detect:
@@ -35,7 +35,7 @@ jobs:
     # the PR diff; a dispatch, a forced or first push, or an unreadable diff
     # fail open (``docker=true``). See scripts/ci/classify_changes.py.
     name: Detect image inputs
-    if: github.repository == 'mekenthompson/hermes-agent'
+    if: github.repository == 'switchroom/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     permissions:
@@ -59,7 +59,7 @@ jobs:
     needs: detect
     if: >-
       needs.detect.outputs.docker == 'true' &&
-      github.repository == 'mekenthompson/hermes-agent' &&
+      github.repository == 'switchroom/hermes-agent' &&
       github.event_name == 'workflow_dispatch' &&
       github.event.inputs.publish != 'true'
     runs-on: ubuntu-latest
@@ -167,7 +167,7 @@ jobs:
     needs: detect
     if: >-
       needs.detect.outputs.docker == 'true' &&
-      github.repository == 'mekenthompson/hermes-agent' &&
+      github.repository == 'switchroom/hermes-agent' &&
       github.ref == 'refs/heads/main' &&
       github.event_name == 'workflow_dispatch' &&
       github.event.inputs.publish == 'true'

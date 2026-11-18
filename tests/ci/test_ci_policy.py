@@ -23,12 +23,12 @@ _spec.loader.exec_module(_mod)
 @pytest.mark.parametrize(
     ("event_name", "repository", "ref", "expected"),
     [
-        ("pull_request", "mekenthompson/hermes-agent", "refs/pull/1/merge", True),
+        ("pull_request", "switchroom/hermes-agent", "refs/pull/1/merge", True),
         ("pull_request", "NousResearch/hermes-agent", "refs/pull/1/merge", True),
-        ("push", "mekenthompson/hermes-agent", "refs/heads/main", True),
-        ("push", "mekenthompson/hermes-agent", "refs/heads/feature", False),
+        ("push", "switchroom/hermes-agent", "refs/heads/main", True),
+        ("push", "switchroom/hermes-agent", "refs/heads/feature", False),
         ("push", "NousResearch/hermes-agent", "refs/heads/main", False),
-        ("workflow_dispatch", "mekenthompson/hermes-agent", "refs/heads/main", False),
+        ("workflow_dispatch", "switchroom/hermes-agent", "refs/heads/main", False),
     ],
 )
 def test_cancel_in_progress_preserves_upstream_pushes(
@@ -91,7 +91,7 @@ def test_selection_uses_boolean_values_and_fork_scope() -> None:
             "site",
         )
     }
-    selected = _mod.selected_jobs(lanes, "mekenthompson/hermes-agent", "pull_request")
+    selected = _mod.selected_jobs(lanes, "switchroom/hermes-agent", "pull_request")
     assert selected["tests"] is False
     assert selected["tests-os"] is False
     assert selected["installer-tests"] is False
@@ -99,14 +99,14 @@ def test_selection_uses_boolean_values_and_fork_scope() -> None:
     lanes["python"] = "true"
     lanes["os_tests"] = "true"
     assert (
-        _mod.selected_jobs(lanes, "mekenthompson/hermes-agent", "pull_request")[
+        _mod.selected_jobs(lanes, "switchroom/hermes-agent", "pull_request")[
             "tests-os"
         ]
         is False
     )
 
 
-@pytest.mark.parametrize("repository", ["mekenthompson/hermes-agent", "NousResearch/hermes-agent"])
+@pytest.mark.parametrize("repository", ["switchroom/hermes-agent", "NousResearch/hermes-agent"])
 @pytest.mark.parametrize("event", ["pull_request", "push"])
 @pytest.mark.parametrize("release", [False, True])
 @pytest.mark.parametrize("catalog", [False, True])
@@ -126,7 +126,7 @@ def test_catalog_lane_uses_shared_selection(repository, event, release, catalog)
 @pytest.mark.parametrize("result", ["success", "skipped", "failure", "cancelled", "missing", None])
 def test_catalog_gate_requires_explicit_applicable_result(catalog, image, result) -> None:
     selected = _mod.selected_jobs(
-        {"catalog": str(catalog).lower()}, "mekenthompson/hermes-agent", "push")
+        {"catalog": str(catalog).lower()}, "switchroom/hermes-agent", "push")
     if image:
         selected = _mod.image_selected_jobs(selected)
     needs = {name: {"result": "success" if required else "skipped"}
@@ -146,7 +146,7 @@ def test_selection_covers_each_orchestrator_prerequisite() -> None:
     )
     jobs = workflow["jobs"]
     expected = set(jobs) - {"all-checks-pass", "image-checks-pass"}
-    selected = _mod.selected_jobs({}, "mekenthompson/hermes-agent", "pull_request")
+    selected = _mod.selected_jobs({}, "switchroom/hermes-agent", "pull_request")
     assert set(selected) == expected == set(jobs["all-checks-pass"]["needs"])
 
 
@@ -182,11 +182,11 @@ def test_upgrade_applicability_reaches_real_upgrade_suite() -> None:
     )
     assert (
         ci["jobs"]["tests"]["with"]["upgrade"]
-        == "${{ github.repository != 'mekenthompson/hermes-agent' && needs.detect.outputs.upgrade == 'true' }}"
+        == "${{ github.repository != 'switchroom/hermes-agent' && needs.detect.outputs.upgrade == 'true' }}"
     )
     assert (
         ci["jobs"]["tests"]["with"]["e2e"]
-        == "${{ github.repository != 'mekenthompson/hermes-agent' && needs.detect.outputs.e2e == 'true' }}"
+        == "${{ github.repository != 'switchroom/hermes-agent' && needs.detect.outputs.e2e == 'true' }}"
     )
     assert tests[True]["workflow_call"]["inputs"]["upgrade"]["default"] is True
     assert tests["jobs"]["e2e-upgrade-plan"]["if"] == "inputs.upgrade"
@@ -196,14 +196,14 @@ def test_upgrade_applicability_reaches_real_upgrade_suite() -> None:
     native = ci["jobs"]["native-install-tests"]
     assert native["with"] == {"commit": "${{ inputs.commit }}", "unit": False, "e2e": False, "upgrade": True, "upgrade_partition": "native"}
     assert native["if"] == "${{ fromJSON(needs.detect.outputs.selected_jobs).native-install-tests }}"
-    assert ci["jobs"]["tests"]["with"]["upgrade_partition"] == "${{ github.repository == 'mekenthompson/hermes-agent' && inputs.release != true && 'runtime' || 'all' }}"
+    assert ci["jobs"]["tests"]["with"]["upgrade_partition"] == "${{ github.repository == 'switchroom/hermes-agent' && inputs.release != true && 'runtime' || 'all' }}"
     assert tests[True]["workflow_call"]["inputs"]["unit"]["default"] is True
     assert tests[True]["workflow_call"]["inputs"]["upgrade_partition"]["default"] == "all"
     assert tests["jobs"]["test"]["if"] == "inputs.unit"
     assert "inputs.upgrade_partition" in tests["concurrency"]["group"]
     lanes = {"python": "true", "upgrade": "true"}
-    for repo, release, expected in (("mekenthompson/hermes-agent", False, False),
-                                    ("mekenthompson/hermes-agent", True, False),
+    for repo, release, expected in (("switchroom/hermes-agent", False, False),
+                                    ("switchroom/hermes-agent", True, False),
                                     ("NousResearch/hermes-agent", False, False)):
         selected = _mod.selected_jobs(lanes, repo, "push", release=release)
         assert selected["native-install-tests"] is expected
@@ -322,7 +322,7 @@ def test_fork_sync_does_not_select_unshipped_surfaces() -> None:
         "rust", "site", "upgrade", "e2e", "e2e_upgrade",
         "uv_lock", "npm_lock", "scan", "deps", "docker_meta", "ci_review",
     )}
-    selected = _mod.selected_jobs(lanes, "mekenthompson/hermes-agent", "push", release=True)
+    selected = _mod.selected_jobs(lanes, "switchroom/hermes-agent", "push", release=True)
     for job in (
         "native-install-tests", "tests-os", "installer-tests", "rust-tests",
         "bootstrap-installer", "e2e-desktop", "e2e-desktop-core", "e2e-desktop-update",
@@ -345,7 +345,7 @@ def test_disabled_upstream_workflows_are_not_fork_selected_calls() -> None:
     }
     jobs = yaml.safe_load((root / ".github/workflows/ci.yaml").read_text())["jobs"]
     lanes = {key: "true" for key in ("python", "frontend", "uv_lock", "npm_lock", "scan", "deps", "docker_meta", "ci_review")}
-    selected = _mod.selected_jobs(lanes, "mekenthompson/hermes-agent", "pull_request")
+    selected = _mod.selected_jobs(lanes, "switchroom/hermes-agent", "pull_request")
     called = set()
     for name, job in jobs.items():
         if not selected.get(name):
@@ -367,7 +367,7 @@ def test_workflow_selection_output_is_boolean_json(tmp_path: Path) -> None:
             **os.environ,
             "GITHUB_OUTPUT": str(output_path),
             "LANES": '{"python":"false","python_prod":"true","frontend":"false","upgrade":"false"}',
-            "REPO": "mekenthompson/hermes-agent",
+            "REPO": "switchroom/hermes-agent",
             "EVENT_NAME": "pull_request",
         },
     )

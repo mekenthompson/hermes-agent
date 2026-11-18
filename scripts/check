@@ -131,20 +131,22 @@ _CHECKS = (*_GUARDS, *_DIFF_GUARDS, "ruff", "health")
 _ALIGNMENT_BRANCH = "house/reconcile-nous-c9b20d7bc08dec1e10779a06d7d9073bc6e7e418"
 _ALIGNMENT_PARENTS = ("f6ac86b0ef3d5e86654132b8aba1ce6f1de45b5e",
                      "c9b20d7bc08dec1e10779a06d7d9073bc6e7e418")
+# The fork moved from mekenthompson to switchroom; older clones keep the redirected origin.
+_FORK_REPOSITORIES = ("switchroom/hermes-agent", "mekenthompson/hermes-agent")
+_FORK_ORIGINS = tuple(url for repo in _FORK_REPOSITORIES
+                      for url in (f"https://github.com/{repo}.git", f"https://github.com/{repo}",
+                                  f"git@github.com:{repo}.git", f"git@github.com:{repo}"))
 
 
 def _alignment_parents(head: str | None) -> tuple[str, ...]:
     branch = os.environ.get("GITHUB_HEAD_REF") or gitio.git(REPO, "branch", "--show-current").strip()
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     origin = gitio.git(REPO, "remote", "get-url", "origin", check=False).strip().lower()
-    if branch != _ALIGNMENT_BRANCH or repository not in ("", "mekenthompson/hermes-agent"):
+    if branch != _ALIGNMENT_BRANCH or repository not in ("", *_FORK_REPOSITORIES):
         return ()
     if repository and os.environ.get("CI_PR_HEAD_REPOSITORY") != repository:
         return ()
-    if origin not in ("https://github.com/mekenthompson/hermes-agent.git",
-                      "https://github.com/mekenthompson/hermes-agent",
-                      "git@github.com:mekenthompson/hermes-agent.git",
-                      "git@github.com:mekenthompson/hermes-agent"):
+    if origin not in _FORK_ORIGINS:
         return ()
     target = head or "HEAD"
     for parent in _ALIGNMENT_PARENTS:

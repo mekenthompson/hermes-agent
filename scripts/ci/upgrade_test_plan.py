@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 
-FORK = "mekenthompson/hermes-agent"
+FORK = "switchroom/hermes-agent"
 LONG_FILES = {"core": "test_upgrade_path.py", "git": "test_shallow_install.py"}
 # Native installation/self-update surfaces. New root files and new suites stay
 # in the runtime partition until explicitly reviewed here.
