@@ -17,6 +17,7 @@ import logging
 import re
 import threading
 import time
+import urllib.error
 import urllib.request
 from typing import Iterable, Optional
 
@@ -26,26 +27,38 @@ _PR_URL_RE = re.compile(r"github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)", re.IGNORE
 _API_URL = "https://api.github.com/repos/{owner}/{repo}/pulls/{number}"
 _TIMEOUT_SECONDS = 5
 _TTL_SECONDS = 300
+_TOKEN_REFUSED = frozenset({401, 403, 404})
 
 _cache: dict[tuple[str, str, int], tuple[float, Optional[bool]]] = {}
 _cache_lock = threading.Lock()
 
 
 def fetch_pr_closed(owner: str, repo: str, number: int) -> Optional[bool]:
-    """GitHub's answer: True closed (merged or not), False open, None unknown."""
+    """GitHub's answer: True closed (merged or not), False open, None unknown.
+
+    A token the repo's owner refuses (an org that forbids long-lived fine-grained
+    tokens answers 403, one the token cannot see 404) is asked again anonymously:
+    a public repo still answers, so its merged PR stops holding the card (HF-740)."""
     from hermes_cli.github_api import github_token
 
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "hermes-kanban-respawn-guard"}
-    token = github_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    request = urllib.request.Request(_API_URL.format(owner=owner, repo=repo, number=number), headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT_SECONDS) as response:
-            data = json.load(response)
-    except (OSError, ValueError) as exc:  # URLError/HTTPError/timeouts are OSError
-        logger.debug("kanban respawn guard: PR %s/%s#%s state unknown: %s", owner, repo, number, exc)
-        return None
+    url = _API_URL.format(owner=owner, repo=repo, number=number)
+    data = None
+    for token in dict.fromkeys((github_token(), None)):
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "hermes-kanban-respawn-guard"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers),
+                                        timeout=_TIMEOUT_SECONDS) as response:
+                data = json.load(response)
+            break
+        except urllib.error.HTTPError as exc:
+            logger.debug("kanban respawn guard: PR %s/%s#%s state unknown: %s", owner, repo, number, exc)
+            if not token or exc.code not in _TOKEN_REFUSED:
+                return None
+        except (OSError, ValueError) as exc:  # URLError/timeouts are OSError
+            logger.debug("kanban respawn guard: PR %s/%s#%s state unknown: %s", owner, repo, number, exc)
+            return None
     state = data.get("state") if isinstance(data, dict) else None
     return True if state == "closed" else False if state == "open" else None
 

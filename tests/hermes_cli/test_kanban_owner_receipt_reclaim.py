@@ -411,6 +411,37 @@ def test_repeated_crash_diagnostic_skips_planned_stops(board, exit_code, flagged
     assert ("repeated_crashes" in {d.kind for d in diagnostics}) is flagged
 
 
+@pytest.mark.parametrize("exit_code,held", [(130, False), (1, True)], ids=["planned-stop", "worker-crash"])
+def test_a_planned_stop_does_not_park_the_card_on_its_own_pr(board, monkeypatch, exit_code, held):
+    """HF-740: the release card that opened and drives its own sync PR was interrupted by a
+    gateway restart, and the respawn guard parked it as "waiting for PR #250 to merge" until a
+    human unblocked it. A planned stop now hands the card straight back to its assignee; a real
+    crash still keeps the duplicate-PR protection."""
+    import hermes_cli.profiles as profmod
+    from hermes_cli import kanban_db_pr_state as prs
+
+    monkeypatch.setattr(prs, "fetch_pr_closed", lambda owner, repo, number: False)  # the PR is open
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    prs.clear_cache()
+    _interrupted_by_stop(board, "t_release", exit_code=exit_code)
+    kb.add_comment(board.conn, "t_release", author="default",
+                   body="The upstream sync is open as https://github.com/switchroom/hermes-agent/pull/250.")
+    kbd.detect_crashed_workers(board.conn)
+    assert board.state("t_release")["status"] == "ready"
+    assert [r.outcome for r in kb.list_runs(board.conn, "t_release")] == ["crashed"]
+
+    spawned: list[str] = []
+    kbd.dispatch_once(board.conn, spawn_fn=lambda task, workspace, board=None: spawned.append(task.id))
+    parks = [json.loads(e["payload"]) for e in board.events("t_release") if e["kind"] == "blocked"]
+    if held:
+        assert spawned == []
+        assert [p["reason"] for p in parks] == ["waiting for PR #250 to merge"]
+    else:
+        assert spawned == ["t_release"]
+        assert parks == []
+    prs.clear_cache()
+
+
 @pytest.mark.parametrize("admission", [
     ("terminal", "failed"),
     # A killed owner: its interpreters die without an interrupted result and the successor

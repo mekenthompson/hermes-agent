@@ -1642,8 +1642,8 @@ def check_respawn_guard(
     #    Exception: a handoff AFTER the newest PR comment (operator reassign,
     #    reviewer changes_requested, review reopen) names the profile that must
     #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
+    #    duplicate implementation (#111910). A crash/reclaim is not a handoff and
+    #    stays guarded; a planned gateway stop is lifted in ``pr_wait_lifted``.
     pr_hits = [(t, _RESPAWN_GUARD_PR_URL_RE.findall(_kb._lossy_text(c["body"]) or "")) for t, c in _rows_since(
         conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW, cols=", body", unreadable=now)]
     if pr_times := [t for t, urls in pr_hits if urls]:  # unreadable time: duplicate-PR risk, fail closed
