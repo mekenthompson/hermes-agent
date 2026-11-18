@@ -11,6 +11,35 @@ import unittest
 
 import pytest
 
+from persistence.core.errors import AuthorityRefusal
+
+
+# Admission-row helpers over the storage interface: the old dict row shape, the authority's own handle.
+def claim_session_input(authority, **kwargs):
+    from gateway.session_authority import admission_row
+    return admission_row(authority.persistence.admissions.claim(**kwargs))
+
+
+def settle_session_input(authority, **kwargs):
+    from gateway.session_authority import admission_row
+    if '_transfers' in kwargs:
+        kwargs['transfers'] = kwargs.pop('_transfers')
+    return admission_row(authority.persistence.admissions.settle(**kwargs))
+
+
+def list_session_admissions(authority, **kwargs):
+    from gateway.session_authority import admission_row
+    return [admission_row(record) for record in authority.persistence.admissions.list(**kwargs)]
+
+
+def get_session_admission(authority, **kwargs):
+    from gateway.session_authority import admission_row
+    return admission_row(authority.persistence.admissions.get(**kwargs))
+
+
+def begin_runtime_epoch(authority, *, instance_id):
+    return authority.persistence.runtime.begin_epoch(instance_id=instance_id)
+
 
 @pytest.fixture(autouse=True)
 def no_bootstrap(monkeypatch):
@@ -80,8 +109,9 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
         self.home = Path(self.temp.name)
         self.addCleanup(reset_hermes_home_override, set_hermes_home_override(self.home))
         self.store = SessionStore(self.home / 'sessions', GatewayConfig())
-        self.addCleanup(self.store._db.close)
-        self.runner = SimpleNamespace(session_store=self.store, _session_db=self.store._db, adapters={},
+        self.persistence = self.store._scoped_persistence()
+        self.addCleanup(self.persistence.close)
+        self.runner = SimpleNamespace(session_store=self.store, _session_db=self.persistence, adapters={},
             _draining=False, config=GatewayConfig(), _cached_agent_for=lambda key: None,
             _peek_session_state=lambda key: None, _primary_profile_name='default')
         self.allowed = {'fixture-author', 'other-author'}
@@ -142,9 +172,8 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
             timestamp=datetime(2026, 1, 1, tzinfo=UTC), allow_gateway_control=control)
 
     async def start(self, message_id='opening'):
-        from hermes_state_runtime import claim_session_input
         receipt = await self.authority.admit_native(self.event(message_id))
-        row = claim_session_input(self.authority.db, epoch=self.authority.epoch, session_id=receipt.ref.session_id)
+        row = claim_session_input(self.authority, epoch=self.authority.epoch, session_id=receipt.ref.session_id)
         self.ref, self.running = receipt.ref, row
         self.agent = FiniteAgent()
         self.authority.executing[self.ref.session_id] = row['generation']
@@ -153,10 +182,9 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
 
     def settle(self, outcome='completed'):
         from gateway.session_queued_controls import steer_transfers
-        from hermes_state_runtime import settle_session_input
         with self.authority.sessions[self.ref.session_id].event_stream.lock:
             transfers = steer_transfers(self.authority, self.ref.session_id, self.running['generation'])
-        return settle_session_input(self.authority.db, epoch=self.authority.epoch,
+        return settle_session_input(self.authority, epoch=self.authority.epoch,
             admission_id=self.running['admission_id'], generation=self.running['generation'],
             outcome=outcome, _transfers=transfers)
 
@@ -166,8 +194,7 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
             self.runner, event, event.source, self.store._generate_session_key(event.source), False)
 
     def row(self, message_id):
-        from hermes_state_runtime import list_session_admissions
-        return next(row for row in list_session_admissions(self.authority.db,
+        return next(row for row in list_session_admissions(self.authority,
             session_id=self.ref.session_id, pending_only=False) if row['request_id'] == message_id)
 
     async def accepted(self, message_id):
@@ -311,14 +338,13 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_conflict_and_unauthorized_actor_never_enter_busy_effects(self):
         from dataclasses import replace
-        from hermes_state_runtime import RuntimeStoreError
         await self.start()
         await self.receive(self.event('same-id', 'original text'))
-        with self.assertRaises(RuntimeStoreError) as conflict:
+        with self.assertRaises(AuthorityRefusal) as conflict:
             await self.receive(self.event('same-id', 'changed text'))
         self.assertEqual(conflict.exception.reason, 'admission_conflict')
         self.allowed.remove('fixture-author')
-        with self.assertRaises(RuntimeStoreError) as denied:
+        with self.assertRaises(AuthorityRefusal) as denied:
             await self.receive(self.event('same-id', 'original text'))
         self.assertEqual(denied.exception.reason, 'permission_denied')
         self.allowed.add('fixture-author')
@@ -328,7 +354,7 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
         await self.receive(self.event('same-id', 'separate actor input', source=other))
         self.assertEqual(len(self.agent.effects), 2)
         self.allowed.remove('fixture-author')
-        with self.assertRaises(RuntimeStoreError):
+        with self.assertRaises(AuthorityRefusal):
             await self.receive(self.event('first-refused-id'))
         self.allowed.add('fixture-author')
         await self.receive(self.event('first-refused-id'))
@@ -349,14 +375,14 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_newer_stop_after_transfer_reservation_does_not_requeue(self):
         from unittest.mock import patch
-        import gateway.session_queued_controls as queued
         await self.start()
-        transfer = queued.steer_session_input
-        def stopped(db, **kwargs):
-            result = transfer(db, **kwargs)
+        admissions = self.authority.persistence.admissions
+        transfer = admissions.steer
+        def stopped(**kwargs):
+            result = transfer(**kwargs)
             self.authority.fence_route(self.route)
             return result
-        with patch.object(queued, 'steer_session_input', stopped):
+        with patch.object(admissions, 'steer', stopped):
             # Keep the real SQLite transition; only inject the control boundary.
             await self.receive(self.event('stopped-transfer'))
         self.assertEqual(self.agent.effects, [])
@@ -366,15 +392,14 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_epoch_and_agent_change_between_prepare_and_apply_do_not_deliver(self):
         from unittest.mock import patch
-        from hermes_state_runtime import begin_runtime_epoch, RuntimeStoreError
         await self.start()
         write = self.authority._admit_native_write
         def new_epoch(**kwargs):
             result = write(**kwargs)
-            begin_runtime_epoch(self.authority.db, instance_id='replacement-owner')
+            begin_runtime_epoch(self.authority, instance_id='replacement-owner')
             return result
         with patch.object(self.authority, '_admit_native_write', new_epoch):
-            with self.assertRaises(RuntimeStoreError) as stale:
+            with self.assertRaises(AuthorityRefusal) as stale:
                 await self.receive(self.event('epoch-change'))
         self.assertEqual(stale.exception.reason, 'stale_epoch')
         self.assertEqual(self.agent.effects, [])
@@ -453,7 +478,6 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.agent.effects), 2)
 
     async def test_media_stays_a_complete_native_turn_and_is_usable_after_running_turn(self):
-        from hermes_state_runtime import claim_session_input, settle_session_input
         await self.start()
         clip = self.home / 'fixture.bin'
         clip.write_bytes(b'bounded fixture attachment')
@@ -466,9 +490,9 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(row['payload']['native_text_v1']['media']), 1)
         self.assertEqual(self.agent.effects, [])
         self.settle()
-        next_row = claim_session_input(self.authority.db, epoch=self.authority.epoch, session_id=self.ref.session_id)
+        next_row = claim_session_input(self.authority, epoch=self.authority.epoch, session_id=self.ref.session_id)
         self.assertEqual(next_row['admission_id'], row['admission_id'])
-        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=next_row['admission_id'],
+        settle_session_input(self.authority, epoch=self.authority.epoch, admission_id=next_row['admission_id'],
             generation=next_row['generation'], outcome='completed')
         self.authority.waiters[row['admission_id']].set_result(None)  # finite no-model execution endpoint
         self.assertEqual(await asyncio.wait_for(observer, 5), (True, None))
@@ -476,7 +500,6 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_foreign_active_profile_cannot_reconcile_or_preempt_this_owner(self):
         from gateway.session_authorities import SessionAuthorities
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-        from hermes_state_runtime import RuntimeStoreError
         await self.start()
         registry = SessionAuthorities(self.home, multiplexed=True)
         registry.add(self.home, self.authority)
@@ -485,7 +508,7 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
         other.mkdir()
         token = set_hermes_home_override(other)
         try:
-            with self.assertRaises(RuntimeStoreError) as mismatch:
+            with self.assertRaises(AuthorityRefusal) as mismatch:
                 await self.receive(self.event('foreign-profile'))
         finally:
             reset_hermes_home_override(token)
@@ -495,7 +518,7 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_full_fifo_reconciles_duplicates_and_keeps_specific_approval_control_usable(self):
         from tools import approval
         from tools.approval_gateway_wait import _ApprovalEntry
-        from hermes_state_runtime import ADMISSION_QUEUE_MAX
+        from persistence.authority.vocabulary import ADMISSION_QUEUE_MAX
         from gateway.session_ingress import QUEUE_FULL_REPLY
         await self.start()
         await self.receive(self.event('already-steered'))
@@ -546,7 +569,6 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
         return adapter, phases, completed
 
     async def test_actual_base_lifecycle_acks_durable_input_before_finite_turn_completion(self):
-        from hermes_state_runtime import list_session_admissions, claim_session_input, settle_session_input
         from tests.waiting import async_wait_until
         adapter, phases, completed = self.base_adapter()
         await adapter.handle_message(self.event('base-lifecycle'))
@@ -554,11 +576,11 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(phases, [('accepted', 'queued')])
         self.assertFalse(completed.is_set())
         session_id = self.store.lookup_by_session_key(self.route).session_id
-        rows = list_session_admissions(self.authority.db, session_id=session_id, pending_only=False)
-        row = claim_session_input(self.authority.db, epoch=self.authority.epoch, session_id=session_id)
+        rows = list_session_admissions(self.authority, session_id=session_id, pending_only=False)
+        row = claim_session_input(self.authority, epoch=self.authority.epoch, session_id=session_id)
         self.assertEqual(row['admission_id'], rows[0]['admission_id'])
         await async_wait_until(lambda: row['admission_id'] in self.authority.waiters)
-        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=row['admission_id'],
+        settle_session_input(self.authority, epoch=self.authority.epoch, admission_id=row['admission_id'],
             generation=row['generation'], outcome='completed')
         self.authority.waiters[row['admission_id']].set_result(None)
         await asyncio.wait_for(completed.wait(), 5)
@@ -566,14 +588,13 @@ class NativeInboundRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(phases[-1], ('processed', 'success'))
 
     async def test_actual_active_base_keeps_distinct_provider_ids_and_bodies_unmerged(self):
-        from hermes_state_runtime import claim_session_input
         from tests.waiting import async_wait_until
         adapter, _phases, completed = self.base_adapter()
         adapter._busy_text_mode = 'queue'  # an ordinary adapter would debounce/merge this burst
         await adapter.handle_message(self.event('opening-base'))
         await self.accepted('opening-base')
         self.ref = self.receipts[0][1].ref
-        self.running = claim_session_input(self.authority.db, epoch=self.authority.epoch, session_id=self.ref.session_id)
+        self.running = claim_session_input(self.authority, epoch=self.authority.epoch, session_id=self.ref.session_id)
         self.agent = FiniteAgent()
         self.authority.executing[self.ref.session_id] = self.running['generation']
         self.authority.adopt_agent(self.ref.session_id, self.running['generation'], self.agent)

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 
-from hermes_state_runtime import RuntimeStoreError
+from persistence.core.errors import AuthorityRefusal
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit
 from tests.waiting import async_wait_until
 
@@ -43,7 +43,7 @@ async def stopped_job(tmp_path, monkeypatch):
             cwd=str(tmp_path), task_id='worker', owner_task_id='worker', session_key='route')
     finally:
         clear_session_vars(tokens)
-    state = SimpleNamespace(db=db, authority=authority, registry=registry, own=own,
+    state = SimpleNamespace(persistence=db, authority=authority, registry=registry, own=own,
                             entered=entered, release=release, executed=[])
     async def execute(owner, ref, row):
         assert owner is state.authority
@@ -54,7 +54,7 @@ async def stopped_job(tmp_path, monkeypatch):
     monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute)
     try:
         assert await asyncio.to_thread(entered.wait, 5)
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
         assert process_stop_pending(db, 's') and not own._completion_event.is_set()
         await _submit(authority, 'only-human')
@@ -86,7 +86,7 @@ async def test_actual_original_reader_wakes_pending_human_without_another_messag
     state = stopped_job
     await _finish_original_reader(state)
     await async_wait_until(lambda: state.executed == ['only-human'], timeout=5)
-    assert process_stop_pending(state.db, 's') is None
+    assert process_stop_pending(state.persistence, 's') is None
     assert state.own.output_buffer.count('original pre-Stop output') == 1
     assert all(value[2] is None for value in state.own._completion_observers.values())
 
@@ -94,16 +94,17 @@ async def test_actual_original_reader_wakes_pending_human_without_another_messag
 @pytest.mark.asyncio
 @pytest.mark.parametrize('invalidated', ['epoch', 'token', 'parent', 'result'])
 async def test_completion_cannot_wake_after_native_scope_or_result_changes(stopped_job, monkeypatch, invalidated):
-    from gateway.session_ancillary import _PROCESS_STOP_PREFIX, process_stop_pending
-    from hermes_state_runtime import begin_runtime_epoch
+    from gateway.session_ancillary import process_stop_pending
+    from persistence.sqlite.authority._native_control import PROCESS_STOP_PREFIX
+    from tests.fixtures.storage_holder import raw_holder
     from tools import process_registry_results as results
     state, scheduled = stopped_job, []
     monkeypatch.setattr(state.authority, '_schedule', lambda ref: scheduled.append(ref))
     if invalidated == 'epoch':
-        begin_runtime_epoch(state.db, instance_id='new-native-owner')
+        state.persistence.runtime.begin_epoch(instance_id='new-native-owner')
     if invalidated == 'token':
         # An unrecognized/replaced durable Stop marker is uncertainty, not authority.
-        state.db.set_meta(_PROCESS_STOP_PREFIX + 's', 'replaced-native-stop')
+        raw_holder(state.persistence).set_meta(PROCESS_STOP_PREFIX + 's', 'replaced-native-stop')
     if invalidated == 'parent':
         assert state.registry.transfer_ownership(state.own.id, from_owner='worker', to_owner='parent',
             to_task_id='parent', to_session_key='route', to_parent_session_id='another-native-owner',
@@ -114,7 +115,7 @@ async def test_completion_cannot_wake_after_native_scope_or_result_changes(stopp
         monkeypatch.setattr(results, 'atomic_json_write', refuse_result)
     await _finish_original_reader(state)
     assert scheduled == [] and state.executed == []
-    assert process_stop_pending(state.db, 's') is not None
+    assert process_stop_pending(state.persistence, 's') is not None
     if invalidated == 'result':
         assert state.own._result_persisted_generation == -1
     else:
@@ -125,13 +126,12 @@ async def test_completion_cannot_wake_after_native_scope_or_result_changes(stopp
 async def test_recovered_native_owner_reconstructs_the_completion_wake(stopped_job, monkeypatch, tmp_path):
     from gateway.session_ancillary import process_stop_pending
     from gateway.session_authority import LiveSession, SessionAuthority
-    from hermes_state_runtime import begin_runtime_epoch, recover_session_inputs
     from tools import process_registry as module
     state = stopped_job
     old = state.authority
-    epoch = begin_runtime_epoch(state.db, instance_id='recovered-native-owner')
-    recover_session_inputs(state.db, epoch=epoch)
-    authority = SessionAuthority(old.runner, profile_id='owned', instance_id='recovered-native-owner', db=state.db, epoch=epoch)
+    epoch = state.persistence.runtime.begin_epoch(instance_id='recovered-native-owner')
+    state.persistence.admissions.recover(epoch=epoch)
+    authority = SessionAuthority(old.runner, profile_id='owned', instance_id='recovered-native-owner', epoch=epoch, persistence=state.persistence)
     authority.sessions['s'] = LiveSession(old.sessions['s'].source, 'route')
     state.authority = authority
     registry = module.ProcessRegistry()
@@ -141,10 +141,10 @@ async def test_recovered_native_owner_reconstructs_the_completion_wake(stopped_j
     state.own = registry.get(state.own.id)
     authority._schedule(REF)  # Existing recovery pump, without adding another admission.
     await asyncio.wait_for(authority.sessions['s'].task, 10)
-    assert state.executed == [] and process_stop_pending(state.db, 's')
+    assert state.executed == [] and process_stop_pending(state.persistence, 's')
     await _finish_original_reader(state)
     await async_wait_until(lambda: state.executed == ['only-human'], timeout=5)
-    assert process_stop_pending(state.db, 's') is None
+    assert process_stop_pending(state.persistence, 's') is None
 
 
 @pytest.mark.asyncio
@@ -175,7 +175,7 @@ async def test_already_ready_result_subscribed_after_cleanup_rechecks_logical_st
     await _finish_original_reader(state)
     assert save_completed_result(state.own)
     assert not state.own._scope_stop_pending and state.executed == []
-    assert process_stop_pending(state.db, 's')
+    assert process_stop_pending(state.persistence, 's')
     if reload_registry:
         registry = module.ProcessRegistry()
         monkeypatch.setattr(module, 'process_registry', registry)
@@ -192,7 +192,7 @@ async def test_already_ready_result_subscribed_after_cleanup_rechecks_logical_st
     _observe_process_stop_completion(state.authority, REF)
     _observe_process_stop_completion(state.authority, REF)
     await async_wait_until(lambda: state.executed == ['only-human'], timeout=5)
-    assert process_stop_pending(state.db, 's') is None
+    assert process_stop_pending(state.persistence, 's') is None
     assert all(value[2] is None for value in state.own._completion_observers.values())
 
 
@@ -214,7 +214,7 @@ async def test_ready_observation_dedup_does_not_poll_an_independent_unknown(stop
     session_ancillary._observe_process_stop_completion(state.authority, REF)
     await async_wait_until(lambda: bool(attempts) and state.authority.sessions['s'].task.done(), timeout=5)
     assert attempts == [REF] and state.executed == []
-    assert session_ancillary.process_stop_pending(state.db, 's')
+    assert session_ancillary.process_stop_pending(state.persistence, 's')
     session_ancillary._observe_process_stop_completion(state.authority, REF)
     barrier = asyncio.Event()
     asyncio.get_running_loop().call_soon(barrier.set)
@@ -233,7 +233,7 @@ async def test_completion_wake_keeps_its_profile_when_the_loop_serves_another(st
         # current request may meanwhile belong to a different profile.
         state.release.set()
         await async_wait_until(lambda: state.executed == ['only-human'], timeout=5)
-        assert not (other / 'state.db').exists()
+        assert not (other / 'state.persistence').exists()
     finally:
         reset_hermes_home_override(token)
 
@@ -297,9 +297,9 @@ async def test_old_completion_cannot_wake_a_genuinely_newer_native_stop(stopped_
         clear_session_vars(tokens)
     try:
         assert await asyncio.to_thread(second_entered.wait, 5)
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await state.authority.interrupt(ACTOR, REF, 1)
-        token = process_stop_pending(state.db, 's')
+        token = process_stop_pending(state.persistence, 's')
         assert token.endswith(':1')
         scheduled = []
         schedule = state.authority._schedule
@@ -309,7 +309,7 @@ async def test_old_completion_cannot_wake_a_genuinely_newer_native_stop(stopped_
         barrier = asyncio.Event()
         asyncio.get_running_loop().call_soon(barrier.set)
         await barrier.wait()
-        assert scheduled == [] and process_stop_pending(state.db, 's') == token
+        assert scheduled == [] and process_stop_pending(state.persistence, 's') == token
         monkeypatch.setattr(state.authority, '_schedule', schedule)
     finally:
         second_release.set()

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.managed_worker import WorkerControls, encode_frame
-from hermes_state_runtime import RuntimeStoreError
+from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
 
 
 @pytest.mark.parametrize('error', [None, RuntimeError('process_stop_unknown'),

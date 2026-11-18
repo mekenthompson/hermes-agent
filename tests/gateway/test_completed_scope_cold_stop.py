@@ -8,7 +8,7 @@ import psutil
 import pytest
 
 from gateway.session_authority import LiveSession, SessionAuthority
-from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch
+from persistence.core.errors import AuthorityRefusal
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit
 from tests.waiting import async_wait_until
 
@@ -56,7 +56,8 @@ async def test_completed_scope_survives_normal_finish_and_cold_stop(tmp_path, mo
     child = None
     attempts = []
     try:
-        db.create_session('foreign-parent', source='cli')
+        from tests.fixtures.storage_seed import seed_session
+        seed_session(db, 'foreign-parent', 'cli')
         for parent, route in [('foreign-parent', 'route'), ('s', 'foreign-route')]:
             tokens = set_session_vars(session_id=parent, session_key=route)
             try:
@@ -113,12 +114,12 @@ async def test_completed_scope_survives_normal_finish_and_cold_stop(tmp_path, mo
         registry.recover_from_checkpoint()  # Ordinary startup, no Stop requested.
         assert attempts == [] and alive()
         assert own.id in {row['session_id'] for row in json.loads(module._checkpoint_path().read_text())}
-        epoch = begin_runtime_epoch(db, instance_id='cold-scope-owner')
+        epoch = db.runtime.begin_epoch(instance_id='cold-scope-owner')
         source = authority.sessions['s'].source
-        authority = SessionAuthority(authority.runner, profile_id='owned', instance_id='cold-scope-owner', db=db, epoch=epoch)
+        authority = SessionAuthority(authority.runner, profile_id='owned', instance_id='cold-scope-owner', epoch=epoch, persistence=db)
         authority.sessions['s'] = LiveSession(source, 'route')
         if refuse:
-            with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+            with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
                 await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
             assert process_stop_pending(db, 's') is not None and alive()
             assert own.id in {row['session_id'] for row in json.loads(module._checkpoint_path().read_text())}
@@ -126,7 +127,7 @@ async def test_completed_scope_survives_normal_finish_and_cold_stop(tmp_path, mo
         if expired_result:
             from tools.process_registry_job import job_quiescent
             # Unit emptiness cannot reconstruct the deleted original PIPE payload/status.
-            with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+            with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
                 await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
             marker = process_stop_pending(db, 's')
             assert marker is not None and not alive()

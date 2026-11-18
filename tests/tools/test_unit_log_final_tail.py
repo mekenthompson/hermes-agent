@@ -30,7 +30,7 @@ def unit_log_job(tmp_path, monkeypatch, request):
     logdir.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setattr(module, "CHECKPOINT_PATH", home / "processes.json")
+    monkeypatch.setattr(module, "_checkpoint_path", lambda: home / "processes.json")
     monkeypatch.setattr(module, "worker_output_log", lambda sid: logdir / (sid + ".log"))
     registry = module.ProcessRegistry()
 

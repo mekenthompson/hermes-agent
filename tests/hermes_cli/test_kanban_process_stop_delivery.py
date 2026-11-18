@@ -22,13 +22,13 @@ def owned_board(tmp_path, monkeypatch):
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
-    from hermes_state import SessionDB
+    from persistence_assembly import store_location
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path / 'kanban'))
     monkeypatch.setattr('gateway.run._load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
-    store._db = SessionDB(db_path=tmp_path / 'state.db')
-    runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False,
+    persistence = store._scoped_persistence()
+    runner = SimpleNamespace(session_store=store, _session_db=persistence, adapters={}, _draining=False,
                              _cached_agent_for=lambda route: None, _adapter_for_source=lambda source: None)
     authority = asyncio.run(initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='fixture'))
     connection = AuthorityConnection(authority, object(), {'user_id': 'owner'})
@@ -45,7 +45,7 @@ def owned_board(tmp_path, monkeypatch):
         policy = build_policy({'cwd': str(tmp_path), 'model': 'm', 'source': 'cli'}, {}, profile_terminal=False)
         policy = replace(policy, source='kanban', kanban_json=json.dumps(context))
         ref = create_local_session(authority, connection.actor, {'request_id': f'owner-{run_id}'}, trusted_policy=policy)
-        binding = dict(db=str(authority.db.db_path), session_id=ref.session_id, request_id=f'run-{run_id}')
+        binding = dict(db=str(store_location(authority.persistence.scope)), session_id=ref.session_id, request_id=f'run-{run_id}')
         binding.update(binding_changes or {})
         with kb.write_txn(conn):
             kb._append_event(conn, task_id, 'owner_admitted', binding, run_id=run_id)
@@ -70,7 +70,7 @@ def owned_board(tmp_path, monkeypatch):
                           calls=calls, client=client, home=tmp_path)
     conn.close()
     asyncio.run(connection.close())
-    authority.db.close()
+    persistence.close()
 
 
 @pytest.mark.parametrize('mismatch', ['profile', 'board', 'task', 'run'])

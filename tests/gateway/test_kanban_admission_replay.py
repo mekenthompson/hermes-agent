@@ -17,7 +17,7 @@ def test_saved_old_request_never_controls_successor(kanban_owner, monkeypatch, t
     from gateway.session_kanban import run_task
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
     from tools import process_registry as module
     from gateway.session_context import clear_session_vars, set_session_vars
 

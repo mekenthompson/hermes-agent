@@ -61,7 +61,7 @@ async def test_native_profile_batch_filters_before_fifo_and_preserves_human(tmp_
     from gateway.session_context import clear_session_vars, set_session_vars
     from gateway.session_contract import SessionActor
     from hermes_constants import get_hermes_home
-    from hermes_state_runtime import list_session_admissions
+    from gateway.session_authority import admission_row
     from plugins.platforms.discord.adapter import DiscordAdapter
     from gateway.session_ingress_context import native_callback
     from tests.gateway.test_native_stop_reconciliation import caller, stop
@@ -100,9 +100,9 @@ async def test_native_profile_batch_filters_before_fifo_and_preserves_human(tmp_
         (home / '.env').write_text('DISCORD_ALLOWED_USERS=42\n')
         with _profile_runtime_scope(home):
             source = adapters[name].build_source(chat_id='42', chat_type='dm', user_id='42')
-            db = runner.session_store._db_for_key(runner.session_store._generate_session_key(source))
+            db = runner.session_store._persistence_for_key(runner.session_store._generate_session_key(source))
             authority = await initialize_session_authority(runner, profile_id=str(home), instance_id=name,
-                                                           db=db, register=name == 'default')
+                                                           persistence=db, register=name == 'default')
             authorities.add(home, authority, name=name)
     async def admit_human(authority, event, name):
         with native_callback(runner, event, rig.homes[name], profile=name):
@@ -149,7 +149,7 @@ async def test_native_profile_batch_filters_before_fifo_and_preserves_human(tmp_
                 assert await runner._deliver_completion_notification(f'ALREADY_RESULT_{index}', already_event) is True
                 already_row = completion_admission(runner, already_event)
                 assert already_row is not None
-                before = list_session_admissions(authority.db, session_id=seed.ref.session_id, pending_only=False)
+                before = [admission_row(r) for r in authority.persistence.admissions.list(session_id=seed.ref.session_id, pending_only=False)]
             foreign = rig.homes['b' if name == 'a' else 'a']
             with _profile_runtime_scope(foreign):
                 assert not save_completed_result(replace(live, completion_consumed=True))
@@ -166,7 +166,7 @@ async def test_native_profile_batch_filters_before_fifo_and_preserves_human(tmp_
                 results = await pending
             assert all(result is True for result in results), results
             with _profile_runtime_scope(home):
-                rows = list_session_admissions(authority.db, session_id=seed.ref.session_id, pending_only=False)
+                rows = [admission_row(r) for r in authority.persistence.admissions.list(session_id=seed.ref.session_id, pending_only=False)]
                 added = [row for row in rows if row['admission_id'] not in {prior['admission_id'] for prior in before}]
                 assert len(added) == 1
                 text = added[0]['payload']['text']
@@ -204,4 +204,4 @@ async def test_native_profile_batch_filters_before_fifo_and_preserves_human(tmp_
     finally:
         await runner._cancel_process_completion_batch_tasks()
         for authority in authorities:
-            authority.db.close()
+            authority.persistence.close()

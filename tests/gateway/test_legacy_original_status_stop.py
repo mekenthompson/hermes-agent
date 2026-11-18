@@ -51,7 +51,7 @@ def test_backend_status_source_cannot_fabricate_a_numeric_exit(tmp_path, monkeyp
 async def test_live_missing_status_cannot_borrow_unit_quiescence_status(tmp_path, monkeypatch):
     from gateway.session_ancillary import process_stop_pending
     from gateway.session_context import clear_session_vars, set_session_vars
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal
     from tools import process_registry as module
     from tools.process_registry_job import job_quiescent, read_job_receipt
     from tools.process_registry_results import save_completed_result
@@ -97,7 +97,7 @@ async def test_live_missing_status_cannot_borrow_unit_quiescence_status(tmp_path
             executed.append(row['request_id'])
             return 'continued once'
         monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute)
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, 0)
         assert job_quiescent(own) and read_job_receipt(own)['exit_code'] is None
         assert own.systemd_unit == unit and own._scope_stop_pending and process_stop_pending(db, 's')
@@ -132,7 +132,8 @@ async def test_cold_legacy_status_stays_fenced_until_original_result_restored(
         tmp_path, monkeypatch, checkpoint_exists, invalid_code, reason):
     from gateway.session_ancillary import process_stop_pending
     from gateway.session_context import clear_session_vars, set_session_vars
-    from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+    from persistence.core.errors import AuthorityRefusal
+    from gateway.session_authority import admission_row
     from tools import process_registry as module
     from tools.process_registry_job import job_quiescent, read_job_receipt
     from tools.process_registry_results import load_completed_results, save_completed_result
@@ -196,7 +197,7 @@ async def test_cold_legacy_status_stays_fenced_until_original_result_restored(
             executed.append(row['request_id'])
             return 'continued once'
         monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute)
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
         marker = process_stop_pending(db, 's')
         assert marker is not None
@@ -222,10 +223,10 @@ async def test_cold_legacy_status_stays_fenced_until_original_result_restored(
         assert saved['output'] == genuine['output'] and saved['completion_consumed']
         assert stale._result_complete and stale.exit_code == 7
         assert json.loads(checkpoint.read_text()) == []
-        with pytest.raises(RuntimeStoreError, match='stale_generation'):
+        with pytest.raises(AuthorityRefusal, match='stale_generation'):
             await authority.interrupt(ACTOR, REF, 0)
         assert process_stop_pending(db, 's') is None and executed == ['after-genuine-original-status']
-        work = [row for row in list_session_admissions(db, session_id='s', pending_only=False)
+        work = [row for row in [admission_row(r) for r in db.admissions.list(session_id='s', pending_only=False)]
                 if row['principal_id'] != 'native-process-stop']
         assert [(row['request_id'], row['status'], row['outcome']) for row in work] == [
             ('after-genuine-original-status', 'terminal', 'completed')]

@@ -129,7 +129,7 @@ def test_authenticated_desktop_process_completion_retains_command_authority(tmp_
     import json
     import time
 
-    from hermes_state import SessionDB
+    from persistence_assembly import open_persistence, profile_scope
     from queue import Empty
     from tests.tui_gateway.test_approval_request_origin import LoginSocket
     from tools import approval_context
@@ -145,7 +145,7 @@ def test_authenticated_desktop_process_completion_retains_command_authority(tmp_
         except Empty:
             break
 
-    db = SessionDB(tmp_path / 'state.db')
+    db = open_persistence(profile_scope(home=tmp_path))
     monkeypatch.setattr(server, '_get_db', lambda: db)
     monkeypatch.setattr(server, '_schedule_agent_build', lambda _sid: None)
     monkeypatch.setattr(server, '_schedule_session_cap_enforcement', lambda: None)

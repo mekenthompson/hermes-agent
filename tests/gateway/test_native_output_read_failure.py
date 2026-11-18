@@ -22,7 +22,7 @@ async def test_cold_output_failure_stays_fenced_until_real_payload_is_available(
         pytest.skip('Actual permission denial requires a non-root test user')
     from gateway.session_ancillary import process_stop_pending
     from gateway.session_context import clear_session_vars, set_session_vars
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal
     from tools import process_registry as module, process_registry_results as results
     from tools.process_registry_job import job_receipt_path, job_quiescent, read_job_receipt
     from utils import atomic_json_write
@@ -73,7 +73,7 @@ async def test_cold_output_failure_stays_fenced_until_real_payload_is_available(
         if retained:
             result = original.kill_process(own.id)
             assert (result['status'], result['error']) == ('error', 'process_stop_unknown')
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, 0)
         await _submit(authority, 'queued-human')
         await asyncio.wait_for(authority.sessions['s'].task, 10)
@@ -98,7 +98,7 @@ async def test_cold_output_failure_stays_fenced_until_real_payload_is_available(
             assert not current._result_complete and current._result_persisted_generation == -1
             assert current._scope_stop_pending and process_stop_pending(db, 's')
             assert not executed
-            with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+            with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
                 await authority.interrupt(ACTOR, REF, 0)
             restored = results.load_completed_results(owns_entry=lambda saved: saved['id'] == own.id)[own.id]
             assert not restored._result_complete and restored._result_persisted_generation == -1
@@ -122,7 +122,7 @@ async def test_cold_output_failure_stays_fenced_until_real_payload_is_available(
         except AssertionError:
             current = module.process_registry.get(own.id)
             task = authority.sessions['s'].task
-            from hermes_state_runtime import list_session_admissions
+            from tests.gateway.test_native_inbound_retry import list_session_admissions
             print({'executed': executed, 'stop': process_stop_pending(db, 's'),
                    'admissions': [(r['request_id'], r['status'], r['outcome'])
                                   for r in list_session_admissions(db, session_id='s', pending_only=False)],

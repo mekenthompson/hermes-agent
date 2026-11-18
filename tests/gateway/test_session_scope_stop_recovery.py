@@ -7,8 +7,7 @@ import sys
 import pytest
 
 from gateway.session_authority import LiveSession, SessionAuthority
-from hermes_state_runtime import begin_runtime_epoch
-from hermes_state_runtime import RuntimeStoreError
+from persistence.core.errors import AuthorityRefusal
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority
 
 
@@ -41,7 +40,7 @@ async def test_refused_owned_scope_survives_reload_without_signaling_foreign_pid
     attempts = []
     monkeypatch.setattr(module, '_stop_systemd_unit', lambda value: attempts.append(value) or False)
     try:
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
         assert await asyncio.to_thread(own._completion_event.wait, 10)
         assert own._scope_stop_pending and process_stop_pending(db, 's') is not None
@@ -53,8 +52,8 @@ async def test_refused_owned_scope_survives_reload_without_signaling_foreign_pid
         saved = json.loads(module._checkpoint_path().read_text(encoding='utf-8'))
         entry = next(item for item in saved if item['session_id'] == own.id)
         assert entry['_scope_stop_pending'] is True and entry['systemd_unit'] == unit
-        epoch = begin_runtime_epoch(db, instance_id='reloaded')
-        reloaded = SessionAuthority(authority.runner, profile_id='owned', instance_id='reloaded', db=db, epoch=epoch)
+        epoch = db.runtime.begin_epoch(instance_id='reloaded')
+        reloaded = SessionAuthority(authority.runner, profile_id='owned', instance_id='reloaded', epoch=epoch, persistence=db)
         reloaded.sessions['s'] = LiveSession(authority.sessions['s'].source, 'route')
         registry = module.ProcessRegistry()
         monkeypatch.setattr(module, 'process_registry', registry)
@@ -130,8 +129,8 @@ async def test_completed_log_reader_cannot_hide_unattempted_owned_scope(tmp_path
         entry.update(_scope_stop_pending=False)
         original._write_checkpoint(extra_entries=[entry])
         record_process_stop(authority, REF, authority._handle(REF).execution_generation)
-        epoch = begin_runtime_epoch(db, instance_id='reloaded')
-        reloaded = SessionAuthority(authority.runner, profile_id='owned', instance_id='reloaded', db=db, epoch=epoch)
+        epoch = db.runtime.begin_epoch(instance_id='reloaded')
+        reloaded = SessionAuthority(authority.runner, profile_id='owned', instance_id='reloaded', epoch=epoch, persistence=db)
         reloaded.sessions['s'] = LiveSession(authority.sessions['s'].source, 'route')
         registry = module.ProcessRegistry()
         monkeypatch.setattr(module, 'process_registry', registry)

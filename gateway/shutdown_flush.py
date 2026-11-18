@@ -404,7 +404,7 @@ def _recover_one_payload(persistence, path: Path, payload: dict[str, Any], *,
             # leave it for the next start.
             blocked_sessions[spooled_sid] += 1
             return False
-        if session_db.get_session(spooled_sid) is None:
+        if persistence.sessions.get(spooled_sid) is None:
             # Missing ownership is not a malformed message and cannot be repaired
             # by retrying an INSERT. Keep original bytes and hold later rows too.
             blocked_sessions[spooled_sid] = 1

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _submit
+from tests.gateway.fixtures.storage_handles import close_storage_handles  # noqa: F401  (autouse closer)
 from tests.waiting import async_wait_until
 
 pytestmark = pytest.mark.platforms('linux')
@@ -33,8 +34,10 @@ async def test_unit_stop_collects_final_payload_before_native_human_fifo(
     from gateway.session_ancillary import process_stop_pending
     from gateway.session_authority import LiveSession, SessionAuthority
     from gateway.session_context import set_session_vars, clear_session_vars
-    from hermes_state import SessionDB
-    from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch, recover_session_inputs, list_session_admissions
+    from tests.fixtures.storage_seed import seed_session
+    from tests.gateway.fixtures.storage_handles import storage_handle
+    from persistence.core.errors import AuthorityRefusal
+    from gateway.session_authority import admission_row
     from tools.process_registry_job import job_quiescent
     module, registry, own, home, reap_child = unit_log_job
     assert own.parent_session_id == 's' and own.session_key == 'route'
@@ -48,12 +51,12 @@ async def test_unit_stop_collects_final_payload_before_native_human_fifo(
     finally:
         clear_session_vars(tokens)
         monkeypatch.setattr(registry, '_scope_argv', launch)
-    db = SessionDB(db_path=home / 'state.db')
-    db.create_session('s', source='test')
+    db = storage_handle(home)
+    seed_session(db, 's', 'test')
     runner = SimpleNamespace(_draining=False, config=SimpleNamespace(multiplex_profiles=False),
                              _adapter_for_source=lambda source: None)
-    authority = SessionAuthority(runner, profile_id='owned', instance_id='current', db=db,
-                                 epoch=begin_runtime_epoch(db, instance_id='current'))
+    authority = SessionAuthority(runner, profile_id='owned', instance_id='current', persistence=db,
+                                 epoch=db.runtime.begin_epoch(instance_id='current'))
     authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human'), 'route')
     stop_empty, ready, executed = module._stop_systemd_unit, False, []
     unit = own.systemd_unit
@@ -75,16 +78,16 @@ async def test_unit_stop_collects_final_payload_before_native_human_fifo(
     release_reader = threading.Event()
     current = registry
     try:
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
         await _submit(authority, 'only-human')
         await asyncio.wait_for(authority.sessions['s'].task, 10)
         assert not executed and process_stop_pending(db, 's')
         if reload_owner:
-            epoch = begin_runtime_epoch(db, instance_id='cold')
-            recover_session_inputs(db, epoch=epoch)
+            epoch = db.runtime.begin_epoch(instance_id='cold')
+            db.admissions.recover(epoch=epoch)
             old = authority
-            authority = SessionAuthority(runner, profile_id='owned', instance_id='cold', db=db, epoch=epoch)
+            authority = SessionAuthority(runner, profile_id='owned', instance_id='cold', epoch=epoch, persistence=db)
             authority.sessions['s'] = LiveSession(old.sessions['s'].source, 'route')
             current = module.ProcessRegistry()
             monkeypatch.setattr(module, 'process_registry', current)
@@ -115,7 +118,7 @@ async def test_unit_stop_collects_final_payload_before_native_human_fifo(
         try:
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
             assert not hold_publication, 'A held original publisher cannot acknowledge cleanup'
-        except RuntimeStoreError as exc:
+        except AuthorityRefusal as exc:
             assert exc.reason == 'process_stop_unknown'
             # Recovery may start a fresh original reader after the child was reaped.
             # Only that genuine unfinished publication permits the bounded refusal.
@@ -131,7 +134,7 @@ async def test_unit_stop_collects_final_payload_before_native_human_fifo(
             release_reader.set()
         await async_wait_until(lambda: executed == ['only-human'] and authority.sessions['s'].task.done(), timeout=10)
         assert process_stop_pending(db, 's') is None and neighbor.process.poll() is None
-        rows = [r for r in list_session_admissions(db, session_id='s', pending_only=False)
+        rows = [r for r in [admission_row(r) for r in db.admissions.list(session_id='s', pending_only=False)]
                 if r['principal_id'] != 'native-process-stop']
         assert [(r['request_id'], r['status'], r['outcome']) for r in rows] == [('only-human', 'terminal', 'completed')]
     finally:

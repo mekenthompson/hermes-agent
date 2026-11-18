@@ -19,7 +19,7 @@ async def test_result_write_refusal_preserves_stop_output_and_retry(tmp_path, mo
     from gateway.session_ancillary import process_stop_pending
     from gateway.session_authority import LiveSession, SessionAuthority
     from gateway.session_context import clear_session_vars, set_session_vars
-    from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch
+    from persistence.core.errors import AuthorityRefusal
     from tools import process_registry as module
     from tools.process_registry_job import job_quiescent
     from tools.process_registry_results import load_completed_results
@@ -62,7 +62,7 @@ async def test_result_write_refusal_preserves_stop_output_and_retry(tmp_path, mo
         assert own.output_buffer.count('original durable output') == 1
         assert Path(own.output_log).exists()
         if native_control:
-            with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+            with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
                 await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
             assert process_stop_pending(db, 's') is not None
             await _submit(authority, 'pending-human')
@@ -81,9 +81,9 @@ async def test_result_write_refusal_preserves_stop_output_and_retry(tmp_path, mo
             assert await asyncio.to_thread(restored._completion_event.wait, 10)
             assert restored._result_persisted_generation == -1
             if native_control:
-                epoch = begin_runtime_epoch(db, instance_id='result-retry-owner')
+                epoch = db.runtime.begin_epoch(instance_id='result-retry-owner')
                 old = authority
-                authority = SessionAuthority(old.runner, profile_id='owned', instance_id='result-retry-owner', db=db, epoch=epoch)
+                authority = SessionAuthority(old.runner, profile_id='owned', instance_id='result-retry-owner', epoch=epoch, persistence=db)
                 authority.sessions['s'] = LiveSession(old.sessions['s'].source, 'route')
         refusing = False
         if native_control:
@@ -110,7 +110,7 @@ async def test_a_saved_partial_snapshot_cannot_stand_in_for_the_failed_final_res
     import threading
     from gateway.session_ancillary import process_stop_pending
     from gateway.session_context import clear_session_vars, set_session_vars
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal
     from tools import process_registry as module
     from tools import process_registry_results as results
     from tests.waiting import async_wait_until
@@ -143,7 +143,7 @@ async def test_a_saved_partial_snapshot_cannot_stand_in_for_the_failed_final_res
         await asyncio.to_thread(own.process.wait, 5)
         registry.poll(own.id)  # Actual exit reconciliation while its original reader is held.
         assert own.exited and not own._completion_event.is_set()
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, 0)
         await _submit(authority, 'pending-human')
         await asyncio.wait_for(authority.sessions['s'].task, 10)

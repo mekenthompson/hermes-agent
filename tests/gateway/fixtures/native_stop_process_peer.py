@@ -87,7 +87,7 @@ async def probe():
     from tools.process_registry import process_registry
     from websockets.asyncio.client import connect
     from tests.waiting import async_wait_until
-    from hermes_state_runtime import list_session_admissions
+    from gateway.session_authority import admission_row
     import psutil
 
     runner = GatewayRunner()
@@ -149,7 +149,7 @@ async def probe():
                                           execution_generation=snapshot['execution_generation'])
             receipt['alive_at_ack'] = not proc.exited
             await asyncio.wait_for(authority.sessions[sid].task, 20)
-            rows = list_session_admissions(authority.db, session_id=sid, pending_only=False)
+            rows = [admission_row(r) for r in authority.persistence.admissions.list(session_id=sid, pending_only=False)]
             receipt['admissions'] = [{k: r.get(k) for k in ('status', 'outcome', 'generation')}
                 for r in rows if r['principal_id'] != 'native-process-stop']
             receipt['stop_controls'] = [{k: r.get(k) for k in

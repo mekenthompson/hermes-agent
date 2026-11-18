@@ -50,13 +50,13 @@ class NativeStructuredStopTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('structured-stop', [row['request_id'] for row in self.all_rows()])
 
     def all_rows(self):
-        from hermes_state_runtime import list_session_admissions
-        return list_session_admissions(self.authority.db, session_id=self.ref.session_id, pending_only=False)
+        from tests.gateway.test_native_inbound_retry import list_session_admissions
+        return list_session_admissions(self.authority, session_id=self.ref.session_id, pending_only=False)
 
     async def test_retired_stop_receipt_keeps_descriptor_without_body_and_never_recaptures(self):
         from gateway.session_ancillary import retry_process_stop
-        from hermes_state_runtime import get_session_admission, RuntimeStoreError
-        from hermes_state_mutation_retirement import delete_in_transaction
+        from persistence.core.errors import AuthorityRefusal
+        from tests.gateway.test_native_inbound_retry import get_session_admission
         await self.start()
         await self.receive(self.stop())
         old = self.row('structured-stop')
@@ -65,10 +65,10 @@ class NativeStructuredStopTests(unittest.IsolatedAsyncioTestCase):
         self.authority.executing.pop(old_ref.session_id, None)
         await retry_process_stop(self.authority, old_ref, self.agent)
         self.store.reset_session(self.route)
-        self.authority.db._execute_write(lambda conn: delete_in_transaction(self.authority.db, conn,
-            old_ref.session_id, {}))
+        from gateway.session_ingress_media import native_inputs_root
+        self.authority.persistence.sessions.delete(old_ref.session_id, media_root=str(native_inputs_root()))
         self.authority.sessions.pop(old_ref.session_id)
-        tombstone = get_session_admission(self.authority.db, admission_id=old['admission_id'])
+        tombstone = get_session_admission(self.authority, admission_id=old['admission_id'])
         self.assertEqual(tombstone['payload'], {'native_stop_v1': old['payload']['native_stop_v1']})
         await self.start('after-retirement')
         await self.receive(self.stop())
@@ -77,14 +77,14 @@ class NativeStructuredStopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.receipts[-1][1].control.request_consumed)
         changed = self.stop()
         changed.text = 'changed original Stop body'
-        with self.assertRaises(RuntimeStoreError) as conflict:
+        with self.assertRaises(AuthorityRefusal) as conflict:
             await self.receive(changed)
         self.assertEqual(conflict.exception.reason, 'admission_conflict')
         self.assertEqual(self.agent.effects, [])
 
     async def test_full_fifo_stop_is_consumed_and_old_duplicate_cannot_stop_later_work(self):
         from gateway.session_ancillary import retry_process_stop
-        from hermes_state_runtime import ADMISSION_QUEUE_MAX
+        from persistence.authority.vocabulary import ADMISSION_QUEUE_MAX
         await self.start()
         for number in range(ADMISSION_QUEUE_MAX):
             await self.authority.admit_native(self.event('queued-' + str(number)))
@@ -121,7 +121,8 @@ class NativeStructuredStopTests(unittest.IsolatedAsyncioTestCase):
     async def test_committed_stop_before_effect_survives_restart_and_blocks_model_claim(self):
         from gateway.session_authority import initialize_session_authority
         from gateway.session_ancillary import process_stop_pending
-        from hermes_state_runtime import claim_session_input, RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal
+        from tests.gateway.test_native_inbound_retry import claim_session_input
         import gateway.session_native_control as controls
         await self.start()
         async def crash(*args):
@@ -131,9 +132,9 @@ class NativeStructuredStopTests(unittest.IsolatedAsyncioTestCase):
                 await self.receive(self.stop())
         original = self.row('structured-stop')['payload']['native_stop_v1']
         self.assertEqual(self.row('structured-stop')['status'], 'queued')
-        self.assertIsNotNone(process_stop_pending(self.authority.db, self.ref.session_id))
-        with self.assertRaises(RuntimeStoreError) as pending:
-            claim_session_input(self.authority.db, epoch=self.authority.epoch, session_id=self.ref.session_id)
+        self.assertIsNotNone(process_stop_pending(self.authority.persistence, self.ref.session_id))
+        with self.assertRaises(AuthorityRefusal) as pending:
+            claim_session_input(self.authority, epoch=self.authority.epoch, session_id=self.ref.session_id)
         self.assertEqual(pending.exception.reason, 'control_pending')
         self.authority = await initialize_session_authority(self.runner, profile_id=str(self.home), instance_id='after-crash')
         self.authority._schedule = lambda ref: self.scheduled.append(ref)
@@ -169,9 +170,9 @@ class NativeStructuredStopTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 release.set()
             self.assertEqual(await asyncio.wait_for(first, 5), (True, None))
-        from hermes_state_runtime import list_session_admissions
+        from tests.gateway.test_native_inbound_retry import list_session_admissions
         self.assertNotIn('before-stop-capture', [row['request_id'] for row in
-            list_session_admissions(self.authority.db, session_id=self.ref.session_id, pending_only=False)])
+            list_session_admissions(self.authority, session_id=self.ref.session_id, pending_only=False)])
         later = asyncio.create_task(self.receive(self.event('later-status', 'What is the status?')))
         await self.accepted('later-status')
         self.assertEqual(self.row('later-status')['status'], 'queued')
@@ -182,10 +183,10 @@ class NativeStructuredStopTests(unittest.IsolatedAsyncioTestCase):
         await self.cancel_observer(later)
 
     async def test_current_revocation_and_unsupported_adapter_refuse_before_effects(self):
-        from hermes_state_runtime import RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal
         await self.start()
         self.adapter.requires_durable_input_ack = False
-        with self.assertRaises(RuntimeStoreError):
+        with self.assertRaises(AuthorityRefusal):
             await self.receive(self.stop('unsupported'))
         self.assertEqual(self.agent.effects, [])
         self.adapter.requires_durable_input_ack = True
@@ -195,7 +196,7 @@ class NativeStructuredStopTests(unittest.IsolatedAsyncioTestCase):
             self.allowed.remove('fixture-author')
             return result
         with patch.object(self.authority, '_admit_native_write', revoke):
-            with self.assertRaises(RuntimeStoreError):
+            with self.assertRaises(AuthorityRefusal):
                 await self.receive(self.stop())
         self.assertEqual(self.agent.effects, [])
         self.assertEqual(self.row('structured-stop')['status'], 'queued')
@@ -204,15 +205,16 @@ class NativeStructuredStopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.agent.effects, [('interrupt', None)])
 
     async def test_epoch_changes_after_commit_refuse_old_owner_before_effect(self):
-        from hermes_state_runtime import begin_runtime_epoch, RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal
+        from tests.gateway.test_native_inbound_retry import begin_runtime_epoch
         import gateway.session_native_control as controls
         await self.start()
         reconcile = controls.reconcile
         async def replaced(authority, ref):
-            begin_runtime_epoch(authority.db, instance_id='replacement-owner')
+            begin_runtime_epoch(authority, instance_id='replacement-owner')
             return await reconcile(authority, ref)
         with patch.object(controls, 'reconcile', replaced):
-            with self.assertRaises(RuntimeStoreError) as stale:
+            with self.assertRaises(AuthorityRefusal) as stale:
                 await self.receive(self.stop())
         self.assertEqual(stale.exception.reason, 'stale_epoch')
         self.assertEqual(self.agent.effects, [])
@@ -230,35 +232,36 @@ class NativeStructuredStopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(receipt.control.request_consumed)
         self.assertTrue(receipt.control.cleanup_pending)
         self.assertEqual(self.row('structured-stop')['outcome'], 'cancelled')
-        self.assertIsNotNone(process_stop_pending(self.authority.db, self.ref.session_id))
+        self.assertIsNotNone(process_stop_pending(self.authority.persistence, self.ref.session_id))
 
     async def test_plain_payload_cannot_claim_control_capacity_or_descriptor(self):
-        from hermes_state_runtime import admit_session_input, RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal
         await self.start()
-        with self.assertRaises(RuntimeStoreError) as invalid:
-            admit_session_input(self.authority.db, epoch=self.authority.epoch, principal_id='ordinary-input',
+        with self.assertRaises(AuthorityRefusal) as invalid:
+            self.authority.persistence.admissions.admit(epoch=self.authority.epoch, principal_id='ordinary-input',
                 session_id=self.ref.session_id, request_id='forged',
                 payload={'text': 'ordinary API data', 'native_stop_v1': {'kind': 'stop'}})
         self.assertEqual(invalid.exception.reason, 'invalid_params')
         self.assertEqual(self.agent.effects, [])
 
     async def test_changed_control_or_work_identity_conflicts_before_target_capture(self):
-        from hermes_state_runtime import RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal
         await self.start()
-        with self.assertRaises(RuntimeStoreError) as conflict:
+        with self.assertRaises(AuthorityRefusal) as conflict:
             await self.receive(self.stop('opening'))
         self.assertEqual(conflict.exception.reason, 'admission_conflict')
         self.assertEqual(self.agent.effects, [])
         await self.receive(self.stop())
         changed = self.stop()
         changed.text = 'changed original source body'
-        with self.assertRaises(RuntimeStoreError) as changed_conflict:
+        with self.assertRaises(AuthorityRefusal) as changed_conflict:
             await self.receive(changed)
         self.assertEqual(changed_conflict.exception.reason, 'admission_conflict')
         self.assertEqual(self.agent.effects, [('interrupt', None)])
 
     async def test_revocation_before_atomic_write_creates_no_control_or_effect(self):
-        from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+        from persistence.core.errors import AuthorityRefusal
+        from tests.gateway.test_native_inbound_retry import list_session_admissions
         from gateway.session_ancillary import process_stop_pending
         await self.start()
         write = self.authority._admit_native_write
@@ -266,22 +269,22 @@ class NativeStructuredStopTests(unittest.IsolatedAsyncioTestCase):
             self.allowed.remove('fixture-author')
             return write(**kwargs)
         with patch.object(self.authority, '_admit_native_write', revoked):
-            with self.assertRaises(RuntimeStoreError) as denied:
+            with self.assertRaises(AuthorityRefusal) as denied:
                 await self.receive(self.stop())
         self.assertEqual(denied.exception.reason, 'permission_denied')
         self.assertEqual(self.agent.effects, [])
-        self.assertIsNone(process_stop_pending(self.authority.db, self.ref.session_id))
-        self.assertEqual(len(list_session_admissions(self.authority.db,
+        self.assertIsNone(process_stop_pending(self.authority.persistence, self.ref.session_id))
+        self.assertEqual(len(list_session_admissions(self.authority,
             session_id=self.ref.session_id, pending_only=False)), 1)
 
     async def test_foreign_profile_and_untyped_control_refuse_without_side_effects(self):
         from gateway.session_authorities import SessionAuthorities
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-        from hermes_state_runtime import RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal
         await self.start()
         untyped = self.stop('untyped')
         untyped.structured_control = 'stop'
-        with self.assertRaises(RuntimeStoreError) as malformed:
+        with self.assertRaises(AuthorityRefusal) as malformed:
             await self.receive(untyped)
         self.assertEqual(malformed.exception.reason, 'invalid_params')
         registry = SessionAuthorities(self.home, multiplexed=True)
@@ -291,7 +294,7 @@ class NativeStructuredStopTests(unittest.IsolatedAsyncioTestCase):
         foreign.mkdir()
         token = set_hermes_home_override(foreign)
         try:
-            with self.assertRaises(RuntimeStoreError) as mismatch:
+            with self.assertRaises(AuthorityRefusal) as mismatch:
                 await self.receive(self.stop('foreign'))
         finally:
             reset_hermes_home_override(token)
@@ -300,28 +303,28 @@ class NativeStructuredStopTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_pending_control_cannot_be_cancelled_as_model_work(self):
         import gateway.session_native_control as controls
-        from hermes_state_runtime import cancel_session_input, RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal
         await self.start()
         async def crash(*args):
             raise RuntimeError('finite interruption after commit')
         with patch.object(controls, 'reconcile', crash):
             with self.assertRaises(RuntimeError):
                 await self.receive(self.stop())
-        with self.assertRaises(RuntimeStoreError) as unsupported:
-            cancel_session_input(self.authority.db, epoch=self.authority.epoch,
+        with self.assertRaises(AuthorityRefusal) as unsupported:
+            self.authority.persistence.admissions.cancel(epoch=self.authority.epoch,
                 admission_id=self.row('structured-stop')['admission_id'])
         self.assertEqual(unsupported.exception.reason, 'unsupported_control')
         self.assertEqual(self.row('structured-stop')['status'], 'queued')
 
     async def test_actual_active_base_dispatches_typed_stop_without_text_command_or_model_turn(self):
-        from hermes_state_runtime import claim_session_input
+        from tests.gateway.test_native_inbound_retry import claim_session_input
         from tests.waiting import async_wait_until
         adapter, _phases, completed = self.base_adapter()
         adapter._busy_text_mode = 'queue'
         await adapter.handle_message(self.event('opening-base'))
         await self.accepted('opening-base')
         self.ref = self.receipts[0][1].ref
-        self.running = claim_session_input(self.authority.db, epoch=self.authority.epoch, session_id=self.ref.session_id)
+        self.running = claim_session_input(self.authority, epoch=self.authority.epoch, session_id=self.ref.session_id)
         self.agent = FiniteAgent()
         self.authority.executing[self.ref.session_id] = self.running['generation']
         self.authority.adopt_agent(self.ref.session_id, self.running['generation'], self.agent)

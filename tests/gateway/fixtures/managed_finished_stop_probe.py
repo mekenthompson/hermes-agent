@@ -7,7 +7,7 @@ import runpy
 from gateway.session_managed_worker import ManagedWorker
 from gateway.session_authority import SessionAuthority
 from gateway import session_ancillary
-from hermes_state_runtime import RuntimeStoreError
+from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
 from tests.waiting import async_wait_until
 from tools.process_registry import process_registry
 from utils import atomic_json_write
@@ -41,14 +41,15 @@ async def observed_drain(self, ref):
         return await drain(self, ref)
     finally:
         from gateway.session_ancillary import process_stop_pending
-        from hermes_state_runtime import list_session_admissions
+        from gateway.session_persistence import authority_persistence
         from tools.process_registry_job import read_job_receipt
+        store = authority_persistence(self)
         with process_registry._lock:
             processes = list(process_registry._running.values()) + list(process_registry._finished.values())
         phase = {'refused': (home / 'refuse-cleanup').exists(),
-                 'stop': process_stop_pending(self.db, ref.session_id),
-                 'admissions': [(r['request_id'], r['status'], r['outcome']) for r in
-                                list_session_admissions(self.db, session_id=ref.session_id, pending_only=False)],
+                 'stop': process_stop_pending(store, ref.session_id),
+                 'admissions': [(r.request_id, r.status, r.outcome) for r in
+                                store.admissions.list(session_id=ref.session_id, pending_only=False)],
                  'processes': [{'id': p.id, 'exited': p.exited, 'pending': p._scope_stop_pending,
                                 'complete': p._result_complete, 'durable': p._result_persisted_generation,
                                 'generation': p.ownership_generation, 'event': p._completion_event.is_set(),

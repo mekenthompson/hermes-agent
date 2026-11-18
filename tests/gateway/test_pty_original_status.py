@@ -8,7 +8,8 @@ import sys
 import psutil
 import pytest
 
-from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+from persistence.core.errors import AuthorityRefusal
+from gateway.session_authority import admission_row
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit
 from tests.waiting import async_wait_until
 
@@ -41,7 +42,7 @@ async def test_unit_pty_status_survives_refused_stop_and_native_fifo(tmp_path, m
     from tools.process_registry_job import job_quiescent, request_job_stop
 
     db, authority = _authority(tmp_path, monkeypatch)
-    monkeypatch.setattr(module, 'CHECKPOINT_PATH', tmp_path / 'processes.json')
+    monkeypatch.setattr(module, '_checkpoint_path', lambda: tmp_path / 'processes.json')
     monkeypatch.setattr(module, 'worker_output_log', lambda sid: None)
     registry = module.ProcessRegistry()
     monkeypatch.setattr(module, 'process_registry', registry)
@@ -111,7 +112,7 @@ async def test_unit_pty_status_survives_refused_stop_and_native_fifo(tmp_path, m
         assert original['result_complete'] is True
 
         stopped_generation = authority._handle(REF).execution_generation
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, stopped_generation)
         marker = process_stop_pending(db, 's')
         assert marker and _alive(foreign)
@@ -130,13 +131,13 @@ async def test_unit_pty_status_survives_refused_stop_and_native_fifo(tmp_path, m
         assert final['exit_code'] == exit_code and final['output'] == expected
         assert final['result_complete'] is True and final['completion_consumed'] is True
         assert own.id not in {row['session_id'] for row in json.loads(module._checkpoint_path().read_text())}
-        rows = [row for row in list_session_admissions(db, session_id='s', pending_only=False)
+        rows = [row for row in [admission_row(r) for r in db.admissions.list(session_id='s', pending_only=False)]
                 if row['principal_id'] != 'native-process-stop']
         assert [(row['request_id'], row['status'], row['outcome']) for row in rows] == [
             ('only-human', 'terminal', 'completed')]
 
         previous_attempts = list(attempts)
-        with pytest.raises(RuntimeStoreError, match='stale_generation'):
+        with pytest.raises(AuthorityRefusal, match='stale_generation'):
             await authority.interrupt(ACTOR, REF, stopped_generation)
         assert attempts == previous_attempts and executed == ['only-human']
         assert process_stop_pending(db, 's') is None and _alive(foreign)

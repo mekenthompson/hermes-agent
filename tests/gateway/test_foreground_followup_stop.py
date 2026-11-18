@@ -10,7 +10,8 @@ import threading
 import psutil
 import pytest
 
-from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+from persistence.core.errors import AuthorityRefusal
+from gateway.session_authority import admission_row
 from tests.gateway.test_native_job_scope_stop import live, spawn
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit
 from tests.tools.test_foreground_job_scope import capture_foreground_output
@@ -116,13 +117,13 @@ if p.exists(): Path({str(effect)!r}).touch()
             assert read_job_receipt(own) is not None, 'Original producer must have captured authentic native identity'
             saved = receipt.read_bytes()
             receipt.unlink()
-            with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+            with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
                 await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
             assert process_stop_pending(db, 's') and live(child)
             await _submit(authority, 'human continuation')
             await asyncio.wait_for(authority.sessions['s'].task, 10)
             assert executed == []
-            assert any(row['status'] == 'queued' for row in list_session_admissions(db, session_id='s'))
+            assert any(row['status'] == 'queued' for row in [admission_row(r) for r in db.admissions.list(session_id='s')])
             _restore_missing_receipt(receipt, saved)
             assert read_job_receipt(own) is not None, 'Authentic native evidence must be fully published'
             # A new ordinary human message drives native recovery; the first
@@ -133,7 +134,7 @@ if p.exists(): Path({str(effect)!r}).touch()
             try:
                 await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
                 first_stop = 'quiescent'
-            except RuntimeStoreError as error:
+            except AuthorityRefusal as error:
                 assert error.reason == 'process_stop_unknown'
                 first_stop = 'unknown_pending'
                 assert process_stop_pending(db, 's') and executed == []
@@ -155,7 +156,7 @@ if p.exists(): Path({str(effect)!r}).touch()
                 'helper_fate': current._detached_host_fate(current_process.pid, current_process.host_start_time),
                 'owner_done': task.done(), 'owner_error': repr(task.exception()) if task.done() else None,
                 'admissions': [(row['request_id'], row['status'], row['outcome'])
-                               for row in list_session_admissions(db, session_id='s', pending_only=False)],
+                               for row in [admission_row(r) for r in db.admissions.list(session_id='s', pending_only=False)]],
                 'reader_alive': current_process._reader_thread.is_alive() if current_process._reader_thread else False,
                 'completion': current_process._completion_event.is_set(),
                 'complete_result': current_process._result_complete,

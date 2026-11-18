@@ -105,9 +105,9 @@ async def test_slack_answered_root_restart_replay_preserves_identity(tmp_path, m
               'ts': '1793821400.000200', 'event_ts': '1793821400.000200', 'message': message}
     try:
         await _deliver(adapter, replay)
-        from hermes_state_runtime import list_session_admissions
+        from tests.gateway.test_native_inbound_retry import list_session_admissions
         # Read the durable rows directly: a replay dropped before admission loads no live session.
-        after = list_session_admissions(authority.db, session_id=before[0]['target_session_id'], pending_only=False)
+        after = list_session_admissions(authority, session_id=before[0]['target_session_id'], pending_only=False)
         assert calls == [], 'neither the answered request nor a changed copy may execute again'
         assert after == before, 'replay must not alter or replace the committed admission'
         if change in ('identical', 'display-name'):

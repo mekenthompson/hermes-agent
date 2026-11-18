@@ -34,8 +34,8 @@ class CancelledNativeCommitTests(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
         await asyncio.gather(*tuple(self.authority._mutation_tasks))
-        from hermes_state_runtime import list_session_admissions
-        rows = list_session_admissions(self.authority.db,
+        from tests.gateway.test_native_inbound_retry import list_session_admissions
+        rows = list_session_admissions(self.authority,
             session_id=self.store.lookup_by_session_key(self.route).session_id)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]['status'], 'queued')
@@ -43,12 +43,12 @@ class CancelledNativeCommitTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.scheduled, 'durable input committed after cancellation must wake its native drain')
 
     async def test_cancelled_busy_observer_keeps_handling_before_drain(self):
-        from hermes_state_runtime import get_session_admission
+        from tests.gateway.test_native_inbound_retry import get_session_admission
         entered, release = asyncio.Event(), asyncio.Event()
         effects = []
 
         async def before_schedule(receipt, fence):
-            row = get_session_admission(self.authority.db, admission_id=receipt.admission_id)
+            row = get_session_admission(self.authority, admission_id=receipt.admission_id)
             self.assertEqual(row['status'], 'queued')
             self.assertFalse(self.scheduled)
             entered.set()
@@ -73,7 +73,7 @@ class CancelledNativeCommitTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_stop_observer_keeps_original_control_reconciliation(self):
         from gateway.platforms.event import StructuredControl
         from gateway.session_ancillary import process_stop_pending
-        from hermes_state_runtime import list_session_admissions
+        from tests.gateway.test_native_inbound_retry import list_session_admissions
         await self.start()
         self.scheduled.clear()
         entered, release = threading.Event(), threading.Event()
@@ -97,11 +97,11 @@ class CancelledNativeCommitTests(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
             await asyncio.gather(*tuple(self.authority._mutation_tasks))
-        rows = list_session_admissions(self.authority.db, session_id=self.ref.session_id, pending_only=False)
+        rows = list_session_admissions(self.authority, session_id=self.ref.session_id, pending_only=False)
         stopped = [row for row in rows if row['request_id'] == event.message_id]
         self.assertEqual(len(stopped), 1)
         self.assertEqual((stopped[0]['status'], stopped[0]['outcome']), ('terminal', 'cancelled'))
         self.assertTrue(event._gateway_accepted)
         self.assertEqual(self.agent.effects, [('interrupt', None)])
-        self.assertIsNotNone(process_stop_pending(self.authority.db, self.ref.session_id))
+        self.assertIsNotNone(process_stop_pending(self.authority.persistence, self.ref.session_id))
         self.assertEqual(len(self.scheduled), 1)

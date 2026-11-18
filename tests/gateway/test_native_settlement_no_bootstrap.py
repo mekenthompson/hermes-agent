@@ -4,6 +4,8 @@ The finite runner/agent settings and actual SQLite admission fixture never run a
 model. The existing guard rejects gateway.run/run_agent imports and activation.
 """
 from types import SimpleNamespace
+
+from persistence.conversation.messages import ConversationRequest, NewMessage
 import unittest
 
 from tests.gateway import test_native_inbound_retry as fixtures
@@ -19,12 +21,12 @@ class NativeSettlementNoBootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_completed_finish_result_commits_and_reuses_exact_reply_without_bootstrap(self):
         from gateway.session_results import admission_result, finish_result
         await self.start()
-        settled, reply = finish_result(self.authority.db, epoch=self.authority.epoch,
+        settled, reply = finish_result(self.authority.persistence, epoch=self.authority.epoch,
             row=self.running, response='finite delivered result', outcome='completed')
         self.assertEqual((settled['status'], settled['outcome']), ('terminal', 'completed'))
         self.assertEqual(reply, 'finite delivered result')
-        self.assertEqual(admission_result(self.authority.db, settled['admission_id'])['result']['final_response'], reply)
-        _, retried = finish_result(self.authority.db, epoch=self.authority.epoch,
+        self.assertEqual(admission_result(self.authority.persistence, settled['admission_id'])['result']['final_response'], reply)
+        _, retried = finish_result(self.authority.persistence, epoch=self.authority.epoch,
             row=self.running, response='different retry must not replace the result', outcome='completed')
         self.assertEqual(retried, reply)
 
@@ -35,16 +37,18 @@ class NativeSettlementNoBootstrapTests(unittest.IsolatedAsyncioTestCase):
                                 ('Gateway shutting down', SHUTDOWN_INTERRUPT_NOTICE)]:
             with self.subTest(cause=cause):
                 await self.start(cause)
-                self.authority.db.append_message(self.ref.session_id, role='user', content=cause)
+                self.authority.persistence.messages.append(self.ref.session_id, NewMessage.from_live({'role': 'user', 'content': cause}))
                 result = {'result': {'interrupted': True, 'interrupt_message': cause, 'messages': [], 'final_response': ''}}
-                settled, _ = finish_result(self.authority.db, epoch=self.authority.epoch,
+                settled, _ = finish_result(self.authority.persistence, epoch=self.authority.epoch,
                     row=self.running, response='', outcome='interrupted', result=result)
                 self.assertEqual(settled['outcome'], 'interrupted')
-                messages = self.authority.db.get_messages(self.ref.session_id)
+                messages = [m.as_openai_message() for m in self.authority.persistence.messages.read_conversation(
+                    self.ref.session_id, ConversationRequest(include_display_only=True))]
                 self.assertEqual(sum(message['content'] == expected for message in messages), 1)
-                finish_result(self.authority.db, epoch=self.authority.epoch,
+                finish_result(self.authority.persistence, epoch=self.authority.epoch,
                     row=self.running, response='', outcome='interrupted', result=result)
-                messages = self.authority.db.get_messages(self.ref.session_id)
+                messages = [m.as_openai_message() for m in self.authority.persistence.messages.read_conversation(
+                    self.ref.session_id, ConversationRequest(include_display_only=True))]
                 self.assertEqual(sum(message['content'] == expected for message in messages), 1)
 
     async def test_owner_reason_and_user_stop_copy_stay_distinct_without_bootstrap(self):

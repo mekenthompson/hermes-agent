@@ -7,7 +7,7 @@ import threading
 import pytest
 
 from gateway.session_contract import SessionActor
-from hermes_state_runtime import list_session_admissions
+from gateway.session_authority import admission_row
 from tests.gateway.test_automation_compression_media import _admit_human, _discord_owner
 from tests.gateway.test_native_stop_reconciliation import caller, stop
 from tests.waiting import async_wait_until
@@ -52,7 +52,7 @@ async def test_native_stop_filters_actual_completion_batch_before_admission(tmp_
         assert 'result' in await stop(caller(authority, actor), ref)
         release.set()
         assert await asyncio.wait_for(task, 10) is None
-        rows = list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)
+        rows = [admission_row(r) for r in authority.persistence.admissions.list(session_id=ref.session_id, pending_only=False)]
         controls = [row for row in rows if row['principal_id'] == 'native-process-stop']
         work = [row for row in rows if row['principal_id'] != 'native-process-stop']
         assert len(controls) == 1 and (controls[0]['status'], controls[0]['outcome']) == ('terminal', 'cancelled')
@@ -63,15 +63,14 @@ async def test_native_stop_filters_actual_completion_batch_before_admission(tmp_
         release.set()
         await runner._cancel_process_completion_batch_tasks()
         await task
-        authority.db.close()
+        authority.persistence.close()
 
 
 @pytest.mark.asyncio
 async def test_stop_during_native_admission_write_refuses_consumed_completion(tmp_path, monkeypatch):
-    from gateway import session_automation
     runner, _adapter, authority, _source, ref, actor, _registry, _own, event = await owner_with_completion(tmp_path, monkeypatch)
     entered, release = threading.Event(), threading.Event()
-    admit = session_automation.admit_session_input
+    admit = authority.persistence.admissions.admit
 
     def held_write(*args, **kwargs):
         if kwargs['principal_id'].startswith('automation:'):
@@ -79,20 +78,20 @@ async def test_stop_during_native_admission_write_refuses_consumed_completion(tm
             assert release.wait(10)
         return admit(*args, **kwargs)
 
-    monkeypatch.setattr(session_automation, 'admit_session_input', held_write)
+    monkeypatch.setattr(authority.persistence.admissions, 'admit', held_write)
     task = asyncio.create_task(runner._deliver_completion_notification('retained stopped output', event))
     try:
         assert await asyncio.to_thread(entered.wait, 10)
         assert 'result' in await stop(caller(authority, actor), ref)
         release.set()
         assert await asyncio.wait_for(task, 10) is False
-        rows = list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)
+        rows = [admission_row(r) for r in authority.persistence.admissions.list(session_id=ref.session_id, pending_only=False)]
         assert len([row for row in rows if row['principal_id'] != 'native-process-stop']) == 1
         assert all(row['status'] == 'terminal' for row in rows if row['principal_id'] == 'native-process-stop')
     finally:
         release.set()
         await task
-        authority.db.close()
+        authority.persistence.close()
 
 
 @pytest.mark.asyncio
@@ -132,7 +131,7 @@ async def test_stop_withdraws_already_queued_completion_and_runs_human_follower(
             monkeypatch.setattr(session_automation, '_withdraw', withdraw)
         assert 'result' in await stop(caller(authority, actor), ref)
         assert kill_calls == [], 'withdrawal recovery must work without another physical kill'
-        rows = list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)
+        rows = [admission_row(r) for r in authority.persistence.admissions.list(session_id=ref.session_id, pending_only=False)]
         completion = next(row for row in rows if row['principal_id'].startswith('automation:'))
         assert (completion['status'], completion['outcome']) == ('terminal', 'cancelled')
         monkeypatch.setattr(SessionAuthority, '_schedule', schedule)
@@ -143,4 +142,4 @@ async def test_stop_withdraws_already_queued_completion_and_runs_human_follower(
         assert registry.is_completion_consumed(own.id)
     finally:
         await runner._cancel_process_completion_batch_tasks()
-        authority.db.close()
+        authority.persistence.close()

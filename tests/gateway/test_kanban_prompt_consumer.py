@@ -13,7 +13,7 @@ async def test_question_consumer_requires_current_native_route_and_claim(tmp_pat
     from gateway.session_kanban_prompts import bind_consumer, require_consumer
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
 
     fixture = NativeInboundRetryTests()
     await fixture.asyncSetUp()

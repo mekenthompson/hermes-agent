@@ -51,7 +51,7 @@ def _drain(queue):
 def _run_completion(tmp_path, monkeypatch, *, creator, submitter):
     """Create over ``creator`` (None = stdio), submit + spawn over ``submitter``, deliver the completion,
     and return (session, completion-turn terminal verdict)."""
-    from hermes_state import SessionDB
+    from persistence_assembly import open_persistence, profile_scope
     from tools import approval_context
     from tools.process_registry import ProcessSession, process_registry
     from tools.process_registry_notifications import format_process_notification
@@ -60,7 +60,7 @@ def _run_completion(tmp_path, monkeypatch, *, creator, submitter):
     from tui_gateway.transport import bind_transport, reset_transport
 
     _drain(process_registry.completion_queue)
-    db = SessionDB(tmp_path / 'state.db')
+    db = open_persistence(profile_scope(home=tmp_path))
     for attr, value in (('_get_db', lambda: db), ('_schedule_agent_build', lambda _sid: None),
                         ('_schedule_session_cap_enforcement', lambda: None),
                         ('_start_agent_build', lambda *_a: None),

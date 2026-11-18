@@ -19,7 +19,7 @@ async def test_unreadable_birth_keeps_the_real_neighbor_safe(tmp_path, monkeypat
     from gateway.session_ancillary import process_stop_pending, retry_process_stop
     from gateway.session_authority import LiveSession, SessionAuthority
     from gateway.session_context import clear_session_vars, set_session_vars
-    from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch
+    from persistence.core.errors import AuthorityRefusal
     from tools import process_registry as module
     from tools.process_registry_output_log import output_dir
     db, authority = _authority(tmp_path, monkeypatch)
@@ -61,9 +61,9 @@ async def test_unreadable_birth_keeps_the_real_neighbor_safe(tmp_path, monkeypat
     monkeypatch.setattr(module, '_stop_systemd_unit', stop_unit)
     current = original
     if native_restart:
-        epoch = begin_runtime_epoch(db, instance_id='unreadable-birth-owner')
+        epoch = db.runtime.begin_epoch(instance_id='unreadable-birth-owner')
         old = authority
-        authority = SessionAuthority(old.runner, profile_id='owned', instance_id='unreadable-birth-owner', db=db, epoch=epoch)
+        authority = SessionAuthority(old.runner, profile_id='owned', instance_id='unreadable-birth-owner', epoch=epoch, persistence=db)
         authority.sessions['s'] = LiveSession(old.sessions['s'].source, 'route')
         current = module.ProcessRegistry()
         monkeypatch.setattr(module, 'process_registry', current)
@@ -73,7 +73,7 @@ async def test_unreadable_birth_keeps_the_real_neighbor_safe(tmp_path, monkeypat
         await asyncio.to_thread(wait_until, lambda: 'unit output' in own.output_buffer, timeout=5)
         if native_restart:
             if refuse_unit:
-                with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+                with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
                     await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
             else:
                 await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)

@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from tests.gateway import test_native_inbound_retry as fixtures
+from tests.fixtures.storage_holder import raw_holder
 
 no_bootstrap = fixtures.no_bootstrap
 
@@ -22,9 +23,9 @@ class NativeInboxDeleteModeTests(unittest.IsolatedAsyncioTestCase):
     settle = fixtures.NativeInboundRetryTests.settle
 
     async def asyncSetUp(self):
-        with patch('hermes_state_wal.resolve_journal_mode', return_value='delete'):
+        with patch('sqlite_support.resolve_journal_mode', return_value='delete'):
             await fixtures.NativeInboundRetryTests.asyncSetUp(self)
-        db = self.authority.db
+        db = raw_holder(self.authority.persistence)
         self.assertFalse(db._wal_active)
         self.assertEqual(db._conn.execute('PRAGMA journal_mode').fetchone()[0].lower(), 'delete')
         # A diagnostic observer makes the exact production deadlock finite on

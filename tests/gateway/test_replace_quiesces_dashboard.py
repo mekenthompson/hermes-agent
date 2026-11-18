@@ -51,7 +51,7 @@ def test_wait_deleted_sidecar_holders_gone_true_when_empty(monkeypatch, tmp_path
     import sys
     fake = MagicMock()
     fake.iter_deleted_sqlite_sidecar_holders = lambda path: []
-    monkeypatch.setitem(sys.modules, "hermes_state_dbfile", fake)
+    monkeypatch.setitem(sys.modules, "persistence.sqlite._state.dbfile", fake)
     assert writers.wait_deleted_sidecar_holders_gone(tmp_path / "state.db", timeout_s=0.2) is True
 
 
@@ -59,7 +59,7 @@ def test_wait_deleted_sidecar_holders_gone_false_when_stuck(monkeypatch, tmp_pat
     import sys
     fake = MagicMock()
     fake.iter_deleted_sqlite_sidecar_holders = lambda path: [(99, "state.db-wal (deleted)")]
-    monkeypatch.setitem(sys.modules, "hermes_state_dbfile", fake)
+    monkeypatch.setitem(sys.modules, "persistence.sqlite._state.dbfile", fake)
     assert writers.wait_deleted_sidecar_holders_gone(tmp_path / "state.db", timeout_s=0.2) is False
 
 

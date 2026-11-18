@@ -9,7 +9,8 @@ import uuid
 import psutil
 import pytest
 
-from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+from persistence.core.errors import AuthorityRefusal
+from gateway.session_authority import admission_row
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit, _wire_turn_agent
 from tests.gateway.test_session_authority_preadopt_stop import Agent
 from tests.gateway.test_unknown_backend_stop_checkpoint import ShellBackend
@@ -112,7 +113,7 @@ async def test_opaque_stop_remains_unknown_through_reader_exit_and_reload(tmp_pa
             assert (result['status'], result['error']) == ('error', 'process_stop_unknown')
         elif control == 'bulk':
             assert await asyncio.to_thread(registry.kill_all, 's', source='session.interrupt') == 0
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
         finish.set()
         await asyncio.wait_for(authority.sessions['s'].task, 20)
@@ -150,7 +151,7 @@ async def test_opaque_stop_remains_unknown_through_reader_exit_and_reload(tmp_pa
         await _submit(authority, 'later human')
         await asyncio.wait_for(authority.sessions['s'].task, 20)
         assert executed == ['head'] and process_stop_pending(db, 's') == token
-        rows = list_session_admissions(db, session_id='s')
+        rows = [admission_row(r) for r in db.admissions.list(session_id='s')]
         assert {row['status'] for row in rows if row['request_id'] != 'head'} == {'queued'}
         saved = json.loads(module._checkpoint_path().read_text())
         assert {session.id, neighbor.id} <= {row['session_id'] for row in saved}
@@ -197,7 +198,7 @@ async def test_ordinary_backend_history_and_lost_resource_evidence(tmp_path, mon
         await _submit(authority, 'ordinary human continuation')
         await asyncio.wait_for(authority.sessions['s'].task, 15)
         assert executed == ['ordinary human continuation'] and process_stop_pending(db, 's') is None
-        with pytest.raises(RuntimeStoreError, match='process_stop_unknown'):
+        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
         await _submit(authority, 'held after explicit Stop')
         await asyncio.wait_for(authority.sessions['s'].task, 15)
