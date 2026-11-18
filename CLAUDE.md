@@ -1,0 +1,2 @@
+@AGENTS.md
+@SWITCHROOM.md
