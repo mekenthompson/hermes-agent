@@ -44,7 +44,7 @@ jobs:
       github.event.workflow_run.event != 'pull_request' &&
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
-      github.repository == 'mekenthompson/hermes-agent'
+      github.repository == 'switchroom/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -94,8 +94,8 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
-          owner: mekenthompson
-          repositories: hermes-fleet
+          owner: switchroom
+          repositories: switchroom
 
       - name: Open the auto-merging pin PR in hermes-fleet
         if: steps.locate.outputs.found == 'true'
@@ -107,4 +107,4 @@ jobs:
             --manifest "$RUNNER_TEMP/handoff/agent-image-manifest.json" \
             --expected-revision "$SOURCE_SHA" \
             --source-run-url "$SOURCE_RUN_URL" \
-            --fleet-repo mekenthompson/hermes-fleet
+            --fleet-repo switchroom/switchroom

@@ -103,8 +103,8 @@ _FORK_UNSHIPPED_LANES = frozenset({
 
 def _fork_leaves_unshipped(lane: str) -> bool:
     """This fork does not schedule upstream install, Desktop, or OS update surfaces."""
-    repo = os.environ.get("GITHUB_REPOSITORY", "mekenthompson/hermes-agent")
-    return repo == "mekenthompson/hermes-agent" and lane in _FORK_UNSHIPPED_LANES
+    repo = os.environ.get("GITHUB_REPOSITORY", "switchroom/hermes-agent")
+    return repo == "switchroom/hermes-agent" and lane in _FORK_UNSHIPPED_LANES
 
 
 def _detect_outputs(lanes: dict[str, bool], event_name: str = "workflow_dispatch") -> dict[str, Any]:
@@ -126,7 +126,7 @@ def _detect_outputs(lanes: dict[str, bool], event_name: str = "workflow_dispatch
         "steps": steps,
         "github": {
             "event_name": event_name,
-            "repository": os.environ.get("GITHUB_REPOSITORY", "mekenthompson/hermes-agent"),
+            "repository": os.environ.get("GITHUB_REPOSITORY", "switchroom/hermes-agent"),
         },
         "inputs": {},
     }
@@ -173,7 +173,7 @@ def _run_workflow(rel: str, *, inputs: dict[str, Any], detect: dict[str, Any] | 
                 "github": {
                     "event_name": "pull_request",
                     "ref_type": "branch",
-                    "repository": os.environ.get("GITHUB_REPOSITORY", "mekenthompson/hermes-agent"),
+                    "repository": os.environ.get("GITHUB_REPOSITORY", "switchroom/hermes-agent"),
                 },
                 "needs": {n: {"outputs": (ran.get(n) or {}).get("outputs", {}),
                               "result": "success" if n in ran else "skipped"} for n in needs},

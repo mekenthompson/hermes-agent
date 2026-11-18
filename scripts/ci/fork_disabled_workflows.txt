@@ -1,4 +1,4 @@
-# Upstream product workflows. Disable these on mekenthompson/hermes-agent.
+# Upstream product workflows. Disable these on switchroom/hermes-agent.
 # They are not called by the fork's selected CI jobs. A renamed upstream file
 # arrives enabled; re-run scripts/ci/disable_fork_upstream_workflows.py.
 archive-inputs.yml

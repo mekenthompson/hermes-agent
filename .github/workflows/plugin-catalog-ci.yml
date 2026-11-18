@@ -96,7 +96,7 @@ jobs:
             # together with reviewed tooling. Keep the exemption bound to this exact
             # fork branch/repository and PR number; pinned-source validation below still runs.
             house_sync=0
-            if [ "${CATALOG_HEAD_REPO:-}" = "mekenthompson/hermes-agent" ] \
+            if [ "${CATALOG_HEAD_REPO:-}" = "switchroom/hermes-agent" ] \
                && [ "${CATALOG_HEAD_REF:-}" = "house/reconcile-nous-c9b20d7bc08dec1e10779a06d7d9073bc6e7e418" ] \
                && [ "${CATALOG_PR_NUMBER:-}" = "237" ] \
                && git merge-base --is-ancestor c9b20d7bc08dec1e10779a06d7d9073bc6e7e418 HEAD^2 \

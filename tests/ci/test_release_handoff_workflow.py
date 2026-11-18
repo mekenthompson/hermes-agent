@@ -39,7 +39,7 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         # this repository's own code may hand off with the App token.
         self.assertIn("github.event.workflow_run.event != 'pull_request'", guard)
         self.assertIn("github.event.workflow_run.head_repository.full_name == github.repository", guard)
-        self.assertIn("github.repository == 'mekenthompson/hermes-agent'", guard)
+        self.assertIn("github.repository == 'switchroom/hermes-agent'", guard)
 
     def test_handoffs_are_serialized_across_source_shas(self) -> None:
         text = workflow_text()
@@ -82,8 +82,8 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         token = job.split("uses: actions/create-github-app-token@", 1)[1].split("\n      - name:", 1)[0]
         self.assertIn("app-id: ${{ vars.RELEASE_BOT_APP_ID }}", token)
         self.assertIn("private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}", token)
-        self.assertIn("owner: mekenthompson", token)
-        self.assertRegex(token, r"(?m)^\s+repositories: hermes-fleet\s*$")
+        self.assertIn("owner: switchroom", token)
+        self.assertRegex(token, r"(?m)^\s+repositories: switchroom\s*$")
         self.assertNotIn("hermes-fleet-private", token)
         self.assertNotIn("hermes-agent", token)
         # The App token is used only by the pin step, never by checkout or download.
@@ -123,7 +123,7 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         pin = job.split("name: Open the auto-merging pin PR", 1)[1]
         self.assertIn("python3 scripts/ci/open_fleet_pin_pr.py", pin)
         self.assertIn('--source-run-url "$SOURCE_RUN_URL"', pin)
-        self.assertIn("--fleet-repo mekenthompson/hermes-fleet", pin)
+        self.assertIn("--fleet-repo switchroom/switchroom", pin)
         self.assertNotIn("--dry-run", pin)
         script = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('"pr", "merge", "--auto", "--squash"', script)

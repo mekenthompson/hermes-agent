@@ -36,8 +36,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-AGENT_REPOSITORY = "ghcr.io/mekenthompson/hermes-agent"
-DEFAULT_FLEET_REPO = "mekenthompson/hermes-fleet"
+AGENT_REPOSITORY = "ghcr.io/switchroom/hermes-agent"
+DEFAULT_FLEET_REPO = "switchroom/switchroom"
 FLEET_MANIFEST_PATH = "release/agent-image-manifest.json"
 MANIFEST_KEYS = {"schema_version", "repository", "revision", "digest", "immutable_ref"}
 REVISION_RE = re.compile(r"^[0-9a-f]{40}$")

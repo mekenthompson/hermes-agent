@@ -16,7 +16,7 @@ SCRIPT = ROOT / "scripts/ci/upgrade_test_plan.py"
 plan = runpy.run_path(str(SCRIPT))["upgrade_matrix"]
 
 
-@pytest.mark.parametrize("repository", ["mekenthompson/hermes-agent", "NousResearch/hermes-agent"])
+@pytest.mark.parametrize("repository", ["switchroom/hermes-agent", "NousResearch/hermes-agent"])
 def test_partition_is_disjoint_and_covers_new_files_and_suites(tmp_path, repository):
     inventory = [
         "test_upgrade_path.py", "test_other.py", "test_new.py",
@@ -30,13 +30,13 @@ def test_partition_is_disjoint_and_covers_new_files_and_suites(tmp_path, reposit
         path.touch()
     matrix = plan(tmp_path, repository)["include"]
     selected = [file for job in matrix for file in job["files"]]
-    expected = inventory if repository != "mekenthompson/hermes-agent" else [
+    expected = inventory if repository != "switchroom/hermes-agent" else [
         file for file in inventory if not file.startswith("handoff/")
     ]
     assert sorted(selected) == sorted(expected)
     assert len(selected) == len(set(selected))
     assert all(job["files"] for job in matrix)
-    if repository == "mekenthompson/hermes-agent":
+    if repository == "switchroom/hermes-agent":
         for long in ("test_upgrade_path.py", "git/test_shallow_install.py"):
             assert next(job["files"] for job in matrix if long in job["files"]) == [long]
         pm = [job for job in matrix if job["shard"].startswith("pm-")]
@@ -48,10 +48,10 @@ def test_partition_is_disjoint_and_covers_new_files_and_suites(tmp_path, reposit
 
 def test_empty_inventory_fails_closed(tmp_path):
     with pytest.raises(ValueError, match="no test files"):
-        plan(tmp_path, "mekenthompson/hermes-agent")
+        plan(tmp_path, "switchroom/hermes-agent")
 
 
-@pytest.mark.parametrize("repository", ["mekenthompson/hermes-agent", "NousResearch/hermes-agent"])
+@pytest.mark.parametrize("repository", ["switchroom/hermes-agent", "NousResearch/hermes-agent"])
 def test_publication_partitions_keep_runtime_coverage_without_duplicate_tests(tmp_path, repository):
     inventory = ROOT / "tests/e2e/core/upgrade"
     files = {path.relative_to(inventory).as_posix() for path in inventory.rglob("test_*.py")}
@@ -63,7 +63,7 @@ def test_publication_partitions_keep_runtime_coverage_without_duplicate_tests(tm
     def selected(partition):
         return [file for job in plan(tmp_path, repository, partition)["include"] for file in job["files"]]
     combined, runtime, native = (selected(partition) for partition in ("all", "runtime", "native"))
-    expected = {file for file in files if repository != "mekenthompson/hermes-agent" or not file.startswith("handoff/")}
+    expected = {file for file in files if repository != "switchroom/hermes-agent" or not file.startswith("handoff/")}
     assert sorted(combined) == sorted(expected)
     assert sorted(runtime + native) == sorted(expected)
     assert len(runtime + native) == len(set(runtime + native))
@@ -88,7 +88,7 @@ def test_cli_output_drives_matrix_without_a_second_discovery(tmp_path):
     output = tmp_path / "output"
     child = subprocess.run(
         [sys.executable, str(SCRIPT)], cwd=ROOT, check=True,
-        env={**os.environ, "GITHUB_REPOSITORY": "mekenthompson/hermes-agent", "GITHUB_OUTPUT": str(output)},
+        env={**os.environ, "GITHUB_REPOSITORY": "switchroom/hermes-agent", "GITHUB_OUTPUT": str(output)},
         capture_output=True, text=True,
     )
     assert output.read_text() == child.stdout
