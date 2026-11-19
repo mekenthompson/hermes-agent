@@ -405,7 +405,7 @@ def test_notifier_terminal_kinds_are_not_gated_on_the_progress_interval():
     notifier_source = inspect.getsource(__import__("gateway.kanban_watchers_notifier", fromlist=["*"]))
     assert "active_work_progress" not in notifier_source
     assert "ACTIVE_WORK_INTERVAL_SECONDS" not in notifier_source
-    note = SimpleNamespace(head="Kanban", title="canary", task=SimpleNamespace(result="shipped"))
+    note = SimpleNamespace(head="Kanban", title="canary", ping_title="canary", task=SimpleNamespace(result="shipped"))
     completed_fmt = _EVENT_FORMATTERS["completed"]
     blocked_fmt = _EVENT_FORMATTERS["blocked"]
     completed, handoff, _review = completed_fmt(

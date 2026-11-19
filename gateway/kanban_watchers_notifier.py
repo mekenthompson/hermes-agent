@@ -424,6 +424,39 @@ def _first_line(text: str, limit: int) -> str:
     return lines[0][:limit] if lines else text[:limit]
 
 
+# Pings that name the task by title; only these consult ``kanban_task_link``.
+_TITLED_KINDS = ("completed", "review_requested")
+_LINK_URL_UNSAFE = re.compile(r"[\s()<>\[\]]")
+
+
+def _markdown_link(answer: Any) -> Optional[str]:
+    """``[text](url)`` from one ``kanban_task_link`` answer, or None when it is not a usable link.
+
+    Standard Markdown, so each adapter's own formatter renders it for its platform. Brackets
+    in the text become parentheses: Telegram and Slack end a link's text at the first ``]``.
+    """
+    if not isinstance(answer, dict):
+        return None
+    url, text = answer.get("url"), answer.get("text")
+    if not isinstance(url, str) or not url.startswith("https://") or _LINK_URL_UNSAFE.search(url):
+        return None
+    if not isinstance(text, str):
+        return None
+    text = " ".join(text.replace("[", "(").replace("]", ")").split())[:120]
+    return f"[{text}]({url})" if text else None
+
+
+def _task_link(task: Any, board: Optional[str]) -> Optional[str]:
+    """The first usable ``kanban_task_link`` answer for ``task`` (blocking: plugin stores)."""
+    from hermes_cli.plugins import has_hook, invoke_hook
+
+    if task is None or not has_hook("kanban_task_link"):
+        return None
+    answers = invoke_hook("kanban_task_link", task_id=task.id, board=board or "default",
+                          title=task.title, body=task.body or "")
+    return next((link for link in map(_markdown_link, answers) if link), None)
+
+
 def _fmt_completed(ev, n) -> tuple:
     # Prefer the run summary from the event payload; fall back to task.result for legacy rows.
     wake_handoff = None
@@ -433,7 +466,7 @@ def _fmt_completed(ev, n) -> tuple:
     elif n.task and n.task.result:
         wake_handoff = _first_line(n.task.result, 160)
     handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
-    return t("gateway.kanban.ping.completed", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
+    return t("gateway.kanban.ping.completed", head=n.head, title=n.ping_title, handoff=handoff), wake_handoff, None
 
 
 def _fmt_review_requested(ev, n) -> tuple:
@@ -446,7 +479,7 @@ def _fmt_review_requested(ev, n) -> tuple:
         summary = str(summary)
         handoff = f"\n{summary[:200]}"
         wake_handoff = _first_line(summary, 200)
-    return t("gateway.kanban.ping.review_requested", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
+    return t("gateway.kanban.ping.review_requested", head=n.head, title=n.ping_title, handoff=handoff), wake_handoff, None
 
 
 def _fmt_changes_requested(ev, n) -> tuple:
@@ -555,6 +588,8 @@ class _KanbanNotification:
         self.task_id = sub["task_id"]
         self.sub_profile = sub.get("notifier_profile") or ""
         self.title = (task.title if task else sub["task_id"])[:120]
+        # Chat pings may name the task as a plugin-supplied link; the wake turn keeps the plain title.
+        self.ping_title = self.title
         self.board_tag = t("gateway.kanban.ping.board_tag", board=self.board_slug) if self.board_slug else ""
         # Attribute the ping to the worker that did the work.
         tag = t("gateway.kanban.ping.assignee_tag", assignee=task.assignee) if task and task.assignee else ""
@@ -902,6 +937,9 @@ class _KanbanNotification:
                     "kanban notifier: dropping subscription %s on %s after %d refusals", exc, False)
             return
         async with owner_scope:
+            if self.send_passive and any(ev.kind in _TITLED_KINDS for ev in self.d["events"]):
+                # In the subscriber's scope (to_thread copies it): that profile's plugins answer.
+                self.ping_title = await asyncio.to_thread(_task_link, self.task, self.board_slug) or self.title
             if not await self._send_pings():
                 return
             # All text pings delivered (or skipped for non-push / wake-only).
