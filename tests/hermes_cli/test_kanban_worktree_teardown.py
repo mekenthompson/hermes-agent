@@ -355,3 +355,50 @@ def test_terminal_scratch_parent_still_swept_after_last_child(
         assert ws.is_dir()  # live child still needs the handoff files
         assert kb.archive_task(conn, child)
     assert not ws.exists()
+
+
+def _worker_completes(monkeypatch: pytest.MonkeyPatch, tid: str, ws: Path) -> None:
+    """Complete ``tid`` the way a dispatched worker does: its own task and run
+    pinned in the env, its cwd inside its workspace, through the tool handler."""
+    import json
+
+    from tools import kanban_tools as kt
+
+    with kbc.connect_closing() as conn:
+        run_id = kb.get_task(conn, tid).current_run_id
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.chdir(ws)
+    out = json.loads(kt._handle_complete({"summary": f"{tid} done"}))
+    assert out.get("ok") is True, out
+
+
+def test_review_chain_reaps_every_scratch_workspace(
+    kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HF-750: implement -> cold review -> follow-up, each worker filing its
+    successor before it completes. The middle card completes while its own child
+    is live, and that deferral used to return before the parent sweep, so the
+    first card's scratch was never removed (#135782)."""
+    monkeypatch.setenv("HERMES_PROFILE", "worker")
+    with kbc.connect_closing() as conn:
+        a, ws_a = _running_scratch_parent(conn, title="implement")
+        b = kb.create_task(conn, title="cold review", assignee="worker", parents=[a])
+    _worker_completes(monkeypatch, a, ws_a)
+    assert ws_a.is_dir()  # the reviewer still needs the handoff files
+
+    with kbc.connect_closing() as conn:
+        assert kb.claim_task(conn, b) is not None
+        ws_b = Path(kbw.resolve_workspace(kb.get_task(conn, b)))
+        kbw.set_workspace_path(conn, b, ws_b)
+        c = kb.create_task(conn, title="follow-up", assignee="worker", parents=[b])
+    _worker_completes(monkeypatch, b, ws_b)
+    assert ws_b.is_dir()  # deferred: the follow-up is live
+    assert not ws_a.exists(), "the implement card's last child is done; its scratch must go"
+
+    with kbc.connect_closing() as conn:
+        assert kb.claim_task(conn, c) is not None
+        ws_c = Path(kbw.resolve_workspace(kb.get_task(conn, c)))
+        kbw.set_workspace_path(conn, c, ws_c)
+    _worker_completes(monkeypatch, c, ws_c)
+    assert not ws_b.exists() and not ws_c.exists()
