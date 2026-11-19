@@ -140,12 +140,17 @@ class ForkRunnerFallbackTests(unittest.TestCase):
         self.assertIn("'8') || '2'", workers)
 
     def test_nested_matrix_target_runner_falls_back_on_untrusted_forks(self) -> None:
+        untrusted = (
+            "(github.repository != 'NousResearch/hermes-agent' || "
+            "(github.event_name == 'pull_request' && "
+            "github.event.pull_request.head.repo.full_name != github.repository))"
+        )
+        windows_only = f"startsWith(matrix.target.runner, 'windows-latest-32') && {untrusted} && 'windows-latest' || matrix.target.runner"
         fallback = (
-            "startsWith(matrix.target.runner, 'windows-latest-32') && "
             "(github.repository != 'NousResearch/hermes-agent' || "
             "(github.event_name == 'pull_request' && "
             "github.event.pull_request.head.repo.full_name != github.repository)) && "
-            "'windows-latest' || matrix.target.runner"
+            "matrix.target.fork_runner || matrix.target.runner"
         )
         hits = []
         for path in (ROOT / ".github/workflows").glob("*.yml"):
@@ -156,8 +161,17 @@ class ForkRunnerFallbackTests(unittest.TestCase):
                 if "matrix.target.runner" not in stripped:
                     continue
                 hits.append(f"{path.name}: {stripped}")
-                self.assertIn(fallback, stripped, f"unguarded nested runner: {path.name}: {stripped}")
+                self.assertTrue(fallback in stripped or windows_only in stripped,
+                                f"unguarded nested runner: {path.name}: {stripped}")
         self.assertIn("pm-bundle.yml: runs-on: ${{ " + fallback + " }}", hits)
+        # Every Nous runner in the nested matrix names its GitHub-hosted fork twin.
+        lines = [x.strip() for x in (ROOT / ".github/workflows/pm-bundle.yml").read_text(encoding="utf-8").splitlines()]
+        runners = [i for i, x in enumerate(lines) if x.startswith("runner:")]
+        self.assertGreater(len(runners), 0)
+        for i in runners:
+            self.assertTrue(lines[i + 1].startswith("fork_runner: "), lines[i])
+            self.assertNotIn("blacksmith", lines[i + 1])
+            self.assertNotIn("-core", lines[i + 1])
 
     def test_docker_large_runners_reject_untrusted_fork_prs(self) -> None:
         trust_guard = (

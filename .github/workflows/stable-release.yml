@@ -528,6 +528,10 @@ jobs:
     if: always()
     needs: [admit, ci, docker, acceptance, candidate-manifest, publication, publish-docker,
             windows-packaged, macos-packaged-arm64]
+    # imagetools needs no BuildKit, but it reads the current builder's buildkitd.toml
+    # registry config. Not useblacksmith/setup-docker-builder: its no-cache-key fallback marks
+    # docker.io `http = true`, Docker Hub 301s the plain-HTTP manifest PUT to HTTPS, Go replays
+    # it as a GET, and the commit 404s (v0.22.3 rc.1-rc.4).
     runs-on: ubuntu-latest
     environment: release-signing
     permissions:
@@ -591,7 +595,9 @@ jobs:
             --candidate-manifest-sha256 "$CANDIDATE_MANIFEST_SHA256" --candidate-commit "$RELEASE_COMMIT" \
             "${args[@]}"
       - name: Set up Docker Buildx for ordered alias promotion
-        uses: useblacksmith/setup-docker-builder@19215110ab936351210feebdfa5b440b4493e184  # v2
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver: docker  # no builder: imagetools then reads no registry config
       - name: Log in to Docker Hub for ordered alias promotion
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
