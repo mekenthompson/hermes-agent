@@ -1758,6 +1758,7 @@ Each hook is documented in full on the **[Event Hooks reference](../../user-guid
 | `kanban_task_claimed` | A kanban task is claimed (dispatcher process, before the worker spawns) | `task_id: str, board: str \| None, assignee: str \| None, run_id: int \| None, profile_name: str` | ignored |
 | `kanban_task_completed` | A kanban task completes (worker process) | `task_id, board, assignee, run_id, profile_name, summary: str \| None` | ignored |
 | `kanban_task_blocked` | A kanban task is blocked (worker process) | `task_id, board, assignee, run_id, profile_name, reason: str \| None` | ignored |
+| `kanban_task_link` | The gateway notifier is about to send a completed or review ping (subscriber profile's scope) | `task_id: str, board: str, title: str, body: str` | `None` or `{"url": "https://...", "text": str}`: the first usable answer names the task as `[text](url)` in the ping; the wake turn keeps the plain title |
 
 Most hooks are fire-and-forget observers — their return values are ignored. The exceptions are `pre_llm_call`, which can inject context into the conversation or block the turn before it reaches the model, and `pre_tool_call`, which can return a block/approve directive.
 
@@ -1808,6 +1809,7 @@ Every name in `hermes_cli.plugins.VALID_HOOKS` has at least one core fire site. 
 | `kanban_task_claimed` | `hermes_cli/kanban_db.py` `claim_task` (through `_fire_task_hook`) |
 | `kanban_task_completed` | `hermes_cli/kanban_db.py` `complete_task` (through `_fire_task_hook`); `hermes_cli/kanban_swarm.py` `create_swarm` |
 | `kanban_task_blocked` | `hermes_cli/kanban_db.py` `block_task` (through `_fire_task_hook`) |
+| `kanban_task_link` | `gateway/kanban_watchers_notifier.py` `_task_link`, from `_KanbanNotification.deliver` |
 | `on_kanban_worker_spawned` | `hermes_cli/kanban_db.py` `_fire_worker_spawned_hook` |
 | `on_kanban_worker_exited` | `hermes_cli/kanban_db_dispatch.py` `detect_crashed_workers` |
 | `on_kanban_worker_stale_claim` | `hermes_cli/kanban_db.py` `release_stale_claims` |
