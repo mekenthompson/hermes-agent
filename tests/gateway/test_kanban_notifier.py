@@ -796,3 +796,37 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_planned_restart_crash_neither_pings_nor_wakes(tmp_path, monkeypatch):
+    """HF-750: a run a planned gateway stop or restart interrupted is requeued
+    without a failure (``owner_stopped``); it is board state, not a decision for
+    the chat. A genuine crash after it still pings and wakes."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "owner-stopped.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="restart survivor", assignee="worker",
+                             session_id="agent:main:telegram:dm:chat-1")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
+                           delivery_mode="notify+wake", delivery_metadata={"chat_type": "dm"})
+        kb._append_event(conn, tid, kind="crashed", payload={
+            "exit_kind": "nonzero_exit", "exit_code": 130, "owner_stopped": True,
+            "attempt_note": "interrupted by a gateway stop or restart, requeued without counting a failure",
+        })
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert adapter.sent == [] and adapter.handled == []
+    assert _unseen_terminal_events(tid) == [], "the cursor still moves past the silent event"
+
+    conn = kbc.connect()
+    try:
+        kb._append_event(conn, tid, kind="crashed", payload={"exit_kind": "nonzero_exit", "exit_code": 1})
+    finally:
+        conn.close()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1 and "stopped unexpectedly" in adapter.sent[0]["text"].lower()
+    assert len(adapter.handled) == 1

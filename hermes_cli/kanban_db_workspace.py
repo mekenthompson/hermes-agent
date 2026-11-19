@@ -380,11 +380,15 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         # Defer while any child is not yet terminal so it can still read
         # handoff artifacts from this workspace.
         if _has_active_children(conn, task_id):
-            _kb._log.debug(
+            _kb._log.info(
                 "Deferring %s workspace cleanup for task %s: "
                 "active children still need workspace at %s",
                 kind, task_id, path,
             )
+            # This task is terminal too, so a parent waiting on it may now be
+            # free: skipping the sweep here stranded every grandparent of a
+            # chain whose cards each file a successor (#135782, HF-750).
+            _try_cleanup_parent_workspaces(conn, task_id)
             return
         # Kill the (dead) tmux worker session BEFORE removing a worktree so a
         # lingering worker never has its cwd deleted from under it.
@@ -405,7 +409,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                 if not _defer_shared_workspace_cleanup(conn, task_id, path):
                     release_lsp_clients(str(wp))
                     shutil.rmtree(wp, ignore_errors=True)
-                    _kb._log.debug("Removed scratch workspace: %s", wp)
+                    _kb._log.info("Removed scratch workspace for task %s: %s", task_id, wp)
             else:
                 _kb._log.warning(
                     "Refusing to remove out-of-scratch workspace for task %s: %s "
@@ -420,7 +424,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         # their deferred cleanup can proceed (#33774).
         _try_cleanup_parent_workspaces(conn, task_id)
     except Exception:
-        pass  # best-effort — never block completion
+        # Best-effort: never block completion, but a leak must be visible.
+        _kb._log.warning("Workspace cleanup failed for task %s", task_id, exc_info=True)
 
 
 def _cleanup_worktree_workspace(
@@ -488,12 +493,12 @@ def _cleanup_worktree_workspace(
                 task_id, wp, (result.stderr or result.stdout or "").strip(),
             )
             return
-        _kb._log.debug("Removed worktree workspace: %s", wp)
+        _kb._log.info("Removed worktree workspace for task %s: %s", task_id, wp)
         branch = (branch_name or "").strip() or f"wt/{task_id}"
         if branch.startswith("wt/"):
             _git(repo_root, "branch", "-D", branch, timeout=30)
     except Exception:
-        pass  # best-effort — never block completion
+        _kb._log.warning("Worktree cleanup failed for task %s at %s", task_id, path, exc_info=True)
 
 
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
@@ -532,9 +537,9 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                     continue
                 release_lsp_clients(str(wp))
                 shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+                _kb._log.info("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
-        pass  # best-effort
+        _kb._log.warning("Deferred parent workspace cleanup failed after task %s", task_id, exc_info=True)
 
 
 def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:

@@ -21,6 +21,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli.kanban_db_controls import _triaged_by_block_loop
 
 from utils import env_int
 
@@ -235,7 +236,10 @@ def specify_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Task ids in the triage column; ``tenant`` narrows the sweep."""
+    """Task ids in the triage column; ``tenant`` narrows the sweep.
+
+    A card the block-loop breaker parked there waits on a human, not on a
+    spec: the sweep skips it, while ``specify <id>`` and ``unblock`` still reach it."""
     with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(conn, status="triage", tenant=tenant, include_archived=False)
-    return [t.id for t in tasks]
+        return [t.id for t in tasks if not _triaged_by_block_loop(conn, t.id)]
