@@ -181,6 +181,10 @@ VALID_HOOKS: set[str] = {
     #   (privacy: task ids, assignees, workspace paths).
     "on_kanban_worker_spawned", "on_kanban_worker_exited", "on_kanban_worker_stale_claim",
     "on_kanban_task_updated", "on_kanban_dispatch_tick",
+    # kanban_task_link: gateway notifier, once per completed/review ping batch, in the subscriber
+    # profile's scope. Kwargs: task_id, board, title, body. Return None or {"url": https URL,
+    # "text": str}; the first usable answer names the task as [text](url) in the chat ping.
+    "kanban_task_link",
     # gateway_platform_event: normalized envelopes only, never raw SDK objects or adapter handles.
     # Kwargs: platform, event_type, payload (event_type-local; see hooks.md). New event types land
     # only together with real fire-sites.
