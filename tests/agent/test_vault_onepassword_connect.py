@@ -17,6 +17,7 @@ stand-in for the Connect REST API:
 from __future__ import annotations
 
 import json
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
@@ -373,23 +374,46 @@ def test_browser_vault_list_and_fill_through_connect(connect):
 
     controls = [{"autocomplete": "username", "formIndex": 0, "index": 0, "label": "", "name": "user", "type": "text"},
                 {"autocomplete": "current-password", "formIndex": 0, "index": 1, "label": "", "name": "pw", "type": "password"}]
-    written = []
+    written, typed = [], []
 
     def fake_eval(task_id, expression):
         if "location.href" in expression:
             return {"success": True, "result": "https://www.example.com/sso"}
         return {"success": True, "result": json.dumps(controls)}
 
-    def fake_eval_secret(task_id, expression):
+    def fake_eval_secret(task_id, expression):  # the core's origin assert, focus check, write, read-back
         written.append(expression)
-        return {"success": True, "result": json.dumps({"filled": 1})}
+        if "ok: true" in expression:
+            return {"success": True, "result": json.dumps({"ok": True})}
+        if 'refused: "focus_lost"' in expression:
+            match = re.search(r'"index":\s*(\d+)', expression)
+            return {"success": True, "result": json.dumps({"focused": int(match.group(1)) if match else -1})}
+        if "reverted" in expression:
+            return {"success": True, "result": json.dumps(
+                {"landed": expression.count('"index"'), "reverted": 0, "missing": []})}
+        return {"success": True, "result": json.dumps({"filled": expression.count('"index"')})}
+
+    class _Sup:  # the trusted-keystroke channel the identifier is typed on
+        def current_page_session(self):
+            return "S1"
+
+        def insert_text(self, text, **kwargs):
+            typed.append(text)
+            return {"ok": True}
+
+        def focus_page(self, origin, accept=None):  # the one open tab is on www
+            if origin != "https://www.example.com":
+                return {"ok": False}
+            return {"ok": True, "url": "https://www.example.com/sso", "session_id": "S1"}
 
     with patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
-         patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_eval_secret):
+         patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_eval_secret), \
+         patch.object(browser_vault_tool, "_ensure_supervisor", return_value=_Sup()), \
+         patch.object(browser_vault_tool, "_page_backend", return_value=None):
         filled = browser_vault_tool.browser_vault_fill(f"op:{LOGIN}")
     result = json.loads(filled)
     assert result["success"] and result["backend"] == "onepassword" and result["origin"] == "https://www.example.com"
-    assert len(written) == 1 and PASSWORD in written[0]
+    assert any(PASSWORD in e for e in written) and PASSWORD not in typed
     for text in (listed, filled):
         assert PASSWORD not in text and TOKEN not in text
 
