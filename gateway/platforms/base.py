@@ -4050,10 +4050,9 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         """Auto-TTS on voice input (voice-first), gated by /voice or voice.auto_tts;
         skipped when streaming TTS already delivered audio this turn."""
         generation = getattr(interrupt_event, "_hermes_run_generation", None)
-        return bool(
-            should_auto_tts_for_source(self, event.source)
-            and event.message_type == MessageType.VOICE and text_content and not media_files
-            and not self._streaming_tts_turn_completed(session_key, generation, event=event))
+        return bool(should_auto_tts_for_source(self, event.source) and event.message_type == MessageType.VOICE
+                    and text_content and not media_files
+                    and not self._streaming_tts_turn_completed(session_key, generation, event=event))
 
     async def _play_tts_file(
         self, event: MessageEvent, text_content: str, tts_path: str, first: bool,

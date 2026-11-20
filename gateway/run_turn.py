@@ -1113,9 +1113,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         # chat, adapter supports streaming, and a usable streaming TTS provider configured. See #60671.
         _stts_adapter = self._delivery_adapter_for(source)
         _is_voice_input = (
-            message_type is not None
-            and str(getattr(message_type, "value", message_type)).lower() == "voice"
-        )
+            message_type is not None and str(getattr(message_type, "value", message_type)).lower() == "voice")
         if _stts_adapter is None or not _is_voice_input or not should_auto_tts_for_source(_stts_adapter, source):
             return
         try:
