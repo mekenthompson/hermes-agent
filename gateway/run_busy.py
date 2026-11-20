@@ -572,11 +572,11 @@ class GatewayBusySessionMixin:
         if not text.strip():
             return text
         import json
-        from gateway.session import label_shared_sender
+        from gateway.session import label_event_sender
 
         source = event.source
-        text = label_shared_sender(
-            source, text, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
+        text = label_event_sender(
+            event, source, text, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False))
         origin = {
             "platform": source.platform.value,
