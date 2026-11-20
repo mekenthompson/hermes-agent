@@ -61,7 +61,7 @@ def run_vault_io(supervisor, task_id, operation):
     """Re-admit page I/O on its captured socket after prompts or connection replacement."""
     from tools.browser_session import session_for_task
 
-    info = supervisor.browser_session_info
+    info = getattr(supervisor, "browser_session_info", None)  # a bare test double has none
     if info is None:
         info = session_for_task(task_id)
     return run_fenced(info, operation)
@@ -78,15 +78,17 @@ def connect_vault(task_id, info, endpoint, policy, timeout):
     return run_fenced(info, attach).get('supervisor')
 
 
-def evaluate_vault(supervisor, task_id, expression):
-    result = run_vault_io(supervisor, task_id, lambda: supervisor.evaluate_runtime(expression))
-    if result.get('code'):
+def evaluate_vault(supervisor, task_id, expression, session_id=None):
+    """Evaluate on the captured socket, re-admitted, pinned to the page session the caller checked."""
+    result = run_vault_io(supervisor, task_id, lambda: supervisor.evaluate_runtime(
+        expression, session_id=session_id, await_promise=False))
+    if 'ok' not in result and result.get('code'):  # the fence refused before the evaluate ran
         return {'success': False, 'error_type': result['code'], 'error': result.get('error', '')}
     if result.get('ok'):
-        return {'success': True, 'result': result.get('result')}
+        return {'success': True, 'result': result.get('result'), 'document': result.get('document')}
     error = str(result.get('error') or 'evaluate failed')
-    return {'success': False, 'error_type': 'supervisor_required' if 'supervisor' in error.lower() else 'eval_failed',
-            'error': error}
+    moved = 'supervisor' in error.lower() or result.get('code') == 'session_changed'
+    return {'success': False, 'error_type': 'supervisor_required' if moved else 'eval_failed', 'error': error}
 
 
 def shares_desktop(session_info, home):

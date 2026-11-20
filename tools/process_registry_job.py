@@ -158,12 +158,13 @@ def record_stopped_unit(registry, entry):
     cached.systemd_unit, cached._scope_stop_pending = '', False
 
 
-def job_argv(session, argv, grace):
+def job_argv(session, argv, grace, pass_fds=()):
     from hermes_dir_acl import make_user_dir
     target = job_receipt_path(session.id)
     make_user_dir(target.parent, mode=0o700, parents=True, exist_ok=True)
     session.native_job_scope = True
-    return [sys.executable, '-I', '-S', str(Path(__file__).resolve()), str(target), str(grace), '--', *argv]
+    fds = ','.join(str(fd) for fd in pass_fds)  # inherited secret pipes the command itself must keep
+    return [sys.executable, '-I', '-S', str(Path(__file__).resolve()), str(target), str(grace), fds, '--', *argv]
 
 
 def request_job_stop(registry, session):
@@ -209,8 +210,8 @@ def signal_job_stop(registry, session, consume_output):
 def _main():
     import ctypes
     target, grace = Path(sys.argv[1]), max(0.0, float(sys.argv[2]))
-    argv = sys.argv[4:]
-    if sys.argv[3] != '--' or not argv:
+    argv, pass_fds = sys.argv[5:], tuple(int(fd) for fd in sys.argv[3].split(',') if fd)
+    if sys.argv[4] != '--' or not argv:
         raise ValueError('native job argv missing')
     pid = os.getpid()
     process_stat = Path('/proc/self/stat').read_text(encoding='utf-8')
@@ -247,7 +248,7 @@ def _main():
         return code
     receipt(False)
     try:
-        child = subprocess.Popen(argv, stdin=None)  # Inherit this job's captured pipe or PTY.
+        child = subprocess.Popen(argv, stdin=None, pass_fds=pass_fds)  # Inherit this job's captured pipe or PTY.
     except OSError:
         code = 126
         receipt(True)

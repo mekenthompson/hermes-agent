@@ -214,7 +214,7 @@ class _ForegroundJob:
             source='session.interrupt', expected_ownership=self._ownership)
 
 
-def spawn_foreground(session, argv, env, cwd, stdin_data):
+def spawn_foreground(session, argv, env, cwd, stdin_data, pass_fds=()):
     """Capture native scope before the first user-command instruction can run."""
     from tools import process_registry as facade
     from tools.environments.base_output import _pipe_stdin
@@ -222,7 +222,7 @@ def spawn_foreground(session, argv, env, cwd, stdin_data):
     from tools.process_registry_job import job_argv, job_receipt_path
     registry = facade.process_registry
     session.cwd = cwd
-    argv = job_argv(session, argv, registry._daemon_term_grace_seconds())
+    argv = job_argv(session, argv, registry._daemon_term_grace_seconds(), pass_fds)
     log = facade.worker_output_log(session.id) or job_receipt_path(session.id).with_name(session.id + '.log')
     output = facade.open_output_log(log)
     resource = reserve_local_process()
@@ -236,7 +236,7 @@ def spawn_foreground(session, argv, env, cwd, stdin_data):
                 stdout=output, stderr=facade.subprocess.STDOUT,
                 stdin=facade.subprocess.PIPE if stdin_data is not None else facade.subprocess.DEVNULL,
                 # detached-spawn: ok — checkpointed native registry owns this scope across worker death; Stop/timeout reap it, not the observing interpreter
-                start_new_session=True)
+                start_new_session=True, pass_fds=tuple(pass_fds))
             session.process, session.pid = proc, proc.pid
             session.host_start_time = registry._safe_host_start_time(proc.pid)
             launch_identity = ownership_identity(session)

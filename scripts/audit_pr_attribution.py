@@ -67,15 +67,14 @@ def is_mapped(email: str) -> bool:
         return True
     if ID_NOREPLY_RE.search(email):
         return True
-    emails_dir = REPO_ROOT / "contributors" / "emails"
-    if (emails_dir / email).is_file():
-        return True
+    # Case-insensitive: the directory cannot hold two case variants of one email.
     folded = email.casefold()
-    if emails_dir.is_dir() and any(path.name.casefold() == folded for path in emails_dir.iterdir()):
+    emails_dir = REPO_ROOT / "contributors" / "emails"
+    if emails_dir.is_dir() and any(p.name.casefold() == folded and p.is_file() for p in emails_dir.iterdir()):
         return True
     authors_py = REPO_ROOT / "scripts" / "releases" / "authors_legacy.py"
     try:
-        if f'"{email}"' in authors_py.read_text(encoding="utf-8-sig", errors="replace"):
+        if f'"{folded}"' in authors_py.read_text(encoding="utf-8-sig", errors="replace").casefold():
             return True
     except OSError:
         pass
