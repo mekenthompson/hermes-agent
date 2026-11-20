@@ -26,6 +26,7 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome, describe_proxy_error, safe_proxy_url_for_log
 from gateway.platforms.event import MessageEvent
 from gateway.platforms.helpers import hash_for_log, typing_metadata_for_turn
+from gateway.voice_scope import should_auto_tts_for_source
 from gateway.response_filters import (
     display_kind_for_event, display_metadata_for_event, is_machinery_display_kind, persisted_user_metadata_for_event,
     reply_expected_metadata,
@@ -1115,7 +1116,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             message_type is not None
             and str(getattr(message_type, "value", message_type)).lower() == "voice"
         )
-        if _stts_adapter is None or not _is_voice_input or not _stts_adapter._should_auto_tts_for_chat(source.chat_id):
+        if _stts_adapter is None or not _is_voice_input or not should_auto_tts_for_source(_stts_adapter, source):
             return
         try:
             from gateway.streaming_tts_consumer import StreamingTTSConsumer

@@ -437,6 +437,7 @@ if (_checkout_root := str(Path(__file__).resolve().parents[2])) not in sys.path:
     sys.path.append(_checkout_root)  # append, never prepend: never shadow same-named installed packages
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import fence_state_after, reply_file_off, try_reply_file, typing_metadata_for_turn, sender_may_see_activity, typing_pause_key, typing_refresh_wanted
+from gateway.voice_scope import should_auto_tts_for_source
 from gateway.platforms.base_post_delivery import run_post_delivery_callback
 from gateway.platforms.base_delivery_ledger import (
     finalize_final_obligation, ledger_attempted, ledger_bracket, record_final_obligation)
@@ -4050,7 +4051,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         skipped when streaming TTS already delivered audio this turn."""
         generation = getattr(interrupt_event, "_hermes_run_generation", None)
         return bool(
-            self._should_auto_tts_for_chat(event.source.chat_id)
+            should_auto_tts_for_source(self, event.source)
             and event.message_type == MessageType.VOICE and text_content and not media_files
             and not self._streaming_tts_turn_completed(session_key, generation, event=event))
 

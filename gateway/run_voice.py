@@ -23,6 +23,7 @@ from gateway.config import Platform
 from gateway.platforms.base import build_auto_tts_output_path
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
+from gateway.voice_scope import should_auto_tts_for_source, voice_scope_id
 
 logger = logging.getLogger("gateway.run")  # log-record parity with the origin module
 
@@ -75,10 +76,26 @@ class GatewayVoiceMixin:
         return base if not profile or profile == "default" else f"{profile}:{base}"
 
     def _voice_key_for_source(self, source: SessionSource) -> str:
-        """Voice mode belongs to the (bot, chat) pair: namespace is the profile that OWNS the
-        receiving adapter, not the routed profile."""
+        """Voice mode belongs to the (bot, chat[, topic]) triple: namespace is the profile that
+        OWNS the receiving adapter, not the routed profile. On Telegram a topic message keys
+        ``<platform>:<chat_id>:<thread_id>`` so ``/voice`` applies to that topic only. This is the
+        writer key for every ``/voice`` change; readers use :meth:`_voice_mode_for_source`."""
         profile = self._adapter_profile_for_source(source)
-        return self._voice_key(source.platform, source.chat_id, profile=profile)
+        return self._voice_key(source.platform, self._voice_scope_for_source(source), profile=profile)
+
+    @staticmethod
+    def _voice_scope_for_source(source: SessionSource) -> str:
+        """Adapter auto-TTS set entry for ``source``: ``<chat_id>[:<thread_id>]``."""
+        return voice_scope_id(source.platform, source.chat_id, getattr(source, "thread_id", None))
+
+    def _voice_mode_for_source(self, source: SessionSource) -> Optional[str]:
+        """Effective ``/voice`` mode: the topic's own choice, else the chat-level one, else None
+        (``voice.auto_tts`` decides)."""
+        key = self._voice_key_for_source(source)
+        if (mode := self._voice_mode.get(key)) is not None:
+            return mode
+        chat_key = self._voice_key(source.platform, source.chat_id, profile=self._adapter_profile_for_source(source))
+        return self._voice_mode.get(chat_key) if chat_key != key else None
 
     def _bind_voice_input_callback(self, adapter) -> None:
         """Route voice transcripts back through the adapter that captured them."""
@@ -447,13 +464,13 @@ class GatewayVoiceMixin:
         if event.source.platform == Platform.LOCAL:
             return False
         chat_id = event.source.chat_id
-        voice_mode = self._voice_mode.get(self._voice_key_for_source(event.source))
+        voice_mode = self._voice_mode_for_source(event.source)
         is_voice_input = event.message_type == MessageType.VOICE
         adapter = self._delivery_adapter_for(event.source)
         adapter_auto_tts = False
         adapter_auto_tts_mode = "all"
         with suppress(Exception):  # adapters without the probe read as False
-            adapter_auto_tts = bool(adapter._should_auto_tts_for_chat(chat_id))
+            adapter_auto_tts = should_auto_tts_for_source(adapter, event.source)
             adapter_auto_tts_mode = getattr(adapter, "_auto_tts_mode", "all")
         # ``voice.auto_tts`` (synced into the adapter at startup) is the fallback only when the
         # chat has no explicit mode; the chat-level all/voice_only/off choice takes precedence.
