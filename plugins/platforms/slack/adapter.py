@@ -67,6 +67,7 @@ try:  # sibling modules; support both package and flat plugin-dir import
     from .adapter_reactions_context import slack_reactions_marker
     from .adapter_socket_lifecycle import SlackSocketLifecycleMixin
     from .adapter_vault_code import SlackVaultCodeMixin
+    from .adapter_thread_titles import AssistantThreadTitles
     from .adapter_image_batch import collect_image_uploads
     from .adapter_forwarded import (
         append_forwards, files_with_forwarded, is_forward, own_bot_ids, shared_message_sections,
@@ -81,6 +82,7 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
     from adapter_reactions_context import slack_reactions_marker  # type: ignore
     from adapter_socket_lifecycle import SlackSocketLifecycleMixin  # type: ignore
     from adapter_vault_code import SlackVaultCodeMixin  # type: ignore
+    from adapter_thread_titles import AssistantThreadTitles  # type: ignore
     from adapter_image_batch import collect_image_uploads  # type: ignore
 
 
@@ -991,10 +993,13 @@ def _is_transient_transport_error(e: BaseException) -> bool:
         and not is_permanent_tls_error)
 
 
-class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformAdapter):
+class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, AssistantThreadTitles, BasePlatformAdapter):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
     mention-gated channels, threads, attachments, slash commands, status text."""
+
+    _session_title_method = staticmethod(_session_title_method)
+    _session_status_method = staticmethod(_session_status_method)
 
     MAX_MESSAGE_LENGTH = 39000  # Slack API allows 40,000 chars; leave margin
     supports_code_blocks = True  # Slack mrkdwn renders fenced code blocks
@@ -1105,6 +1110,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         self._native_task_card_streams: dict[tuple[str, str, str], _NativeTaskCardStream] = {}
         # Guard: set the Slack AI thread title once per DM thread, not per reply.
         self._titled_assistant_threads: set = set()
+        # Threads whose model-generated title landed (the raw first-message title is provisional).
+        self._semantically_titled_assistant_threads: set = set()
         # Slash-command contexts so send() can route the first reply ephemerally. Keyed
         # (team_id, channel_id, user_id), two-part when no team id → {"response_url", "ts"}.
         self._slash_command_contexts: dict[tuple[str, ...], dict[str, Any]] = {}
@@ -3724,37 +3731,6 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             ).assistant_threads_setSuggestedPrompts(**kwargs)
         except Exception as e:
             logger.debug("[Slack] assistant.threads.setSuggestedPrompts failed: %s", e)
-
-    def _assistant_thread_title_enabled(self) -> bool:
-        raw = self.config.extra.get("assistant_thread_titles", True)
-        if isinstance(raw, str):
-            return raw.strip().lower() not in {"0", "false", "no", "off"}
-        return bool(raw)
-
-    async def _set_assistant_thread_title(
-        self, channel_id: str, thread_ts: str, title_source: str, *, team_id: str = "") -> None:
-        """Best-effort title for visible Slack AI DM threads."""
-        if (
-            not self._app or not channel_id or not thread_ts or not title_source
-            or not self._assistant_thread_title_enabled()):
-            return
-        key = self._workspace_thread_key(team_id, channel_id, thread_ts)
-        if not key or key in self._titled_assistant_threads:
-            return
-        title = re.sub(r"\s+", " ", title_source).strip()
-        if not title or title.startswith("/"):
-            return
-        title = title[:77].rstrip() + "..." if len(title) > 80 else title
-        try:
-            _set_title = _session_title_method(self._get_client(channel_id, team_id=team_id))
-            await _set_title(channel_id=channel_id, thread_ts=thread_ts, title=title)
-        except Exception as e:
-            logger.debug("[Slack] session title set failed: %s", e)
-            return
-        self._titled_assistant_threads.add(key)
-        # Evict oldest thread_ts first so recently titled threads keep their guard.
-        self._evict_oldest_by_ts(
-            self._titled_assistant_threads, self._TITLED_ASSISTANT_THREADS_MAX, lambda e: e[2])
 
     async def _seed_dm_session(
         self, metadata: dict[str, str], *, thread_ts: Optional[str], fail_log: tuple[Any, ...]

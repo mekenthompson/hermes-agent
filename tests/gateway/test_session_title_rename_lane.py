@@ -24,7 +24,8 @@ from gateway.run_turn_runner import TurnRunner
 def _attach(lane):
     """Attach the title callback for *lane* and return (callback, renames)."""
     renames: list = []
-    source = types.SimpleNamespace(platform=Platform.DISCORD, chat_id="chan-1")
+    source = types.SimpleNamespace(platform=Platform.SLACK if lane == "slack" else Platform.DISCORD,
+                                   chat_id="chan-1", chat_type="dm", thread_id="thread-1")
 
     runner = types.SimpleNamespace(
         _is_telegram_topic_lane=lambda src: lane == "telegram",
@@ -35,6 +36,9 @@ def _attach(lane):
             lambda src, sid, title: renames.append(title)
         ),
         _schedule_discord_semantic_thread_rename=(
+            lambda src, sid, title: renames.append(title)
+        ),
+        _schedule_slack_assistant_thread_title=(
             lambda src, sid, title: renames.append(title)
         ),
     )
@@ -49,7 +53,7 @@ def _attach(lane):
     return agent._on_session_title, renames
 
 
-@pytest.mark.parametrize("lane", ["telegram", "discord"])
+@pytest.mark.parametrize("lane", ["telegram", "discord", "slack"])
 def test_the_rename_waits_for_the_model_title(lane):
     callback, renames = _attach(lane)
 

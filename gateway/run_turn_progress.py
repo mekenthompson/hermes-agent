@@ -1169,7 +1169,7 @@ class GatewayTurnProgressMixin:
                 return
             runner = self._runner
             source = runner._recover_discord_auto_thread_source(ctx.source, ctx.session_key)
-            # Both lanes spend a rate-limited platform call per title, so they use the model's title
+            # Every lane spends a rate-limited platform call per title, so they use the model's title
             # only (TitleCallback); renaming twice burns Discord's 2-per-10-min budget on a throwaway.
             # Relay Discord predicate is shape-only: whether the connector auto-threaded our reply is
             # only knowable AFTER delivery, so register eagerly and let the rename lane look up the
@@ -1178,6 +1178,8 @@ class GatewayTurnProgressMixin:
                 lane = "_schedule_telegram_topic_title_rename"
             elif runner._is_discord_auto_thread_lane(source) or runner._is_relay_discord_channel_lane(source):
                 lane = "_schedule_discord_semantic_thread_rename"
+            elif getattr(source.platform, "value", source.platform) == "slack" and source.chat_type == "dm" and source.thread_id:
+                lane = "_schedule_slack_assistant_thread_title"
             else:
                 return
             agent._on_session_title = lambda title, title_source: (
