@@ -63,7 +63,7 @@ def test_vault_readmission_uses_browser_owner_after_prompt(cross_home, monkeypat
 
     class Supervisor:
         browser_session_info = None
-        def evaluate_runtime(self, expression):
+        def evaluate_runtime(self, expression, *, session_id=None, **kwargs):
             evaluated.append(expression)
             return {'ok': True, 'result': '{}'}
 

@@ -30,7 +30,7 @@ def bound_connection(tmp_path, monkeypatch):
         def stop(self):
             self.stopped = True
 
-        def evaluate_runtime(self, expression):
+        def evaluate_runtime(self, expression, *, session_id=None, **kwargs):
             self.evaluated.append(expression)
             return {'ok': True, 'result': 42}
 
@@ -80,7 +80,7 @@ def test_vault_binding_refuses_human_prompt_takeover_and_resumes(bound_connectio
         assert supervisor.evaluated == []
     finally:
         lease.release('viewer', profile_key=owner)
-    assert vault._eval_js_secret('task', '42') == {'success': True, 'result': 42}
+    assert vault._eval_js_secret('task', '42') == {'success': True, 'result': 42, 'document': None}
 
 
 def test_captured_connection_keeps_its_owner_when_task_rebinds(bound_connection, monkeypatch):
