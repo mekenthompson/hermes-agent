@@ -6,6 +6,7 @@ import argparse
 
 import pytest
 
+from hermes_cli import kanban_db as kb
 from hermes_cli import projects_cmd
 from hermes_cli import projects_db as pdb
 
@@ -57,5 +58,28 @@ def test_rename_and_archive(tmp_path):
         assert len(pdb.list_projects(conn)) == 1
 
 
+@pytest.mark.parametrize("board", ["missing-board", "bad/board"])
+def test_create_rejects_unknown_board_without_creating_project(tmp_path, board):
+    assert _run(["create", "Widget", str(tmp_path), "--board", board]) == 2
+    with pdb.connect_closing() as conn:
+        assert pdb.get_project(conn, "widget") is None
 
 
+@pytest.mark.parametrize("board", ["missing-board", "bad/board"])
+def test_bind_board_rejects_unknown_board_and_keeps_existing_binding(tmp_path, board):
+    assert _run(["create", "Widget", str(tmp_path), "--board", "default"]) == 0
+    assert _run(["bind-board", "widget", board]) == 2
+    with pdb.connect_closing() as conn:
+        assert pdb.get_project(conn, "widget").board_slug == "default"
+
+
+def test_bind_existing_board_and_explicit_unbind(tmp_path):
+    kb.create_board("named-board")
+    assert _run(["create", "Widget", str(tmp_path), "--board", "named-board"]) == 0
+    assert _run(["bind-board", "widget", "default"]) == 0
+    with pdb.connect_closing() as conn:
+        assert pdb.get_project(conn, "widget").board_slug == "default"
+    assert _run(["bind-board", "widget", "named-board"]) == 0
+    assert _run(["bind-board", "widget"]) == 0
+    with pdb.connect_closing() as conn:
+        assert pdb.get_project(conn, "widget").board_slug is None

@@ -217,6 +217,16 @@ def find_by_primary_path(conn: sqlite3.Connection, path: str, *, include_archive
     return None
 
 
+def _bound_board_slug(board_slug: str) -> str:
+    """Normalize a non-empty board binding and require that the board exists."""
+    from hermes_cli import kanban_db as kb
+
+    slug = kb._normalize_board_slug(board_slug)
+    if not slug or not kb.board_exists(slug):
+        raise ValueError(f"no such kanban board: {board_slug}")
+    return slug
+
+
 def create_project(
     conn: sqlite3.Connection, *, name: str, slug: Optional[str] = None, folders: Optional[Iterable[str]] = None,
     primary_path: Optional[str] = None, description: Optional[str] = None, icon: Optional[str] = None,
@@ -227,6 +237,10 @@ def create_project(
     name = str(name or "").strip()
     if not name:
         raise ValueError("project name must not be empty")
+    if board_slug and board_slug.strip():
+        board_slug = _bound_board_slug(board_slug)
+    else:
+        board_slug = None
     slug_candidate = normalize_slug(slug) if slug else _slugify(name)
     pid = "p_" + secrets.token_hex(4)
     now = _now()
@@ -247,7 +261,7 @@ def create_project(
             "INSERT INTO projects (id, slug, name, description, icon, color, board_slug,  primary_path, created_at, archived) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
             (pid, _unique_slug(conn, slug_candidate), name, description, icon, color,
-             normalize_slug(board_slug) if board_slug else None, primary, now),
+             board_slug, primary, now),
         )
         conn.executemany(
             "INSERT INTO project_folders (project_id, path, label, is_primary, added_at) VALUES (?, ?, ?, ?, ?)",
@@ -281,7 +295,7 @@ def update_project(
         if not name:
             raise ValueError("project name must not be empty")
     if board_slug is not None:
-        board_slug = normalize_slug(board_slug) if board_slug.strip() else ""
+        board_slug = _bound_board_slug(board_slug) if board_slug.strip() else ""
     # (column, provided value, stored value) — "" clears icon/color/board_slug to NULL.
     fields = [
         (col, given, stored) for col, given, stored in (

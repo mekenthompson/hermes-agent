@@ -814,3 +814,18 @@ def test_project_tree_rows_name_every_lineage_segment():
         "comp-tip": ("comp-root", ["comp-root", "comp-tip"]),
         "loc-b": (None, ["loc-a", "loc-b"]),
     }
+
+
+def _call_error(method, params):
+    return server._methods[method](1, params).get("error")
+
+
+def test_projects_rpc_reject_unknown_board_slug(tmp_path):
+    created = _call("projects.create", {"name": "Widget", "folders": [str(tmp_path)]})["project"]
+    assert _call_error("projects.update", {"id": created["id"], "board_slug": "missing-board"})
+    assert _call("projects.get", {"id": created["id"]})["project"]["board_slug"] in (None, "")
+    assert _call_error(
+        "projects.create", {"name": "Other", "board_slug": "missing-board"}
+    )
+    listed = _call("projects.list")["projects"]
+    assert [p["name"] for p in listed] == ["Widget"]
