@@ -1192,7 +1192,7 @@ def create_task(
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
-    from hermes_cli.kanban_db_guard_wait import CREATION_HOLD_SOURCE
+    from hermes_cli.kanban_db_guard_wait import creation_block_payload, validate_transient_hold
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
@@ -1203,8 +1203,7 @@ def create_task(
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
-    if transient_hold and initial_status != "blocked":
-        raise ValueError("transient_hold applies only to initial_status='blocked'")
+    validate_transient_hold(transient_hold, initial_status)
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
@@ -1317,8 +1316,7 @@ def create_task(
                         conn,
                         task_id,
                         "blocked",
-                        {"reason": "initial_status", "status": "blocked", "actor": created_by or "user",
-                         **({"source": CREATION_HOLD_SOURCE} if transient_hold else {})},
+                        creation_block_payload(created_by or "user", transient_hold=transient_hold),
                     )
                 if task_status == "todo":
                     # Parked behind an open parent: record why, exactly as

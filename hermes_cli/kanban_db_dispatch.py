@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Upstream-mirrored native Kanban module; keep its shape for Nous syncs, no downstream facade split (as kanban_db.py).
 """Dispatcher: crash/stale/orphan detection, failure accounting and the respawn circuit breaker, memory-aware concurrency caps, the one-shot ``dispatch_once`` pass, worker spawning (``_default_spawn``), worker-log rotation and the long-lived ``run_daemon`` loop.
 
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached
