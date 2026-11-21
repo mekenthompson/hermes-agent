@@ -18,15 +18,18 @@ import uuid
 
 from tools.interrupt import get_interrupt_reason, is_interrupted
 from tools import approval_context as _ctx
+from tools import approval_deferred
 from tools.approval_human_wait import activity_heartbeat, human_wait_window
 
 logger = logging.getLogger("tools.approval")
 
+_LEADER_WAKE_GRACE_S = 2.0
+
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("authority", "cancelled", "card_deny_only", "data", "event", "expired", "identity", "observers",
-                 "owner", "reason", "result", "settle")
+    __slots__ = ("authority", "cancelled", "card_deny_only", "data", "deferred", "event", "expired", "expires_at",
+                 "grant_scope", "identity", "observers", "owner", "reason", "result", "route", "settle")
 
     def __init__(self, data: dict):
         self.owner = None
@@ -54,6 +57,12 @@ class _ApprovalEntry:
         self.cancelled: str | None = None
         # The prompt timed out unanswered; followers woken by its event adopt that timeout.
         self.expired = False
+        # Timed out and parked answerable (``tools.approval_deferred``): set with the fields below by
+        # ``approval_deferred.park``, in the waiting thread's own scope.
+        self.deferred = False
+        self.grant_scope = None
+        self.route: dict = {}
+        self.expires_at = 0.0
 
 
 def _identity_digest(text) -> str:
@@ -143,6 +152,10 @@ def _await_coalesced_leader(session_key: str, leader, payload: dict):
     state = _poll_event(leader.event, session_key, timeout_s=leader.data.get("timeout_s"),
                         interrupt_log="Coalesced approval wait interrupted — "
                                       "returning deny for session %s")
+    if state == "timeout":
+        # Our deadline trails the leader's only by how much later we started. Let the leader's own wake-up
+        # land first: it carries whether the prompt parked answerable (``leader.deferred``).
+        leader.event.wait(_LEADER_WAKE_GRACE_S)
     if state == "set" and leader.result is None and leader.expired:
         state = "timeout"
     cancelled = _cancel_cause(state, leader)
@@ -157,18 +170,26 @@ def _await_coalesced_leader(session_key: str, leader, payload: dict):
     if choice == "once":
         # The post hook fires for the fresh prompt's own lifecycle, not here.
         return None
-    extra = {"cancelled": cancelled} if cancelled else {}
+    extra: dict = {"cancelled": cancelled} if cancelled else {}
+    if state == "timeout" and leader.deferred:
+        # The leader's prompt parked answerable: this follower defers on the same request.
+        extra.update(deferred=True, request_id=leader.data["request_id"])
     return _finish(payload, resolved, choice, getattr(leader, "reason", None), coalesced=True, **extra)
 
 
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *, surface: str = "gateway",
-                            identity: str | None = None) -> dict:
+                            identity: str | None = None, deferrable: bool = False) -> dict:
     """Enqueue *approval_data*, notify the user, and block until resolved or timed
     out. Shared by the terminal command guard, the execute_code guard, the plugin
     escalation gate, and MCP elicitation. Returns ``{"resolved", "choice",
     "reason"}`` or ``{"resolved": False, "choice": None, "notify_failed": True}``
     when the notify callback raised. Persisting the choice and building the
     tool-facing result stay with the caller.
+
+    With *deferrable* (the gates that own a tool result: :func:`tools.approval._human_decision`) a
+    timeout PARKS the entry answerable instead of dropping it and the unresolved decision carries
+    ``deferred: True`` plus the ``request_id`` (``tools.approval_deferred``); callers that handle a
+    timeout themselves keep the hard timeout.
 
     Identical concurrent approvals (same *identity* — the executed command, defaulting to the
     displayed ``command`` — and pattern-key set) are coalesced: parallel tool calls would
@@ -223,12 +244,14 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         if adopted is not None:
             return adopted
 
-    def _drop_entry(state: str) -> str | None:
+    def _drop_entry(state: str, *, defer: bool = False) -> str | None:
         """Leave the queue and return the choice committed so far. Reading ``entry.result`` and
         removing the entry are one critical section under the approval lock: ``resolve_gateway_approval``
         commits under the same lock, so a choice that landed after the deadline check but before this
         removal is still ours to honour, and one arriving later finds no entry (the client is told
-        nothing was pending instead of being acked "ok" while the agent denies)."""
+        nothing was pending instead of being acked "ok" while the agent denies). A timed-out entry that
+        *defer*s moves to the parked registry in the same section, so there is no instant at which a late
+        answer finds it in neither place; its surface hooks then wait for its real end."""
         with _approval._lock:
             choice = entry.result
             queue = _approval._gateway_queues.get(session_key, [])
@@ -236,8 +259,13 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
                 queue.remove(entry)
             if not queue:
                 _approval._gateway_queues.pop(session_key, None)
-            settle, entry.settle = entry.settle, None
-            observers, entry.observers = entry.observers, []
+            parked, evicted = (approval_deferred.park(session_key, entry)
+                               if defer and choice is None and state == "timeout" else (False, []))
+            if parked:
+                settle, observers = None, []
+            else:
+                settle, entry.settle = entry.settle, None
+                observers, entry.observers = entry.observers, []
             if choice is None and state in ("timeout", "notify_failed"):
                 # Coalesced followers block on this event: wake them with the leader's outcome rather than
                 # leaving them waiting their own full timeout on a prompt that no longer exists.
@@ -245,6 +273,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
                 if state == "notify_failed":
                     entry.cancelled = "the approval prompt could not be delivered"
                 entry.event.set()
+        approval_deferred.run_settle(evicted, "timeout")
         if settle is not None or observers:
             # ``request.cancel`` carries a RequestCancelReason: a choice committed from another surface is
             # ``resolved``; a withdrawn entry (woken with no choice — session torn down, turn ended, client
@@ -290,14 +319,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             # Coalesced followers wake with the cause instead of a deny nobody issued.
             entry.cancelled = cancelled
             entry.event.set()
-        choice = _drop_entry(state)
+        choice = _drop_entry(state, defer=deferrable)
         if state == "interrupted":
             # Our own decision stays a fail-closed deny.
             choice = "deny"
         # A choice that landed in the gap between the deadline check and leaving the queue is an answer,
         # not a timeout (#112548) — the same first-settlement rule as server_requests.send().
         resolved = state != "timeout" or choice is not None
-        extra = {"cancelled": cancelled} if cancelled else {}
+        extra: dict = {"cancelled": cancelled} if cancelled else {}
+        if entry.deferred:
+            extra.update(deferred=True, request_id=entry.data["request_id"])
         human.outcome = _hook_choice(resolved, choice, extra)
         # Bounded settle trace (#138133): without this, a timeout that nobody answered leaves no
         # gateway-side record of how the wait ended — only the BLOCKED text the agent sees.

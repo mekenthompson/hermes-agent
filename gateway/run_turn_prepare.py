@@ -698,6 +698,10 @@ class GatewayTurnPrepareMixin:
         if not policy_for_runner_source(self, source).can_run(source.user_id, "sethome"):
             return
         platform_name = source.platform.value
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get(platform_name)
+        if entry is not None and entry.has_home_channel is False:
+            return  # the platform declares it has no home-channel concept: the nudge would be noise
         env_key = _home_target_env_var(platform_name)
         # Multiplex: the home channel may live only in the profile secret scope, not os.environ.
         home_env = ""

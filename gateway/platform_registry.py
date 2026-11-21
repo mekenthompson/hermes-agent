@@ -119,6 +119,11 @@ class PlatformEntry:
     # credential (an event bus, not a person), so user allowlists and pairing do not apply. Never
     # set it for a chat platform: any sender would reach the agent. Consumer: Home Assistant.
     trusted_inbound: bool = False
+    # The platform has a "home channel" concept (where cron results and cross-platform messages are
+    # delivered, set with /sethome). False for a surface whose conversations are not a person's chat to
+    # nominate (an issue tracker thread, a ticket queue): the one-time "no home channel is set, /sethome"
+    # nudge is never sent there. Consumer: Linear (the plugin declares it; core ships no Linear adapter).
+    has_home_channel: bool = True
     # Built-in display defaults tier ("high" | "medium" | "low" | "minimal", see
     # gateway/display_config.py) used below the user's display.* overrides; "" = global defaults.
     display_tier: str = ""

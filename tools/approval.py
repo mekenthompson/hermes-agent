@@ -21,7 +21,7 @@ from typing import Any, Iterable, Optional
 
 from utils import env_var_enabled, is_truthy_value
 from agent.i18n import t
-from tools import approval_context
+from tools import approval_context, approval_deferred
 from tools.approval_context import (
     _get_session_platform, _is_cron_approval_context,
     _is_gateway_approval_context, _is_interactive_cli, _is_single_query_approval_context,
@@ -160,22 +160,29 @@ def resolve_gateway_approval(session_key: str, choice: str,
     # (``choice == "once"`` covers only the leader) and the protected-write and elicitation
     # gates read ``entry.result`` directly, so an alias of "once" must already be "once" here.
     choice = canonical_approval_choice(choice)
+    approval_deferred.expire_due()
+    parked = None
     with _lock:
         queue = _gateway_queues.get(session_key)
-        if not queue:
-            return 0
-        if request_id:
-            entry = _entry_for_request(session_key, request_id)
-            if entry is None:
+        live = _entry_for_request(session_key, request_id)
+        if request_id and live is None:
+            # Not a live wait: a prompt that timed out was parked answerable, and is answered the same
+            # way, by its id. Bare "oldest" / "all" answers never reach a parked prompt.
+            parked = approval_deferred.commit(session_key, request_id, choice, reason)
+            if parked is None:
                 return 0
-            queue.remove(entry)
-            targets = [entry]
+            targets = []
+        elif not queue:
+            return 0
+        elif request_id:
+            queue.remove(live)
+            targets = [live]
         elif resolve_all:
             targets = list(queue)
             queue.clear()
         else:
             targets = [queue.pop(0)]
-        if not queue:
+        if queue is not None and not queue:
             _gateway_queues.pop(session_key, None)
         # Popping the entry and committing its outcome are ONE critical section: the waiter's
         # ``_drop_entry`` reads ``entry.result`` under this same lock after its deadline check, so a
@@ -185,6 +192,11 @@ def resolve_gateway_approval(session_key: str, choice: str,
             if reason:
                 entry.reason = reason
             entry.event.set()
+    if parked is not None:
+        # The agent thread that asked is long gone: tell its session, and let the surfaces retire the card.
+        approval_deferred.announce(session_key, parked, choice, reason)
+        approval_deferred.run_settle([parked], "resolved")
+        return 1
     return len(targets)
 
 
@@ -196,11 +208,18 @@ def _entry_for_request(session_key: str, request_id: Optional[str]):
     return next((e for e in _gateway_queues.get(session_key) or [] if e.data.get("request_id") == request_id), None)
 
 
+def _any_entry_for_request(session_key: str, request_id: Optional[str]):
+    """:func:`_entry_for_request`, else the parked (timed-out, still answerable) entry with that id. Every
+    check that gates ANSWERING a request (Deny-only card, authority, ack) reads through this, so a parked
+    request is held to exactly the rules of a live one. Caller holds ``_lock``."""
+    return _entry_for_request(session_key, request_id) or approval_deferred.entry_for_request(session_key, request_id)
+
+
 def restrict_gateway_approval_card_to_deny(session_key: str, request_id: Optional[str], restricted: bool = True) -> None:
     """Mark a pending request whose card could not show the whole command: a card tap may only deny it.
     Every request starts marked; ``restricted=False`` lifts the mark once its card shows the whole command."""
     with _lock:
-        entry = _entry_for_request(session_key, request_id)
+        entry = _any_entry_for_request(session_key, request_id)
         if entry is not None:
             entry.card_deny_only = restricted
 
@@ -224,7 +243,7 @@ def resolve_gateway_approval_card(session_key: str, choice: str, request_id: Opt
     if not request_id:
         return 0
     with _lock:  # re-entrant: the settle below takes it again
-        target = _entry_for_request(session_key, request_id)
+        target = _any_entry_for_request(session_key, request_id)
         if target is not None and choice != "deny" and target.card_deny_only:
             return 0
         if target is not None and actor_id is not None:
@@ -256,13 +275,15 @@ def withdraw_gateway_approval(session_key: str, request_id: str, cause: str) -> 
 def list_gateway_approvals(session_key: str) -> list[dict]:
     """Return replay-safe snapshots of unresolved approvals for one session."""
     with _lock:
-        return [dict(entry.data) for entry in _gateway_queues.get(session_key, [])]
+        return [dict(entry.data) for entry in _gateway_queues.get(session_key, [])] + approval_deferred.snapshots(session_key)
 
 
 def list_gateway_approval_authority(session_key: str) -> list[dict]:
     """Per unresolved approval: its ``request_id`` and who may answer it (requester, approvers)."""
     with _lock:
-        return [{"request_id": e.data.get("request_id"), **e.authority} for e in _gateway_queues.get(session_key, [])]
+        live = [{"request_id": e.data.get("request_id"), **e.authority} for e in _gateway_queues.get(session_key, [])]
+        # Oldest-first selection ("/approve") reaches live waits before parked prompts.
+        return live + approval_deferred.authority_rows(session_key)
 
 
 def register_gateway_settle(session_key: str, request_id: str, settle) -> bool:
@@ -289,13 +310,20 @@ def observe_gateway_settle(session_key: str, request_id: str, observer) -> bool:
 def ack_gateway_approval(session_key: str, request_id: str) -> bool:
     """A client's receipt of one approval request: True while that request is still pending."""
     with _lock:
-        return _entry_for_request(session_key, request_id) is not None
+        return _any_entry_for_request(session_key, request_id) is not None
 
 
 def has_blocking_approval(session_key: str) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
     with _lock:
         return bool(_gateway_queues.get(session_key))
+
+
+def has_deferred_approval(session_key: str) -> bool:
+    """A prompt of this session timed out and is still answerable (``tools.approval_deferred``). Deliberately
+    not part of :func:`has_blocking_approval`: no thread waits on it, so it is neither a busy backend nor
+    something a bare conversational "yes" may answer — only an explicit /approve, /deny or card tap does."""
+    return approval_deferred.has_parked(session_key)
 
 
 def pending_gateway_approval_count() -> int:
@@ -371,6 +399,9 @@ def clear_session(session_key: str) -> None:
             # the prompt was withdrawn, nobody denied it.
             entry.cancelled = "the session ended before the prompt was answered"
             entry.event.set()
+        # Parked (timed-out) prompts and unspent late answers die with the conversation they belong to.
+        parked = approval_deferred.clear_session(session_key)
+    approval_deferred.run_settle(parked, "session_closed")
     _release_permission_mode_dependents(session_key)
     # Session-persistent code kernels (local and remote) share this owner key and die at the same boundary so a
     # finished conversation cannot leak a live interpreter.
@@ -628,7 +659,7 @@ def _approved() -> dict:
 # ``approval.summary.<outcome>`` (``approval.summary.default`` for unknown outcomes). ``message`` is
 # addressed to the model ("Do NOT retry ..."); surfaces render ``user_summary`` first and fold the
 # model text away, so a Reject click does not read like an error the user caused.
-_USER_SUMMARY_OUTCOMES = frozenset({"denied", "timeout", "notify_failed", "cancelled", "blocked"})
+_USER_SUMMARY_OUTCOMES = frozenset({"denied", "timeout", "deferred", "notify_failed", "cancelled", "blocked"})
 # ``_GateSpec.noun`` values (identifiers) -> ``approval.noun.<noun>`` for the human sentence.
 _USER_SUMMARY_NOUNS = frozenset({"command", "code", "action"})
 
@@ -648,6 +679,24 @@ def _denied(message: str, *, pattern_key: str, description: str, outcome: str, n
     return {"approved": False, "message": message, "pattern_key": pattern_key,
             "description": description, "outcome": outcome, "user_consent": False,
             "user_summary": _user_summary(outcome, noun), **extra}
+
+
+_DEFERRED_MESSAGE = (
+    "DEFERRED: approval for this {noun} is still pending with the user (request {request_id}). Nothing ran and the "
+    "user has neither approved nor refused it. Do NOT rephrase it, retry it, or attempt the same outcome another "
+    "way; every variation sends the user another card. Continue with unrelated work. If the user answers later "
+    "you will get a notification in this session with their decision; if (and only if) it says approved, "
+    "re-issue the exact same {noun}, unchanged."
+)
+
+
+def _deferred(noun: str, *, pattern_key: str, description: str, request_id: str) -> dict:
+    """The approval timed out unanswered but stays open with the user (``tools.approval_deferred``): not
+    consent and not a refusal, so the agent keeps working elsewhere. ``approved`` is False; the command
+    runs only if a later answer is spent by re-issuing it through the normal gate."""
+    return {"approved": False, "message": _DEFERRED_MESSAGE.format(noun=noun, request_id=request_id),
+            "pattern_key": pattern_key, "description": description, "outcome": "deferred", "user_consent": False,
+            "approval_deferred": True, "request_id": request_id, "user_summary": _user_summary("deferred", noun)}
 
 
 def _blocked(message: str, *, pattern_key: str, description: str) -> dict:
@@ -1016,6 +1065,18 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
     }, True
 
 
+def _deferred_reissue(noun: str, session_key: str, command: str, pattern_keys: list[str], pattern_key: str,
+                      description: str) -> tuple[dict | None, "approval_deferred.LateDecision | None"]:
+    """``(result, late)`` for a command whose earlier gateway prompt timed out and was parked
+    (``tools.approval_deferred``). Still open: ``result`` is DEFERRED again, with no second card. Answered
+    since: ``late`` is that answer, spent once in place of the prompt. Every floor ahead of the human step
+    already ran for this re-issue, so a rule that tightened meanwhile still blocks it."""
+    if (open_request := approval_deferred.pending_match(session_key, command, pattern_keys)) is not None:
+        return _deferred(noun, pattern_key=pattern_key, description=description,
+                         request_id=open_request.data["request_id"]), None
+    return None, approval_deferred.take_decision(session_key, command, pattern_keys)
+
+
 def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
@@ -1034,7 +1095,12 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
 
     smart_denied = False
     manual_only = not SMART_MANUAL_ONLY_DESCRIPTIONS.isdisjoint(pattern_keys)
-    if smart and not manual_only:
+    late = None
+    if is_gateway or is_ask:
+        reissue, late = _deferred_reissue(spec.noun, session_key, command, pattern_keys, pattern_key, description)
+        if reissue is not None:
+            return reissue
+    if smart and not manual_only and late is None:
         result, smart_denied = _smart_gate(spec, command, description, pattern_key, pattern_keys,
                                            session_key, human_present=is_cli or is_gateway or is_ask)
         if result is not None:
@@ -1075,6 +1141,38 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             return _user_approved(session_key, description)
         return _approved()
 
+    def user_denied(deny_reason) -> dict:
+        # ``/deny <reason>`` free text is relayed verbatim so the agent can adapt rather than only hearing "denied".
+        return deny(spec.gateway_refused, "denied", reason="denied by user",
+                    reason_addendum=(f' Reason given by the user: "{deny_reason}".' if deny_reason else ""),
+                    timeout_addendum="", deny_reason=deny_reason)
+
+    def from_gateway(decision: dict) -> dict:
+        """The gate result for a finished gateway round trip. Consent contract: silence is NOT consent, and
+        an explicit deny is a hard halt, both BLOCKED. A timed-out prompt that stays open with the user is
+        DEFERRED instead (``tools.approval_deferred``): not consent, and not a refusal."""
+        if decision.get("notify_failed"):
+            return _denied(spec.notify_failed, pattern_key=pattern_key,
+                           description=description, outcome="notify_failed", noun=spec.noun)
+        choice, deny_reason = decision["choice"], decision.get("reason")
+        if decision.get("cancelled"):
+            # The prompt was withdrawn (turn interrupted or ended) before anyone answered:
+            # still fail closed, but do not attribute a refusal to the user.
+            return deny(spec.gateway_refused, "cancelled",
+                        reason=f"approval was withdrawn before the user answered ({decision['cancelled']})",
+                        reason_addendum="", timeout_addendum="", deny_reason=None)
+        if not decision["resolved"] and decision.get("deferred"):
+            return _deferred(spec.noun, pattern_key=pattern_key, description=description,
+                             request_id=decision["request_id"])
+        if not decision["resolved"]:
+            return deny(spec.gateway_refused, "timeout", reason="timed out without user response",
+                        reason_addendum="", timeout_addendum=" Silence is not consent.", deny_reason=deny_reason)
+        return user_denied(deny_reason) if choice is None or choice == "deny" else grant(choice)
+
+    if late is not None:
+        # A single-operation card stays one operation however it was answered (as in ``grant`` live).
+        return user_denied(late.reason) if late.choice == "deny" else grant("once" if late.one_shot else late.choice)
+
     if spec.transport:
         attempt = _present_with_selected_transport(
             command=command, description=description, pattern_key=pattern_key, pattern_keys=pattern_keys,
@@ -1109,29 +1207,9 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             }
             if smart_denied:
                 data["smart_denied"] = True
-            decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway", identity=command)
-            if decision.get("notify_failed"):
-                return _denied(spec.notify_failed, pattern_key=pattern_key,
-                               description=description, outcome="notify_failed", noun=spec.noun)
-            # Consent contract: silence is NOT consent, and an explicit deny is a hard
-            # halt — both produce a BLOCKED outcome. ``/deny <reason>`` free text is
-            # relayed verbatim so the agent can adapt rather than only hearing "denied".
-            choice, deny_reason = decision["choice"], decision.get("reason")
-            if decision.get("cancelled"):
-                # The prompt was withdrawn (turn interrupted or ended) before anyone answered:
-                # still fail closed, but do not attribute a refusal to the user.
-                return deny(spec.gateway_refused, "cancelled",
-                            reason=f"approval was withdrawn before the user answered ({decision['cancelled']})",
-                            reason_addendum="", timeout_addendum="", deny_reason=None)
-            if not decision["resolved"]:
-                return deny(spec.gateway_refused, "timeout", reason="timed out without user response",
-                            reason_addendum="", timeout_addendum=" Silence is not consent.",
-                            deny_reason=deny_reason)
-            if choice is None or choice == "deny":
-                return deny(spec.gateway_refused, "denied", reason="denied by user",
-                            reason_addendum=(f' Reason given by the user: "{deny_reason}".' if deny_reason else ""),
-                            timeout_addendum="", deny_reason=deny_reason)
-            return grant(choice)
+            decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway", identity=command,
+                                               deferrable=True)
+            return from_gateway(decision)
 
         # No gateway callback (cron, batch, or ask-mode leaked into an interactive CLI, historically via `import
         # gateway.run`): paint the local panel when possible instead of a pending_approval that makes the agent look

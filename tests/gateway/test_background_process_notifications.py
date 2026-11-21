@@ -344,6 +344,38 @@ async def test_post_turn_watch_drain_all_injects_from_queued_event_origin(monkey
 
 
 @pytest.mark.asyncio
+async def test_late_approval_decision_is_injected_into_the_originating_chat(monkeypatch, tmp_path):
+    """HF-792: the user answering an approval that had timed out is announced to the session that asked, by
+    the same drain that delivers watch notices, and the injected text tells the agent to re-issue the command."""
+    from gateway.session import SessionSource
+    from tools import approval_deferred
+    from tools.approval_gateway_wait import _ApprovalEntry
+    from tools.process_registry import process_registry
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    session_key = "agent:main:telegram:dm:123:42"
+    runner.session_store._entries[session_key] = SimpleNamespace(
+        origin=SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", thread_id="42",
+                             user_id="owner", user_name="ken"))
+    entry = _ApprovalEntry({"command": "docker compose up -d", "description": "d", "request_id": "req-1"})
+    entry.route = {"platform": "telegram", "chat_id": "123", "thread_id": "42", "user_id": "owner"}
+    while not process_registry.completion_queue.empty():  # events another test left behind
+        process_registry.completion_queue.get_nowait()
+    approval_deferred.announce(session_key, entry, "once", None)
+    completion_queue = queue.Queue()
+    completion_queue.put(process_registry.completion_queue.get_nowait())
+
+    await runner._drain_watch_notifications(completion_queue)
+
+    adapter.handle_message.assert_awaited_once()
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert synth_event.source.chat_id == "123" and synth_event.source.thread_id == "42"
+    assert "APPROVED once" in synth_event.text and "docker compose up -d" in synth_event.text
+    assert "re-issue" in synth_event.text and completion_queue.empty()
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_drops_stale_trigger_reply_anchor(monkeypatch, tmp_path):
     """Regression for #52694: the synthetic watch event must not reuse the triggering
     message id as its reply anchor.

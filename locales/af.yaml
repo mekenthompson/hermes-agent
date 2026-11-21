@@ -26,6 +26,7 @@ approval:
   summary:
     denied: "Jy het hierdie {noun} geweier — dit is nie uitgevoer nie."
     timeout: "Geen antwoord binne {window} — die {noun} is nie uitgevoer nie."
+    deferred: "No answer within {window} — the {noun} did not run yet. It stays open for you to approve or deny; your answer will be passed on."
     notify_failed: "Die goedkeuringsversoek kon nie afgelewer word nie — die {noun} is nie uitgevoer nie."
     cancelled: "Die goedkeuringsprompt is teruggetrek of het jou nooit bereik nie — die {noun} is nie uitgevoer nie."
     blocked: "Hierdie {noun} word nie in 'n onbewaakte sessie toegelaat nie — dit is nie uitgevoer nie."

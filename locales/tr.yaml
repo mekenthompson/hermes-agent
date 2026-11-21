@@ -26,6 +26,7 @@ approval:
   summary:
     denied: "Bu {noun} için onayı reddettiniz — çalıştırılmadı."
     timeout: "{window} içinde yanıt gelmedi — {noun} çalıştırılmadı."
+    deferred: "No answer within {window} — the {noun} did not run yet. It stays open for you to approve or deny; your answer will be passed on."
     notify_failed: "Onay isteği iletilemedi — {noun} çalıştırılmadı."
     cancelled: "Onay istemi geri çekildi veya size hiç ulaşmadı — {noun} çalıştırılmadı."
     blocked: "Bu {noun} gözetimsiz bir oturumda izinli değil — çalıştırılmadı."

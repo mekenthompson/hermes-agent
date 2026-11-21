@@ -1568,9 +1568,9 @@ class TestApprovalTimeoutIsNotConsent:
                 os.environ[k] = v
 
     def _force_short_timeout(self, monkeypatch, seconds=0.05):
-        monkeypatch.setattr(
+        monkeypatch.setattr(  # deferred_ttl 0: the hard timeout these pin; deferral is in test_approval_deferred.py
             approval_context, "_get_approval_config",
-            lambda: {"mode": "manual", "timeout": seconds},
+            lambda: {"mode": "manual", "timeout": seconds, "deferred_ttl": 0},
         )
 
     def test_timeout_blocks_with_no_consent_and_timeout_hook(self, monkeypatch):

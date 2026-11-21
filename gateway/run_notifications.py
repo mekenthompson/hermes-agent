@@ -1032,7 +1032,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             return (evt_type, producer_id, "")
         # A liveness tick is one watch event like a match: without an identity the session authority
         # refuses it and the drain requeues it forever.
-        if evt_type in {"watch_match", "watch_disabled", "heartbeat"} and evt.get("event_id"):
+        if evt_type in {"watch_match", "watch_disabled", "heartbeat", "approval_decision"} and evt.get("event_id"):
             return (evt_type, str(evt["session_id"]), str(evt["event_id"]))
         if evt_type == "completion":
             producer_id = str(evt.get("session_id") or "")

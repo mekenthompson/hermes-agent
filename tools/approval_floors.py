@@ -21,6 +21,8 @@ from tools.approval_detection import (
 
 logger = logging.getLogger("tools.approval")
 
+_HARDLINE_LOG_CHARS = 4000
+
 
 def _match_user_deny_rule(command: str) -> str | None:
     """Return the matching ``approvals.deny`` glob, or None. User-defined fnmatch
@@ -97,7 +99,13 @@ _RECOVERY_STEPS = (
 
 
 def _hardline_block_result(description: str, command: str = "") -> dict:
-    """Build the standard block result for a hardline match."""
+    """Build the standard block result for a hardline match. The command is logged (redacted, bounded)
+    so a false positive can be diagnosed from the log: the block message alone names the rule, not the text."""
+    if command:
+        from agent.redact import redact_approval_display
+        shown = redact_approval_display(command)
+        logger.warning("Hardline block (%s): %s%s", description, shown[:_HARDLINE_LOG_CHARS],
+                       f"... [{len(shown) - _HARDLINE_LOG_CHARS} more characters]" if len(shown) > _HARDLINE_LOG_CHARS else "")
     message = (
         f"BLOCKED (hardline): {description}. "
         "This command is on the unconditional blocklist and cannot "

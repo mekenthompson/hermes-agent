@@ -26,6 +26,7 @@ approval:
   summary:
     denied: "Sie haben abgelehnt — {noun} wurde nicht ausgeführt."
     timeout: "Keine Antwort innerhalb von {window} — {noun} wurde nicht ausgeführt."
+    deferred: "Keine Antwort innerhalb von {window} — {noun} wurde noch nicht ausgeführt. Die Anfrage bleibt offen; Ihre Antwort wird weitergeleitet."
     notify_failed: "Die Genehmigungsanfrage konnte nicht zugestellt werden — {noun} wurde nicht ausgeführt."
     cancelled: "Die Genehmigungsabfrage wurde zurückgezogen oder hat Sie nie erreicht — {noun} wurde nicht ausgeführt."
     blocked: "{noun} ist in einer unbeaufsichtigten Sitzung nicht erlaubt — nicht ausgeführt."

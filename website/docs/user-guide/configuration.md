@@ -3234,6 +3234,16 @@ Smart mode is particularly useful for reducing approval fatigue — it lets the 
 Setting `approvals.mode: off` disables all safety checks for terminal commands. Only use this in trusted, sandboxed environments.
 :::
 
+### Deferred approvals (unanswered prompts)
+
+When a chat approval prompt gets no answer within `approvals.timeout`, the agent is told the request is **DEFERRED**: nothing ran and nothing was consented to, it must not rephrase around the request, and it carries on with unrelated work. The card stays answerable for `approvals.deferred_ttl` seconds (default `21600`, 6 hours; `0` restores the hard `BLOCKED` timeout). Answer it with a card tap, `/approve` or `/deny` (a bare "yes" never answers a deferred prompt). Your answer is delivered to the originating session as a notification; the agent then re-issues the exact command, which takes the same approval path as a fresh request (`once` covers one run, `session`/`always` persist at that re-issue, `deny` blocks it). Nothing is ever run by the answer itself, a reworded command prompts afresh, and every hard block and deny rule still applies when the command is re-issued.
+
+```yaml
+approvals:
+  timeout: 300
+  deferred_ttl: 21600   # 0 = unanswered prompts fail closed as BLOCKED (old behaviour)
+```
+
 ### Denial circuit breaker
 
 `approvals.denial_breaker_threshold` (default `3`) guards against the agent retrying variations of a command the smart-approval reviewer keeps denying — each retry burns another guardian LLM call. After that many consecutive denials in a session, the deny message escalates to a hard-stop instruction telling the agent to stop, report the blocked operation, and ask you to run it manually or `/approve`. Any approval resets the count; set `0` to disable:

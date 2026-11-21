@@ -610,6 +610,17 @@ def _get_approval_timeout() -> int:
     return min(raw, safe_cap)
 
 
+def _get_approval_deferred_ttl() -> int:
+    """``approvals.deferred_ttl``: how long (seconds, default 6h) a gateway approval that timed out
+    stays answerable and a late answer stays spendable (``tools.approval_deferred``). ``0`` or less
+    disables deferral: a timeout is the hard BLOCKED it used to be. Same platform-safe clamp as the timeout."""
+    from agent.deadline import MAX_SAFE_TIMEOUT_S
+    try:
+        return min(int(_get_approval_config().get("deferred_ttl", 21600)), int(MAX_SAFE_TIMEOUT_S))
+    except (ValueError, TypeError):
+        return 21600
+
+
 def format_approval_window(seconds: int) -> str:
     """The ONE human wording for an approval timeout window, shared by the CLI timeout notice,
     the tool result's ``user_summary`` and the gateway card copy so every surface agrees:

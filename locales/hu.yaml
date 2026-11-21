@@ -26,6 +26,7 @@ approval:
   summary:
     denied: "Elutasítottad — a {noun} nem futott le."
     timeout: "Nem érkezett válasz {window} alatt — a {noun} nem futott le."
+    deferred: "No answer within {window} — the {noun} did not run yet. It stays open for you to approve or deny; your answer will be passed on."
     notify_failed: "A jóváhagyási kérést nem sikerült kézbesíteni — a {noun} nem futott le."
     cancelled: "A jóváhagyási kérést visszavonták, vagy el sem jutott hozzád — a {noun} nem futott le."
     blocked: "Felügyelet nélküli munkamenetben ez a {noun} nem engedélyezett — nem futott le."

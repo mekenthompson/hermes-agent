@@ -2994,7 +2994,7 @@ def _format_gateway_process_notification(evt: dict) -> str | None:
         text += "]"
         return text
 
-    if evt_type in ("async_delegation", "heartbeat"):
+    if evt_type in ("async_delegation", "heartbeat", "approval_decision"):
         from tools.process_registry_notifications import format_process_notification
         return format_process_notification(evt)
 
@@ -3016,7 +3016,7 @@ def _drain_gateway_watch_events(completion_queue) -> list[dict]:
         if not event_visible(evt) or evt_type == "async_delegation":
             requeue.append(evt)  # hosted: only its own scope may deliver it; async_delegation: its own watcher does
         elif evt_type in {"watch_match", "watch_disabled", "watch_overflow_tripped", "watch_overflow_released",
-                          "heartbeat"}:
+                          "heartbeat", "approval_decision"}:
             watch_events.append(evt)
         # else: process completion events are handled by the watcher task
     for evt in requeue:

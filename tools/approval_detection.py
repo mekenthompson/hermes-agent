@@ -446,10 +446,17 @@ def _detect_hardline_command(command: str) -> tuple:
     if "whatif" in command.lower() and not whatif_preview_is_real(command):
         patterns = _HARDLINE_PATTERNS_NO_WHATIF
     capped: list[str] = []
+    # The power-command rules read the command without the heredoc bodies a non-shell program only copies
+    # or interprets (`cat <<EOF`, `python - <<EOF`): a body line starting with `reboot` is text. Every other
+    # rule, and these when the command could run what it wrote, still read the raw command.
+    power_source = _power_scan_source(command)
+    skip_power = power_source != command
     for command_variant in hardline_detection_variants(command, capped=capped):
         variant_lower = command_variant.lower()
         masked_lower: str | None = None
         for pattern_re, description, quote_masked in patterns:
+            if skip_power and description in _POWER_HARDLINE_DESCRIPTIONS:
+                continue
             if quote_masked and masked_lower is None:
                 # Positionless rules see quoted prose as DATA, except under shell carriers
                 # (sh -c, eval, source) whose quoted argument is code — those scan raw. bash -c
@@ -460,8 +467,37 @@ def _detect_hardline_command(command: str) -> tuple:
                 )
             if pattern_re.search(masked_lower if quote_masked else variant_lower):
                 return (True, description)
+    if skip_power:
+        for command_variant in hardline_detection_variants(power_source, capped=capped):
+            variant_lower = command_variant.lower()
+            for pattern_re, description, _quote_masked in patterns:
+                if description in _POWER_HARDLINE_DESCRIPTIONS and pattern_re.search(variant_lower):
+                    return (True, description)
     # eval code nested past _MAX_EVAL_NESTING was not inspected: fail closed like the other parser limits.
     return (True, _PARSER_LIMIT_DESCRIPTION) if capped else (False, None)
+
+
+# The shutdown/reboot family of hardline rules (descriptions as listed in HARDLINE_PATTERNS).
+_POWER_HARDLINE_DESCRIPTIONS = frozenset({
+    "system shutdown/reboot", "init 0/6 (shutdown/reboot)", "systemctl poweroff/reboot",
+    "telinit 0/6 (shutdown/reboot)"})
+# What could run a file the same command string wrote: a shell, an exec-style launcher, or a path used as
+# a command. Any of these outside the bodies keeps the bodies on the floor (`cat > j.sh <<EOF ... EOF; bash j.sh`).
+_MAY_RUN_WRITTEN_RE = re.compile(
+    r"(?<![\w./-])(?:sh|bash|zsh|dash|ksh|fish|csh|tcsh|ash|source|eval|exec|xargs|make|ssh|su|chmod|install|ln|at|batch)"
+    r"(?![\w-])|(?:^|[;&|\n(`]|\$\()\s*(?:\./|\.\./|/|~/|\.\s)", re.IGNORECASE)
+
+
+def _power_scan_source(command: str) -> str:
+    """*command* with data-only heredoc bodies removed, for the power rules; *command* itself when there is
+    nothing to remove or what is left could run a file the bodies wrote."""
+    if "<<" not in command:
+        return command
+    from tools.shell_heredoc import mask_heredoc_bodies_for_power_scan
+    dropped = mask_heredoc_bodies_for_power_scan(command)
+    if dropped == command or _MAY_RUN_WRITTEN_RE.search(dropped):
+        return command
+    return dropped
 
 
 # ---- Dangerous command patterns -----------------------------------------------------------

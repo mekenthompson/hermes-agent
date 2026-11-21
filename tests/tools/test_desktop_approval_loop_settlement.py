@@ -166,7 +166,7 @@ def test_approve_once_response_frame_settles_without_persisting(approval_env, mo
     finally:
         mod.unregister_gateway_notify(SESSION)
     assert asked, "once persisted and skipped the next prompt"
-    assert again.get("outcome") == "timeout"
+    assert again.get("outcome") == "deferred"  # unanswered: parked, not approved
 
 
 def test_explicit_denial_arrives_through_approval_respond(approval_env, monkeypatch):
@@ -187,7 +187,7 @@ def test_explicit_denial_arrives_through_approval_respond(approval_env, monkeypa
     assert result.get("user_consent") is False
 
 
-def test_silence_is_timeout_not_consent(approval_env, monkeypatch):
+def test_silence_is_deferred_not_consent(approval_env, monkeypatch):
     mod = approval_env
     _manual(monkeypatch, 0.05)
     peer = _Peer()
@@ -199,8 +199,8 @@ def test_silence_is_timeout_not_consent(approval_env, monkeypatch):
         mod.unregister_gateway_notify(SESSION)
         _unbind(server)
     assert result["approved"] is False
-    assert result.get("outcome") == "timeout"
-    assert "Silence is not consent" in result["message"]
+    assert result.get("outcome") == "deferred" and result.get("user_consent") is False
+    assert result["message"].startswith("DEFERRED")
     assert _approval_frames(peer)
 
 
@@ -262,9 +262,11 @@ def test_wrong_session_and_late_frame_do_not_approve(approval_env, monkeypatch):
     finally:
         mod.unregister_gateway_notify(SESSION)
         _unbind(server)
-    assert result.get("outcome") == "timeout"
+    assert result.get("outcome") == "deferred"
     assert wrong["result"]["resolved"] == 0
-    assert late is False
+    # The request stays open on its own client (tools.approval_deferred): its late answer is accepted and
+    # recorded for the agent's re-issue, it approves and persists nothing by itself.
+    assert late is True
     assert not mod._session_approved.get(SESSION)
 
 

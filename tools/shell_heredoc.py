@@ -29,6 +29,15 @@ _STRICT_INERT_HEREDOC_CONSUMER_RE = re.compile(
 _DATA_HEREDOC_CONSUMER_RE = _STRICT_INERT_HEREDOC_CONSUMER_RE
 
 
+# Owners whose heredoc body is DATA to a non-shell consumer: a program that copies it (`cat`, `tee`) or an
+# interpreter of another language reading its program from stdin. Used only by the power-command floor
+# (``mask_heredoc_bodies_for_power_scan``); a shell, ``ssh``, ``su`` or ``xargs`` owner never matches.
+_POWER_DATA_CONSUMER_RE = re.compile(
+    r"^\s*(?:sudo\s+(?:-[^\s]+\s+)*)?(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:env\s+)?(?:[A-Za-z0-9_./-]+/)?"
+    r"(?:python(?:3(?:\.\d+)*)?|node(?:js)?|ruby|perl|php|cat|tee)(?=\s|$)",
+    re.IGNORECASE)
+
+
 def _span_end(command: str, cursor: int, closer: str) -> int:
     """Index just past the backslash-aware span opened at ``cursor``."""
     end = cursor + 1
@@ -221,9 +230,12 @@ def iter_heredoc_bodies(command: str):
 
 
 def _inert_heredoc_body_ranges(
-        command: str, consumer_re: re.Pattern = _INERT_HEREDOC_CONSUMER_RE) -> list[tuple[int, int]]:
+        command: str, consumer_re: re.Pattern = _INERT_HEREDOC_CONSUMER_RE, *,
+        allow_unquoted: bool = False) -> list[tuple[int, int]]:
     """``(start, end)`` of every provably inert body incl. its terminator line (see module
-    docstring); empty when any ``<<`` is unknown or unterminated, so nothing is masked."""
+    docstring); empty when any ``<<`` is unknown or unterminated, so nothing is masked.
+    ``allow_unquoted`` also takes an unquoted-delimiter body that holds no ``$(`` or backtick: the
+    shell expands such a body but only a substitution executes anything, so without one it is text."""
     # Runs on every terminal call: skip the state machine when no '<<' exists; stop past the last.
     if "<<" not in command:
         return []
@@ -255,10 +267,10 @@ def _inert_heredoc_body_ranges(
                 return []  # unterminated
             body_ranges.append((body_cursor, close_end))
             body_cursor = close_end
-        if (
-            all(quoted for _delimiter, _strip_tabs, quoted in specs)
-            and not post_heredoc_list_operator
-        ):
+        literal = all(quoted for _delimiter, _strip_tabs, quoted in specs) or (
+            allow_unquoted and not any(
+                "$(" in command[start:end] or "`" in command[start:end] for start, end in body_ranges))
+        if literal and not post_heredoc_list_operator:
             masked_opener = _mask_simple_quotes(command[command_start:command_end])
             masked_owner = _mask_simple_quotes(command[owner_start:command_end])
             if not any(
@@ -289,6 +301,17 @@ def strip_inert_heredoc_bodies(command: str, *, mask_code_consumers: bool = True
     """
     consumer_re = _INERT_HEREDOC_CONSUMER_RE if mask_code_consumers else _STRICT_INERT_HEREDOC_CONSUMER_RE
     return _replace_ranges(command, _inert_heredoc_body_ranges(command, consumer_re), keep_newlines=True)
+
+
+def mask_heredoc_bodies_for_power_scan(command: str) -> str:
+    """*command* with the bodies a non-shell consumer only reads (see ``_POWER_DATA_CONSUMER_RE``) removed,
+    quoted delimiter or not, terminator lines kept. For the shutdown/reboot floor only: a body line that
+    starts with `reboot` is prose or code in another language, never a shell command. Bodies a shell
+    runs (`bash <<EOF`, `ssh host <<EOF`, `... | sh`), openers with a substitution, unterminated and
+    mis-parsed `<<` stay."""
+    bodies = [(start, max(start, command.rfind("\n", start, end - 1) + 1))
+              for start, end in _inert_heredoc_body_ranges(command, _POWER_DATA_CONSUMER_RE, allow_unquoted=True)]
+    return _replace_ranges(command, bodies, keep_newlines=False)
 
 
 def mask_heredoc_bodies_for_shell_scan(command: str, *, code_consumers: bool) -> str:

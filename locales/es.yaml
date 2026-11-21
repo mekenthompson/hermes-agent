@@ -26,6 +26,7 @@ approval:
   summary:
     denied: "Denegaste este {noun}: no se ejecutó."
     timeout: "Sin respuesta en {window}: el {noun} no se ejecutó."
+    deferred: "Sin respuesta en {window}: el {noun} aún no se ejecutó. Sigue abierto para que lo apruebes o lo rechaces; tu respuesta se transmitirá."
     notify_failed: "No se pudo entregar la solicitud de aprobación: el {noun} no se ejecutó."
     cancelled: "La solicitud de aprobación se retiró o nunca te llegó: el {noun} no se ejecutó."
     blocked: "Este {noun} no está permitido en una sesión sin supervisión: no se ejecutó."

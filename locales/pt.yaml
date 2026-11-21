@@ -26,6 +26,7 @@ approval:
   summary:
     denied: "Você negou {noun} — nada foi executado."
     timeout: "Sem resposta em {window} — {noun} não rodou."
+    deferred: "Sem resposta em {window} — {noun} ainda não rodou. Continua aberto para você aprovar ou negar; sua resposta será repassada."
     notify_failed: "Não foi possível entregar o pedido de aprovação — {noun} não rodou."
     cancelled: "O pedido de aprovação foi retirado ou nunca chegou até você — {noun} não rodou."
     blocked: "Em uma sessão sem supervisão, {noun} não tem permissão — nada foi executado."

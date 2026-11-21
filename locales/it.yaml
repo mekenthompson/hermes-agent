@@ -26,6 +26,7 @@ approval:
   summary:
     denied: "Hai negato {noun} — nessuna esecuzione."
     timeout: "Nessuna risposta entro {window} — nessuna esecuzione per {noun}."
+    deferred: "Nessuna risposta entro {window} — {noun} non è ancora stato eseguito. La richiesta resta aperta; la tua risposta verrà inoltrata."
     notify_failed: "Impossibile recapitare la richiesta di approvazione — nessuna esecuzione per {noun}."
     cancelled: "La richiesta di approvazione è stata ritirata o non ti ha mai raggiunto — nessuna esecuzione per {noun}."
     blocked: "In una sessione non presidiata non è possibile autorizzare {noun} — nessuna esecuzione."
