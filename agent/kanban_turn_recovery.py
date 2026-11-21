@@ -170,7 +170,7 @@ def _kanban_db_path() -> Optional[str]:
     """The dispatcher-pinned board DB — no ambient resolution, ever.
 
     The dispatcher pins ``HERMES_KANBAN_DB`` (plus run id + claim lock) at spawn
-    (``hermes_cli/kanban_db_dispatch.py``); that pin IS the exact authority
+    (``hermes_cli/kanban_db_dispatch/__init__.py``); that pin IS the exact authority
     carrier the retry proof must re-check. If the pin is absent there is no
     exact carrier to re-prove, so this returns ``None`` and the caller fails
     closed: resolving whatever board is ambient *now* would silently move the

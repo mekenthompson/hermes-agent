@@ -138,6 +138,11 @@ def sample_memory() -> dict[str, Any]:
             if available_kib is not None and available_kib < sample.get("mem_available_kib", available_kib + 1):
                 sample["mem_available_kib"] = available_kib
                 source = "cgroup"
+            # Usage unreadable: available is still the host figure, which can
+            # exceed the container's limit. Never report more free than total.
+            total_kib, avail_kib = sample.get("mem_total_kib"), sample.get("mem_available_kib")
+            if total_kib is not None and avail_kib is not None and avail_kib > total_kib:
+                sample["mem_available_kib"] = total_kib
         sample["memory_source"] = source
     return sample
 

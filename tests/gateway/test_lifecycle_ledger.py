@@ -193,6 +193,35 @@ def test_sample_memory_limit_above_host_never_inflates(tmp_path, monkeypatch) ->
 
 
 @pytest.mark.platforms("linux")
+@pytest.mark.parametrize("current", [None, "garbage"])
+def test_sample_memory_unreadable_usage_clamps_available_to_limit(tmp_path, monkeypatch, current) -> None:
+    # 4 GiB limit, host says 35 GiB free: without usage the host figure must
+    # not leak through as more free memory than the container has.
+    cg = tmp_path / "cg"
+    _cgroup_v2(cg, max_=str(4 * 1024**3), current=0)
+    if current is None:
+        (cg / "memory.current").unlink()
+    else:
+        (cg / "memory.current").write_text(current + "\n")
+    _patch_sources(monkeypatch, _fake_meminfo(tmp_path), cg)
+    sample = sample_memory()
+    assert sample["mem_total_kib"] == 4 * _GIB_KIB
+    assert sample["mem_available_kib"] == 4 * _GIB_KIB
+    assert sample["memory_source"] == "cgroup"
+
+
+@pytest.mark.platforms("linux")
+def test_sample_memory_unreadable_usage_keeps_smaller_host_available(tmp_path, monkeypatch) -> None:
+    cg = tmp_path / "cg"
+    _cgroup_v2(cg, max_=str(40 * 1024**3), current=0)
+    (cg / "memory.current").unlink()
+    _patch_sources(monkeypatch, _fake_meminfo(tmp_path, avail_kib=3 * _GIB_KIB), cg)
+    sample = sample_memory()
+    assert sample["mem_total_kib"] == 40 * _GIB_KIB
+    assert sample["mem_available_kib"] == 3 * _GIB_KIB
+
+
+@pytest.mark.platforms("linux")
 def test_sample_memory_cgroup_limit_drives_default_concurrency(tmp_path, monkeypatch) -> None:
     from hermes_cli.kanban_db_dispatch import derive_default_max_in_progress
 

@@ -1,5 +1,9 @@
 """Dispatcher: crash/stale/orphan detection, failure accounting and the respawn circuit breaker, memory-aware concurrency caps, the one-shot ``dispatch_once`` pass, worker spawning (``_default_spawn``), worker-log rotation and the long-lived ``run_daemon`` loop.
 
+Topic modules: ``max_in_progress`` resolves ``kanban.max_in_progress`` per
+tick and keeps the last good cap on a bad value (shared by the gateway
+dispatcher and ``run_daemon``).
+
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached
 late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 ``kanban_db.<name>`` keeps working.
@@ -26,6 +30,9 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli.kanban_db_dispatch.max_in_progress import MaxInProgressTracker
+from hermes_cli.kanban_db_dispatch.max_in_progress import configured_max_in_progress
+from hermes_cli.kanban_db_dispatch.max_in_progress import read_max_in_progress_setting
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli._startup_fast import project_root_str
 
@@ -1884,26 +1891,6 @@ def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
     return derive_default_max_in_progress()
 
 
-def configured_max_in_progress() -> Optional[int]:
-    """Read ``kanban.max_in_progress`` from config, or None when unset/invalid.
-
-    Shared so every dispatch entry point agrees on "explicitly configured": a
-    positive integer wins, anything else falls through to the derived default.
-    """
-    try:
-        from hermes_cli.config import load_config_readonly
-        raw = (load_config_readonly() or {}).get("kanban", {}).get("max_in_progress")
-    except Exception:
-        return None
-    if raw is None:
-        return None
-    try:
-        ival = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return ival if ival >= 1 else None
-
-
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -2868,11 +2855,12 @@ def run_daemon(
                 with contextlib.suppress(ValueError, OSError):
                     signal.signal(sig, _handle)
 
+    # Re-resolved every tick (config load is mtime-cached) so operator edits
+    # apply without a restart; a bad edit keeps the last good cap (HF-789).
+    cap_tracker = MaxInProgressTracker()
     while not stop_event.is_set():
         try:
-            # Re-resolved every tick (config load is mtime-cached) so operator
-            # edits apply without a restart.
-            max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+            max_in_progress = cap_tracker.resolve(derive_default_max_in_progress)
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,

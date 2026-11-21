@@ -1812,7 +1812,7 @@ Every name in `hermes_cli.plugins.VALID_HOOKS` has at least one core fire site. 
 | `kanban_task_blocked` | `hermes_cli/kanban_db.py` `block_task` (through `_fire_task_hook`) |
 | `kanban_task_link` | `gateway/kanban_watchers_notifier.py` `_task_link`, from `_KanbanNotification.deliver` |
 | `on_kanban_worker_spawned` | `hermes_cli/kanban_db.py` `_fire_worker_spawned_hook` |
-| `on_kanban_worker_exited` | `hermes_cli/kanban_db_dispatch.py` `detect_crashed_workers` |
+| `on_kanban_worker_exited` | `hermes_cli/kanban_db_dispatch/__init__.py` `detect_crashed_workers` |
 | `on_kanban_worker_stale_claim` | `hermes_cli/kanban_db.py` `release_stale_claims` |
 | `on_kanban_task_updated` | `hermes_cli/kanban_db.py` `notify_task_updated` |
 | `on_kanban_dispatch_tick` | `hermes_cli/kanban_db.py` `_fire_dispatch_tick_hook` |

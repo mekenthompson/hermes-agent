@@ -34,7 +34,8 @@ class _DispatcherSettings:
     """``kanban.*`` dispatch settings, read once at boot (restart to apply).
 
     Exception: ``max_in_progress`` is re-resolved every tick in
-    :meth:`_KanbanDispatcher.tick_once_for_board`; this field is the boot value.
+    :meth:`_KanbanDispatcher.tick_once_for_board`; this field is the boot value
+    and seeds the last good cap.
     """
 
     interval: float
@@ -136,6 +137,9 @@ class _KanbanDispatcher:
         self.kb = kb
         self.settings = settings
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+        # Same per-tick resolver as the standalone daemon, seeded with the boot
+        # cap so an invalid edit keeps it instead of loosening (HF-789).
+        self.max_in_progress_tracker = _kbd().MaxInProgressTracker(settings.max_in_progress)
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
@@ -188,8 +192,9 @@ class _KanbanDispatcher:
             return None
         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
         # Re-resolved every tick like the standalone daemon (config load is
-        # mtime-cached), so an edit to kanban.max_in_progress applies live.
-        kwargs["max_in_progress"] = _kbd().resolve_max_in_progress(_kbd().configured_max_in_progress())
+        # mtime-cached), so an edit to kanban.max_in_progress applies live. An
+        # invalid value keeps the last good cap; it never goes unlimited.
+        kwargs["max_in_progress"] = self.max_in_progress_tracker.resolve(_kbd().derive_default_max_in_progress)
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).

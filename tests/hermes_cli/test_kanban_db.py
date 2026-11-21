@@ -1635,7 +1635,7 @@ def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monk
 
     from hermes_cli import kanban_db_dispatch as kbd
 
-    root = str(Path(kbd.__file__).resolve().parents[1])
+    root = str(Path(kbd.__file__).resolve().parents[2])  # hermes_cli/kanban_db_dispatch/__init__.py
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
