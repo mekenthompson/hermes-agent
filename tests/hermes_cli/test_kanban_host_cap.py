@@ -85,6 +85,57 @@ def test_run_daemon_resolves_and_passes_max_in_progress(
     assert captured.get("max_in_progress") == 3
 
 
+def _run_daemon_over_configs(kanban_home, monkeypatch, bodies: list) -> list:
+    """Run the daemon one tick per config body (written before that tick)."""
+    import os
+
+    caps: list = []
+    stop = threading.Event()
+    cfg = kanban_home / "config.yaml"
+    state = {"i": 0, "mtime": 1_700_000_000_000_000_000}
+
+    def write(body):
+        cfg.write_text(("kanban:\n" + body) if body else "{}\n", encoding="utf-8")
+        state["mtime"] += 100_000_000_000
+        os.utime(cfg, ns=(state["mtime"], state["mtime"]))
+
+    def fake_dispatch_once(conn, **kwargs):
+        caps.append(kwargs.get("max_in_progress"))
+        return kb.DispatchResult()
+
+    def on_tick(res):
+        state["i"] += 1
+        if state["i"] >= len(bodies):
+            stop.set()
+        else:
+            write(bodies[state["i"]])
+
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+    write(bodies[0])
+    kbd.run_daemon(interval=0.001, stop_event=stop, on_tick=on_tick)
+    return caps
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["  max_in_progress: abc\n", "  max_in_progress: 0\n", "  max_in_progress: -3\n",
+     '  max_in_progress: ""\n', "  max_in_progress:\n"],
+    ids=["abc", "zero", "negative", "empty_string", "empty_key"],
+)
+@pytest.mark.parametrize("derived", [99, None], ids=["derived99", "memory_unknown"])
+def test_run_daemon_invalid_edit_keeps_last_good_cap(kanban_home, monkeypatch, bad, derived):
+    """HF-789: a bad mid-run value keeps the previous cap in the daemon too."""
+    monkeypatch.setattr(kbd, "derive_default_max_in_progress", lambda sample=None: derived)
+    caps = _run_daemon_over_configs(
+        kanban_home, monkeypatch, ["  max_in_progress: 2\n", bad, bad, "  max_in_progress: 7\n"],
+    )
+    assert caps == [2, 2, 2, 7]
+
+
+def test_run_daemon_removed_key_uses_derived_default(kanban_home, monkeypatch):
+    monkeypatch.setattr(kbd, "derive_default_max_in_progress", lambda sample=None: 4)
+    caps = _run_daemon_over_configs(kanban_home, monkeypatch, ["  max_in_progress: 2\n", ""])
+    assert caps == [2, 4]
 
 
 def test_configured_max_in_progress_parsing(monkeypatch):
