@@ -446,9 +446,9 @@ def _detect_hardline_command(command: str) -> tuple:
     if "whatif" in command.lower() and not whatif_preview_is_real(command):
         patterns = _HARDLINE_PATTERNS_NO_WHATIF
     capped: list[str] = []
-    # The power-command rules read the command without the heredoc bodies a non-shell program only copies
-    # or interprets (`cat <<EOF`, `python - <<EOF`): a body line starting with `reboot` is text. Every other
-    # rule, and these when the command could run what it wrote, still read the raw command.
+    # The power-command rules read the command without the bodies of a sole `cat|tee <<EOF` that only prints
+    # them: a body line starting with `reboot` is text. Every other rule, and these for any other shape
+    # (interpreters, file writes, pipes, a later command), still read the raw command.
     power_source = _power_scan_source(command)
     skip_power = power_source != command
     for command_variant in hardline_detection_variants(command, capped=capped):
@@ -481,23 +481,16 @@ def _detect_hardline_command(command: str) -> tuple:
 _POWER_HARDLINE_DESCRIPTIONS = frozenset({
     "system shutdown/reboot", "init 0/6 (shutdown/reboot)", "systemctl poweroff/reboot",
     "telinit 0/6 (shutdown/reboot)"})
-# What could run a file the same command string wrote: a shell, an exec-style launcher, or a path used as
-# a command. Any of these outside the bodies keeps the bodies on the floor (`cat > j.sh <<EOF ... EOF; bash j.sh`).
-_MAY_RUN_WRITTEN_RE = re.compile(
-    r"(?<![\w./-])(?:sh|bash|zsh|dash|ksh|fish|csh|tcsh|ash|source|eval|exec|xargs|make|ssh|su|chmod|install|ln|at|batch)"
-    r"(?![\w-])|(?:^|[;&|\n(`]|\$\()\s*(?:\./|\.\./|/|~/|\.\s)", re.IGNORECASE)
 
 
 def _power_scan_source(command: str) -> str:
-    """*command* with data-only heredoc bodies removed, for the power rules; *command* itself when there is
-    nothing to remove or what is left could run a file the bodies wrote."""
+    """*command* with printed-only heredoc bodies removed, for the power rules; *command* itself unless the
+    whole string is a sole `[sudo] cat|tee <<EOF` that writes no file (``mask_heredoc_bodies_for_power_scan``).
+    A positive rule on purpose: anything after the heredoc, or any file write, could run the body later."""
     if "<<" not in command:
         return command
     from tools.shell_heredoc import mask_heredoc_bodies_for_power_scan
-    dropped = mask_heredoc_bodies_for_power_scan(command)
-    if dropped == command or _MAY_RUN_WRITTEN_RE.search(dropped):
-        return command
-    return dropped
+    return mask_heredoc_bodies_for_power_scan(command)
 
 
 # ---- Dangerous command patterns -----------------------------------------------------------

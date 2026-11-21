@@ -1,9 +1,9 @@
 """The shutdown/reboot hardline floor does not read heredoc data bodies as commands (HF-792).
 
-A line that merely STARTS with ``reboot`` / ``halt`` / ``shutdown`` inside a body that a non-shell
-program only copies or interprets (``cat <<EOF``, ``python - <<EOF``) used to produce an unapprovable
-"Hardline block: system shutdown/reboot". Real commands, bodies a shell runs, and bodies the same
-command could run later still block.
+A line that merely STARTS with ``reboot`` / ``halt`` / ``shutdown`` inside a body that a sole
+``[sudo] cat|tee <<EOF`` only prints used to produce an unapprovable "Hardline block: system
+shutdown/reboot". That is the only exempt shape. Real commands, bodies a shell or interpreter runs,
+file writes (which something could run later) and anything after the heredoc still block.
 """
 
 from __future__ import annotations
@@ -20,17 +20,48 @@ BLOCKED = "system shutdown/reboot"
 
 
 @pytest.mark.parametrize("command", [
-    "cat > notes.md <<EOF\nHF-761: resume\n\nreboot handling\nEOF",
+    "cat <<EOF\nHF-761: resume\n\nreboot handling\nEOF",
+    "cat <<'EOF'\nreboot the box at 5pm\nEOF",
+    "sudo cat <<'EOF'\nshutdown now\nEOF",
+    "tee <<EOF\nreboot\nEOF",
+    "tee -a <<'EOF'\nshutdown at 5pm\nEOF",
+    "/bin/cat -n <<EOF\nhalt the loop\nEOF",
+    "cat <<-EOF\n\treboot\n\tEOF",
+    "cat <<'A' <<'B'\nreboot\nA\npoweroff\nB\n",
+])
+def test_printed_heredoc_bodies_are_not_commands(command):
+    assert detect_hardline_command(command) == (False, None)
+
+
+# HF-792 review round 1: each of these blocks on base 24dbdde and passed the floor on 566e3833.
+@pytest.mark.parametrize("command", [
+    "python3 - <<'EOF'\nimport os\nos.system('reboot')\nEOF",          # interpreter bodies are code
+    "python3 <<'EOF'\nimport os\nos.execvp('reboot', ['reboot'])\nEOF",
     "python3 - <<EOF\nx = 1\nhalt the loop\nEOF",
     "python3 <<'PY'\nx = 1\nshutdown = 3\nPY",
+    "node <<EOF\nshutdown now\nEOF",
+    "perl <<'EOF'\nsystem('reboot')\nEOF",
+    "ruby <<'EOF'\nexec('reboot')\nEOF",
+    "php <<'EOF'\nreboot\nEOF",
+    "cat <<'EOF' > x\nreboot\nEOF\ntimeout 5 /bin/sh x",                # write-then-run
+    "cat <<'EOF' > x\nreboot\nEOF\npython3 x",
+    "cat <<'EOF' > x\nreboot\nEOF\nsystemd-run --wait x",
+    "cat <<'EOF' > x\nreboot\nEOF\ncrontab x",
+    "cat > ~/.bashrc <<'EOF'\nreboot\nEOF",                               # a file write of any kind
+    "cat > notes.md <<EOF\nHF-761: resume\n\nreboot handling\nEOF",
+    "cat <<'EOF' >> x\nreboot\nEOF",
+    "cat <<'EOF' 2>x\nreboot\nEOF",
     "tee f <<EOF\nreboot\nEOF",
     "sudo tee /etc/motd <<EOF\nshutdown at 5pm\nEOF",
-    "node <<EOF\nshutdown now\nEOF",
-    "cat <<-EOF\n\treboot\n\tEOF",
+    "cat <<'EOF' | crontab -\nreboot\nEOF",
     "cat > a <<EOF\nreboot\nEOF\ncat > b <<'EOF'\npoweroff\nEOF\nls",
+    "cat <<'EOF'\nreboot\nEOF\nls",                                       # anything after the heredoc
+    "ls\ncat <<'EOF'\nreboot\nEOF",                                       # ...or before it
+    "sudo -u root cat <<'EOF' > /etc/rc.local\nreboot\nEOF",
 ])
-def test_data_heredoc_bodies_are_not_commands(command):
-    assert detect_hardline_command(command) == (False, None)
+def test_interpreter_bodies_and_file_writes_stay_on_the_floor(command):
+    verdict = detect_hardline_command(command)
+    assert verdict[0] is True and verdict[1] in {BLOCKED, "systemctl poweroff/reboot"}, verdict
 
 
 @pytest.mark.parametrize("command", [
@@ -85,5 +116,7 @@ def test_a_blocked_command_is_logged_in_full_but_bounded(caplog):
 def test_the_guard_blocks_a_real_command_and_lets_a_data_heredoc_through(monkeypatch):
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     assert check_all_command_guards("reboot", "local")["hardline"] is True
-    allowed = check_all_command_guards("cat > notes.md <<EOF\nreboot handling\nEOF", "local")
+    allowed = check_all_command_guards("cat <<EOF\nreboot handling\nEOF", "local")
     assert not allowed.get("hardline")
+    written = check_all_command_guards("cat > notes.md <<EOF\nreboot handling\nEOF", "local")
+    assert written.get("hardline") is True
