@@ -17,6 +17,12 @@
  *    desktop shell fires only while the user is AWAY from Hermes. This is the
  *    door that covers "walked away and the worker hit a blocker".
  *
+ * A `blocked` event the board wrote itself — payload.source `creation_hold`
+ * (an integration parks a card it is still preparing and lifts the hold within
+ * a second) or `respawn_guard` (the dispatcher's park, which clears by itself)
+ * — asks nobody to act, so it advances the cursor but never notifies. A card a
+ * person creates blocked carries no source and still does.
+ *
  * Cursor contract: first observation of a board baselines
  * seen[board] = GET /board latest_event_id (MAX task_events.id for that
  * board). Events id <= seen are historical/replay — never notified, no
@@ -53,6 +59,10 @@ const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>(
   ['gave_up', { titleKey: 'notify.gaveUpTitle', toast: 'error' }],
   ['timed_out', { titleKey: 'notify.timedOutTitle', toast: 'warning' }]
 ])
+
+/** Board-owned `blocked` sources; mirrors BOARD_HOLD_SOURCES in
+ *  hermes_cli/kanban_db_guard_wait.py (which the gateway notifier also honours). */
+const BOARD_HOLD_SOURCES = new Set(['creation_hold', 'respawn_guard'])
 
 const seenEventIdByBoard = new Map<string, number>()
 const baselinePending = new Set<string>()
@@ -207,8 +217,9 @@ export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent
     cursor = ev.id
     seenEventIdByBoard.set(slug, cursor)
     const spec = TERMINAL_NOTIFY.get(ev.kind ?? '')
+    const boardHold = ev.kind === 'blocked' && BOARD_HOLD_SOURCES.has(trimmed(ev.payload?.source))
 
-    if (spec) {
+    if (spec && !boardHold) {
       try {
         notifyOne(ev.kind!, spec, ev)
         fired = true

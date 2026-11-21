@@ -195,6 +195,7 @@ def _create_swarm_uncommitted(
         priority=priority,
         idempotency_key=idempotency_key,
         initial_status="blocked",
+        transient_hold=True,  # activated inline below: nobody is asked to unblock it
         **common,
     )
 

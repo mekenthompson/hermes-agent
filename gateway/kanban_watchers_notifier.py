@@ -55,12 +55,13 @@ _ARTIFACT_KINDS = ("completed", "review_requested")
 
 def _board_state_event(ev) -> bool:
     """Board state, not a decision for anyone: the respawn guard's park clears by
-    itself, and a run a planned gateway stop or restart interrupted is requeued
-    without a failure (``owner_stopped``), so neither pings nor wakes."""
-    from hermes_cli.kanban_db_guard_wait import is_park_event
+    itself, an integration's creation hold is lifted by the integration, and a run
+    a planned gateway stop or restart interrupted is requeued without a failure
+    (``owner_stopped``), so none of them pings or wakes."""
+    from hermes_cli.kanban_db_guard_wait import is_board_hold_event
     if ev.kind == "crashed":
         return (ev.payload or {}).get("owner_stopped") is True
-    return is_park_event(ev.kind, ev.payload)
+    return is_board_hold_event(ev.kind, ev.payload)
 
 
 def diagnostic_event(ev) -> bool:
