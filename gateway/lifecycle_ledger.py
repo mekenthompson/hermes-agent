@@ -110,7 +110,7 @@ def _cgroup_memory_kib() -> Optional[tuple[int, Optional[int]]]:
             in_use = max(usage - _stat_field(stat_dir / "memory.stat", inactive_key), 0)
             available = max(limit - in_use, 0) // 1024
         return limit // 1024, available
-    except Exception:
+    except (OSError, ValueError):  # helpers already absorb these; belt-and-braces for odd cgroup fs
         return None
 
 
