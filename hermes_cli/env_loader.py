@@ -7,6 +7,7 @@ import io
 import itertools
 import logging
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -154,6 +155,23 @@ def source_supplied_names() -> tuple[str, ...]:
     process value (``skipped_existing``). The launch value in ``os.environ`` is still not a routed
     profile's to inherit, so the strip must see the skipped names too."""
     return tuple(sorted(set(_SECRET_SOURCES) | _SOURCE_SUPPLIED_NAMES))
+
+
+# Names only, never values: the env-var names a parent Hermes process knew a secret source supplied,
+# carried into a child that inherits those VALUES (a Kanban / cron / session worker). The child's own
+# source fetch can fail (rate limit, Connect down), and then its own record is empty while its environ
+# still holds every vault value; without the parent's names its terminal and browser children would
+# inherit them all again (``secrets.child_env``).
+SOURCE_SUPPLIED_NAMES_ENV = "HERMES_SOURCE_SUPPLIED_NAMES"
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def inherited_source_supplied_names() -> frozenset[str]:
+    """The names the launching parent carried in :data:`SOURCE_SUPPLIED_NAMES_ENV` (invalid entries
+    dropped). Read at call time from this process's environ, so it holds whatever this process inherited."""
+    raw = os.environ.get(SOURCE_SUPPLIED_NAMES_ENV, "")
+    return frozenset(name for name in (part.strip() for part in raw.split(","))
+                     if _ENV_NAME_RE.fullmatch(name))
 
 
 def launch_dotenv_keys() -> frozenset[str]:

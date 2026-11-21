@@ -54,6 +54,8 @@ terminal:
   env_passthrough: [CLOUDFLARE_API_TOKEN]
 ```
 
+A Hermes worker process (Kanban, cron, session worker) inherits the hydrated values together with their names, in `HERMES_SOURCE_SUPPLIED_NAMES` (names only, never values). Its terminal and browser children still do not get those values, even when the worker's own secret-source fetch fails.
+
 `secrets.child_env: inherit` restores the old behaviour, where every child inherits every hydrated secret, so a single `env` in a command prints them all.
 
 ## Adding your own backend
