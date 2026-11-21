@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import agent.background_review as background_review
+from agent import background_review
 import agent.tool_executor as executor
 import model_tools
 from agent.background_review import cancel_background_review_for_live_turn
