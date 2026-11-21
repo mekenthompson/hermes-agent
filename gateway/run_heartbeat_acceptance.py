@@ -76,6 +76,7 @@ async def admit_heartbeat(runner, adapter, source, session_id, route):
     event = MessageEvent(text=prompt, source=source, internal=True, message_id=identity,
         metadata={'gateway_session_key': route, 'gateway_session_id': session_id})
     event._heartbeat_session_id = session_id
+    event._heartbeat_origin = state.origin
     try:
         await authority.admit_automation(adapter, event, identity)
     except BaseException:
