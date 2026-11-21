@@ -15,6 +15,13 @@ ages out of the window, or the card is handed to another profile. It never
 pings or wakes a subscriber (``is_park_event``): nobody has to act. The release
 is a ``promoted`` event, never ``unblocked``, so it does not count as the
 explicit one-run consent.
+
+A creation hold (``create_task(initial_status="blocked", transient_hold=True)``)
+is the other board-owned ``blocked`` event: an integration parks a card it is
+still preparing and lifts the hold itself, usually within a second. It carries
+``source: creation_hold`` and is never auto-released here. ``is_board_hold_event``
+names both, so no consumer (notifier, Desktop toast) reports either as a block
+someone must answer; a card a person creates blocked has no source and still does.
 """
 from __future__ import annotations
 
@@ -22,6 +29,8 @@ import sqlite3
 from typing import Any, Optional
 
 PARK_SOURCE = "respawn_guard"
+CREATION_HOLD_SOURCE = "creation_hold"
+BOARD_HOLD_SOURCES = (PARK_SOURCE, CREATION_HOLD_SOURCE)
 # The block-lifecycle events; the newest one says whether a park still stands.
 _LIFECYCLE = "('blocked', 'block_loop_detected', 'unblocked', 'promoted')"
 
@@ -74,6 +83,12 @@ def is_park_event(kind: str, payload: Any) -> bool:
     """The dispatcher's own park. It clears by itself (merge, window, handoff), so
     the notifier neither pings nor wakes anyone for it."""
     return kind == "blocked" and isinstance(payload, dict) and payload.get("source") == PARK_SOURCE
+
+
+def is_board_hold_event(kind: str, payload: Any) -> bool:
+    """A ``blocked`` event the board wrote itself (the dispatcher's park, or an
+    integration's creation hold): nobody is asked to act on it."""
+    return kind == "blocked" and isinstance(payload, dict) and payload.get("source") in BOARD_HOLD_SOURCES
 
 
 def record_respawn_guard(conn: sqlite3.Connection, task_id: str, reason: str, *, lane: str) -> None:

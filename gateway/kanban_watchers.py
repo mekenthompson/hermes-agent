@@ -311,14 +311,25 @@ class GatewayKanbanWatchersMixin:
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
                 now = int(time.time())
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
-                    held = _kbd.describe_suppression(res for _slug, res in (results or []))
-                    logger.warning(
-                        "kanban dispatcher stuck: ready queue non-empty for "
-                        "%d consecutive ticks but 0 workers spawned.%s Check "
-                        "profile health (venv, PATH, credentials) and "
-                        "`hermes kanban list --status ready`.",
-                        bad_ticks, f" Last tick held back: {held}." if held else "",
-                    )
+                    tick_results = [res for _slug, res in (results or [])]
+                    capacity = _kbd.describe_capacity(tick_results)
+                    if capacity:
+                        # Running workers fill the cap: ready work waits for a slot, not for a fix.
+                        logger.info(
+                            "kanban dispatcher at capacity: ready queue non-empty for %d "
+                            "consecutive ticks, running %s. Ready work starts as workers "
+                            "finish; this is not a profile-health problem.",
+                            bad_ticks, capacity,
+                        )
+                    else:
+                        held = _kbd.describe_suppression(tick_results)
+                        logger.warning(
+                            "kanban dispatcher stuck: ready queue non-empty for "
+                            "%d consecutive ticks but 0 workers spawned.%s Check "
+                            "profile health (venv, PATH, credentials) and "
+                            "`hermes kanban list --status ready`.",
+                            bad_ticks, f" Last tick held back: {held}." if held else "",
+                        )
                     last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
