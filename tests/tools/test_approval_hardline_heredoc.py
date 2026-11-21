@@ -50,6 +50,9 @@ def test_data_heredoc_bodies_are_not_commands(command):
     "cat <<EOF $(reboot)\nx\nEOF",                       # a substitution in the opener runs
     "cat <<EOF\n$(reboot)\nEOF",                         # ...and one in an expanded body
     "cat <<EOF\n`reboot`\nEOF",
+    "cat <<EOF\ntrue; \"reboot\"\nEOF",                  # an expanded body holding shell syntax is not text
+    "tee f <<EOF\nls; reboot\nEOF",
+    "cat > f <<EOF\nx && shutdown -h now\nEOF",
     "cat > j.sh <<'EOF'\nreboot\nEOF\nbash j.sh",        # the same command runs what it wrote
     "cat > j.sh <<EOF\nreboot\nEOF\nchmod +x j.sh && ./j.sh",
     "cat > j.sh <<EOF\nreboot\nEOF\n/tmp/j.sh",

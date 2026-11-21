@@ -36,6 +36,8 @@ _POWER_DATA_CONSUMER_RE = re.compile(
     r"^\s*(?:sudo\s+(?:-[^\s]+\s+)*)?(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:env\s+)?(?:[A-Za-z0-9_./-]+/)?"
     r"(?:python(?:3(?:\.\d+)*)?|node(?:js)?|ruby|perl|php|cat|tee)(?=\s|$)",
     re.IGNORECASE)
+# What disqualifies an unquoted-delimiter body from ``allow_unquoted``: an expansion, or shell syntax.
+_UNQUOTED_BODY_SHELL_SYNTAX_RE = re.compile(r"[$`\\'\";&|()<>]")
 
 
 def _span_end(command: str, cursor: int, closer: str) -> int:
@@ -234,8 +236,10 @@ def _inert_heredoc_body_ranges(
         allow_unquoted: bool = False) -> list[tuple[int, int]]:
     """``(start, end)`` of every provably inert body incl. its terminator line (see module
     docstring); empty when any ``<<`` is unknown or unterminated, so nothing is masked.
-    ``allow_unquoted`` also takes an unquoted-delimiter body that holds no ``$(`` or backtick: the
-    shell expands such a body but only a substitution executes anything, so without one it is text."""
+    ``allow_unquoted`` also takes an unquoted-delimiter body that is plain text: no character the shell
+    expands (``$``, backtick, backslash) and none that reads as shell code (quotes, ``;``, ``&``, ``|``,
+    parentheses, redirects). An expanded body is otherwise not literal, so ``cat <<EOF`` holding
+    ``true; "reboot"`` stays on the floor while a prose line that starts with ``reboot`` does not."""
     # Runs on every terminal call: skip the state machine when no '<<' exists; stop past the last.
     if "<<" not in command:
         return []
@@ -269,7 +273,7 @@ def _inert_heredoc_body_ranges(
             body_cursor = close_end
         literal = all(quoted for _delimiter, _strip_tabs, quoted in specs) or (
             allow_unquoted and not any(
-                "$(" in command[start:end] or "`" in command[start:end] for start, end in body_ranges))
+                _UNQUOTED_BODY_SHELL_SYNTAX_RE.search(command, start, end) for start, end in body_ranges))
         if literal and not post_heredoc_list_operator:
             masked_opener = _mask_simple_quotes(command[command_start:command_end])
             masked_owner = _mask_simple_quotes(command[owner_start:command_end])
