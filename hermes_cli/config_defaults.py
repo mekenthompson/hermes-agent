@@ -2353,6 +2353,11 @@ DEFAULT_CONFIG = {
         # Optional ordering of enabled sources (e.g. [onepassword, bitwarden]); default registration
         # order. Mapped sources (explicit VAR→ref) always beat bulk sources (BSM project dumps);
         # first claim on a var wins, later ones warn. "sources": [],
+        # What spawned children (terminal, background jobs, cron/user scripts, browser, helper CLIs)
+        # see of the names a source hydrated. "declared": only names listed in
+        # terminal.env_passthrough or a loaded skill's required_environment_variables reach terminal-
+        # family children, none reach helper children. "inherit": every hydrated name (pre-change).
+        "child_env": "declared",
         "bitwarden": {
             "enabled": False,  # When false, BSM is never contacted and bws is never auto-installed.
             # Env var holding the machine-account token — the one bootstrap secret; lives in

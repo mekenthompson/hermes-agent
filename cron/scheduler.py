@@ -3659,6 +3659,8 @@ def _launch_external_cron_worker(job: dict) -> bool:
             scrub_secrets=multiplex_active,
             inherit_profile_home=True,
             extra={"HERMES_HOME": str(profile_home)},
+            # The worker is a Hermes agent for the profile, not a user script (secrets.child_env).
+            withhold_source_secrets=False,
         ))
     worker_env = systemd_user_bus_env(worker_env)
     # Unattended worker: the gateway sets HERMES_EXEC_ASK at startup (interactive launches set

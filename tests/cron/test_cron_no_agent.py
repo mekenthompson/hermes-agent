@@ -368,6 +368,9 @@ def test_a_routed_profile_script_never_receives_a_launch_only_name(hermes_env, m
                               applied=[], skipped_existing=["LAUNCH_SKIPPED_SECRET"])],
         provenance={}))
     env_loader._apply_external_secret_sources(launch)  # the real registry path; the source loses to the env
+    # A source-hydrated name reaches a script only by declaration (``secrets.child_env: declared``).
+    from tools import env_passthrough
+    monkeypatch.setattr(env_passthrough, "_load_config_passthrough", lambda: frozenset({"ROUTED_VAULT_ONLY"}))
     environ_before = dict(os.environ)
 
     routed = launch / "profiles" / "ops"

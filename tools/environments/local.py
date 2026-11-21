@@ -30,7 +30,7 @@ from tools.environments.local_env_policy import (
     _home_adapter_secret_env, _home_declared_key_env, _matches_terminal_first_party_prefix,
     _plugin_terminal_env_strip_keys,
     _registered_adapter_secret_env, _registry_adapter_secret_env, _secret_source_bootstrap_env,
-    strip_profile_gate_env, strip_supervised_process_identity)
+    strip_profile_gate_env, strip_supervised_process_identity, withheld_source_secret_names)
 from tools.environments.local_pythonpath import (
     _build_hermes_repo_root_aliases, _strip_hermes_owned_pythonpath_and_runtime_markers)
 from tools.environments.base_session_env import (
@@ -272,7 +272,9 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
     from hermes_cli.plugins_session_env import resolve_session_env
     if plugin_env := resolve_session_env(env.get("HERMES_SESSION_ID", "")):
-        for name, value in _scrub_credentials(plugin_env, inherit_credentials=False).items():
+        # A plugin naming a value for the child is an explicit mapping, not inheritance.
+        for name, value in _scrub_credentials(plugin_env, inherit_credentials=False,
+                                              withhold_source_secrets=False).items():
             if value is None:
                 env.pop(name, None)
             else:
@@ -281,12 +283,14 @@ def _inject_session_context_env(env: dict) -> None:
 
 def _filter_secret_env(
     items: Mapping[str, str], out: dict, *, unwrap_force: bool,
-    plugin_strip: frozenset = frozenset()) -> None:
+    plugin_strip: frozenset = frozenset(), withhold: frozenset = frozenset()) -> None:
     """Copy *items* into *out*, dropping Hermes-managed secrets. ``_HERMES_FORCE_<NAME>``
     unwraps to ``NAME`` when ``unwrap_force`` (caller extras / terminal env), else is
     dropped. Blocklisted names survive only via env_passthrough registration or as
     context-entitled first-party ``BUZZ_*`` vars; the latter are used directly, never
-    scope-resolved (UnscopedSecretError under multiplex)."""
+    scope-resolved (UnscopedSecretError under multiplex). *withhold* (upper-folded,
+    :func:`withheld_source_secret_names`) holds the secret-source names this child does not
+    inherit: they survive only the same way, by declaration."""
     try:
         from tools.env_passthrough import is_env_passthrough, resolve_passthrough_value
     except Exception:
@@ -306,6 +310,8 @@ def _filter_secret_env(
         first_party = _is_terminal_first_party_env(key)
         passthrough = is_env_passthrough(key)
         if _is_provider_env_blocklisted(key, registered) and not (passthrough or first_party):
+            continue
+        if withhold and key.upper() in withhold and not (passthrough or first_party):
             continue
         if passthrough and not first_party:
             value = resolve_passthrough_value(key, value)
@@ -327,13 +333,14 @@ def _finalize_child_env(env: dict) -> dict:
 
 
 def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
-    """Filter each ``(items, unwrap_force)`` in *parts* into one env, rewrite PATH via
-    *fix_path* (always prepending the hermes install dir so bare ``hermes`` resolves
-    for children of a systemd/cron-launched gateway), then apply the shared guards."""
+    """Filter each ``(items, unwrap_force, withhold)`` in *parts* into one env (*withhold*: the
+    secret-source names that part may only pass by declaration, see :func:`_filter_secret_env`),
+    rewrite PATH via *fix_path* (always prepending the hermes install dir so bare ``hermes``
+    resolves for children of a systemd/cron-launched gateway), then apply the shared guards."""
     out: dict[str, str] = {}
-    for items, unwrap_force in parts:
+    for items, unwrap_force, withhold in parts:
         _filter_secret_env(drop_bridge_markers(dict(items)), out, unwrap_force=unwrap_force,
-                           plugin_strip=plugin_strip)
+                           plugin_strip=plugin_strip, withhold=withhold)
     # Declared names the bound profile scope holds but the process env never did (a routed
     # profile's own .env / sources) — the filter above can only see names already present.
     # Unguarded on purpose: a scope/config failure here must be loud, not silently drop the
@@ -349,10 +356,15 @@ def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
     return _finalize_child_env(out)
 
 
-def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
+def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None, *,
+                             withhold_source_secrets: bool = True) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment (background/PTY
-    spawn path, search workers, computer-use driver, user-script runners)."""
-    return _scrubbed_env([(base_env or {}, False), (extra_env or {}, True)],
+    spawn path, search workers, computer-use driver, user-script runners). Secret-source
+    names *base_env* inherited are withheld unless declared (``secrets.child_env``); *extra_env*
+    is the caller's explicit mapping. ``withhold_source_secrets=False`` is for a Hermes agent
+    process acting for the profile (a Kanban / cron worker), not for a user command."""
+    withhold = withheld_source_secret_names() if withhold_source_secrets else frozenset()
+    return _scrubbed_env([(base_env or {}, False, withhold), (extra_env or {}, True, frozenset())],
                          _plugin_terminal_env_strip_keys(), lambda p: p)
 
 
@@ -365,7 +377,8 @@ def _terminal_env(env: dict) -> dict:
 
 
 def hermes_subprocess_env(
-    *, inherit_credentials: bool = False, base_env: dict[str, str] | None = None
+    *, inherit_credentials: bool = False, base_env: dict[str, str] | None = None,
+    withhold_source_secrets: bool = True,
 ) -> dict[str, str]:
     """Sanitize a non-terminal child's environment (no skill passthrough).
 
@@ -376,13 +389,18 @@ def hermes_subprocess_env(
     Terminal and execute_code spawns use the skill-aware sanitizer instead.
     """
     env = dict(base_env) if base_env is not None else os.environ.copy()
-    env = _scrub_credentials(env, inherit_credentials=inherit_credentials)
+    env = _scrub_credentials(env, inherit_credentials=inherit_credentials,
+                             withhold_source_secrets=withhold_source_secrets)
     env.setdefault("PYTHONUTF8", "1")  # Windows UTF-8 safety for spawned processes
     return _finalize_child_env(env)
 
 
-def _scrub_credentials(env: dict, *, inherit_credentials: bool) -> dict:
-    """Tier 1 (always) and, unless ``inherit_credentials``, Tier 2 provider/tool credentials, in place."""
+def _scrub_credentials(env: dict, *, inherit_credentials: bool, withhold_source_secrets: bool = True) -> dict:
+    """Tier 1 (always) and, unless ``inherit_credentials``, Tier 2 provider/tool credentials, in place.
+    Secret-source names go too (``secrets.child_env: declared``): these helper children (browser,
+    TTS, LSP, ACP agents) have no passthrough contract. Under ``inherit_credentials`` a
+    source-supplied provider credential is Tier 2 and stays."""
+    withheld = withheld_source_secret_names() if withhold_source_secrets else frozenset()
     # Credential names fold to uppercase for membership: on Windows the env block
     # itself is case-insensitive, so a lowercase-stored ``gh_token`` IS GH_TOKEN.
     home_secrets = _home_adapter_secret_env()  # one manifest stamp per scrub
@@ -392,6 +410,8 @@ def _scrub_credentials(env: dict, *, inherit_credentials: bool) -> dict:
     for key in list(env):
         if (key.upper() in strip_folded
                 or (not inherit_credentials and _is_provider_env_blocklisted(key, registered))
+                or (key.upper() in withheld
+                    and not (inherit_credentials and _is_provider_env_blocklisted(key, registered)))
                 or key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX)
                 or _is_hermes_internal_secret(key)):
             del env[key]
@@ -401,7 +421,7 @@ def _scrub_credentials(env: dict, *, inherit_credentials: bool) -> dict:
 def build_subprocess_env(
     base: Mapping[str, str] | None = None, *, inherit_profile_home: bool = True,
     scrub_secrets: bool = True, extra: Mapping[str, str] | None = None,
-    strip_launch_profile: bool = False) -> dict[str, str]:
+    strip_launch_profile: bool = False, withhold_source_secrets: bool = True) -> dict[str, str]:
     """Single factory for child-process envs. ``base=None`` snapshots ``os.environ``.
     ``scrub_secrets=True`` -> :func:`_sanitize_subprocess_env` (profile home inherent,
     ``inherit_profile_home`` ignored). ``scrub_secrets=False`` keeps the base's secrets
@@ -426,7 +446,8 @@ def build_subprocess_env(
             # exactly as they do in the launch process (``_apply_managed_env`` applies them last).
             restore_managed_env(env)
     if scrub_secrets:
-        return _sanitize_subprocess_env(env, dict(extra) if extra else None)
+        return _sanitize_subprocess_env(env, dict(extra) if extra else None,
+                                        withhold_source_secrets=withhold_source_secrets)
     if inherit_profile_home:
         _apply_profile_home(env)
     if extra:
@@ -458,7 +479,10 @@ def served_profile_child_env(
     from agent.secret_scope import (
         UnscopedSecretError, build_profile_secret_scope, current_secret_scope, is_multiplex_active)
     from hermes_constants import apply_scratch_tmp_env, get_hermes_home_override
-    env = dict(base) if base is not None else hermes_subprocess_env(inherit_credentials=inherit_credentials)
+    # A credentialed child runs the agent or mints its token for the profile: it keeps the profile's
+    # source-hydrated names, as a standalone ``hermes -p X`` hydrating them itself would.
+    env = dict(base) if base is not None else hermes_subprocess_env(
+        inherit_credentials=inherit_credentials, withhold_source_secrets=not inherit_credentials)
     target = str(target_home or get_hermes_home_override() or "")
     routed = bool(target) and _is_routed_home(target)
     if target:
@@ -854,8 +878,10 @@ def _make_run_env(env: dict) -> dict:
     ``agent.session_client_env``) replaces the daemon's beneath the backend's own ``env``."""
     from agent.session_client_env import toolchain_environ
     base = routed_terminal_base()
+    # The backend's own ``env`` is an explicit mapping; only inherited secret-source names are withheld.
+    withhold = withheld_source_secret_names() - {k.upper() for k in env}
     run_env = _scrubbed_env(
-        [(dict(toolchain_environ(base) | env), True)],
+        [(dict(toolchain_environ(base) | env), True, withhold)],
         frozenset(),
         lambda p: _user_tools_first(_append_missing_sane_path_entries(p)),
     )
