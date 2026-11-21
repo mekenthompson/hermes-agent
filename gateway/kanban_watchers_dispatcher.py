@@ -31,7 +31,11 @@ _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malform
 
 @dataclass
 class _DispatcherSettings:
-    """``kanban.*`` dispatch settings, read once at boot (restart to apply)."""
+    """``kanban.*`` dispatch settings, read once at boot (restart to apply).
+
+    Exception: ``max_in_progress`` is re-resolved every tick in
+    :meth:`_KanbanDispatcher.tick_once_for_board`; this field is the boot value.
+    """
 
     interval: float
     max_spawn: Any
@@ -183,6 +187,9 @@ class _KanbanDispatcher:
         if not self._quarantine_lifted(slug, fingerprint):
             return None
         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+        # Re-resolved every tick like the standalone daemon (config load is
+        # mtime-cached), so an edit to kanban.max_in_progress applies live.
+        kwargs["max_in_progress"] = _kbd().resolve_max_in_progress(_kbd().configured_max_in_progress())
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
