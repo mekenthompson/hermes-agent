@@ -91,6 +91,21 @@ def is_board_hold_event(kind: str, payload: Any) -> bool:
     return kind == "blocked" and isinstance(payload, dict) and payload.get("source") in BOARD_HOLD_SOURCES
 
 
+def validate_transient_hold(transient_hold: bool, initial_status: str) -> None:
+    """Refuse ``transient_hold`` on a card that is not created ``blocked``."""
+    if transient_hold and initial_status != "blocked":
+        raise ValueError("transient_hold applies only to initial_status='blocked'")
+
+
+def creation_block_payload(actor: str, *, transient_hold: bool) -> dict[str, Any]:
+    """The ``blocked`` event payload of a card created blocked; a creation hold
+    carries ``source: creation_hold`` so it reads as board-owned."""
+    payload: dict[str, Any] = {"reason": "initial_status", "status": "blocked", "actor": actor}
+    if transient_hold:
+        payload["source"] = CREATION_HOLD_SOURCE
+    return payload
+
+
 def record_respawn_guard(conn: sqlite3.Connection, task_id: str, reason: str, *, lane: str) -> None:
     """Make a refused spawn visible without writing a row every tick.
 
