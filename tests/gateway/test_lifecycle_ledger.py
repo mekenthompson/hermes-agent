@@ -75,6 +75,133 @@ def test_sample_memory_has_expected_keys_on_linux() -> None:
     assert "mem_available_kib" in sample
 
 
+# --- container (cgroup) awareness -----------------------------------------
+
+_GIB_KIB = 1024 * 1024
+_V1_UNLIMITED = "9223372036854771712"
+
+
+def _fake_meminfo(tmp_path: Path, total_kib: int = 62 * _GIB_KIB, avail_kib: int = 35 * _GIB_KIB) -> Path:
+    path = tmp_path / "meminfo"
+    path.write_text(
+        f"MemTotal:       {total_kib} kB\nMemFree:         100 kB\n"
+        f"MemAvailable:   {avail_kib} kB\nSwapTotal:      1000 kB\nSwapFree:        400 kB\n"
+    )
+    return path
+
+
+def _patch_sources(monkeypatch, meminfo: Path, cgroup_root: Path) -> None:
+    from gateway import lifecycle_ledger
+
+    monkeypatch.setattr(lifecycle_ledger, "_MEMINFO_PATH", str(meminfo))
+    monkeypatch.setattr(lifecycle_ledger, "_CGROUP_ROOT", cgroup_root)
+
+
+def _cgroup_v2(root: Path, *, max_: str, current: int, inactive_file: int = 0, anon: int = 0) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "memory.max").write_text(max_ + "\n")
+    (root / "memory.current").write_text(f"{current}\n")
+    (root / "memory.stat").write_text(f"anon {anon}\nfile 0\ninactive_file {inactive_file}\n")
+
+
+def _cgroup_v1(root: Path, *, limit: str, usage: int, inactive_file: int = 0) -> None:
+    mem = root / "memory"
+    mem.mkdir(parents=True, exist_ok=True)
+    (mem / "memory.limit_in_bytes").write_text(limit + "\n")
+    (mem / "memory.usage_in_bytes").write_text(f"{usage}\n")
+    (mem / "memory.stat").write_text(f"cache 0\ntotal_inactive_file {inactive_file}\n")
+
+
+@pytest.mark.platforms("linux")
+def test_sample_memory_v2_limit_caps_total_and_available(tmp_path, monkeypatch) -> None:
+    cg = tmp_path / "cg"
+    _cgroup_v2(cg, max_=str(12 * 1024**3), current=int(11.5 * 1024**3))
+    _patch_sources(monkeypatch, _fake_meminfo(tmp_path), cg)
+    sample = sample_memory()
+    assert sample["mem_total_kib"] == 12 * _GIB_KIB
+    assert sample["mem_available_kib"] == (12 * 1024**3 - int(11.5 * 1024**3)) // 1024
+    assert sample["memory_source"] == "cgroup"
+    assert sample["swap_used_kib"] == 600
+
+
+@pytest.mark.platforms("linux")
+def test_sample_memory_v2_available_excludes_reclaimable_inactive_file(tmp_path, monkeypatch) -> None:
+    cg = tmp_path / "cg"
+    _cgroup_v2(cg, max_=str(12 * 1024**3), current=11 * 1024**3, inactive_file=4 * 1024**3)
+    _patch_sources(monkeypatch, _fake_meminfo(tmp_path), cg)
+    sample = sample_memory()
+    # usage without reclaimable cache = 7 GiB -> 5 GiB headroom
+    assert sample["mem_available_kib"] == 5 * _GIB_KIB
+
+
+@pytest.mark.platforms("linux")
+def test_sample_memory_v2_max_is_unlimited_uses_meminfo(tmp_path, monkeypatch) -> None:
+    cg = tmp_path / "cg"
+    _cgroup_v2(cg, max_="max", current=11 * 1024**3)
+    _patch_sources(monkeypatch, _fake_meminfo(tmp_path), cg)
+    sample = sample_memory()
+    assert sample["mem_total_kib"] == 62 * _GIB_KIB
+    assert sample["mem_available_kib"] == 35 * _GIB_KIB
+    assert sample["memory_source"] == "meminfo"
+
+
+@pytest.mark.platforms("linux")
+def test_sample_memory_v1_limit_caps_total_and_available(tmp_path, monkeypatch) -> None:
+    cg = tmp_path / "cg"
+    _cgroup_v1(cg, limit=str(8 * 1024**3), usage=7 * 1024**3, inactive_file=2 * 1024**3)
+    _patch_sources(monkeypatch, _fake_meminfo(tmp_path), cg)
+    sample = sample_memory()
+    assert sample["mem_total_kib"] == 8 * _GIB_KIB
+    assert sample["mem_available_kib"] == 3 * _GIB_KIB
+    assert sample["memory_source"] == "cgroup"
+
+
+@pytest.mark.platforms("linux")
+def test_sample_memory_v1_sentinel_is_unlimited_uses_meminfo(tmp_path, monkeypatch) -> None:
+    cg = tmp_path / "cg"
+    _cgroup_v1(cg, limit=_V1_UNLIMITED, usage=7 * 1024**3)
+    _patch_sources(monkeypatch, _fake_meminfo(tmp_path), cg)
+    sample = sample_memory()
+    assert sample["mem_total_kib"] == 62 * _GIB_KIB
+    assert sample["mem_available_kib"] == 35 * _GIB_KIB
+    assert sample["memory_source"] == "meminfo"
+
+
+@pytest.mark.platforms("linux")
+def test_sample_memory_unreadable_cgroup_falls_back_to_meminfo(tmp_path, monkeypatch) -> None:
+    cg = tmp_path / "cg"
+    cg.mkdir()
+    (cg / "memory.max").write_text("garbage\n")
+    _patch_sources(monkeypatch, _fake_meminfo(tmp_path), cg)
+    sample = sample_memory()
+    assert sample["mem_total_kib"] == 62 * _GIB_KIB
+    assert sample["mem_available_kib"] == 35 * _GIB_KIB
+    assert sample["memory_source"] == "meminfo"
+    # no cgroup dir at all
+    _patch_sources(monkeypatch, _fake_meminfo(tmp_path), tmp_path / "missing")
+    assert sample_memory()["mem_total_kib"] == 62 * _GIB_KIB
+
+
+@pytest.mark.platforms("linux")
+def test_sample_memory_limit_above_host_never_inflates(tmp_path, monkeypatch) -> None:
+    cg = tmp_path / "cg"
+    _cgroup_v2(cg, max_=str(200 * 1024**3), current=1024**3)
+    _patch_sources(monkeypatch, _fake_meminfo(tmp_path), cg)
+    sample = sample_memory()
+    assert sample["mem_total_kib"] == 62 * _GIB_KIB
+    assert sample["mem_available_kib"] == 35 * _GIB_KIB
+
+
+@pytest.mark.platforms("linux")
+def test_sample_memory_cgroup_limit_drives_default_concurrency(tmp_path, monkeypatch) -> None:
+    from hermes_cli.kanban_db_dispatch import derive_default_max_in_progress
+
+    cg = tmp_path / "cg"
+    _cgroup_v2(cg, max_=str(2 * 1024**3), current=1024**3)
+    _patch_sources(monkeypatch, _fake_meminfo(tmp_path), cg)
+    assert derive_default_max_in_progress(sample_memory()) == 4  # 2048 MiB / 512
+
+
 # ---------------------------------------------------------------------------
 # First boot / clean lifecycle
 # ---------------------------------------------------------------------------
