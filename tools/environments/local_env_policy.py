@@ -411,6 +411,46 @@ def _is_hermes_internal_secret(key: str) -> bool:
     return upper.startswith("GATEWAY_RELAY_") and upper.endswith(("_SECRET", "_KEY", "_TOKEN"))
 
 
+# ``secrets.child_env``: what a spawned child sees of the names an external secret source
+# (``secrets.onepassword.env``, Bitwarden, a ``command`` or plugin source) supplied. Those names are
+# arbitrary operator choices (``CLOUDFLARE_API_TOKEN``, ``POSTIZ_API_KEY``, ...) that no static
+# blocklist can enumerate, so with inherit-all every terminal command, background job, cron script
+# and browser started with every vault secret in its environment: one ``env`` dump in a probe copied
+# them into tool logs, a coding CLI's shell snapshot and a Chromium crash report.
+# ``"declared"`` (default) withholds them unless declared — ``terminal.env_passthrough`` or a loaded
+# skill's ``required_environment_variables`` — on the terminal-family spawns, and unconditionally on
+# the non-terminal helper spawns (browser, TTS, LSP, ACP agents), which have no passthrough contract.
+# ``"inherit"`` restores the previous behaviour. Any other value is ``"declared"``: fail closed.
+SOURCE_CHILD_ENV_DECLARED = "declared"
+SOURCE_CHILD_ENV_INHERIT = "inherit"
+
+
+def source_secret_child_env_mode() -> str:
+    """The bound profile's ``secrets.child_env`` (see above). Read from the raw config.yaml via the
+    read-only reader (cached on the file signature, so cheap per spawn and current after an edit);
+    an unreadable file falls back to the newest ``good`` backup, else the safe default."""
+    try:
+        raw = _raw_config_behind_effective()
+    except Exception:
+        return SOURCE_CHILD_ENV_DECLARED
+    secrets = raw.get("secrets") if isinstance(raw, dict) else None
+    value = secrets.get("child_env") if isinstance(secrets, dict) else None
+    if isinstance(value, str) and value.strip().lower() == SOURCE_CHILD_ENV_INHERIT:
+        return SOURCE_CHILD_ENV_INHERIT
+    return SOURCE_CHILD_ENV_DECLARED
+
+
+def withheld_source_secret_names() -> frozenset:
+    """Upper-folded env names an external secret source supplied in this process (applied, or lost
+    to a pre-existing value: ``env_loader.source_supplied_names``), which a child does not get by
+    inheritance under ``secrets.child_env: declared``. Empty under ``inherit``. Names only; the
+    caller decides whether a declaration lets one through."""
+    if source_secret_child_env_mode() == SOURCE_CHILD_ENV_INHERIT:
+        return frozenset()
+    from hermes_cli.env_loader import source_supplied_names
+    return frozenset(name.upper() for name in source_supplied_names())
+
+
 # A field naming the env var a credential is read from: ``key_env``, ``api_key_env``, ``secret_env``
 # (``hooks.outbound[]``), ``access_token_env`` / ``service_account_token_env`` (secret sources).
 _CONFIG_KEY_ENV_FIELD_RE = re.compile(r"(?:^|_)(?:key|token|secret|password)_env$", re.IGNORECASE)

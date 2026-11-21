@@ -2741,6 +2741,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env = build_subprocess_env(
             scrub_secrets=is_multiplex_active() or routed,
             inherit_profile_home=True,
+            # The worker is a Hermes agent for the profile, not a user command (secrets.child_env).
+            withhold_source_secrets=False,
         )
     # For another profile, host plumbing only: a gateway the client cold-starts gets this env plus the
     # assignee's secrets, which replace values but never remove one (kanban_worker_env).

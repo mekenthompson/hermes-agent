@@ -486,7 +486,9 @@ def _worker_env(authority):
     # its ``.env`` settings would otherwise reach the secondary's worker (cron/kanban rule).
     # Strip the RAW environ before the constructor injects this turn's own session/bridge context:
     # a launch ``.env`` name (HERMES_SESSION_ID...) must not erase a value derived for this turn.
-    env = build_subprocess_env(base=strip_launch_profile_env(os.environ.copy(), home), scrub_secrets=True)
+    # A session worker is a Hermes agent for the profile, not a user command (secrets.child_env).
+    env = build_subprocess_env(base=strip_launch_profile_env(os.environ.copy(), home), scrub_secrets=True,
+                               withhold_source_secrets=False)
     secrets = build_profile_secret_scope(home)
     if routed:
         # Same rule as served_profile_child_env: env_passthrough / first-party carve-outs must not

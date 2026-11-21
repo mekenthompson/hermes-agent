@@ -19,7 +19,7 @@ def stub_sanitized_env(monkeypatch):
     ``build_browser_env`` adds on top."""
     from tools.environments import local
     holder = {}
-    monkeypatch.setattr(local, "hermes_subprocess_env", lambda inherit_credentials=False: dict(holder))
+    monkeypatch.setattr(local, "hermes_subprocess_env", lambda inherit_credentials=False, **_kw: dict(holder))
     return holder
 
 

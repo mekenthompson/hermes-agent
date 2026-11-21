@@ -47,6 +47,15 @@ Both apply to every source — bundled and plugin — because they live in the o
 
 Terminal commands, `execute_code` sandboxes and [`no_agent` cron scripts](../features/cron.md#giving-a-script-a-credential) run with a sanitized environment: Hermes-managed credentials are stripped, and only variables you declare in `terminal.env_passthrough` (or a loaded skill's `required_environment_variables`) are forwarded. A declared variable is forwarded with the **owning profile's** value — from that profile's `.env` or its secret sources — even when the profile is served by a multi-profile gateway or the Desktop/dashboard backend and its secrets never entered the process environment. A profile's declared value never reaches another profile's children, and the launch profile's `.env` credentials are dropped from children that run for a served profile. Provider credentials cannot be declared; see [Security → Credential scoping](../security.md).
 
+The same rule covers every name a secret source hydrates, whatever you called it (`CLOUDFLARE_API_TOKEN`, `POSTIZ_API_KEY`, ...). With `secrets.child_env: declared` (the default) a hydrated name reaches a terminal command, background job or script only when it is declared as above, and never reaches the browser or other helper processes. Hermes itself still reads every hydrated value. A tool that needs one from the shell gets it by declaration:
+
+```yaml
+terminal:
+  env_passthrough: [CLOUDFLARE_API_TOKEN]
+```
+
+`secrets.child_env: inherit` restores the old behaviour, where every child inherits every hydrated secret, so a single `env` in a command prints them all.
+
 ## Adding your own backend
 
 Third-party secret managers ship as standalone plugins, not core PRs. A backend subclasses `agent.secret_sources.base.SecretSource` (one required method: `fetch(cfg, home_path) -> FetchResult`) and registers via `ctx.register_secret_source(MySource())` in the plugin's `register(ctx)`. The orchestrator owns precedence, conflict handling, timeouts, and provenance — your source only fetches. Full guide with the contract rules, subprocess-safety helper, and conformance kit: [Building a Secret Source Plugin](../../developer-guide/secret-source-plugin.md).
