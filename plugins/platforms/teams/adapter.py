@@ -644,7 +644,7 @@ class TeamsAdapter(BasePlatformAdapter):
     async def _on_card_action(
         self, ctx: ActivityContext[AdaptiveCardInvokeActivity]
     ) -> InvokeResponse[AdaptiveCardActionMessageResponse]:
-        from tools.approval import has_blocking_approval, has_deferred_approval, resolve_gateway_approval_card
+        from tools.approval import resolve_gateway_approval_card
 
         data = ctx.activity.value.action.data or {}
         hermes_action = data.get("hermes_action", "")
@@ -664,7 +664,9 @@ class TeamsAdapter(BasePlatformAdapter):
             return self._invoke_message(refusal_text(requester))  # shown to the clicker; card keeps its buttons
         # Cards from an older build carry cmd/desc in the button data instead.
         cmd, desc = self._approval_previews.get(data.get("prompt_id", ""), (data.get("cmd", ""), data.get("desc", "")))
-        if not (has_blocking_approval(session_key) or has_deferred_approval(session_key)) or not resolve_gateway_approval_card(
+        # Resolves nothing (0) unless the card's own request is still live or parked answerable (a timed-out
+        # prompt, ``tools.approval_deferred``), so an expired card needs no separate pending check.
+        if not resolve_gateway_approval_card(
                 session_key, choice, data.get("request_id"), actor_id=clicker, extra=self.config.extra):
             body = _approval_body(cmd, desc)
             return self._invoke_card([*body, TextBlock(text=t("platform.shared.approval_expired"), wrap=True)])

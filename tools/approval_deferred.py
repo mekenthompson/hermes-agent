@@ -49,7 +49,7 @@ _MAX_PARKED_PER_SESSION = 8
 _MAX_DECISIONS = 128
 
 _parked: dict[str, list] = {}  # session_key -> parked _ApprovalEntry, oldest first
-_decisions: dict[tuple, "LateDecision"] = {}  # (grant scope, identity digest, pattern keys) -> answer
+_decisions: dict[tuple, LateDecision] = {}  # (grant scope, identity digest, pattern keys) -> answer
 
 # Session vars the originating chat is routed by, as ``terminal_tool_background._ROUTING_FIELDS``
 # stamps them on a background process: the answer is delivered the way a completion notice is.

@@ -541,7 +541,6 @@
     "plugins/platforms/teams/adapter.py gateway.platforms.shared_ingress.bind_listener": 1,
     "plugins/platforms/teams/adapter.py hermes_cli.setup_platforms.declines_reconfigure": 1,
     "plugins/platforms/teams/adapter.py pm.extras.ensure_and_bind": 1,
-    "plugins/platforms/teams/adapter.py tools.approval.has_blocking_approval": 1,
     "plugins/platforms/teams/summary_writer.py agent.i18n.t": 1,
     "plugins/platforms/telegram/adapter.py agent.deadline.run_bounded_async": 1,
     "plugins/platforms/telegram/adapter.py agent.i18n.get_language": 1,
