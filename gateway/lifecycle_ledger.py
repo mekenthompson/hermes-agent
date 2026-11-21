@@ -59,16 +59,91 @@ def _proc_fields(path: str, wanted: dict[str, str]) -> dict[str, int]:
     return found
 
 
+_MEMINFO_PATH = "/proc/meminfo"
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+
+
+def _read_int(path: Path) -> Optional[int]:
+    """Non-negative int from a cgroup file; ``None`` when unreadable/empty/``max``."""
+    try:
+        value = int(path.read_text(encoding="utf-8-sig").strip())
+    except (OSError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _stat_field(path: Path, key: str) -> int:
+    """``key`` from a cgroup ``memory.stat`` file; 0 when absent/unreadable."""
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            for line in fh:
+                name, _, rest = line.partition(" ")
+                if name == key:
+                    return max(int(rest.strip()), 0)
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def _cgroup_memory_kib() -> Optional[tuple[int, Optional[int]]]:
+    """``(limit_kib, available_kib)`` when under a finite cgroup memory limit, else ``None``.
+
+    ``/proc/meminfo`` inside a container reports HOST memory.  Available = limit minus usage
+    without reclaimable page cache (``inactive_file``), so cache the kernel will drop on demand
+    is not counted as pressure.  ``available_kib`` is ``None`` when usage is unreadable.
+    cgroup v2 first, then v1; never raises.
+    """
+    try:
+        root = _CGROUP_ROOT
+        v2_limit = _read_int(root / "memory.max")
+        if v2_limit is not None:
+            limit, usage_file, stat_dir, inactive_key = v2_limit, "memory.current", root, "inactive_file"
+        else:
+            stat_dir = root / "memory"
+            limit = _read_int(stat_dir / "memory.limit_in_bytes")
+            usage_file, inactive_key = "memory.usage_in_bytes", "total_inactive_file"
+        if limit is None or limit <= 0 or limit >= (1 << 62):  # v1 "unlimited" is ~2^63
+            return None
+        usage = _read_int(stat_dir / usage_file)
+        available = None
+        if usage is not None:
+            in_use = max(usage - _stat_field(stat_dir / "memory.stat", inactive_key), 0)
+            available = max(limit - in_use, 0) // 1024
+        return limit // 1024, available
+    except (OSError, ValueError):  # helpers already absorb these; belt-and-braces for odd cgroup fs
+        return None
+
+
 def sample_memory() -> dict[str, Any]:
     """Cheap /proc snapshot (KiB): own RSS + MemTotal/MemAvailable + swap used.  Linux-only
-    (``{}`` elsewhere), never raises; the 30s heartbeat embeds it so OOM cycles are classifiable."""
+    (``{}`` elsewhere), never raises; the 30s heartbeat embeds it so OOM cycles are classifiable.
+
+    Under a cgroup memory limit (Docker ``--memory``), total/available are capped to the
+    container's limit/headroom and ``memory_source`` is ``"cgroup"``; otherwise ``"meminfo"``."""
     sample = _proc_fields("/proc/self/status", {"VmRSS": "rss_kib"})
-    mem = _proc_fields("/proc/meminfo", {"MemTotal": "mem_total_kib", "MemAvailable": "mem_available_kib",
-                                         "SwapTotal": "SwapTotal", "SwapFree": "SwapFree"})
+    mem = _proc_fields(_MEMINFO_PATH, {"MemTotal": "mem_total_kib", "MemAvailable": "mem_available_kib",
+                                       "SwapTotal": "SwapTotal", "SwapFree": "SwapFree"})
     swap_total, swap_free = mem.pop("SwapTotal", None), mem.pop("SwapFree", None)
     sample.update(mem)
     if swap_total is not None and swap_free is not None:
         sample["swap_used_kib"] = swap_total - swap_free
+    if mem:
+        source = "meminfo"
+        cgroup = _cgroup_memory_kib()
+        if cgroup is not None:
+            limit_kib, available_kib = cgroup
+            if limit_kib < sample.get("mem_total_kib", limit_kib + 1):
+                sample["mem_total_kib"] = limit_kib
+                source = "cgroup"
+            if available_kib is not None and available_kib < sample.get("mem_available_kib", available_kib + 1):
+                sample["mem_available_kib"] = available_kib
+                source = "cgroup"
+            # Usage unreadable: available is still the host figure, which can
+            # exceed the container's limit. Never report more free than total.
+            total_kib, avail_kib = sample.get("mem_total_kib"), sample.get("mem_available_kib")
+            if total_kib is not None and avail_kib is not None and avail_kib > total_kib:
+                sample["mem_available_kib"] = total_kib
+        sample["memory_source"] = source
     return sample
 
 
