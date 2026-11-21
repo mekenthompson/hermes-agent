@@ -39,11 +39,19 @@ _UNIT_SECONDS = {
 # field -> (coercer, default used when the stored value is missing/falsy)
 USER_HEARTBEAT_ORIGIN = "user"
 ACTIVE_WORK_HEARTBEAT_ORIGIN = "active-work"
+# A managed active-work check is a cheap scan every ``interval_seconds`` that wakes the model only when
+# the tracked work changed (``work_fingerprint`` != ``woken_fingerprint``). Completions and stops already
+# re-enter the session as their own messages, so what remains is a silent hang: with work still running
+# and nothing different, wake once per this floor. 30 minutes caps an unchanged long job at ~48 model
+# turns a day (vs ~480 at the 180s cadence) while a stall, a stop or an exit is still seen at the next
+# scan through the fingerprint, not through this floor.
+ACTIVE_WORK_LIVENESS_FLOOR_SECONDS = 30 * 60
 
 _STATE_FIELDS = {
     "prompt": (str, ""), "interval_seconds": (int, 0), "status": (str, "active"),
     "created_at": (float, 0.0), "last_fired_at": (float, 0.0), "fire_count": (int, 0),
     "origin": (str, USER_HEARTBEAT_ORIGIN),
+    "work_fingerprint": (str, ""), "woken_fingerprint": (str, ""),
 }
 
 
@@ -77,6 +85,9 @@ class HeartbeatState:
     last_fired_at: float = 0.0
     fire_count: int = 0
     origin: str = USER_HEARTBEAT_ORIGIN  # user | active-work; missing legacy rows are user-authored
+    # active-work only: the tracked work as the last scan saw it / as it was when the model was last woken.
+    work_fingerprint: str = ""
+    woken_fingerprint: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -90,6 +101,16 @@ class HeartbeatState:
         if self.status != "active" or not self.prompt or self.interval_seconds <= 0:
             return False
         return (time.time() if now is None else now) - (self.last_fired_at or self.created_at) >= self.interval_seconds
+
+    def has_news(self, now: Optional[float] = None) -> bool:
+        """Whether a due tick is worth a model turn. A user-authored heartbeat always is; a managed
+        active-work check only when its tracked work changed since the last wake or the liveness floor
+        has passed (``last_fired_at`` is the last wake: a tick with no news is never claimed)."""
+        if self.origin != ACTIVE_WORK_HEARTBEAT_ORIGIN:
+            return True
+        now = time.time() if now is None else now
+        return (self.work_fingerprint != self.woken_fingerprint
+                or now - (self.last_fired_at or self.created_at) >= ACTIVE_WORK_LIVENESS_FLOOR_SECONDS)
 
     def render_prompt(self) -> str:
         interval = format_interval(self.interval_seconds)
@@ -173,7 +194,8 @@ class HeartbeatManager:
     def __init__(self, session_id: str):
         self.session_id = session_id
         self._state: Optional[HeartbeatState] = load_heartbeat(session_id)
-        self._last_claim: Optional[tuple[float, int]] = None  # (last_fired_at, fire_count) before the last due_prompt
+        # (last_fired_at, fire_count, woken_fingerprint) before the last due_prompt
+        self._last_claim: Optional[tuple[float, int, str]] = None
 
     @property
     def state(self) -> Optional[HeartbeatState]:
@@ -237,8 +259,12 @@ class HeartbeatManager:
         self._state = load_heartbeat(self.session_id)
         return self._state
 
-    def ensure_managed(self, prompt: str, interval_seconds: int, *, origin: str) -> str:
+    def ensure_managed(self, prompt: str, interval_seconds: int, *, origin: str, work_fingerprint: str = "") -> str:
         """Install or refresh a managed heartbeat. Never replace a different origin.
+
+        ``work_fingerprint`` is the tracked work as the caller just scanned it. A new check (and a row
+        saved before fingerprints existed) takes it as already-woken, so the work the model started
+        this turn does not earn its own wake; later changes do.
 
         Returns ``installed``, ``kept``, ``updated``, or ``preserved-user``.
         """
@@ -250,25 +276,28 @@ class HeartbeatManager:
             raise ValueError(f"interval must be at least {MIN_INTERVAL_SECONDS}s")
         if origin == USER_HEARTBEAT_ORIGIN:
             raise ValueError("managed heartbeats cannot use the user origin")
-        current = self.reload()
-        if current is not None and current.status in {"active", "paused"} and current.origin != origin:
-            return "preserved-user"
-        if current is not None and current.origin == origin and current.status == "active":
-            if current.prompt == prompt and current.interval_seconds == interval_seconds:
-                return "kept"
-            current.prompt = prompt
-            current.interval_seconds = interval_seconds
-            save_heartbeat(self.session_id, current)
-            return "updated"
-        created_at = current.created_at if current and current.origin == origin else time.time()
-        last_fired = current.last_fired_at if current and current.origin == origin else 0.0
-        fire_count = current.fire_count if current and current.origin == origin else 0
-        self._state = HeartbeatState(
-            prompt=prompt, interval_seconds=interval_seconds, status="active",
-            created_at=created_at, last_fired_at=last_fired, fire_count=fire_count, origin=origin,
-        )
-        save_heartbeat(self.session_id, self._state)
-        return "installed"
+        with _CLAIM_LOCK:  # the fingerprint write must not lose a claim (or be lost to one) landing in between
+            current = self.reload()
+            if current is not None and current.status in {"active", "paused"} and current.origin != origin:
+                return "preserved-user"
+            if current is not None and current.origin == origin and current.status == "active":
+                action = "kept" if (current.prompt, current.interval_seconds) == (prompt, interval_seconds) else "updated"
+                refreshed = (prompt, interval_seconds, work_fingerprint, current.woken_fingerprint or work_fingerprint)
+                if refreshed != (current.prompt, current.interval_seconds, current.work_fingerprint, current.woken_fingerprint):
+                    (current.prompt, current.interval_seconds,
+                     current.work_fingerprint, current.woken_fingerprint) = refreshed
+                    save_heartbeat(self.session_id, current)
+                return action
+            created_at = current.created_at if current and current.origin == origin else time.time()
+            last_fired = current.last_fired_at if current and current.origin == origin else 0.0
+            fire_count = current.fire_count if current and current.origin == origin else 0
+            self._state = HeartbeatState(
+                prompt=prompt, interval_seconds=interval_seconds, status="active",
+                created_at=created_at, last_fired_at=last_fired, fire_count=fire_count, origin=origin,
+                work_fingerprint=work_fingerprint, woken_fingerprint=work_fingerprint,
+            )
+            save_heartbeat(self.session_id, self._state)
+            return "installed"
 
     def clear_if_origin(self, origin: str) -> bool:
         """Clear only a heartbeat this origin owns. User-authored rows stay."""
@@ -286,7 +315,7 @@ class HeartbeatManager:
         """
         with _CLAIM_LOCK:
             s = self._state
-            if s is None or not s.is_due(now):
+            if s is None or not s.is_due(now) or not s.has_news(now):
                 return None
             # Compare-and-set on the stored row: the gateway poller and a viewer's due_prompt RPC each hold
             # their own manager over it, and only one may take the tick. A row cleared or paused since is lost too.
@@ -295,9 +324,10 @@ class HeartbeatManager:
                     stored.last_fired_at, stored.fire_count) != (s.last_fired_at, s.fire_count):
                 self._state = stored
                 return None
-            self._last_claim = (s.last_fired_at, s.fire_count)
+            self._last_claim = (s.last_fired_at, s.fire_count, s.woken_fingerprint)
             s.last_fired_at = now if now is not None else time.time()
             s.fire_count += 1
+            s.woken_fingerprint = s.work_fingerprint
             save_heartbeat(self.session_id, s)
             return s.render_prompt()
 
@@ -312,7 +342,7 @@ class HeartbeatManager:
         if current is None or current.status != "active" or (current.last_fired_at, current.fire_count) != (
                 s.last_fired_at, s.fire_count):
             return False
-        s.last_fired_at, s.fire_count = claim
+        s.last_fired_at, s.fire_count, s.woken_fingerprint = claim
         self._last_claim = None
         save_heartbeat(self.session_id, s)
         return True
