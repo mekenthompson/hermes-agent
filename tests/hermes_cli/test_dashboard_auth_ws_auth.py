@@ -154,6 +154,36 @@ class TestWsTicketEndpoint:
         # returns either 401 or 302. Either is fine.
         assert r.status_code in (302, 401)
 
+    def test_explicit_token_mints_single_use_ticket_without_entering_ws_url(self, gated_app, monkeypatch):
+        configured_token = "desktop-session-token-0123456789abcdef"
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN", configured_token)
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", True, raising=False)
+
+        response = gated_app.post(
+            "/api/auth/ws-ticket",
+            headers={web_server._SESSION_HEADER_NAME: configured_token},
+        )
+
+        assert response.status_code == 200
+        ticket = response.json()["ticket"]
+        first = _fake_ws(query={"ticket": ticket})
+        replay = _fake_ws(query={"ticket": ticket})
+        direct = _fake_ws(query={"token": configured_token})
+
+        assert _web_server_chat._ws_auth_ok(first) is True
+        assert first._hermes_auth_identity == {
+            "user_id": "dashboard-session-token",
+            "provider": "dashboard-session-token",
+        }
+        assert _web_server_chat._ws_auth_ok(replay) is False
+        # Stock Desktop also uses this explicitly configured reusable URL for
+        # initial connect and reconnect; it remains the same synthetic identity.
+        assert _web_server_chat._ws_auth_ok(direct) is True
+        assert direct._hermes_auth_identity == {
+            "user_id": "dashboard-session-token",
+            "provider": "dashboard-session-token",
+        }
+
 
     def test_get_method_is_not_allowed(self, gated_app):
         _logged_in(gated_app)
@@ -212,15 +242,10 @@ def _fake_ws(
 ):
     """Build a stand-in for starlette.WebSocket good enough for _ws_auth_ok."""
 
-    class _QP:
-        def __init__(self, q):
-            self._q = q
-
-        def get(self, k, default=""):
-            return self._q.get(k, default)
+    from starlette.datastructures import QueryParams
 
     return SimpleNamespace(
-        query_params=_QP(query),
+        query_params=QueryParams(query),
         headers={"sec-websocket-protocol": ", ".join(protocols)} if protocols else {},
         client=SimpleNamespace(host=client_host),
         url=SimpleNamespace(path=path),
@@ -328,10 +353,34 @@ class TestWsAuthOkGated:
         assert _web_server_chat._ws_auth_ok(ambiguous) is False
 
 
-    def test_legacy_token_rejected_in_gated_mode(self, gated_app):
-        """Critical: gated mode must NOT honour the legacy token path
-        even when someone has access to the in-process value of
-        _SESSION_TOKEN (e.g. a leaked log line)."""
+    def test_explicit_configured_token_authenticates_reusable_standard_desktop_urls(self, gated_app, monkeypatch):
+        """A configured (never generated) gateway token supports /api/ws reconnects."""
+        configured_token = "test-configured-dashboard-token-0123456789abcdef"
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN", configured_token)
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", True, raising=False)
+
+        initial = _fake_ws(query={"token": configured_token}, path="/api/ws")
+        reconnect = _fake_ws(query={"token": configured_token}, path="/api/ws")
+
+        assert _web_server_chat._ws_auth_reason(initial) == (None, "explicit-token")
+        assert _web_server_chat._ws_auth_reason(reconnect) == (None, "explicit-token")
+        assert initial._hermes_auth_identity == {
+            "user_id": "dashboard-session-token",
+            "provider": "dashboard-session-token",
+        }
+
+    def test_multiple_gated_credentials_are_rejected_without_consuming_ticket(self, gated_app, monkeypatch):
+        configured_token = "test-configured-dashboard-token-0123456789abcdef"
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN", configured_token)
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", True, raising=False)
+        ticket = mint_ticket(user_id="ticket-user", provider="stub")
+
+        conflict = _fake_ws(query={"token": configured_token, "ticket": ticket}, path="/api/ws")
+        assert _web_server_chat._ws_auth_reason(conflict) == ("credential_conflict", "multiple")
+        assert _web_server_chat._ws_auth_ok(_fake_ws(query={"ticket": ticket})) is True
+
+    def test_generated_process_token_stays_rejected_in_gated_mode(self, gated_app, monkeypatch):
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", False, raising=False)
         ws = _fake_ws(query={"token": web_server._SESSION_TOKEN})
         assert _web_server_chat._ws_auth_ok(ws) is False
 
@@ -388,6 +437,71 @@ class TestWsAuthOkGated:
             "user_id": "remote-desktop-user",
             "provider": "stub",
         }
+
+    def test_provider_outage_rejects_without_disclosing_token_or_provider_details(
+        self, gated_app, monkeypatch, tmp_path
+    ):
+        from hermes_cli.dashboard_auth import audit as audit_mod, middleware
+        from hermes_cli.dashboard_auth.base import ProviderError
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        if hasattr(audit_mod, "_LOGGER"):
+            monkeypatch.setattr(audit_mod, "_LOGGER", None, raising=False)
+        sentinel = "audit-provider-error-sensitive-detail"
+
+        def unavailable(*args, **kwargs):
+            raise ProviderError(sentinel)
+
+        monkeypatch.setattr(middleware, "_verify_access_token", unavailable)
+        ws = _fake_ws(query={"token": "audit-session-credential"}, path="/api/ws")
+        assert _web_server_chat._ws_auth_reason(ws) == ("token_unavailable", "token")
+        assert not hasattr(ws, "_hermes_auth_identity")
+        for log in (tmp_path / "logs").glob("dashboard_auth_audit*.jsonl"):
+            text = log.read_text()
+            assert sentinel not in text
+            assert "audit-session-credential" not in text
+
+    def test_generated_process_token_never_reaches_session_provider(self, gated_app, monkeypatch):
+        from hermes_cli.dashboard_auth import middleware
+
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN_IS_EXPLICIT", False)
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("a generated process token must not be offered to a session provider")
+
+        monkeypatch.setattr(middleware, "_verify_access_token", forbidden)
+        ws = _fake_ws(query={"token": web_server._SESSION_TOKEN}, path="/api/ws")
+        assert _web_server_chat._ws_auth_reason(ws) == ("token_mismatch", "token")
+        assert not hasattr(ws, "_hermes_auth_identity")
+
+    def test_provider_token_cannot_bypass_or_consume_ticket(self, gated_app):
+        access_token = _sign({
+            "sub": "remote-user", "email": "user@example.test", "name": "Remote User",
+            "org_id": "org-1", "exp": int(time.time()) + 3600,
+        })
+        ticket = mint_ticket(user_id="ticket-owner", provider="stub")
+        ws = _fake_ws(query={"token": access_token, "ticket": ticket}, path="/api/ws")
+        assert _web_server_chat._ws_auth_reason(ws) == ("credential_conflict", "multiple")
+        assert not hasattr(ws, "_hermes_auth_identity")
+        assert _web_server_chat._ws_auth_ok(_fake_ws(query={"ticket": ticket})) is True
+
+    def test_provider_session_token_drives_real_channel_websocket_roundtrip(self, gated_app, monkeypatch):
+        import json
+
+        monkeypatch.setattr(web_server, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+        access_token = _sign({
+            "sub": "remote-user", "email": "user@example.test", "name": "Remote User",
+            "org_id": "org-1", "exp": int(time.time()) + 3600,
+        })
+        query = f"channel=reconciliation&token={access_token}"
+        # Share one ASGI portal between both sockets. Independent TestClient
+        # portals would put the broadcaster and subscriber on different loops.
+        with gated_app._portal_factory() as portal:
+            monkeypatch.setattr(gated_app, "portal", portal)
+            with gated_app.websocket_connect(f"wss://fly-app.fly.dev/api/events?{query}") as subscriber:
+                with gated_app.websocket_connect(f"wss://fly-app.fly.dev/api/pub?{query}") as publisher:
+                    publisher.send_text(json.dumps({"event": "reconciliation-probe"}))
+                    assert subscriber.receive_json() == {"event": "reconciliation-probe"}
 
     def test_invalid_session_token_rejected_in_gated_mode(self, gated_app):
         """A bogus ?token= fails with token_invalid (and audits), not a crash."""

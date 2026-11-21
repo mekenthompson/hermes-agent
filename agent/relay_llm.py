@@ -184,6 +184,15 @@ def execute(
 ) -> Any:
     """Run one non-streaming physical provider attempt through Relay.
     ``session_id`` defaults to the inherited Hermes turn's session (unmanaged when there is none)."""
+    if _has_running_event_loop():
+        # asyncio.run cannot start here, and raising makes every nested aux call
+        # (smart approval) escalate in 0.0s. The worker has no running loop, so the
+        # managed attempt is created there rather than left un-awaited on this one.
+        from agent.async_utils import run_blocking_off_running_loop
+        return run_blocking_off_running_loop(lambda: execute(
+            request, callback, name=name, model_name=model_name, session_id=session_id,
+            metadata=metadata, defer_logical_completion=defer_logical_completion,
+        ))
     attempt = _ManagedAttempt.resolve(session_id, request, metadata, name=name, model_name=model_name)
     if attempt is None:
         return callback(request)

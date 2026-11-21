@@ -449,6 +449,17 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _owner_stopped(run) -> bool:
+    """True when the crash sweep booked this run as interrupted by a planned gateway stop."""
+    metadata = _task_field(run, "metadata")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except ValueError:
+            return False
+    return isinstance(metadata, dict) and metadata.get("owner_stopped") is True
+
+
 def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Trailing run outcomes show >= cfg["crash_threshold"] (default 2)
     consecutive ``crashed`` with no ``completed``/``reclaimed`` between. Fires
@@ -471,6 +482,9 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     last_err = None
     for r in _runs_newest_first(runs):
         outcome = _task_field(r, "outcome")
+        if outcome == "crashed" and _owner_stopped(r):
+            # A planned gateway stop interrupted it; the breaker does not count it either.
+            continue
         if outcome == "crashed":
             consecutive += 1
             if last_err is None:

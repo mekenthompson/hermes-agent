@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from concurrent.futures import Future
 from typing import Any, Coroutine, Optional
 
@@ -48,3 +49,38 @@ def consume_detached_task_result(task: asyncio.Future[Any]) -> None:
         task.exception()
     except (asyncio.CancelledError, Exception):
         pass
+
+
+def run_blocking_off_running_loop(fn):
+    """Run ``fn`` off this thread when it already has a running event loop.
+
+    ``asyncio.run`` cannot start on that thread. The worker gets a copy of the
+    caller's contextvars, including the profile home. Joining does not drain
+    the caller's ready queue: a Desktop approval answer is delivered by another
+    thread setting a ``threading.Event``, and socket reads belong to the loop
+    that owns the transport.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return fn()
+    if not loop.is_running():
+        return fn()
+    box: dict[str, Any] = {}
+
+    def worker() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException:
+            # The caller re-raises this. Log here so the thread boundary is not a
+            # silent swallow if the caller is gone.
+            _DEFAULT_LOGGER.exception("off-loop call failed")
+            box["error"] = sys.exc_info()[1]
+
+    from agent.memory_provider import spawn_context_thread
+    thread = spawn_context_thread(worker, name="hermes-off-loop", daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")

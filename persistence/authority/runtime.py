@@ -44,6 +44,7 @@ __all__ = [
     "ModelPick",
     "MutationCommand",
     "MutationOutcome",
+    "Notice",
     "PinnedIdentity",
     "PreparedMutation",
     "ReasoningPick",
@@ -279,8 +280,18 @@ class Sidebar(_Command):
     _keys: ClassVar[tuple[str, ...]] = ("title", "archived", "hidden", "pinned", "unread")
 
 
+@dataclass(frozen=True, slots=True)
+class Notice(_Command):
+    """``notice`` (house): a durable operator operation notice, appended to the idle conversation as an internal user
+    notification with its exact-retry receipt. ``text`` is non-blank and at most 4000 characters."""
+
+    text: str
+    operation: ClassVar[str] = "notice"
+    _keys: ClassVar[tuple[str, ...]] = ("text",)
+
+
 #: The closed command union of ``mutate`` and ``prepare_mutation``.
-MutationCommand = ModelPick | Branch | ReasoningPick | Workspace | EditorMcp | EditPolicy | Compress | Delete | Reset | Import | Rewind | Rename | Archive | Sidebar
+MutationCommand = ModelPick | Branch | ReasoningPick | Workspace | EditorMcp | EditPolicy | Compress | Delete | Reset | Import | Rewind | Rename | Archive | Sidebar | Notice
 
 
 def _editor_fingerprint(value: Any) -> str | None:
@@ -356,8 +367,16 @@ def _parse_metadata(operation: str, payload: dict[str, Any]) -> MutationCommand:
     return Sidebar(**payload)
 
 
+def _parse_notice(operation: str, payload: dict[str, Any]) -> MutationCommand | None:
+    text = payload.get("text")
+    if set(payload) == {"text"} and isinstance(text, str) and text.strip() and len(text) <= 4000:
+        return Notice(text=text)
+    return None
+
+
 # The operations with their own payload rule; every other one is a metadata edit (``rename``, ``archive``, ``sidebar``) or refused.
 _PARSERS = {
+    "notice": _parse_notice,
     "model": _parse_model, "branch": _parse_branch, "compress": _parse_compress,
     "reasoning": _parse_policy, "workspace": _parse_policy, "editor_mcp": _parse_policy, "edit_policy": _parse_policy,
     "delete": _parse_transcript, "reset": _parse_transcript, "import": _parse_transcript, "rewind": _parse_transcript,

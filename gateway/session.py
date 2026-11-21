@@ -676,6 +676,12 @@ def is_shared_multi_user_session(
     return not (thread_sessions_per_user if source.thread_id else group_sessions_per_user)
 
 
+def is_system_injection(event) -> bool:
+    """A gateway-made turn (internal event, or a scheduled heartbeat, which stays non-internal so
+    authorization and Stop still apply): it speaks with its own system header, never a human's label."""
+    return bool(getattr(event, "internal", False) or getattr(event, "_heartbeat_session_id", None))
+
+
 def label_shared_sender(
     source: SessionSource, text: str, *, group_sessions_per_user: bool = True,
     thread_sessions_per_user: bool = False,

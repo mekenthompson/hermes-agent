@@ -180,6 +180,8 @@ KANBAN_BLOCK_SCHEMA = _schema(
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "expected_event_id": {"type": "integer", "minimum": 1,
+                              "description": "Optional latest_event_id from show. Refuse if this task changed; retain the same token on retry."},
         "reason": _prop("string", (
                 "What you need answered or what stopped you, in one or "
                 "two sentences. Don't paste the whole conversation; the "
@@ -320,6 +322,8 @@ KANBAN_COMMENT_SCHEMA = _schema(
                 "kanban_list to discover ids."
         )),
         "body": _prop("string", "Markdown-supported comment body."),
+        "human_checkpoint": _prop("boolean", "Publish this comment as a durable update for subscribed humans."),
+        "request_id": _prop("string", "Stable caller ID for this checkpoint. Required with human_checkpoint; retries must reuse it."),
     },
     ["task_id", "body"],
 )
@@ -523,13 +527,16 @@ KANBAN_CREATE_SCHEMA = _schema(
 KANBAN_UNBLOCK_SCHEMA = _schema(
     "kanban_unblock",
     (
-        "Unblock a Kanban task. It moves to ready when all parents are done, "
+        "Unblock a Kanban task, including one that repeated blocks sent to triage. "
+        "It moves to ready when all parents are done, "
         "or todo while any parent remains open. Orchestrator-only — only "
         "profiles with the kanban toolset can unblock routed work; "
         "dispatcher-spawned task workers never see this tool."
     ),
     {
         "task_id": _prop("string", "Blocked task id to move to ready or parent-gated todo."),
+        "expected_event_id": {"type": "integer", "minimum": 1,
+                              "description": "Optional latest_event_id from show. A newer Stop or other event refuses this resume; do not refresh it on a retry."},
     },
     ["task_id"],
 )

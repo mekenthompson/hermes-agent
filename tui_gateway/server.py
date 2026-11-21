@@ -200,6 +200,7 @@ _LONG_HANDLERS = frozenset({
     "wake.status", "session.active_list", "session.branch", "session.compress", "session.list",
     "session.resume", "session.save", "session.workspace.move", "shell.exec", "skills.manage", "slash.exec",
     "onboarding.start", "onboarding.state", "subagent.roster",
+    "display.clipboard.read",  # a blocking X selection round-trip, up to 15 s inside a sandbox
     "command.dispatch",  # /goal draft invokes the auxiliary model; never block the RPC reader
     "shared_metrics.set",  # consent reconcile waits on the metrics store's write lock
 })
@@ -909,7 +910,8 @@ def _session_for_key(session_key: str) -> dict | None:
         return next((s for s in list(_sessions.values()) if s.get("session_key") == session_key), None)
 
 
-def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session_id: str = "") -> list:
+def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session_id: str = "",
+                         isolated_browser_owner=None) -> list:
     with contextlib.suppress(Exception):
         from gateway.session_context import set_session_vars
         sess = _session_for_key(session_key) if session_key else None
@@ -918,6 +920,7 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
         resolved = cwd if cwd is not None else (str(sess.get("cwd") or "") if sess is not None else "")
         source = _resolve_session_platform()
         profile = _current_profile_name()
+        browser_control_provider = browser_control_subject = ""
         # Live conversation id for subprocess HERMES_SESSION_ID: an explicitly empty contextvar is authoritative
         # (no os.environ fallback), so never leave it "" — agent's durable session_id, then session_key.
         session_id = session_key
@@ -926,9 +929,25 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             # App-global backends multiplex profiles: prefer the live session's own home.
             profile = profile_name_for_home(sess.get("profile_home")) or profile
             session_id = getattr(sess.get("agent"), "session_id", None) or session_key
+            identity = getattr(sess.get("transport"), "auth_identity", None)
+            from tui_gateway.browser_handoff_identity import browser_handoff_identity
+            handoff_identity = browser_handoff_identity(identity)
+            if handoff_identity is not None:
+                browser_control_provider = handoff_identity.provider
+                browser_control_subject = handoff_identity.subject
+            elif (_session_source(sess) == "desktop" and isinstance(isolated_browser_owner, tuple)
+                  and len(isolated_browser_owner) == 2
+                  and all(isinstance(part, str) and part for part in isolated_browser_owner)):
+                # The compute host received this identity only through its
+                # exact claimed turn frame. No browser-control principal or
+                # live-turn delegation grant crosses the process boundary.
+                browser_control_provider, browser_control_subject = isolated_browser_owner
         return set_session_vars(
-            session_key=session_key, session_id=session_id, source=source,
-            profile=profile, cwd=resolved, ui_session_id=ui_session_id, cron_session="")
+            session_key=session_key, session_id=session_id, platform=source, source=source,
+            cwd=resolved,
+            browser_control_provider=browser_control_provider,
+            browser_control_subject=browser_control_subject, profile=profile,
+            ui_session_id=ui_session_id, cron_session="")
     return []
 
 
@@ -1302,14 +1321,13 @@ def _get_usage(agent) -> dict:
             for _key, _val in (("avg_latency_s", _total_lat / _n), ("avg_tps", _avg_vel)):
                 if _val is not None and _val == _val and 0 < _val < 1e6:  # guard NaN/negative/absurd provider timings
                     usage[_key] = round(float(_val), 1)
-    # Window plans only: the desktop status bar's allowance (the canonical feed carries the same one).
-    from gateway.session_usage import plan_gauge
-    if (gauge := plan_gauge(agent)) is not None:
-        usage["plan_gauge"] = gauge
     # Live count of background/async subagents (CLI status bar ⛓ parity, same async_delegation registry).
     with contextlib.suppress(Exception):
         from tools.async_delegation import active_count as _async_active_count
         usage["active_subagents"] = _async_active_count()
+    from gateway.session_usage import plan_gauge
+    if (gauge := plan_gauge(agent)) is not None:
+        usage["plan_gauge"] = gauge
     # Dev-only live credits-spent readout, gated on HERMES_DEV_CREDITS so the payload stays clean otherwise.
     if is_truthy_value(os.environ.get("HERMES_DEV_CREDITS")):
         with contextlib.suppress(Exception):
@@ -1463,7 +1481,10 @@ def _session_info(agent, session: dict | None = None) -> dict:
     pending_provider = str(pending_switch.get("display_provider") or "").strip()
     provider = mirror.get("provider", getattr(agent, "provider", ""))
     if provider == "custom" and "provider" not in mirror and agent is not None:
-        provider = _scoped_session_provider(agent, sess)
+        # Clients reuse this identity for new chats without carrying the endpoint or key.
+        # Broadcast/resume callers need not be bound to this session's profile.
+        with _profile_build_scope(sess.get("profile_home") or _hermes_home):
+            provider = _runtime_model_config(agent).get("provider", provider)
     model = pending_model or mirror.get("model", getattr(agent, "model", ""))
     # The level the route's entry clamp actually sends (== reasoning_effort when verbatim), so the
     # Desktop can say "ultra sends max on this route" like `/reasoning` does instead of presenting a
@@ -1648,6 +1669,9 @@ def _hydrate_session_cwd(sid: str, key: str, session_db, profile_home: str | Non
 # breaking the (cosmetic) pet surface.
 _pet_payload_cache_lock = threading.Lock()
 _pet_payload_cache: dict[tuple, dict] = {}
+
+
+from .session_titles import _branch_title
 
 
 def _pet_cfg() -> dict:

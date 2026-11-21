@@ -199,6 +199,10 @@ def peek_session(request: Request):
     checks (Webapp sign-in binding, bearers only a native app was given) and none of its side
     effects: no refresh, no cookie writes, no audit records, no 401. A public route uses it to
     decide how much to show; an expired or unverifiable session reads as signed out."""
+    import hermes_cli.web_server as _web_server
+
+    if _web_server._has_valid_explicit_session_token(request):
+        return _web_server._explicit_session_token_session()
     bearer = _extract_bearer(request)
     if bearer:
         if not webapp_sign_in.access_token_works_alone(request, bearer):
@@ -245,6 +249,16 @@ def _session_expired_response(request: Request) -> Response:
     clear_session_cookies(response, prefix=prefix_from_request(request),
                           gateway=webapp_sign_in.cookie_gateway(request))
     return response
+
+
+async def _serve_without_session_cookie(request: Request, call_next) -> Response:
+    """Try the deployment header, then the normal silent sign-in or no-cookie response."""
+    header_session = _session_token_header_session(request)
+    if header_session is not None:
+        request.state.session = header_session
+        return await call_next(request)
+    auto = _auto_sso_response(request)
+    return auto if auto is not None else _unauth_response(request, reason="no_cookie")
 
 
 def _cookie_write_refusal(
@@ -297,6 +311,15 @@ async def gated_auth_middleware(
     cookie_logout = (own_origin or other_page) and request.url.path == "/auth/logout"
     if _path_is_public(request.url.path) and not cookie_logout:
         return await call_next(request)
+    # Explicit dashboard tokens are configured administrator credentials for
+    # native remote clients. Check them before provider bearer verification so
+    # an unavailable provider cannot reject a valid configured connection.
+    # Import inside the request: a module-level import cycles through
+    # web_server -> body_limit -> this module before _path_is_public exists.
+    import hermes_cli.web_server as _web_server
+    if _web_server._has_valid_explicit_session_token(request):
+        request.state.session = _web_server._explicit_session_token_session()
+        return await call_next(request)
     # RFC 8252 native-app bearer path: the same provider-minted access token the cookie flow
     # stores, verified with the same provider stack, no cookie read or set. A presented-but-
     # invalid bearer gets the structured 401 so the desktop refreshes/re-logs instead of
@@ -319,13 +342,7 @@ async def gated_auth_middleware(
         # Hermes Desktop's "Session token" connection sends the deployment session token in its
         # own header, not as a bearer. It is tried only with no session cookie at all, so a cookie
         # session is served exactly as before; anything else gets main's no-cookie handling.
-        header_session = _session_token_header_session(request)
-        if header_session is not None:
-            request.state.session = header_session
-            return await call_next(request)
-        # No session at all: try the silent portal bounce before /login.
-        auto = _auto_sso_response(request)
-        return auto if auto is not None else _unauth_response(request, reason="no_cookie")
+        return await _serve_without_session_cookie(request, call_next)
     if webapp_sign_in.applies(request) and not webapp_sign_in.check(request):
         # A login on the gateway's Webapp holds only while the browser credential it was bound to is
         # in use; signing out replaced it. The cookies stay and open nothing until it signs in again.

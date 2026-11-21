@@ -220,6 +220,7 @@ def _cmd_bind_board(args, conn, proj) -> str:
             slug = kb._normalize_board_slug(args.board)
             if slug and (slug == kb.DEFAULT_BOARD or kb.board_exists(slug)):
                 kb.write_board_metadata(slug, default_workdir=proj.primary_path)
+        # health: allow BLE001, S110 -- Upstream ff294849 treats board defaults as best-effort.
         except Exception:
             pass
     return f"Bound {proj.slug} -> board {args.board}"

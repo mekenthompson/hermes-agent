@@ -486,18 +486,48 @@ class SQLiteCoordinationRepository(DeliveryObligationVerbs, SubagentLedgerVerbs)
     # (every child of the unit waits on a promised automatic resume) is recorded but never offered.
     def record_delegation_completion(self, *, delegation_id: DelegationId, state: str, completed_at: float,
                                      event: JsonValue, result: JsonValue,
-                                     delivery: Literal["pending", "delivered"] = "pending") -> None:
+                                     delivery: Literal["pending", "delivered"] = "pending",
+                                     on_cancel=None):
+        """House: ``on_cancel`` (owner memory only) answers the cancelled ``(state, event, result)`` that replaces
+        a late completion when a durable stop intent committed first; that completion is always ``pending``. A
+        committed intent is acknowledged in the same write. Returns the ``(event, result)`` stored."""
         if delivery not in COMPLETION_DELIVERIES:
             raise AuthorityRefusal("invalid_params", field="delivery")
         now = time.time()
         def _do(conn):
+            stored_state, stored_event, stored_result, stored_delivery = state, event, result, delivery
+            row = conn.execute("SELECT stop_state FROM async_delegations WHERE delegation_id=?",
+                               (delegation_id,)).fetchone()
+            if row is not None and row[0] == "cancel_requested" and on_cancel is not None:
+                stored_state, stored_event, stored_result = on_cancel()
+                stored_delivery = "pending"
             conn.execute("""UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-                   event_json=?, result_json=?, delivery_state=?
+                   event_json=?, result_json=?, delivery_state=?,
+                   stop_state=CASE WHEN stop_state='cancel_requested' THEN 'acknowledged' ELSE stop_state END,
+                   stop_acknowledged_at=CASE WHEN stop_state='cancel_requested' THEN ? ELSE stop_acknowledged_at END
                    WHERE delegation_id=?""",
-                (state, completed_at, now,
-                 json.dumps(event), json.dumps(result), delivery, delegation_id))
+                (stored_state, completed_at, now,
+                 json.dumps(stored_event), json.dumps(stored_result), stored_delivery, now, delegation_id))
+            return stored_event, stored_result
         with translated():
-            self._ledger_write(_do)
+            return self._ledger_write(_do)
+
+    def record_delegation_stop_intents(self, *, delegation_ids, reason: str) -> frozenset:
+        """House: atomically record cancellation BEFORE signalling descendants; returns the ids whose live row
+        accepted the intent (the only children a caller may signal)."""
+        now = time.time()
+        def _do(conn):
+            accepted = set()
+            for delegation_id in delegation_ids:
+                changed = conn.execute("""UPDATE async_delegations
+                       SET stop_state='cancel_requested', stop_reason=?, stop_requested_at=?, updated_at=?
+                       WHERE delegation_id=? AND state IN ('running','stalling','finalizing') AND stop_state=''""",
+                    (reason, now, now, delegation_id)).rowcount
+                if changed:
+                    accepted.add(delegation_id)
+            return frozenset(accepted)
+        with translated():
+            return self._ledger_write(_do)
 
     def record_unit_child(self, *, delegation_id: DelegationId, entry: JsonValue) -> None:
         """Merge one finished child of a still-running unit into the stored partial by ``task_index``; the caller
@@ -689,14 +719,15 @@ class SQLiteCoordinationRepository(DeliveryObligationVerbs, SubagentLedgerVerbs)
         def _read(conn):
             return conn.execute("""SELECT origin_session, state, dispatched_at, completed_at,
                           result_json, delivery_state, delivery_attempts,
-                          origin_session_id
+                          origin_session_id, stop_state, stop_reason, stop_requested_at, stop_acknowledged_at
                    FROM async_delegations WHERE delegation_id=?""", (delegation_id,)).fetchone()
         with translated():
             row = self._ledger_read(_read)
         return None if row is None else DelegationRecord(
             delegation_id=delegation_id, origin_session=row[0], state=row[1], dispatched_at=row[2],
             completed_at=row[3], result=json.loads(row[4]) if row[4] else None,
-            delivery_state=DeliveryState(row[5]), delivery_attempts=row[6], origin_session_id=row[7] or "")
+            delivery_state=DeliveryState(row[5]), delivery_attempts=row[6], origin_session_id=row[7] or "",
+            stop_state=row[8] or "", stop_reason=row[9], stop_requested_at=row[10], stop_acknowledged_at=row[11])
 
     # A session's delegations finished inside the failure window, newest first; the caller expands failed
     # tasks.
@@ -727,7 +758,8 @@ class SQLiteCoordinationRepository(DeliveryObligationVerbs, SubagentLedgerVerbs)
         def _read(conn):
             return conn.execute("""SELECT delegation_id, origin_session, origin_ui_session_id,
                           parent_session_id, dispatched_at, owner_pid,
-                          owner_started_at, task_json, origin_session_id, result_json, state, updated_at
+                          owner_started_at, task_json, origin_session_id, result_json, state, updated_at,
+                          stop_state, stop_reason
                    FROM async_delegations WHERE state='running'""").fetchall()
         with translated():
             rows = self._ledger_read(_read)
@@ -735,9 +767,10 @@ class SQLiteCoordinationRepository(DeliveryObligationVerbs, SubagentLedgerVerbs)
             delegation_id=DelegationId(delegation_id), origin_session=session_key, origin_ui_session_id=origin_ui,
             parent_session_id=parent_id, dispatched_at=dispatched_at, owner_pid=pid, owner_started_at=started,
             task=json.loads(task_json or "{}"), origin_session_id=origin_sid or "",
-            result=json.loads(result_json) if result_json else None, state=last_state, updated_at=updated_at)
+            result=json.loads(result_json) if result_json else None, state=last_state, updated_at=updated_at,
+            stop_state=stop_state or "", stop_reason=stop_reason)
             for (delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json, origin_sid,
-                 result_json, last_state, updated_at) in rows)
+                 result_json, last_state, updated_at, stop_state, stop_reason) in rows)
 
     def has_replayable_completions(self) -> bool:
         def _read(conn):

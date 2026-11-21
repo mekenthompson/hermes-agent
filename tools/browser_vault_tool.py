@@ -162,6 +162,10 @@ def _holds_checked_session(task_id: str, checked: Optional[str]) -> bool:
     return checked is not None and supervisor.current_page_session() == checked
 
 
+# Set only around an operation's own stamp removal, which may run after a takeover (_fenced_page_op).
+_unstamping: ContextVar[bool] = ContextVar("vault_unstamping", default=False)
+
+
 @contextmanager
 def _stamps_removed(task_id: str, nonce: str) -> Iterator[None]:
     """Remove the stamps of the inspection ``nonce`` on every exit of the operation that made them.
@@ -177,7 +181,11 @@ def _stamps_removed(task_id: str, nonce: str) -> Iterator[None]:
     try:
         yield
     finally:
-        _eval_js(task_id, build_unstamp_js(nonce))
+        token = _unstamping.set(True)
+        try:
+            _eval_js(task_id, build_unstamp_js(nonce))
+        finally:
+            _unstamping.reset(token)
 
 
 @contextmanager
@@ -231,10 +239,13 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     if supervisor is None:
         return {"success": False, "error": "no supervised browser session for this task; open the page with "
                                            "browser_exec first"}
-    sup = supervisor.evaluate_runtime(expression, session_id=session, await_promise=False)
-    if sup.get("ok"):
-        return {"success": True, "result": sup.get("result")}
-    return {"success": False, "error": str(sup.get("error") or "evaluate failed")}
+    if _unstamping.get():  # stamp cleanup only; see _stamps_removed
+        sup = supervisor.evaluate_runtime(expression, session_id=session, await_promise=False)
+        if sup.get("ok"):
+            return {"success": True, "result": sup.get("result")}
+        return {"success": False, "error": str(sup.get("error") or "evaluate failed")}
+    from tools.browser_session_fence import evaluate_vault
+    return evaluate_vault(supervisor, task_id, expression, session_id=session)
 
 
 def _ensure_supervisor(task_id: str):
@@ -245,17 +256,22 @@ def _ensure_supervisor(task_id: str):
 
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
     if supervisor is not None:
+        from tools.browser_session_fence import profile_matches
+        info = getattr(supervisor, "browser_session_info", None)
+        if info is not None and not profile_matches(info):
+            return None
         return supervisor
     from tools.browser_session import session_for_task
     from tools.browser_session_cdp import get_dialog_policy_config, resolve_cdp_override
 
-    cdp_url = str(session_for_task(task_id).get("cdp_url") or "")
+    info = session_for_task(task_id)
+    cdp_url = str(info.get("cdp_url") or "")
     if not cdp_url:
         return None
     policy, timeout_s = get_dialog_policy_config()
     try:
-        return SUPERVISOR_REGISTRY.get_or_start(task_id=task_id, cdp_url=resolve_cdp_override(cdp_url),
-                                                dialog_policy=policy, dialog_timeout_s=timeout_s)
+        from tools.browser_session_fence import connect_vault
+        return connect_vault(task_id, info, resolve_cdp_override(cdp_url), policy, timeout_s)
     except Exception as exc:  # health: allow BLE001 -- a failed attach is reported as supervisor_required
         logger.debug("vault fill: supervisor attach to the task's session failed (%s)", exc)
         return None
@@ -293,27 +309,26 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
             ),
         }
 
-    taken = _human_lease_refusal(task_id)
-    if taken is not None:
-        return taken
-
     if page is not None:
-        return _page_eval(page, task_id, expression, secret=True)
+        from tools.browser_vault_preview import active_page
+        if page is active_page():
+            return _page_eval(page, task_id, expression, secret=True)
+        # Plugin-owned pages have no captured CDP socket. Preserve their
+        # transport and re-admit the task's display lease at the write.
+        from tools.browser_session import session_for_task
+        from tools.browser_session_fence import run_fenced
+        out = run_fenced(session_for_task(task_id), lambda: _page_eval(page, task_id, expression, secret=True))
+        return {**out, "error_type": out["code"]} if out.get("code") and not out.get("success") else out
+
+    # Re-admit on the captured socket after a possibly human-length code
+    # prompt: a result check alone cannot undo a credential write.
+    from tools.browser_session_fence import evaluate_vault
     try:
-        sup = supervisor.evaluate_runtime(expression, session_id=session, await_promise=False)
+        return evaluate_vault(supervisor, task_id, expression, session_id=session)
     except Exception as exc:  # health: allow BLE001 -- its text can quote the expression, i.e. the secret
         logger.debug("vault fill: secret-bearing evaluate raised %s", type(exc).__name__)
         return {"success": False, "error_type": "eval_failed",
                 "error": "The browser could not run the vault script."}
-    if sup.get("ok"):
-        return {"success": True, "result": sup.get("result"), "document": sup.get("document")}
-    return {
-        "success": False,
-        "error_type": "supervisor_required"
-        if "supervisor" in str(sup.get("error") or "").lower() or sup.get("code") == "session_changed"
-        else "eval_failed",
-        "error": str(sup.get("error") or "eval failed"),
-    }
 
 
 def _human_lease_refusal(task_id: str) -> Optional[dict[str, Any]]:
@@ -328,11 +343,20 @@ def _human_lease_refusal(task_id: str) -> Optional[dict[str, Any]]:
     if active_page() is not None or not _bot_desktop_browser_session(task_id):
         return None
     from tools.bot_desktop import lease as _bd_lease
-    try:
-        _bd_lease.assert_agent_may_act()
+    from tools.browser_session import session_for_task
+    from tools.browser_session_fence import owner_home
+    try:  # the lease of the profile that owns this browser, not the launch home's
+        _bd_lease.assert_agent_may_act(owner_home(session_for_task(task_id)))
     except _bd_lease.HumanHasControl as exc:
         return {"success": False, "error_type": "human_has_control", "error": str(exc)}
+    except RuntimeError as exc:
+        return {"success": False, "error_type": "browser_profile_mismatch", "error": str(exc)}
     return None
+
+
+def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
+    from tools.browser_session import session_for_task, shares_bot_desktop_browser
+    return shares_bot_desktop_browser(session_for_task(task_id))
 
 
 def _parse_json_result(raw: Any) -> Any:
@@ -378,7 +402,7 @@ _TAB_PROBES = {
 _FRAME_PROBE = _deep_probe("iframe, frame, object, embed")
 
 
-def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[_CheckedPage]:
+def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[_CheckedPage] | dict:
     """Point the supervisor's page session at the open tab on ``origin`` that holds a ``kind`` form
     (browser_exec sessions open their own tabs, so the tab the supervisor attached to first is rarely the
     login page). Returns the origin (its URL for ``origin=""``) and the session ``focus_page`` attached
@@ -392,7 +416,11 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[_Check
         supervisor = None
     if supervisor is None:
         return None
-    focused = supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
+    from tools.browser_session_fence import run_vault_io
+    focused = run_vault_io(supervisor, task_id,
+                           lambda: supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind)))
+    if "ok" not in focused and focused.get("code"):
+        return focused  # the fence refused: another profile's browser, or a human holds the screen
     if not focused.get("ok"):
         return None
     return _CheckedPage(origin or str(focused.get("url") or ""), focused.get("session_id"))
@@ -426,6 +454,8 @@ def _bound_page_origin(task_id: str, meta: Any, probe_kind: str) -> _CheckedPage
                 "error": f"Vault item {meta.id!r} has no bound origin; {meta.kind} items are filled only on "
                          "the site they were saved for."}
     page = next((p for p in (_focus_bound_origin(task_id, c, probe_kind) for c in allowed) if p), None)
+    if isinstance(page, dict):
+        return page
     page = page or _current_page_check(task_id)
     if page is None:
         return {"success": False,
@@ -714,13 +744,24 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, *, with_ident
         return json.dumps({"success": False, "error_type": "payment_declined",
                            "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
 
-    with backend.fill_context(), _pinned_page_session(effective_task_id, page) as unpinned:
+    # Confirmation can hand control to a human. Re-admit before opening the
+    # backend context or inspecting the page, not merely after the result.
+    from tools.browser_vault_preview import active_page
+    if active_page() is not None:
+        return _fill_saved_item(backend, handle, meta, page, effective_task_id, with_identifier)
+    return _fenced_page_op(effective_task_id, lambda: _fill_saved_item(
+        backend, handle, meta, page, effective_task_id, with_identifier))
+
+
+def _fill_saved_item(backend: Any, handle: str, meta: Any, page: _CheckedPage, task_id: str,
+                     with_identifier: bool = False) -> str:
+    with backend.fill_context(), _pinned_page_session(task_id, page) as unpinned:
         refusal = unpinned or snapshot_refusal(backend, handle, meta, page.origin)
         if refusal is not None:
             return json.dumps(refusal)
         nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
-        with _stamps_removed(effective_task_id, nonce):
-            return _fill_bound_page(backend, handle, meta, page.origin, effective_task_id, nonce, with_identifier)
+        with _stamps_removed(task_id, nonce):
+            return _fill_bound_page(backend, handle, meta, page.origin, task_id, nonce, with_identifier)
 
 
 def _identifier_fill(classified: list, raw_controls: list[dict[str, Any]],
@@ -855,7 +896,10 @@ def _trusted_typing_fill(supervisor: Any, task_id: str, type_fills: list[dict[st
             return _abort("human_has_control", taken["error"])
         # Typed only into the document the focus check ran on (``document``): a redirect that
         # committed since is refused by the supervisor.
-        typed = supervisor.insert_text(text, session_id=pinned, document=document)
+        from tools.browser_session_fence import run_vault_io
+        typed = run_vault_io(supervisor, task_id, lambda: supervisor.insert_text(text, session_id=pinned, document=document))
+        if "ok" not in typed and typed.get("code"):
+            return _abort(typed["code"], typed.get("error", ""))
         if typed.get("ok"):
             return None
         error_type, message = _INSERT_REFUSALS.get(typed.get("code"), ("fill_unverified", ""))
@@ -1260,11 +1304,6 @@ BROWSER_VAULT_SCHEMA = {
         "required": ["action"],
     },
 }
-
-
-def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
-    from tools.browser_session import session_for_task, shares_bot_desktop_browser
-    return shares_bot_desktop_browser(session_for_task(task_id))
 
 
 def _fenced_page_op(task_id: Optional[str], fn) -> str:

@@ -447,8 +447,28 @@ def _run_post_turn_followups(
     notifications.  Each nested submit re-checks ``running`` under the lock."""
     steer = result.get("pending_steer") if isinstance(result, dict) else None
     if isinstance(steer, str) and steer.strip():
+        corrections = session.pop("_chat_followup_corrections", [])
+        if corrections:
+            from gateway.chat_execution_recovery import ChatExecutionStore
+            from hermes_constants import get_process_hermes_home
+            current_key = str(session.get("session_key") or sid)
+            store = ChatExecutionStore(session.get("profile_home") or get_process_hermes_home())
+            # Keep the original claims until native admission. A rotation also
+            # aliases them to the current key before the queued turn is visible.
+            if not all(store.submit_claims_active(current_key, (submit_id,), source_key=source_key)
+                       for source_key, submit_id in corrections):
+                return
         with session["history_lock"]:
-            _enqueue_prompt(session, steer, session.get("transport"))
+            if session.get("_turn_cancel_requested"):
+                for source_key, submit_id in corrections:
+                    store.abandon_submit(source_key, submit_id)
+                    session.get("_chat_pending_submit_ids", set()).discard(submit_id)
+                return
+            envelope = _enqueue_prompt(session, steer, session.get("transport"))
+            if envelope is not None and corrections:
+                envelope.setdefault("_chat_submit_ids", []).extend(
+                    submit_id for _, submit_id in corrections)
+                envelope["_chat_submit_key"] = current_key
     if _drain_queued_prompt(rid, sid, session):
         return
     if goal_followup:
@@ -509,6 +529,7 @@ class _TurnRun:
     prompt_text: str = ""
     marker_key: str = ""
     receipt_attempted: bool = False
+    chat_execution_generation: int | None = None
 
 
 def _adopt_out_of_band_turns(session: dict) -> None:
@@ -673,7 +694,8 @@ def _sync_agent_daybreak(agent) -> None:
                           and (_load_cfg().get("agent") or {}).get("daybreak") is True)
 
 
-def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str]):
+def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str],
+                        admit_worker=None, isolated_browser_owner=None):
     """Bind scopes, sync the agent, snapshot history, build the run message; returns
     ``(prompt, run_message, cols, streamer)`` or None when @-expansion was refused.
     Scopes fill field by field so a failure midway still leaves every bound token for the
@@ -684,7 +706,13 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     from tools.approval_context import set_current_session_key
     scopes = st.scopes
     scopes.approval = set_current_session_key(session["session_key"])
-    scopes.session_tokens = _set_session_context(session["session_key"], ui_session_id=sid)
+    scopes.session_tokens = _set_session_context(session["session_key"], ui_session_id=sid,
+                                                 isolated_browser_owner=isolated_browser_owner)
+    from gateway.session_context import set_turn_user_message
+    set_turn_user_message("")
+    if st.chat_execution_generation is not None:
+        from gateway.session_context import set_session_run_generation
+        set_session_run_generation(st.chat_execution_generation)
     # Profile turn: that profile's home + secrets + terminal policy. Launch-profile turn: unscoped in a
     # single-profile process; once multiplexing is active (#68559 / #107422 residual) its OWN scope,
     # built from the env frozen at activation — get_secret() fails closed then, so an unscoped default
@@ -708,6 +736,8 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     _adopt_out_of_band_turns(session)
     st.agent = agent = session["agent"]
     _sync_agent_daybreak(agent)
+    if admit_worker is not None:
+        admit_worker(agent)
     # Snapshot after the model sync: a deferred switch's history mutation belongs to this turn.
     with session["history_lock"]:
         st.history = list(session["history"])
@@ -1146,7 +1176,29 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    turn_author: dict | None = None, report_ownership_refusal: bool = True) -> bool:
+    turn_author: dict | None = None, approval_origin=None, approval_reservations=None,
+    authenticated_isolated_browser_owner=None,
+    approval_completion_events=None, chat_submit_ids: tuple[str, ...] = (),
+    chat_submit_key: str | None = None, report_ownership_refusal: bool = True) -> bool:
+    from gateway.chat_execution_recovery import ChatExecutionStore
+    from hermes_constants import get_process_hermes_home
+    import uuid
+    chat_submit_ids = tuple(chat_submit_ids)
+    with session["history_lock"]:
+        correction_lock = session.setdefault("_chat_correction_lock", threading.RLock())
+        session["_chat_correction_closed"] = False
+    submit_key = str(session.get("session_key") or sid)
+    submit_store = ChatExecutionStore(session.get("profile_home") or get_process_hermes_home())
+    if chat_submit_ids:
+        if not submit_store.submit_claims_active(
+                submit_key, chat_submit_ids, source_key=chat_submit_key):
+            return False
+    else:
+        submit_id = uuid.uuid4().hex
+        if not submit_store.begin_submit(submit_key, submit_id):
+            return False
+        chat_submit_ids = (submit_id,)
+        session.setdefault("_chat_pending_submit_ids", set()).add(submit_id)
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -1159,6 +1211,8 @@ def _run_prompt_submit(
         sid, session, text, image_paths, queued_prompt_generation, display_kind, display_metadata,
         report_ownership_refusal=report_ownership_refusal)
     if admitted is None:
+        from tui_gateway.session_auto_continue import _abandon_unadmitted_chat_submits
+        _abandon_unadmitted_chat_submits(session, chat_submit_key or submit_key, chat_submit_ids)
         return False
     images, agent = admitted
     from gateway.warning_notifications import diagnostic_turn_muted
@@ -1189,6 +1243,40 @@ def _run_prompt_submit(
     if not muted:
         _emit("message.start", sid)
 
+    def approval_scope():
+        from contextlib import nullcontext
+        if approval_reservations is not None:
+            from tools.approval_context import completion_approval_task
+            return completion_approval_task(approval_reservations, 'completion:' + str(rid))
+        if approval_origin is None:
+            return nullcontext()
+        requester, admission_id, inflight, request_text, queued_generation = approval_origin
+        claimed_inflight = session.get("inflight_turn") if inflight is None else inflight
+        from hermes_constants import get_process_hermes_home
+        from tools.approval_context import approval_task_context
+        from weakref import WeakSet
+        owned = []
+
+        def current():
+            with session["history_lock"]:
+                return (not session.get("_closing") and not session.get("_finalized")
+                        and not session.get("_turn_cancel_requested")
+                        and _sessions.get(sid) is session
+                        and (queued_generation is None or int(session.get("_queued_prompt_generation", 0)) == queued_generation)
+                        and (not owned[0].parent_open() or
+                             (session.get("running") and
+                              session.get("inflight_turn") is claimed_inflight)))
+
+        def own(lease):
+            owned.append(lease)
+            with session["history_lock"]:
+                session.setdefault("_approval_task_leases", WeakSet()).add(lease)
+
+        return approval_task_context(
+            request_text, identity=requester, profile=str(session.get("profile_home") or get_process_hermes_home()),
+            session=str(session.get("session_key") or sid), task_id=admission_id,
+            run_id=admission_id, is_current=current, owner=own)
+
     def run_body():
         # RPC-dispatcher ContextVars do not follow onto this thread: rebind the transport
         # before any tool can commission a child (delegate_task captures it as authority).
@@ -1200,8 +1288,39 @@ def _run_prompt_submit(
         st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
             notification_category=(display_metadata or {}).get("notification_category"))
         goal_followup = None
+        execution_store = None
+        execution_scope = None
+        execution_started = False
+        generation = None
         try:
-            prepared = _prepare_turn_input(sid, session, st, text, images)
+            from gateway.chat_execution_recovery import ChatExecutionStore
+            from agent.chat_execution_context import bind_chat_execution
+            from hermes_constants import get_process_hermes_home
+            home = str(session.get("profile_home") or get_process_hermes_home())
+            key = str(session.get("session_key") or sid)
+            execution_store = ChatExecutionStore(home)
+
+            def admit_worker(agent):
+                nonlocal generation, execution_started, execution_scope
+                from gateway.session_context import set_session_run_generation
+                actual_session_id = str(getattr(agent, "session_id", "") or "")
+                generation = execution_store.start_local_worker(key, actual_session_id, chat_submit_ids)
+                if generation is None:
+                    raise RuntimeError("Durable Desktop/TUI worker admission refused")
+                session.get("_chat_pending_submit_ids", set()).difference_update(chat_submit_ids)
+                execution_started = True
+                st.chat_execution_generation = generation
+                execution_scope = bind_chat_execution(home, key, generation)
+                execution_scope.__enter__()
+                # The capability sync may have rebuilt the agent after the first
+                # session bind. Rebind every identity field from the selected agent.
+                st.scopes.session_tokens = _set_session_context(
+                    key, ui_session_id=sid, isolated_browser_owner=authenticated_isolated_browser_owner)
+                set_session_run_generation(generation)
+
+            prepared = _prepare_turn_input(
+                sid, session, st, text, images, admit_worker=admit_worker,
+                isolated_browser_owner=authenticated_isolated_browser_owner)
             if prepared is None:
                 if st.terminal_callback is not None and not st.receipt_attempted:
                     st.receipt_attempted = True
@@ -1210,6 +1329,15 @@ def _run_prompt_submit(
                     st.receipt_committed = True
                 return
             prompt, run_message, cols, streamer = prepared
+            from gateway.session_context import set_turn_user_message
+            owner = session.get("transport_owner")
+            requester = approval_origin[0] if approval_origin else ""
+            # A local stdio submit may address an attached Desktop session, but its
+            # instruction is not the authenticated Desktop owner's instruction.
+            owner_matches = (isinstance(owner, tuple) and len(owner) == 2
+                             and requester == f"{owner[0]}:{owner[1]}")
+            set_turn_user_message(text if ((owner_matches or authenticated_isolated_browser_owner is not None)
+                                           and isinstance(text, str)) else "")
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
                 display_metadata, turn_author, text)
@@ -1230,6 +1358,29 @@ def _run_prompt_submit(
         except Exception as e:
             _recover_turn_exception(sid, session, st, e)
         finally:
+            if execution_scope is not None:
+                execution_scope.__exit__(None, None, None)
+            if execution_started:
+                try:
+                    if not execution_store.worker_finished(key, generation):
+                        logger.error("Durable Desktop/TUI worker completion refused for %s/%s", key, generation)
+                except Exception:
+                    logger.exception("Durable Desktop/TUI worker completion uncertain for %s/%s", key, generation)
+            elif st.terminal_callback is None or st.receipt_committed:
+                # A direct prompt has no hosted receipt; a hosted delivery must
+                # commit its failed terminal receipt before its claim settles.
+                from tui_gateway.session_auto_continue import _abandon_unadmitted_chat_submits
+                _abandon_unadmitted_chat_submits(session, chat_submit_key or submit_key, chat_submit_ids)
+            with correction_lock:
+                session["_chat_correction_closed"] = True
+                corrections = session.pop("_chat_accepted_corrections", [])
+                pending_steer = (st.result.get("pending_steer") if isinstance(st.result, dict) else None)
+                if corrections and pending_steer:
+                    session["_chat_followup_corrections"] = corrections
+                elif corrections and execution_started and not st.error_retained:
+                    for source_key, submit_id in corrections:
+                        submit_store.abandon_submit(source_key, submit_id)
+                        session.get("_chat_pending_submit_ids", set()).discard(submit_id)
             _release_turn_scopes(sid, session, st)
             try:  # a raising settle step must not skip the trim / HERMES_HOME reset
                 _current_runtime_session_record.reset(runtime_session_token)
@@ -1272,13 +1423,22 @@ def _run_prompt_submit(
         return st.result, goal_followup
     def run():
         from agent.notification_presentation import notification_turn
+        from tools.approval_context import release_background_approval_task
         # _prepare_turn_input owns profile binding for the worker. The context
         # here only gates presentation; do not introduce a second runtime scope.
         from agent.notification_presentation import notification_policy_snapshot
-        with notification_policy_snapshot(agent, "tui", notification_config), notification_turn(agent, muted=muted, session_id=sid):
-            followup = run_body()
-        if followup is not None:
-            _run_post_turn_followups(rid, sid, session, *followup)
+        try:
+            with notification_policy_snapshot(agent, "tui", notification_config), notification_turn(agent, muted=muted, session_id=sid), approval_scope():
+                followup = run_body()
+            if followup is not None:
+                _run_post_turn_followups(rid, sid, session, *followup)
+        finally:
+            if approval_completion_events is not None:
+                from gateway.session_approval_completion import release_completion_event_reservation
+                for event in approval_completion_events:
+                    release_completion_event_reservation(event)
+            for reservation in approval_reservations or ():
+                release_background_approval_task(reservation)
     # The handle is resolved BEFORE _sessions_lock: a profile session opens its own SessionDB through the
     # state registry, and _sessions_lock gates every create/close/prompt on this backend.
     with _routing_provenance_db(session) as routing_db, _persistence_for(routing_db) as routing, _sessions_lock:
@@ -1291,6 +1451,9 @@ def _run_prompt_submit(
                 _reopen_routed_session_row(routing, sid, session)
             can_start = _start_session_work(run, name=f"prompt-turn-{sid}", session=session) is not None
     if not can_start:
+        if terminal_callback is None:
+            from tui_gateway.session_auto_continue import _abandon_unadmitted_chat_submits
+            _abandon_unadmitted_chat_submits(session, chat_submit_key or submit_key, chat_submit_ids)
         with session["history_lock"]:
             session["running"] = False
             if session.get(SESSION_KEY) is segments:

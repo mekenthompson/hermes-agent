@@ -55,15 +55,15 @@ def check_api_turn(authority, ref, payload):
         raise AuthorityRefusal('runtime_draining')
     if 'api_turn_v1' in payload:
         data = payload['api_turn_v1']
-        # 'browser_control' is accepted and ignored: admissions persisted while the removed
-        # browser-extension control existed may carry it and must still recover.
+        # Old browser-extension admissions may still be queued; the field has no execution effect.
         if (set(data) - {'history', 'settings', 'turn_author', 'media', 'run_owner_scope', 'browser_control',
-                         'relay_metadata', 'resume_unanswered'}
+                         'transfer_auth', 'relay_metadata', 'resume_unanswered'}
                 or data.get('resume_unanswered', True) is not True
                 or not {'history', 'settings'} <= set(data)
                 or not isinstance(data.get('relay_metadata', {}), dict)
                 or (data['history'] is not None and not isinstance(data['history'], list))
-                or ('run_owner_scope' in data and not _valid_owner_scope(data['run_owner_scope']))):
+                or ('run_owner_scope' in data and not _valid_owner_scope(data['run_owner_scope']))
+                or ('transfer_auth' in data and not _valid_transfer_auth(data['transfer_auth']))):
             raise AuthorityRefusal('invalid_params')
         if set(data['settings']) - set(_SETTING_KEYS):
             raise AuthorityRefusal('invalid_params')
@@ -76,13 +76,54 @@ def _valid_owner_scope(value):
     return isinstance(value, str) and _OWNER_SCOPE_RE.fullmatch(value) is not None
 
 
+def _valid_transfer_auth(value):
+    return (isinstance(value, dict) and set(value) == {'principal', 'transport_family'}
+            and isinstance(value['principal'], str)
+            and re.fullmatch(r'principal:[^:\s]+:[0-9a-f]{32}', value['principal']) is not None
+            and value['transport_family'] in ('local-api', 'remote-api'))
+
+
+def _rebind_transfer_auth(adapter, bound, profile):
+    """Recheck a durable bearer identity against this session's profile and current key."""
+    if not _valid_transfer_auth(bound):
+        return None
+    from gateway.platforms.api_server import _api_request_profile
+    token = _api_request_profile.set(None if profile == 'default' else profile)
+    try:
+        if not adapter._expected_api_key():
+            return None
+        expected = adapter._derive_api_transfer_principal(profile)
+    finally:
+        _api_request_profile.reset(token)
+    return bound if hmac.compare_digest(bound['principal'], expected) else None
+
+
 def api_session_vars():
-    """Session-context fields an executing API admission binds beyond the shared source:
-    #98619 history-delivery provenance. ``{}`` when no API admission is executing."""
+    """Return history-delivery provenance for an executing API admission."""
     current = api_execution.get()
     if current is None:
         return {}
     return {'session_history_delivery': current['settings'].get('session_history_delivery') or ''}
+
+
+def api_transfer_context():
+    """Return only a still-valid bearer admission's exact user instruction."""
+    current = api_execution.get()
+    if current is None or not isinstance(current.get('content'), str):
+        return '', '', ''
+    bound = current.get('transfer_auth') or {}
+    return bound.get('principal', ''), bound.get('transport_family', ''), current['content']
+
+
+def bind_api_transfer_session(tokens, context):
+    """Pair the selected native API session with its revalidated admission."""
+    if context.source.platform.value == 'api_server' and context.session_id:
+        principal, family, instruction = api_transfer_context()
+        if principal and family and instruction:
+            from gateway.session_context import set_api_transfer_identity, set_turn_user_message
+            set_turn_user_message(instruction)
+            set_api_transfer_identity(principal, family, context.session_id)
+    return tokens
 
 
 def check_api_settings(adapter, settings):
@@ -174,6 +215,11 @@ def admit_api_steps(adapter, **kwargs):
         # This opaque namespace is persisted in the same row/transaction as
         # admission. It is never a bearer credential or execution input.
         payload['api_turn_v1']['run_owner_scope'] = run_owner_scope
+    from gateway.platforms.api_server_transfer import current as current_transfer_auth
+    transfer_principal, transfer_family = current_transfer_auth()
+    transfer_auth = {'principal': transfer_principal, 'transport_family': transfer_family}
+    if _valid_transfer_auth(transfer_auth):
+        payload['api_turn_v1']['transfer_auth'] = transfer_auth
     # Refuse a foreign-surface target before committing any media for it (a refused
     # admission otherwise retains its image bytes under native-inputs/ forever).
     existing = store.sessions.get(sid)
@@ -426,6 +472,9 @@ def prepare_api_execution(authority, ref, payload):
     return {'adapter': adapter, 'settings': settings, 'history': data['history'] if data else None,
             'content': content, 'turn_author': data.get('turn_author') if data else None,
             'relay_metadata': data.get('relay_metadata') if data else None,
+            'transfer_auth': _rebind_transfer_auth(
+                adapter, data.get('transfer_auth'),
+                authority.sessions[ref.session_id].source.profile or 'default') if data else None,
             'resume_unanswered': bool(data and data.get('resume_unanswered'))}
 
 

@@ -25,8 +25,10 @@ async def test_a_drain_cancelled_during_the_review_cancel_clears_the_executing_s
     ref = SessionRef('p', 'review-cancel-stamp')
     live = LiveSession(SimpleNamespace(chat_id=ref.session_id), 'route')
     run = prepare_background_review_run(live.review)  # a review still in its request phase
-    owner = SimpleNamespace(executing={ref.session_id: 7})  # as _stamp_claim left it
-    task = asyncio.ensure_future(SessionAuthority._execute_claimed(owner, ref, live, {'admission_id': 'a'}))
+    # As _stamp_claim left it; house Stop fencing also reads delivered_stops and the row generation.
+    owner = SimpleNamespace(executing={ref.session_id: 7}, delivered_stops={})
+    row = {'admission_id': 'a', 'generation': 1}
+    task = asyncio.ensure_future(SessionAuthority._execute_claimed(owner, ref, live, row))
     try:
         # The canceller has fenced the review and now waits (off-loop) for its acknowledgement.
         assert await asyncio.to_thread(run.cancel_requested.wait, 10), 'the turn never cancelled the review'

@@ -231,20 +231,19 @@ def verify_jwt(
     ``leeway`` is seconds of clock-skew tolerance on the time claims (default
     60 — the previous zero-leeway made any issuer-ahead skew fail login, #47815).
 
-    Only an unreachable (or malformed) JWKS is ``ProviderError`` (503). Every other failure (not a JWT,
-    unknown kid, expired, not yet valid, bad signature, wrong aud/iss, missing claim) is
-    ``InvalidCodeError``: the token is not ours (verify_session -> None -> 401 / next
-    provider). Folding "not ours" into 503 produced #94558 (opaque bearers) and #47815
-    (clock skew), and answered a Portal token minted for another client with "unreachable".
-    A wrong aud/iss is logged with the token's and the configured values, because it is also
-    what config drift (wrong client_id / portal URL) looks like.
+    Unreachable or malformed JWKS → ``ProviderError`` (503). A bearer that is not
+    verifiable by this provider (opaque peer key, foreign kid) → ``InvalidCodeError``
+    (None / next provider). Expiry and not-yet-valid claims are caller credential
+    failures, not evidence that the provider is unavailable.
     """
     import jwt  # lazy — keeps startup fast for the ungated path
 
     try:
         signing_key = jwks_client.get_signing_key_from_jwt(token)
     except Exception as exc:
-        raise classify_jwks_lookup_error(exc) from exc
+        # Pass the client and token so an unknown kid on a usable key set is a
+        # credential failure, not an IDP outage.
+        raise classify_jwks_lookup_error(exc, jwks_client=jwks_client, token=token) from exc
     try:
         return jwt.decode(
             token, signing_key.key, algorithms=algorithms, audience=audience, issuer=issuer, leeway=leeway,

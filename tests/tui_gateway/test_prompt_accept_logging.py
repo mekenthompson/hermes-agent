@@ -83,12 +83,54 @@ def turn_env(turn_stubs, monkeypatch):
 def _records(caplog, needle):
     return [r for r in caplog.records if needle in r.getMessage()]
 
+
+@pytest.mark.parametrize("correction_after_stop", [False, True])
+def test_stop_settles_accepted_correction_claim_before_followup_dispatch(tmp_path, correction_after_stop):
+    from gateway.chat_execution_recovery import ChatExecutionStore
+    from tui_gateway.prompt_turn import _run_post_turn_followups
+    from tui_gateway.session_auto_continue import _abandon_queued_chat_submits
+
+    store = ChatExecutionStore(tmp_path)
+    assert store.start_local_worker("gw-session-key", "actual-turn") == 1
+    assert store.worker_finished("gw-session-key", 1)
+    assert store.begin_submit("gw-session-key", "accepted-steer")
+    session = _session(profile_home=tmp_path, _turn_cancel_requested=True,
+                       _chat_pending_submit_ids={"accepted-steer"})
+    if not correction_after_stop:
+        session["_chat_followup_corrections"] = [("gw-session-key", "accepted-steer")]
+    with session["history_lock"]:
+        _abandon_queued_chat_submits(session)
+    if correction_after_stop:
+        session["_chat_followup_corrections"] = [("gw-session-key", "accepted-steer")]
+    _run_post_turn_followups("rid", "ui-sid", session, {"pending_steer": "correction"}, None)
+    assert not store.submit_claims_active("gw-session-key", ("accepted-steer",))
+    assert store.retire_for_handoff("gw-session-key", 1, "handoff")["status"] == "retired"
+
+
+def test_pre_worker_admission_refusal_settles_synthesized_submit_claim(turn_stubs, monkeypatch, tmp_path):
+    from gateway.chat_execution_recovery import ChatExecutionStore
+
+    store = ChatExecutionStore(tmp_path)
+    assert store.start_local_worker("gw-session-key", "prior-turn") == 1
+    assert store.worker_finished("gw-session-key", 1)
+    session = _session(running=True, profile_home=tmp_path)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: True)
+    monkeypatch.setattr(server, "_admit_prompt_turn", lambda *args, **kwargs: None)
+
+    assert server._run_prompt_submit("rid", "sid", session, "queued text") is False
+    assert store.retire_for_handoff("gw-session-key", 1, "handoff")["status"] == "retired"
+
 SECRETISH_PROMPT = "please rotate QDRANT_API_KEY=hunter2-super-secret now"
 
 def test_accepted_and_finished_records_on_success(turn_env, caplog):
+    from tools.registry import _current_tool_invocation_context
+    user_messages = []
+    def run_conversation(*_args, **_kwargs):
+        user_messages.append(_current_tool_invocation_context().user_message)
+        return {"final_response": "done"}
     agent = types.SimpleNamespace(
         session_id="agent-sid-1",
-        run_conversation=lambda *a, **k: {"final_response": "done"},
+        run_conversation=run_conversation,
         clear_interrupt=lambda: None,
     )
     session = _session(agent=agent, running=True)
@@ -108,6 +150,116 @@ def test_accepted_and_finished_records_on_success(turn_env, caplog):
 
     fin = finished[0].getMessage()
     assert "hunter2" not in fin
+    assert user_messages == [""]  # an unstamped or synthetic turn cannot authorize a transfer
+
+
+def test_desktop_turn_binds_real_journal_and_authenticated_user_instruction(turn_env, monkeypatch, tmp_path):
+    import os
+    from agent.chat_execution_context import observe_tool_before_execution
+    from gateway.chat_execution_recovery import ChatExecutionStore
+    from tools.registry import _current_tool_invocation_context
+
+    seen = []
+    def run_conversation(*_args, **_kwargs):
+        context = _current_tool_invocation_context()
+        seen.append((context.session_key, context.session_id, context.run_generation,
+                     context.user_message, observe_tool_before_execution(),
+                     ChatExecutionStore(tmp_path).worker_process_matches(
+                         context.session_key, context.run_generation, context.session_id, os.getpid())))
+        return {"final_response": "done"}
+
+    agent = types.SimpleNamespace(session_id="actual-desktop-session", run_conversation=run_conversation,
+                                  clear_interrupt=lambda: None)
+    peer = types.SimpleNamespace(auth_identity={"provider": "basic", "user_id": "alice"})
+    session = _session(agent=agent, running=True, profile_home=tmp_path, source="desktop",
+                       transport_owner=("basic", "alice"), transport=peer)
+    monkeypatch.setitem(server._sessions, "ui-sid", session)
+    text = "Transfer ABC-1 to this chat"
+    server._run_prompt_submit("rid", "ui-sid", session, text,
+                              approval_origin=("basic:alice", "turn-id", None, text, None))
+    assert seen == [("gw-session-key", "actual-desktop-session", 1, text, True, True)]
+    receipt = ChatExecutionStore(tmp_path).retire_for_handoff("gw-session-key", 1, "transfer-id")
+    assert receipt["status"] == "retired"
+    assert receipt["effects"] == "unknown"
+
+
+def test_isolated_desktop_child_binds_only_transfer_identity_from_validated_frame(turn_env, monkeypatch, tmp_path):
+    from tools.registry import _current_tool_invocation_context
+
+    seen = []
+    def run_conversation(*_args, **_kwargs):
+        ctx = _current_tool_invocation_context()
+        seen.append((ctx.browser_control_provider, ctx.browser_control_subject, ctx.user_message))
+        return {"final_response": "done"}
+
+    agent = types.SimpleNamespace(session_id="actual-desktop-session", run_conversation=run_conversation,
+                                  clear_interrupt=lambda: None)
+    session = _session(agent=agent, running=True, profile_home=tmp_path, source="desktop",
+                       transport_owner=None, transport=types.SimpleNamespace())
+    monkeypatch.setitem(server._sessions, "ui-sid", session)
+    text = "Transfer ABC-1 to this chat"
+    server._run_prompt_submit("rid", "ui-sid", session, text,
+                              authenticated_isolated_browser_owner=("basic", "alice"))
+    assert seen == [("basic", "alice", text)]
+
+
+def test_stdio_submit_cannot_borrow_attached_desktop_transfer_identity(turn_env, monkeypatch, tmp_path):
+    from tools.registry import _current_tool_invocation_context
+
+    seen = []
+    def run_conversation(*_args, **_kwargs):
+        ctx = _current_tool_invocation_context()
+        seen.append((ctx.browser_control_provider, ctx.browser_control_subject, ctx.user_message))
+        return {"final_response": "done"}
+
+    agent = types.SimpleNamespace(session_id="actual-desktop-session", run_conversation=run_conversation,
+                                  clear_interrupt=lambda: None)
+    peer = types.SimpleNamespace(auth_identity={"provider": "basic", "user_id": "alice"})
+    session = _session(agent=agent, running=True, profile_home=tmp_path, source="desktop",
+                       transport_owner=("basic", "alice"), transport=peer)
+    monkeypatch.setitem(server._sessions, "ui-sid", session)
+    text = "Transfer ABC-1 to this chat"
+    origin = server._approval_origin_for_direct_submit(
+        session, text, text, internal_hosted_submit=False, raw_author=None,
+        display_kind=None, turn_isolation=False, transport=server._stdio_transport)
+    assert origin is not None and origin[0] == "local:stdio"
+    server._run_prompt_submit("rid", "ui-sid", session, text, approval_origin=origin)
+    assert seen == [("basic", "alice", "")]
+
+
+def test_desktop_worker_tracks_agent_rebuilt_during_turn_preparation(turn_env, monkeypatch, tmp_path):
+    from agent.chat_execution_context import observe_tool_before_execution
+    from gateway.chat_execution_recovery import ChatExecutionStore
+    from tools.registry import _current_tool_invocation_context
+
+    seen = []
+    def run_new(*_args, **_kwargs):
+        ctx = _current_tool_invocation_context()
+        seen.append((ctx.session_id, ctx.run_generation, observe_tool_before_execution()))
+        return {"final_response": "done"}
+
+    old = types.SimpleNamespace(session_id="old-rotated-tip",
+                                run_conversation=lambda *_a, **_k: (_ for _ in ()).throw(
+                                    AssertionError("old agent must not execute")),
+                                clear_interrupt=lambda: None, _session_title_hint="Bot Chat")
+    new = types.SimpleNamespace(session_id="new-live-tip", run_conversation=run_new,
+                                clear_interrupt=lambda: None)
+    session = _session(agent=old, running=True, profile_home=tmp_path, source="desktop",
+                       bot_caps_seen="previous-capabilities")
+    monkeypatch.setitem(server._sessions, "ui-sid", session)
+    from tools import bot_mode_probe
+    monkeypatch.setattr(bot_mode_probe, "capability_fingerprint", lambda _home: "new-capabilities")
+    def rebuild(_sid, record, **_kwargs):
+        record["agent"] = new
+        return new
+    monkeypatch.setattr(server, "_rebuild_session_agent", rebuild)
+
+    server._run_prompt_submit("rid", "ui-sid", session, "continue")
+
+    assert seen == [("new-live-tip", 1, True)]
+    receipt = ChatExecutionStore(tmp_path).retire_for_handoff("gw-session-key", 1, "handoff")
+    assert receipt["status"] == "retired"
+    assert receipt["session_id"] == "new-live-tip"
 
 
 @pytest.mark.parametrize("settle_info_raises", [False, True])

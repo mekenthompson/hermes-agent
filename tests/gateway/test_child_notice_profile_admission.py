@@ -5,6 +5,7 @@ owning profile's settings, a handoff to the parent, and the stale child pin.
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,6 +16,7 @@ from gateway.run import GatewayRunner
 from persistence_assembly import store_location
 from tests.fixtures.storage_read import session_row
 from tests.fixtures.storage_seed import seed_session
+from tests.waiting import async_wait_until
 
 OWNERS = ["child", "handoff", "foreground", "live_handoff"]
 
@@ -40,6 +42,16 @@ def _build_rig(monkeypatch, tmp_path, request, surface_a, mode):
     request.addfinalizer(runner.close_all_session_db_handles)
     request.addfinalizer(runner.session_store.close_all_db_handles)
     runner._completion_notification_batch_window = 0
+    # Transport tests still use a real, birth-identified process for durable handoff.
+    import subprocess
+    import sys
+    child_process = subprocess.Popen([sys.executable, '-c', 'import threading; threading.Event().wait(120)'])
+    birth_ticks = registry._safe_host_start_time(child_process.pid)
+    def release_child():
+        if child_process.poll() is None:
+            child_process.terminate()
+            child_process.wait(timeout=10)
+    request.addfinalizer(release_child)
     admitted = []
     homes = {}
     for name, surface in (("a", surface_a), ("b", not surface_a)):
@@ -71,14 +83,16 @@ def _build_rig(monkeypatch, tmp_path, request, surface_a, mode):
     runner.adapters[Platform.TELEGRAM] = transport
     runner._profile_adapters = {name: {Platform.TELEGRAM: transport} for name in homes}
     runner._profile_configs = {name: GatewayConfig() for name in homes}
-    return SimpleNamespace(runner=runner, registry=registry, adapter=adapter, admitted=admitted, homes=homes)
+    return SimpleNamespace(runner=runner, registry=registry, adapter=adapter, admitted=admitted, homes=homes, pid=child_process.pid, birth=birth_ticks)
 
 
 def _transfer_to_parent(rig, leg):
-    assert rig.registry.transfer_ownership(
-        leg.proc.id, from_owner="sa-child", to_owner="parent-owner", to_task_id="parent-owner",
-        to_session_key=leg.entry.session_key, note="finish build",
-    ) is leg.proc
+    from gateway.run import _profile_runtime_scope
+    with _profile_runtime_scope(rig.homes[leg.name]):
+        assert rig.registry.transfer_ownership(
+            leg.proc.id, from_owner="sa-child", to_owner="parent-owner", to_task_id="parent-owner",
+            to_session_key=leg.entry.session_key, to_parent_session_id=leg.entry.session_id, note="finish build",
+        ) is leg.proc
 
 
 async def _for_each_leg(rig, owner, surface_a, path, consume):
@@ -106,6 +120,7 @@ async def _for_each_leg(rig, owner, surface_a, path, consume):
             owner_task_id="parent-owner" if owner == "foreground" else "sa-child",
             task_id="container-parent", session_key=entry.session_key,
             parent_session_id=child, notify_on_complete=True, output_buffer="READY\n", started_at=1.0,
+            pid=rig.pid, host_start_time=rig.birth,
         )
         registry._running[proc.id] = proc
         watcher = {
@@ -137,7 +152,7 @@ async def _for_each_leg(rig, owner, surface_a, path, consume):
                 assert event.metadata["gateway_session_id"] == entry.session_id
         completion = runner._build_process_completion_event(watcher, proc, proc.id)
         assert completion["owner_task_id"] == proc.owner_task_id
-        assert completion["parent_session_id"] == child
+        assert completion["parent_session_id"] == (entry.session_id if handed_off else child)
         assert proc.notify_on_complete is True
         if not proc.exited:
             proc.mark_exited(2)
@@ -205,6 +220,49 @@ async def test_process_watcher_follows_the_owning_profile(
         assert rig.adapter.send.await_count == expected_sends
 
     await _for_each_leg(rig, owner, surface_a, path, consume)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_completion_waits_for_profile_policy_before_flushing(monkeypatch, tmp_path, request,
+                                                                              private_db_probe_cleanup):
+    """A slow sibling policy check still belongs to the batch already awaiting delivery."""
+    rig = _build_rig(monkeypatch, tmp_path, request, True, "all")
+    runner = rig.runner
+    runner._completion_notification_batch_window = 0
+    original_scope = runner._completion_event_scope
+
+    async def consume(leg):
+        _transfer_to_parent(rig, leg)
+        leg.proc.output_buffer = "PROCESS_RESULT"
+        event = runner._build_process_completion_event(leg.watcher, leg.proc, leg.proc.id)
+        companion = {**event, "session_id": f"companion-{leg.name}-{leg.index}",
+                     "owner_task_id": "parent-owner", "output": "COMPANION_RESULT"}
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        @asynccontextmanager
+        async def delayed_scope(evt):
+            if evt is companion:
+                entered.set()
+                await release.wait()
+            async with original_scope(evt):
+                yield
+
+        runner._completion_event_scope = delayed_scope
+        first = asyncio.create_task(runner._enqueue_process_completion_notification("PROCESS_RESULT", event))
+        second = asyncio.create_task(runner._enqueue_process_completion_notification("COMPANION_RESULT", companion))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            # Wait until the zero-width flush reaches the pending preflight, then let it finish.
+            await async_wait_until(lambda: bool(runner._completion_batch_preflight_ready), timeout=2,
+                                   what="completion flush to await the sibling's profile check")
+        finally:
+            release.set()
+        assert await asyncio.gather(first, second) == [True, True]
+        assert len(rig.admitted) == 1
+        assert "PROCESS_RESULT" in rig.admitted[0][0].text
+        assert "COMPANION_RESULT" in rig.admitted[0][0].text
+
+    await _for_each_leg(rig, "live_handoff", True, "batch_child_first", consume)
 
 
 @pytest.mark.asyncio

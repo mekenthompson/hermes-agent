@@ -13,6 +13,9 @@ from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tu
 # /fast stores "priority" or None (explicit normal), so key PRESENCE decides, not truthiness.
 _UNSET_TIER = object()
 SERVICE_TIER_UNSET = _UNSET_TIER  # public alias
+AGENT_PENDING_SENTINEL = object()
+_INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
+_INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
 
 
 @dataclass
@@ -29,6 +32,7 @@ class TurnState:
     follow_up_event: Any = None
     started_ts: float = 0.0  # 0.0 = not running
     lease: Any = None  # cross-process active-session slot lease
+    worker_done: Any = None  # physical worker Event; an asyncio wrapper is not completion proof
     busy_ack_ts: float = 0.0  # debounce; 0.0 = never acked
     # Ends the turn while it is still in pre-agent setup (``run_turn_setup_guard``); None otherwise.
     setup_stop: Optional[Callable[[], bool]] = None
@@ -58,7 +62,7 @@ class TurnState:
 
     def clear(self) -> None:
         """Reset the per-turn slot.  The caller pops ``lease`` first to release it."""
-        self.agent = self.lease = self.event = self.ctx = self.follow_up_event = self.setup_stop = None
+        self.agent = self.lease = self.event = self.ctx = self.worker_done = self.follow_up_event = self.setup_stop = None
         self.started_ts = self.busy_ack_ts = 0.0
 
 
@@ -94,6 +98,8 @@ class PersistentState:
     # Legacy runner-level pending text (flushed on shutdown); not the adapter-level one.
     pending_command_text: Optional[str] = None
     run_generation: int = 0  # monotonic; NEVER reset (stale-run detection depends on it)
+    # Explicit admission identity survives Stop's turn-slot cleanup until context capture.
+    chat_execution_reservation: Optional[tuple[str, str, int]] = None
     # Consecutive hygiene compression failures (the in-agent ladder is unreachable: hygiene builds
     # a FRESH AIAgent per run).  Reset on success; process-local, mirrored to the DB by run.py.
     # Monotonic run-generation counter (#28686). NEVER reset: clearing it would break stale-run detection.

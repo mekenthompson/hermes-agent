@@ -14,8 +14,12 @@ from tests.waiting import async_wait_until
 
 
 @pytest.mark.platforms("linux")
-def test_stop_before_hello_terminates_child_and_settles_interrupted(monkeypatch):
+def test_stop_before_hello_terminates_child_and_settles_interrupted(tmp_path, monkeypatch):
     from gateway import session_managed_worker as managed
+    from tests.fixtures.storage_seed import seed_session
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    db = storage_handle(tmp_path)
+    seed_session(db, 'session', 'test')
     spawned = []
     original = subprocess.Popen
 
@@ -27,7 +31,8 @@ def test_stop_before_hello_terminates_child_and_settles_interrupted(monkeypatch)
     monkeypatch.setattr(managed.subprocess, 'Popen', wedged_child)
     ref = SessionRef('profile', 'session')
     checks = []
-    authority = SimpleNamespace(profile_id='profile', pending_results={}, waiters={},
+    authority = SimpleNamespace(profile_id='profile', pending_results={}, waiters={}, persistence=db,
+        epoch=db.runtime.begin_epoch(instance_id='fixture'),
         adopt_agent=lambda session_id, generation, worker: None,
         authorize=lambda actor, ref, cap: checks.append(cap),
         check_approval_generation=lambda session_id, generation: checks.append(generation))
@@ -42,6 +47,7 @@ def test_stop_before_hello_terminates_child_and_settles_interrupted(monkeypatch)
         async with asyncio.timeout(10):
             return await turn
     assert asyncio.run(scenario()) == ''
+    db.close()
     assert checks == ['session:control', 3]
     assert authority.pending_results['adm']['result']['interrupted'] is True
     assert ref.session_id not in authority._managed_workers

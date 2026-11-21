@@ -60,7 +60,7 @@ from hermes_cli.plugins_capability_ctx import PluginCapabilityCtxMixin
 from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
 from hermes_cli.plugins_registrars import _SCOPED_PROVIDER_REGISTRARS, make_scoped_provider_registrar
 from hermes_cli.plugins_state import (
-    PluginState, _locked_plugin_state, _nested_plugin_mapping, _nested_plugin_value,
+    PluginState, _locked_plugin_state, _nested_plugin_mapping, _nested_plugin_value, _plugin_home_key,
     _plugin_relative_segments, _plugin_settings_entry, save_plugin_setting,
 )
 # PluginContext lives in plugins_context.py; this facade stays its public import path.
@@ -181,6 +181,10 @@ VALID_HOOKS: set[str] = {
     #   (privacy: task ids, assignees, workspace paths).
     "on_kanban_worker_spawned", "on_kanban_worker_exited", "on_kanban_worker_stale_claim",
     "on_kanban_task_updated", "on_kanban_dispatch_tick",
+    # kanban_task_link: gateway notifier, once per completed/review ping batch, in the subscriber
+    # profile's scope. Kwargs: task_id, board, title, body. Return None or {"url": https URL,
+    # "text": str}; the first usable answer names the task as [text](url) in the chat ping.
+    "kanban_task_link",
     # gateway_platform_event: normalized envelopes only, never raw SDK objects or adapter handles.
     # Kwargs: platform, event_type, payload (event_type-local; see hooks.md). New event types land
     # only together with real fire-sites.
@@ -308,6 +312,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._approval_transports: dict[str, Any] = {}
         self._slack_action_handlers: list[tuple] = []
         self._platform_handler_factories: dict[str, list[tuple]] = {}
+        self._profile_services: list[tuple[str, Any]] = []
         # Process-owned discovery listeners (``on_plugin_loaded``); never cleared by unload().
         self._plugin_loaded_listeners: list[Callable] = []
         # Event bus: owner-tagged subscriptions (unload removes zombies); one daemon worker keeps
@@ -728,15 +733,6 @@ _published_gateway_host_lock = threading.Lock()
 # aimed at a non-launch profile. ``None`` until the TUI/desktop process installs it.
 _published_tui_message_injector: tuple[object, Callable] | None = None
 _published_tui_host_lock = threading.Lock()
-
-
-def _plugin_home_key() -> Path:
-    """Resolved active Hermes home — the key for per-profile plugin managers (plugins capture the
-    home at registration, so a process serving several profiles cannot share one manager)."""
-    try:
-        return get_hermes_home().expanduser().resolve()
-    except Exception:
-        return get_hermes_home().expanduser()
 
 
 def _clear_plugin_submodules(manager: Optional[PluginManager]) -> None:
@@ -1193,12 +1189,7 @@ def get_pre_tool_call_directive(
     return (details.action, details.message)
 
 
-def get_pre_tool_call_block_message(
-    tool_name: str, args: Optional[dict[str, Any]], **hook_kwargs: Any
-) -> Optional[str]:
-    """Deprecated shim: only the ``block`` message (or ``None``); ``approve`` is invisible here."""
-    directive, message = get_pre_tool_call_directive(tool_name, args, **hook_kwargs)
-    return message if directive == "block" else None
+from hermes_cli.plugins_dispatch import get_pre_tool_call_block_message
 
 
 def resolve_pre_tool_block(

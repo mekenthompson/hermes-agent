@@ -352,6 +352,7 @@ class ACPClient:
             proc.terminate()
             proc.wait(timeout=2)
         except Exception:
+            logger.debug("ACP process terminate failed; killing", exc_info=True)
             with contextlib.suppress(Exception):
                 proc.kill()
 
@@ -554,6 +555,7 @@ class ACPClient:
                 try:
                     response = _jsonrpc_result(message_id, _FS_HANDLERS[method](msg.get("params") or {}, cwd))
                 except Exception as exc:
+                    logger.debug("ACP file request failed", exc_info=True)
                     response = _jsonrpc_error(message_id, -32602, str(exc))
         else:
             response = _jsonrpc_error(message_id, -32601, f"ACP client method '{method}' is not supported by Hermes yet.")

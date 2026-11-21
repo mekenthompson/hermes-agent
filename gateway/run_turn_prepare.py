@@ -787,7 +787,7 @@ class GatewayTurnPrepareMixin:
         restore_gateway_yolo(session_key, session_entry.yolo)  # None: TurnRunner seeds the launch policy
         context = build_session_context(source, self.config, session_entry, event)
         # Session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        _session_env_tokens = self._set_turn_session_env(context, run_generation)
         # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.
         from gateway.response_filters import display_kind_for_event
         persist_user_display_kind = display_kind_for_event(event)
@@ -819,6 +819,25 @@ class GatewayTurnPrepareMixin:
         # Keep human text separate from skills, sender metadata, and other model context.
         # With no text (e.g. voice-only), retain the existing enriched-message title fallback.
         title_user_message = event.text or None
+        # Only a revalidated, committed native admission may carry its original
+        # human text to a transfer tool. Rewritten commands and synthetic turns
+        # cannot borrow the sender/session context to manufacture an instruction.
+        from gateway.session_ingress import executing_admission, native_transfer_instruction
+        native_instruction = native_transfer_instruction.get()
+        if (executing_admission.get() and native_instruction is not None
+                and native_instruction[0] is event
+                and isinstance(event.text, str) and event.text == native_instruction[1]
+                and not event.internal and not event.inherit_channel_pin
+                and event.allow_gateway_control
+                and source.platform not in (Platform.LOCAL, Platform.API_SERVER)
+                and source.user_id and event.source.platform == source.platform
+                and event.source.chat_id == source.chat_id
+                and event.source.user_id == source.user_id
+                and event.source.profile == source.profile
+                and event.source.scope_id == source.scope_id
+                and event.source.thread_id == source.thread_id):
+            from gateway.session_context import set_turn_user_message
+            set_turn_user_message(native_instruction[1])
 
         # Auto-load bound skill(s) only on NEW sessions; ongoing ones carry the content in history.
         _auto = getattr(event, "auto_skill", None)

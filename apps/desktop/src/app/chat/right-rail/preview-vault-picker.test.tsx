@@ -239,4 +239,3 @@ describe('PreviewVaultButton unlock owner fence (#150283 P1-2 SECURITY)', () => 
     expect(unlock!.params.password).toBe('hunter2')
   })
 })
-

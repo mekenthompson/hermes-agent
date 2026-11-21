@@ -531,7 +531,10 @@ async function main() {
   });
   if (values.format === 'results') {
     const jobs = (await readStdin()).split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
-    const annotations = /** @type {TagAnnotation[]} */ (JSON.parse(values.tags));
+    // A skipped pick-releases job leaves --tags empty. That is a missing
+    // chart, not a failed matrix: parse the same default the flag documents.
+    const tagsRaw = typeof values.tags === 'string' && values.tags.trim() ? values.tags : '[]';
+    const annotations = /** @type {TagAnnotation[]} */ (JSON.parse(tagsRaw));
     /** @type {Map<string, number>} */
     const artifactById = new Map();
     if (values.artifacts) {

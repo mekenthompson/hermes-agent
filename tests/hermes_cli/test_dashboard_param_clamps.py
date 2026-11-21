@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "clamp-test-token")
+    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "clamp-test-token-0123456789abcdef0123456789")
     from hermes_cli import web_server
     from persistence_assembly import open_persistence, profile_scope
     from tests.fixtures.storage_seed import seed_session
@@ -30,7 +30,7 @@ def client(tmp_path, monkeypatch):
         seed_session(store, "clamp-session", "cli")
 
     with closing(TestClient(web_server.app, raise_server_exceptions=False)) as c:
-        c.headers["Authorization"] = "Bearer clamp-test-token"
+        c.headers["Authorization"] = f"Bearer {web_server._SESSION_TOKEN}"
         yield c
 
 

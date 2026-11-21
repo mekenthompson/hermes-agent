@@ -1,0 +1,11 @@
+{
+  "email": "patrick@disenthrall.me",
+  "commits": [
+    {
+      "sha": "33b8776db688b6926bdd35feb87a841abfc5ccea",
+      "name": "Not Governor",
+      "source_url": "https://github.com/NousResearch/hermes-agent/commit/33b8776db688b6926bdd35feb87a841abfc5ccea",
+      "reason": "Nous commit author object is null. Committer OutThisLife is not the author, so no login was mapped."
+    }
+  ]
+}

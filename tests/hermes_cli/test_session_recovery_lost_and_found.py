@@ -241,6 +241,9 @@ def test_unreadable_schema_without_cli_names_the_sqlite3_requirement(
     from persistence.sqlite.admin import _lost_and_found as laf
 
     monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: None)
+    # The refusal reason is process-global state left by whichever real probe ran last in this worker
+    # (e.g. a host sqlite3 with the WAL-reset bug); pin it to the scenario under test.
+    monkeypatch.setattr(laf, "find_sqlite3_cli_refusal", lambda: {"reason": "missing"})
     with pytest.raises(SessionRecoverySourceError) as excinfo:
         recover_session_database(
             source,

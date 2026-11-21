@@ -587,7 +587,9 @@ class _RunLaunch:
     session_history_delivery: bool
     agent_kwargs: dict  # ``_create_agent`` keyword arguments (prompt, model overrides, route, room policy)
     request_profile: Any
+    api_transfer_family: str = ""
     turn_author: Optional[dict[str, Any]] = None  # memory-attribution label only; grants nothing
+    api_transfer_principal: str = ""
     admission: Any = None
     walked_from: Optional[str] = None  # the swept stored session the chain moved past (``bind_api_steps``)
 
@@ -866,6 +868,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
                 self._run_statuses, self._run_owners)
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
+    api_transfer_principal, api_transfer_family = _api_server._transfer.current()
     launch = _RunLaunch(
         self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
         conversation_history, session_history_delivery,
@@ -874,7 +877,9 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
             **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
         request_profile=_api_server._api_request_profile.get(),
-        turn_author=turn_author, walked_from=walked_from if session_id == stored_session_id else None)
+        api_transfer_family=api_transfer_family,
+        turn_author=turn_author, api_transfer_principal=api_transfer_principal,
+        walked_from=walked_from if session_id == stored_session_id else None)
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
     # receipt drives this run's status, so `peer run` keeps its run_id and `peer status` still works.
@@ -934,7 +939,8 @@ def _served_runtime(agent) -> dict[str, str]:
 
 def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_server):
     """Executor-thread body of one run; returns ``(result, usage, served_runtime)``."""
-    from gateway.session_context import clear_session_vars
+    from gateway.session_context import (clear_session_vars, set_api_transfer_identity,
+                                         set_turn_user_message)
     from gateway.hosted_room_execution_policy import (
         RoomExecutionPolicy, bind_room_execution_policy, reset_room_execution_policy)
     # No eager slash-worker pre-warm: slash.exec spawns one on demand (its error path already relies on that
@@ -970,6 +976,11 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 session_history_delivery="1" if run.session_history_delivery else "")
             if session_tokens:
                 resets.append((session_tokens, clear_session_vars))
+            if run.api_transfer_principal:
+                set_turn_user_message(run.user_message)
+                set_api_transfer_identity(run.api_transfer_principal,
+                                          run.api_transfer_family,
+                                          run.session_id)
             if run.agent_kwargs["room_dispatch"] is not None:
                 policy = RoomExecutionPolicy.from_mapping(run.agent_kwargs["room_execution_policy"] or {})
                 resets.append((bind_room_execution_policy(policy), reset_room_execution_policy))
@@ -979,9 +990,11 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             _api_server._publish_turn_process_ownership(agent, effective_task_id)
             # Passed only when set: a human turn keeps today's call shape.
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
-            r = agent.run_conversation(
-                user_message=run.user_message, conversation_history=run.conversation_history,
-                task_id=effective_task_id, **author_kwargs)
+            with _api_server._transfer.admitted_serialized_tool_turn(
+                    run.approval_session_key, session_id or "", agent):
+                r = agent.run_conversation(
+                    user_message=run.user_message, conversation_history=run.conversation_history,
+                    task_id=effective_task_id, **author_kwargs)
         finally:
             # Clear ownership now so a later stop can't reap work this run left running.
             _api_server._clear_turn_process_ownership(agent)

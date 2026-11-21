@@ -18,7 +18,7 @@ import sys
 
 import pytest
 
-from tests.gateway.test_native_http_auth import daemon
+from tests.gateway.test_native_http_auth import DASHBOARD_TEST_TOKEN, daemon
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -62,7 +62,7 @@ def test_cli_creates_through_a_live_gateway_local_and_by_url(tmp_path, monkeypat
 
         # This home's own gateway by URL: it reports the instance this home's discovery names, so the
         # profile it made here gets this terminal's command.
-        url = descriptor["api_origin"].replace("http:", "ws:") + "/api/ws?token=normal-http-owner"
+        url = descriptor["api_origin"].replace("http:", "ws:") + "/api/ws?token=" + DASHBOARD_TEST_TOKEN
         monkeypatch.setenv("HERMES_TUI_GATEWAY_URL", url)
         profile_cmd._profile_create(parser.parse_args(["profile", "create", "viaurl"]))
         out = capsys.readouterr().out
@@ -76,7 +76,7 @@ def test_cli_creates_through_a_live_gateway_local_and_by_url(tmp_path, monkeypat
         remote = _create(terminal_home, user, "byurl", env={"HERMES_TUI_GATEWAY_URL": url})
         out = remote.stdout + remote.stderr
         assert remote.returncode == 0, out
-        assert "normal-http-owner" not in out
+        assert DASHBOARD_TEST_TOKEN not in out
         assert (home / "profiles" / "byurl" / "config.yaml").is_file(), out
         assert not (terminal_home / "profiles").exists(), out
         # The same from that home, asking for its command: the profile is not in this home, so no command.
@@ -151,7 +151,8 @@ def test_a_url_terminal_on_work_clones_the_gateways_work_not_its_launch_profile(
     """A URL's connection carries no profile-bound ticket: ``hermes -p work profile create --clone`` from
     another home names ``work``, and the multiplexed gateway clones ITS work (keys, SOUL.md)."""
     from tests.gateway.test_multiplex_cold_profile_sidebar_mutation import multiplex_daemon
-    token = {"HERMES_DASHBOARD_SESSION_TOKEN": "url-terminal-owner"}
+    owner_token = "url-terminal-owner-" + "x" * 32  # the dashboard token has a 32-char floor
+    token = {"HERMES_DASHBOARD_SESSION_TOKEN": owner_token}
     with multiplex_daemon(tmp_path, profiles=("work",), env=token) as (home, descriptor, _env):
         user = tmp_path / "user"
         work = home / "profiles" / "work"
@@ -162,7 +163,7 @@ def test_a_url_terminal_on_work_clones_the_gateways_work_not_its_launch_profile(
         (terminal_home / "profiles" / "work").mkdir(parents=True)
         (terminal_home / "config.yaml").write_text("{}\n")  # a real Hermes root, so `-p work` resolves
         (terminal_home / "profiles" / "work" / "config.yaml").write_text("{}\n")
-        url = descriptor["api_origin"].replace("http:", "ws:") + "/api/ws?token=url-terminal-owner"
+        url = descriptor["api_origin"].replace("http:", "ws:") + "/api/ws?token=" + owner_token
         clone = _create_on_profile(terminal_home, user, "work", "urlclone", "--clone",
                                    env={"HERMES_TUI_GATEWAY_URL": url})
         out = clone.stdout + clone.stderr
@@ -171,5 +172,5 @@ def test_a_url_terminal_on_work_clones_the_gateways_work_not_its_launch_profile(
         made = home / "profiles" / "urlclone"
         assert (made / "SOUL.md").read_text() == "the gateway's work soul\n", out
         assert "sk-or-gateway-work" in (made / ".env").read_text()
-        assert "url-terminal-owner" not in out
+        assert owner_token not in out
         assert not (terminal_home / "profiles" / "urlclone").exists(), out

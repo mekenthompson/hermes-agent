@@ -10,6 +10,15 @@ from __future__ import annotations
 
 from typing import Callable, Sequence, Tuple
 
+def primary_failure_wording(error: Exception) -> tuple[str, str]:
+    """Return user and log wording without coupling copy to the auth facade at import time."""
+    from hermes_cli import auth
+
+    if auth.is_rate_limited_auth_error(error):
+        return "rate-limited (429)", "Primary provider quota exhausted"
+    return "auth failed", "Primary auth failed"
+
+
 # httpx class names and stdlib bases that mean "the request never got a usable answer".
 _NETWORK_ERROR_TYPES = frozenset({
     "ConnectError", "ConnectTimeout", "ReadTimeout", "PoolTimeout", "WriteTimeout", "TimeoutException",

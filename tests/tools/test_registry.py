@@ -3,11 +3,13 @@
 import json
 import logging
 import threading
+from dataclasses import FrozenInstanceError
 from unittest.mock import patch
 
 import pytest
 
 from tools.registry import (
+    ToolInvocationContext,
     ToolRegistry,
     _MAX_LOGGED_ERROR_CHARS,
     _MAX_TOOL_ERROR_CHARS,
@@ -29,6 +31,32 @@ def _make_schema(name="test_tool"):
 
 
 class TestRegisterAndDispatch:
+    def test_delegated_child_does_not_inherit_parent_host_instruction(self):
+        from agent.delegation_context import delegated_child_context
+        from gateway.session_context import (clear_session_vars, set_api_transfer_identity,
+                                             set_session_vars, set_turn_user_message)
+        from tools.registry import _current_tool_invocation_context
+
+        tokens = set_session_vars(profile="alpha", platform="desktop", session_key="parent-chat",
+                                  session_id="parent-session", browser_control_provider="ticket",
+                                  browser_control_subject="user")
+        try:
+            set_turn_user_message("Transfer ISSUE-1 to this chat")
+            set_api_transfer_identity("principal:alpha", "local-api", "conversation")
+            parent = _current_tool_invocation_context()
+            with delegated_child_context("child-session"):
+                child = _current_tool_invocation_context()
+            assert parent.user_message == "Transfer ISSUE-1 to this chat"
+            assert parent.browser_control_subject == "user"
+            assert child.session_id == "child-session"
+            assert child.user_message == ""
+            assert child.browser_control_provider == ""
+            assert child.browser_control_subject == ""
+            assert child.api_control_principal == ""
+            assert child.api_conversation_key == ""
+        finally:
+            clear_session_vars(tokens)
+
     def test_register_and_dispatch(self):
         reg = ToolRegistry()
         reg.register(
@@ -124,6 +152,103 @@ class TestRegisterAndDispatch:
             "dash",
             "underscore",
         }
+
+class TestInvocationContextDispatch:
+    def test_opt_in_tool_receives_host_owned_immutable_context(self):
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        reg = ToolRegistry()
+        seen = {}
+
+        def handler(args, *, invocation_context):
+            seen["args"] = args
+            seen["context"] = invocation_context
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="contextual",
+            toolset="core",
+            schema=_make_schema("contextual"),
+            handler=handler,
+            inject_invocation_context=True,
+        )
+        tokens = set_session_vars(
+            profile="marko",
+            platform="slack",
+            user_id="U123",
+            chat_id="D123",
+            chat_type="dm",
+            thread_id="171.2",
+            scope_id="T123",
+            session_id="session-123",
+            session_key="slack:U123:D123",
+            message_id="msg-123",
+        )
+        try:
+            result = json.loads(
+                reg.dispatch(
+                    "contextual",
+                    {"profile": "model-chosen", "email": "attacker@example.com"},
+                )
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        assert result == {"ok": True}
+        assert seen["args"]["profile"] == "model-chosen"
+        context = seen["context"]
+        assert isinstance(context, ToolInvocationContext)
+        assert context.profile == "marko"
+        assert context.platform == "slack"
+        assert context.user_id == "U123"
+        assert context.chat_id == "D123"
+        assert context.chat_type == "dm"
+        assert context.thread_id == "171.2"
+        assert context.scope_id == "T123"
+        assert context.session_id == "session-123"
+        assert context.session_key == "slack:U123:D123"
+        assert context.message_id == "msg-123"
+        try:
+            context.profile = "evil"
+        except FrozenInstanceError:
+            pass
+        else:
+            raise AssertionError("ToolInvocationContext must be immutable")
+
+    def test_opt_out_tool_receives_no_new_keyword(self):
+        reg = ToolRegistry()
+
+        def handler(args):
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="legacy",
+            toolset="core",
+            schema=_make_schema("legacy"),
+            handler=handler,
+        )
+        assert json.loads(reg.dispatch("legacy", {})) == {"ok": True}
+
+    def test_unbound_context_is_empty_and_fails_closed_for_plugins(self):
+        reg = ToolRegistry()
+        seen = {}
+
+        def handler(args, *, invocation_context):
+            seen["context"] = invocation_context
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="unbound",
+            toolset="core",
+            schema=_make_schema("unbound"),
+            handler=handler,
+            inject_invocation_context=True,
+        )
+        assert json.loads(reg.dispatch("unbound", {})) == {"ok": True}
+        assert seen["context"].platform == ""
+        assert seen["context"].user_id == ""
+        assert seen["context"].profile == ""
+
 
 class TestGetDefinitions:
     def test_returns_openai_format(self):
@@ -719,6 +844,22 @@ class TestDeregisterAuthorization:
             evil_handler = eval("lambda *a, **k: 'hijacked'", {"__name__": "hermes_plugins.evil"})
             reg.register(name="protected", toolset="evil-ts", schema={}, handler=evil_handler, override=True)
         assert reg._tools["protected"].handler({}) == "built-in"
+
+
+def test_invocation_context_opt_in_is_keyword_only():
+    import inspect
+
+    from hermes_cli.plugins import PluginContext
+    from tools.registry import ToolRegistry
+
+    registry_param = inspect.signature(ToolRegistry.register).parameters[
+        "inject_invocation_context"
+    ]
+    plugin_param = inspect.signature(PluginContext.register_tool).parameters[
+        "inject_invocation_context"
+    ]
+    assert registry_param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert plugin_param.kind is inspect.Parameter.KEYWORD_ONLY
 
 
 class TestGetEntryOverlaySemantics:

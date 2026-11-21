@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 
 admission_author = ContextVar('admission_author', default=None)
 executing_admission = ContextVar('executing_admission', default=False)
+# The committed native envelope, not mutable model-facing text, owns any human
+# instruction exposed to a tool. The event identity ties it to this exact turn.
+native_transfer_instruction = ContextVar('native_transfer_instruction', default=None)
 # The live session while the executing turn is one its viewer submitted (``is_viewer_input``), else None.
 viewer_turn: ContextVar = ContextVar('viewer_turn', default=None)
 # Set by a busy-path caller that must be released once its input is durably queued.
@@ -42,44 +45,65 @@ ALREADY_ADMITTED_REPLY = ('⚠️ Hermes already received a different message un
                           'version was not saved. Send it again as a new message to continue.')
 
 
-async def admit_message(authority, event):
+def _store_refusal_reply(authority, event, exc):
+    """The chat reply for a native admission ``AuthorityRefusal`` refused before commit, or raise it."""
+    if exc.reason == 'stale_generation' and exc.field == 'route':
+        return None  # a later /stop or /new of the chat fenced it, as main cancels a queued row
+    if exc.reason == 'invalid_params' and exc.field:
+        # Refused before commit (_validate_native): a refusal notice instead of a generic turn error.
+        # The reply reaches the whole chat, so only content clauses are named; trust and provenance
+        # clauses (and any new one) stay generic, and gateway.log keeps the clause (``_refuse``).
+        named = f'{exc.reason}: {exc.field}' if exc.field in _CONTENT_CLAUSES else exc.reason
+        return (f'⚠️ Hermes refused this message ({named}), so it was not saved '
+                'or answered. Ask the operator to check gateway.log.')
+    runner = authority.runner
+    if exc.reason == 'runtime_draining' and runner._draining:
+        # A restart's after-turn wait or a stop refused it before commit: the same notice the
+        # in-process path gives, not a turn error that offers a /retry into the drain (#152410).
+        from agent.i18n import t
+        return t('gateway.busy.drain_rejected_new_work', action=runner._status_action_gerund())
+    if exc.reason == 'admission_conflict' and exc.field == ADMITTED_REQUEST_CONFLICT['field']:
+        # The provider id is already admitted with other content (a redelivery of the same message
+        # resolves to its row in ``reconcile_native_retry``): the earlier message is the one that runs.
+        logger.warning('Native message %s refused: its id is already admitted with other content',
+                       getattr(event, 'message_id', None))
+        return ALREADY_ADMITTED_REPLY
+    if exc.reason != 'queue_full':
+        raise exc
+    # Nothing was committed (main's busy-queue cap): say so instead of a generic turn error.
+    return QUEUE_FULL_REPLY
+
+
+async def admit_message(authority, event, *, busy=False):
     from gateway.session_authority import messaging_admission
     accepted, committed = busy_acceptance.get(), busy_commit.get()
     busy_acceptance.set(None)  # the drain task this schedules must not inherit the busy caller's future
     busy_commit.set(None)
     ingress = messaging_admission.set(True if accepted is None else accepted)
+    presentation = [None]
     try:
-        receipt = await authority.admit_native(event)
+        before_schedule = None
+        if busy and event.structured_control is None:
+            from gateway.session_native_busy import prepare, apply
+            prepared = prepare(authority, event)
+            async def before_schedule(receipt, fence):
+                presentation[0] = await apply(authority, event, receipt, prepared, fence)
+        receipt = await authority.admit_native(event, before_schedule=before_schedule)
         if committed is not None and not committed.done():
             committed.set_result(None)  # the row is durable (any status): a barrier may go on
     except AuthorityRefusal as exc:
-        if exc.reason == 'stale_generation' and exc.field == 'route':
-            return None  # a later /stop or /new of the chat fenced it, as main cancels a queued row
-        if exc.reason == 'invalid_params' and exc.field:
-            # Refused before commit (_validate_native): a refusal notice instead of a generic turn error.
-            # The reply reaches the whole chat, so only content clauses are named; trust and provenance
-            # clauses (and any new one) stay generic, and gateway.log keeps the clause (``_refuse``).
-            named = f'{exc.reason}: {exc.field}' if exc.field in _CONTENT_CLAUSES else exc.reason
-            return (f'⚠️ Hermes refused this message ({named}), so it was not saved '
-                    'or answered. Ask the operator to check gateway.log.')
-        runner = authority.runner
-        if exc.reason == 'runtime_draining' and runner._draining:
-            # A restart's after-turn wait or a stop refused it before commit: the same notice the
-            # in-process path gives, not a turn error that offers a /retry into the drain (#152410).
-            from agent.i18n import t
-            return t('gateway.busy.drain_rejected_new_work', action=runner._status_action_gerund())
-        if exc.reason == 'admission_conflict' and exc.field == ADMITTED_REQUEST_CONFLICT['field']:
-            # The provider id is already admitted with other content (a redelivery of the same message
-            # resolves to its row in ``reconcile_native_retry``): the earlier message is the one that runs.
-            logger.warning('Native message %s refused: its id is already admitted with other content',
-                           getattr(event, 'message_id', None))
-            return ALREADY_ADMITTED_REPLY
-        if exc.reason != 'queue_full':
-            raise
-        # Nothing was committed (main's busy-queue cap): say so instead of a generic turn error.
-        return QUEUE_FULL_REPLY
+        return _store_refusal_reply(authority, event, exc)
     finally:
         messaging_admission.reset(ingress)
+    if event.structured_control is not None:
+        return None  # a control receipt never owns a model turn or a model waiter
+    if presentation[0] is not None:
+        # Presentation is outside native admission ordering: a slow ACK cannot
+        # prevent a later input/Stop from committing or reaching the live turn.
+        try:
+            await presentation[0]()
+        except Exception:
+            logger.exception('Native busy input was accepted but its acknowledgement failed')
     if receipt.status == 'terminal':
         return None
     # Only the delivery waiter is process-local; execution reads the committed snapshot.
@@ -338,6 +362,11 @@ async def execute_admission(authority, ref, row):
         # turn's resolver never re-reads (and on a transient failure drops) an admitted completion.
         event.metadata['gateway_proven_session_id'] = (
             authority.physical_target(ref) if 'native_text_v1' in row['payload'] else event.metadata['gateway_session_id'])
+    # A claim is gated on the runtime being open (``_require_admission_open``), so a claimed row was
+    # admitted before any drain: the drain gate turns away NEW work only. Without this, a drain that
+    # begins between the claim's commit and the turn's start settles an already receipted wake
+    # ``completed`` with the drain notice, and the producer (which took the receipt as final) never retries.
+    event._admitted_before_drain = True
     provenance = row['payload'].get('native_text_v1', {}).get('provenance')
     home = None
     if provenance is not None:
@@ -347,6 +376,7 @@ async def execute_admission(authority, ref, row):
     from gateway.session_api_turn import api_execution, prepare_api_execution
     from gateway.session_results import execution_result
     is_api = live.source.platform == Platform.API_SERVER
+    task_scope = _approval_task_scope(authority, ref, row, live, event, is_api=is_api)
     if not (event.internal or is_api or live.source.platform == Platform.LOCAL):
         # The claim on a chat route (native or a viewer's submit): a /new before the turn resolves
         # its session must not move it onto the fresh conversation (main's /new cancelled its task).
@@ -359,11 +389,16 @@ async def execute_admission(authority, ref, row):
     captured = {}
     result_token = execution_result.set(captured)
     token = executing_admission.set(True)
+    native_instruction_token = native_transfer_instruction.set(
+        (event, row['payload']['text'])
+        if 'native_text_v1' in row['payload'] and not is_api
+        and not event.internal and isinstance(row['payload'].get('text'), str)
+        else None)
     # This drain, not the handler's unwind, releases the turn's crash marker (see below).
     event._turn_marker_handoff = True
     handed = False
     try:
-        async with _admission_scope(authority, ref, home, row, event, captured):
+        async with _admission_scope(authority, ref, home, row, event, captured, task_scope):
             if is_api:
                 # Committed media resolves under the owning profile's home, like admission did.
                 prepared = prepare_api_execution(authority, ref, row['payload'])
@@ -409,6 +444,7 @@ async def execute_admission(authority, ref, row):
             await _hand_over_turn_marker(authority, row['admission_id'], event)
             return response
     finally:
+        native_transfer_instruction.reset(native_instruction_token)
         if not native:
             # No adapter task awaits this turn to run its post-delivery callbacks: the drain runs them
             # once the turn settled and its reply went out (``fire_post_delivery``).
@@ -420,6 +456,77 @@ async def execute_admission(authority, ref, row):
         api_execution.reset(api_token)
         admission_author.reset(author_token)
         viewer_turn.reset(viewer_token)
+
+
+def _approval_task_scope(authority, ref, row, live, event, *, is_api):
+    """Bind consent evidence to this exact authenticated admission and live owner."""
+    from contextlib import nullcontext
+    if event.internal:
+        if is_api:
+            return nullcontext()
+        from gateway.session_approval_completion import completion_task_scope
+        return completion_task_scope(authority, row, live)
+    if (is_api or not isinstance(event.text, str)
+            or not event.text.strip() or not isinstance(row.get('generation'), int)):
+        return nullcontext()
+    payload = row.get('payload') or {}
+    from gateway.session_operator import is_viewer_input, check_local_input
+    native = isinstance(payload.get('native_text_v1'), dict)
+    local = not native and is_viewer_input(row)
+    if not (native or local) or not getattr(event.source, 'user_id', None):
+        return nullcontext()
+    if local:
+        # The server-stamped envelope and live source must name the committed principal.
+        check_local_input(authority, ref, row)
+    else:
+        import json
+        source = event.source
+        principal = json.dumps([source.profile, source.platform.value, source.chat_id,
+                                source.thread_id, source.user_id], separators=(',', ':'))
+        if row['principal_id'] != 'messaging:' + principal:
+            return nullcontext()
+    from tools.approval_context import approval_task_context
+    from gateway.session_authority import admission_row
+    store = authority_persistence(authority)
+
+    def is_current():
+        if authority.sessions.get(ref.session_id) is not live:
+            return False
+        record = store.admissions.get(admission_id=row['admission_id'])
+        committed = admission_row(record) if record is not None else None
+        if (committed is None or committed['owner_epoch'] != authority.epoch
+                or committed['generation'] != row['generation']
+                or committed['target_session_id'] != ref.session_id):
+            return False
+        if committed['status'] == 'started':
+            if authority.executing.get(ref.session_id) != row['generation']:
+                return False
+            run_generation = getattr(event, '_approval_run_generation', None)
+            return (run_generation is not None
+                    and authority.runner._is_session_run_current(live.route, run_generation))
+        # Detached children may finish after the original turn has settled. Their
+        # reservation is held by the lease. Recheck the live route as well: a
+        # completed historical row alone cannot authorize a replacement session.
+        if committed['status'] != 'terminal' or committed['outcome'] != 'completed':
+            return False
+        entry = authority.runner.session_store.lookup_by_session_key(live.route)
+        return (entry is not None and not entry.suspended
+                and (entry.session_id == ref.session_id
+                     or store.lineage.tip(ref.session_id) == entry.session_id))
+
+    def own(lease):
+        from weakref import WeakSet
+        with live.event_stream.lock:
+            leases = getattr(live, 'approval_task_leases', None)
+            if leases is None:
+                leases = live.approval_task_leases = WeakSet()
+            leases.add(lease)
+
+    return approval_task_context(
+        event.text, identity=row['principal_id'],
+        profile=str(authority.profile_id), session=str(live.route),
+        task_id=row['admission_id'], run_id=str(row['generation']), is_current=is_current, owner=own,
+    )
 
 
 def _launch_body_if_launch_owner(authority):
@@ -436,12 +543,12 @@ def _launch_body_if_launch_owner(authority):
 
 
 @asynccontextmanager
-async def _admission_scope(authority, ref, home, row, event, captured):
+async def _admission_scope(authority, ref, home, row, event, captured, task_scope):
     """The execution scope, inside the adapter lifecycle the executor owns for a producer-admitted
     turn (``session_producer_lifecycle``; a no-op for every other admission)."""
     from agent.runtime_scope import bind_turn, claim_fence
     async with producer_turn(authority, row, event, captured):
-        with await _execution_scope(authority, home), bind_turn(ref.session_id, row['admission_id'], claim_fence(row)):
+        with await _execution_scope(authority, home), task_scope, bind_turn(ref.session_id, row['admission_id'], claim_fence(row)):
             yield
 
 

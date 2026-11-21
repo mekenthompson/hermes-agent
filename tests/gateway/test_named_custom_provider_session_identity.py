@@ -263,4 +263,3 @@ def test_live_unpersisted_session_reports_the_requested_entry(monkeypatch):
     atomic_config_write(get_config_path(), CONFIG)
     session = {"agent": _agent(), "session_key": "not-persisted", "profile_home": str(get_hermes_home())}
     assert _live_session_identity(session) == ("beta-model", "custom:beta")
-

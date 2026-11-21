@@ -89,6 +89,54 @@ def _warn_foreign_login(session: dict, transport) -> None:
                        session.get("session_key"), creator or "(none)", attaching)
 
 
+def _server_verified_transport_owner(transport) -> tuple[str, str] | None:
+    """Return a ticket subject only from the server-stamped WS upgrade claim."""
+    from tui_gateway.browser_handoff_identity import browser_handoff_identity
+    identity = browser_handoff_identity(getattr(transport, "auth_identity", None))
+    return (identity.provider, identity.subject) if identity is not None else None
+
+
+def _transport_approval_principal(transport) -> str | None:
+    """Approval-provenance principal for ``transport``: a digest of its server-stamped login, or None.
+
+    Deliberately separate from ``_server_verified_transport_owner``: that owner tuple also gates attach
+    (4013) and the browser-control principal, which project only bare ``{user_id, provider}`` ticket
+    identities. Every real dashboard / native socket carries extra server-stamped keys (``profile_scope``,
+    ``issuer``, ``profile_id``...), so its owner is None and a Desktop submit never got an approval
+    lease (HF-683). This principal is consulted only to admit the user's own direct submit into an
+    approval task, which the same login can already drive interactively. It never comes from RPC params.
+    """
+    from gateway.session_identity import authenticated_principal_digest, is_authenticated_identity
+    identity = getattr(transport, "auth_identity", None)
+    if not isinstance(identity, dict) or not is_authenticated_identity(identity):
+        return None
+    return authenticated_principal_digest(identity)
+
+
+def _session_transport_stamps(transport) -> dict:
+    """The transport-derived fields every live-session record carries, stamped from the creating
+    (or resuming) socket. One builder so no record site can miss one (HF-683 approval_principal)."""
+    return {"transport_owner": _server_verified_transport_owner(transport),
+            "transport": transport or _stdio_transport,
+            "auth_user_id": _transport_auth_user_id(transport),
+            "approval_principal": _transport_approval_principal(transport)}
+
+
+def _session_attachment_error(rid, session: dict, transport) -> dict | None:
+    """Fail closed for a ticketed transport unless it matches the live session owner.
+
+    Local stdio and legacy transports carry no cloud subject and retain their existing
+    attach behavior.  A legacy live session has no trustworthy owner, so a ticketed
+    transport cannot claim it; persisted ownership needs an explicit schema contract.
+    """
+    requester = _server_verified_transport_owner(transport)
+    if requester is None:
+        return None
+    if session.get("transport_owner") == requester:
+        return None
+    return _err(rid, 4013, "session is owned by another authenticated subject")
+
+
 def _attach_session_transport(session: dict | None, transport) -> bool:
     """Add live peers; flatten captured queued fanouts without nesting authority."""
     if not session or transport is None:

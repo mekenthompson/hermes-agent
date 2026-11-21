@@ -126,8 +126,10 @@ async def test_input_queued_behind_a_live_worker_is_released_then_runs_when_it_f
     try:
         registered = await worker_request(connection, ref, scope | {'kind': 'compute'}, operation='register')
         # Native ingress waits on the admission it committed; a blocked FIFO must answer it.
-        event = SimpleNamespace()
-        async def admit_native(_event):
+        from gateway.platforms.event import MessageEvent
+        event = MessageEvent(text='hi', source=authority.sessions['owned'].source)
+        async def admit_native(_event, *, before_schedule=None):
+            assert before_schedule is None  # This fixture exercises ordinary, non-busy admission.
             return await authority.submit(actor, Submission('behind', ref, {'text': 'hi'}, 'queue'))
         authority.admit_native = admit_native
         reply = await asyncio.wait_for(admit_message(authority, event), 5)

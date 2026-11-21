@@ -5,6 +5,38 @@ from pathlib import Path
 import pytest
 
 
+def test_runtime_state_matches_requires_executable_selected_interpreter(tmp_path, monkeypatch):
+    from pm.environments import install_state_dir, selected_venv, venv_python
+    from pm import paths
+    from pm.install import _runtime_state_matches
+
+    root = tmp_path / "repo"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(paths, "repo_root", lambda: root)
+    environment = install_state_dir(root) / "environments" / "candidate" / "venv"
+    environment.mkdir(parents=True)
+    (environment / "pyvenv.cfg").write_text("home = fixture\n", encoding="utf-8")
+    facts_path = install_state_dir(root) / "facts.json"
+    facts_path.write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(environment), "stamp": "current",
+    }}}), encoding="utf-8")
+    binary = venv_python(environment)
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o755)
+    fact = {"stamp": "current", "environment": str(environment)}
+    assert selected_venv(root) == environment
+
+    assert _runtime_state_matches(fact, "current")
+    binary.unlink()
+    binary.symlink_to(environment / "missing-python")
+    assert not _runtime_state_matches(fact, "current")
+    binary.unlink()
+    binary.write_text("not executable", encoding="utf-8")
+    binary.chmod(0o644)
+    assert not _runtime_state_matches(fact, "current")
+
+
 def test_install_runtime_selection_is_scoped_and_read_only(tmp_path, monkeypatch):
     from pm import environments as runtime_paths
 

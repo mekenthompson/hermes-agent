@@ -22,7 +22,7 @@ def _runner(*, waiting):
         readers.append(threading.current_thread())
         return session_id
 
-    authority = SimpleNamespace(profile_id="default", sessions={"sid": SimpleNamespace(background_wait=wait, task=None)},
+    authority = SimpleNamespace(profile_id="default", sessions={"sid": SimpleNamespace(background_wait=wait, task=None, route="other-route")},
                                 logical_owner=logical_owner)
     store = SimpleNamespace(peek_session_id=lambda key: "sid")
     return SimpleNamespace(session_authority=authority, session_store=store), wait, readers

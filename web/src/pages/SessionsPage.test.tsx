@@ -123,6 +123,8 @@ afterEach(async () => {
 });
 
 describe("SessionsPage per-row profile routing (#99387)", () => {
+  // 5s default is tight on 4-core GitHub-hosted runners; the page render
+  // waits for the delete button after several provider mounts.
   it("sends every per-row request to the row's owning profile, not the management default", async () => {
     await renderSessionsPage([
       { id: "sid-guanli", profile: "guanli", source: "cli", model: null, title: "Managed", started_at: 1, ended_at: null,
@@ -154,7 +156,7 @@ describe("SessionsPage per-row profile routing (#99387)", () => {
     );
     await act(async () => click(confirm ?? null));
     expect(apiMocks.deleteSession).toHaveBeenCalledWith("sid-guanli", "guanli");
-  });
+  }, 15000);
 
   it("routes a search result through the profile stamped on that result", async () => {
     apiMocks.searchSessions.mockResolvedValue({

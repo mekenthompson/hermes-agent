@@ -113,6 +113,7 @@ from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
+from gateway.platforms import api_server_transfer as _transfer
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
 from gateway.platforms.api_server_bot_chat import reset_local_title_owner
@@ -791,6 +792,7 @@ def _admit_api_agent_request(handler):
         draining = self._draining_response()
         if draining is not None:
             return draining
+        transfer_token = _transfer.bind_authenticated_request(self, request, _api_request_profile.get())
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
@@ -799,6 +801,7 @@ def _admit_api_agent_request(handler):
         finally:
             _release_pending_api_work(self, reservation)
             _api_agent_request_reservation.reset(token)
+            _transfer.clear_authenticated_request(transfer_token)
     return _wrapped
 
 
@@ -2381,6 +2384,24 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 if len(entry) < 3 or features[entry[2]]},
         })
 
+    def _derive_api_transfer_principal(self, profile: str) -> str:
+        """Derive a bearer transfer principal from this profile's current API key."""
+        key = self._expected_api_key() or self._api_key or ""
+        digest = hashlib.sha256(f"{profile}\x00{key}".encode()).hexdigest()
+        return f"principal:{profile}:{digest[:32]}"
+
+    def _derive_browser_control_principal(self, profile: str) -> str:
+        """Compatibility seam for the shared API transfer helper."""
+        return self._derive_api_transfer_principal(profile)
+
+    @staticmethod
+    def _api_transfer_transport_family(request: web.Request) -> str:
+        return _transfer.browser_control_transport_family(request)
+
+    def _browser_control_transport_family(self, request: web.Request) -> str:
+        """Compatibility seam for the shared API transfer helper."""
+        return self._api_transfer_transport_family(request)
+
     @_require_auth
     async def _handle_skills(self, request: web.Request) -> web.Response:
         """GET /v1/skills — deterministic JSON listing of installed skills (name, description,
@@ -3550,7 +3571,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         from gateway.session_context import set_session_vars
         return set_session_vars(
             platform="api_server", chat_id=chat_id, session_key=session_key, session_id=session_id,
-            profile=profile, async_delivery=False, cron_session="", session_history_delivery=session_history_delivery)
+            profile=profile,
+            async_delivery=False, cron_session="", session_history_delivery=session_history_delivery)
 
     def _turn_runtime_metadata(
         self, agent: Any, *, route: Optional[dict[str, Any]], requested_runtime: Optional[dict[str, Any]],
@@ -3670,6 +3692,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         loop = asyncio.get_running_loop()
         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
         request_profile = _api_request_profile.get()
+        transfer_auth = _transfer.current()
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -3678,6 +3701,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     chat_id=session_id or "", session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "", profile=request_profile or "",
                     session_history_delivery=session_history_delivery)
+                _transfer.bind_legacy_turn(transfer_auth, user_message, session_id)
                 agent = None
                 from agent.notification_presentation import notification_turn
                 from gateway.warning_notifications import diagnostic_turn_muted
@@ -3737,8 +3761,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         approval_token = set_current_session_key(approval_session_key)
                         register_gateway_notify(approval_session_key, approval_notify_callback)
                     try:
-                        with notification_turn(agent, muted=muted, session_id=session_id or ""):
-                            result = agent.run_conversation(**conversation_kwargs)
+                        with _transfer.admitted_serialized_tool_turn(
+                                gateway_session_key or session_id or "", session_id or "", agent):
+                            with notification_turn(agent, muted=muted, session_id=session_id or ""):
+                                result = agent.run_conversation(**conversation_kwargs)
                     finally:
                         if approval_token is not None:
                             from tools.approval_context import reset_current_session_key

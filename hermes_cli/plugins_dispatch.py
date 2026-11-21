@@ -21,6 +21,16 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Union
 
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION
 
+def get_pre_tool_call_block_message(
+    tool_name: str, args: Optional[dict[str, Any]], **hook_kwargs: Any
+) -> Optional[str]:
+    """Deprecated shim: only the ``block`` message (or ``None``); ``approve`` is invisible here."""
+    from hermes_cli import plugins
+
+    directive, message = plugins.get_pre_tool_call_directive(tool_name, args, **hook_kwargs)
+    return message if directive == "block" else None
+
+
 logger = logging.getLogger("hermes_cli.plugins")
 
 # Allowlist of agent-turn hot-path hooks bounded by plugins.hook_callback_timeout (fail-open:
@@ -49,6 +59,8 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
     "pre_command",
     # Fires inside the compression commit window (lease held): a hung plugin must not wedge the session.
     "post_compaction",
+    # Fail-open: a hung tracker lookup sends the plain-title ping instead of stalling the notifier.
+    "kanban_task_link",
 }
 # Hooks whose calls are told apart by another payload field: one session's commands are one
 # sequence, so a still-running callback skips that session's next command, not another session's.

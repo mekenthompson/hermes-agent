@@ -50,7 +50,7 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 |---|---|---|
 | Approve | Acceptance criteria and verification pass | `kanban_complete` |
 | Request changes | Correctable implementation defects remain | `kanban_comment`, then `kanban_request_changes` |
-| Escalate | A human decision or external prerequisite is required | `kanban_block` |
+| Escalate | A human decision remains unanswered or an external prerequisite prevents progress | `kanban_block` |
 
 A requested-changes transition returns the task to its original implementer. When that implementer requests review again without naming a reviewer, the persisted reviewer provenance routes the re-review back to the same reviewer profile.
 
@@ -142,7 +142,14 @@ State where the defect is, how it reproduces, why it violates the task, and what
 
 #### Escalate
 
-Use escalation only when the reviewer and implementer cannot resolve the problem without a human decision or external prerequisite:
+If this worker has a trusted human conversation and the `clarify` tool is available,
+ask the required human question with `clarify` and wait for the answer before
+choosing a verdict. A reply supplies context; it does not replace independent
+verification, authorize a merge, or satisfy an outstanding acceptance criterion.
+
+Use escalation when no answerable human route is available, the question remains
+unanswered, or an external prerequisite still prevents the reviewer and implementer
+from resolving the problem:
 
 ```text
 kanban_block(
@@ -163,7 +170,7 @@ Do not edit the implementation while acting as reviewer. Request changes and let
 - **Vague findings:** “Needs work” does not give the implementer a reproducible correction target.
 - **Style-only blocking:** Do not request changes for preference-level nits when behavior and repository standards are satisfied.
 - **Skipping prior rounds:** Re-review must confirm both the requested corrections and preservation of previously passing behavior.
-- **Using blockers for ordinary rework:** Correctable defects belong in `kanban_request_changes`; reserve `kanban_block` for genuine external blockers or human decisions.
+- **Using blockers for ordinary rework:** Correctable defects belong in `kanban_request_changes`; reserve `kanban_block` for genuine external blockers or human decisions that cannot be answered through the available trusted conversation.
 - **Completing without evidence:** Every approval summary must name the checks or artifacts actually inspected.
 
 ## Verification

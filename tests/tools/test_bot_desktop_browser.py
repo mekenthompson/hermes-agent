@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -102,15 +104,51 @@ def test_dock_browser_caps_its_disk_cache():
 
 def _fake_running_instance(user_data_dir, pid: int, port: int) -> None:
     (user_data_dir / "DevToolsActivePort").write_text(f"{port}\n/devtools/browser/abc\n", encoding="utf-8")
-    os.symlink(f"host-{pid}", user_data_dir / "SingletonLock")
+    os.symlink(f"{socket.gethostname()}-{pid}", user_data_dir / "SingletonLock")
+
+
+@pytest.fixture
+def chromium_process(monkeypatch, tmp_path):
+    """Present this process's real listener as a Chromium with a selected profile."""
+    import psutil
+
+    real_process = psutil.Process
+    identity = {"exe": "/usr/bin/chromium", "profile": str(tmp_path), "uid": os.getuid(),
+                "owns_listener": True}
+
+    class ChromiumProcess:
+        def __init__(self, pid):
+            self.real = real_process(pid)
+
+        def exe(self):
+            return identity["exe"]
+
+        def cmdline(self):
+            return [identity["exe"], f"--user-data-dir={identity['profile']}", "--remote-debugging-port=0"]
+
+        def uids(self):
+            return SimpleNamespace(real=identity["uid"], effective=identity["uid"])
+
+        def net_connections(self, **kwargs):
+            return self.real.net_connections(**kwargs) if identity["owns_listener"] else []
+
+    monkeypatch.setattr(psutil, "Process", ChromiumProcess)
+    return identity
 
 
 def _devtools_server():
     """A loopback server answering ``/json/version`` like the dock's Chromium (browser id ``abc``)."""
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            port = self.server.server_address[1]
-            body = json.dumps({"webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/abc"}).encode()
+            if self.path != "/json/version":
+                self.send_error(404)
+                return
+            if self.server.redirect:
+                self.send_response(302)
+                self.send_header("Location", "http://foreign.example/json/version")
+                self.end_headers()
+                return
+            body = json.dumps({"webSocketDebuggerUrl": self.server.endpoint}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -121,11 +159,14 @@ def _devtools_server():
             pass
 
     server = HTTPServer(("127.0.0.1", 0), Handler)
+    server.endpoint = f"ws://127.0.0.1:{server.server_port}/devtools/browser/abc"
+    server.redirect = False
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
 
-def test_running_instance_port_requires_live_pid_and_open_port(tmp_path):
+@pytest.mark.platforms("linux")
+def test_running_instance_port_requires_live_pid_and_open_port(tmp_path, chromium_process):
     from tools import browser_launcher as launcher
 
     server = _devtools_server()
@@ -136,16 +177,190 @@ def test_running_instance_port_requires_live_pid_and_open_port(tmp_path):
 
         # Both files outlive a closed Chromium: a dead pid must not be trusted.
         os.unlink(tmp_path / "SingletonLock")
-        os.symlink("host-2147483000", tmp_path / "SingletonLock")
+        os.symlink(f"{socket.gethostname()}-2147483000", tmp_path / "SingletonLock")
         assert launcher.running_instance(str(tmp_path)) is None
     finally:
         server.shutdown()
         server.server_close()
     # Live pid, port no longer accepting: still not attachable.
     os.unlink(tmp_path / "SingletonLock")
-    os.symlink(f"host-{os.getpid()}", tmp_path / "SingletonLock")
+    os.symlink(f"{socket.gethostname()}-{os.getpid()}", tmp_path / "SingletonLock")
     assert launcher.running_instance(str(tmp_path)) is None
     assert launcher.running_instance(str(tmp_path / "missing")) is None
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("marker", [None, "not-a-port\n", "65536\n/devtools/browser/abc\n"])
+def test_missing_or_corrupt_marker_recovers_only_the_owner_endpoint(tmp_path, chromium_process, marker):
+    from tools import browser_launcher as launcher
+
+    server = _devtools_server()
+    try:
+        (tmp_path / "SingletonLock").symlink_to(f"{socket.gethostname()}-{os.getpid()}")
+        if marker is not None:
+            (tmp_path / "DevToolsActivePort").write_text(marker, encoding="utf-8")
+        assert launcher.running_instance(str(tmp_path)) == (
+            server.server_port, "/devtools/browser/abc", os.getpid())
+        chromium_process["owns_listener"] = False
+        assert launcher.running_instance(str(tmp_path)) is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("exe", ["/usr/bin/chromium", "/usr/bin/brave-browser", "/usr/bin/microsoft-edge"])
+def test_supported_chromium_family_profiles_recover(tmp_path, chromium_process, exe):
+    from tools import browser_launcher as launcher
+
+    server = _devtools_server()
+    try:
+        chromium_process["exe"] = exe
+        (tmp_path / "SingletonLock").symlink_to(f"{socket.gethostname()}-{os.getpid()}")
+        assert launcher.running_instance(str(tmp_path)) == (
+            server.server_port, "/devtools/browser/abc", os.getpid())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("change", ["wrong_exe", "wrong_profile", "wrong_uid", "other_listener"])
+def test_recovery_refuses_unverified_profile_owner(tmp_path, chromium_process, change):
+    from tools import browser_launcher as launcher
+
+    server = _devtools_server()
+    try:
+        (tmp_path / "SingletonLock").symlink_to(f"{socket.gethostname()}-{os.getpid()}")
+        chromium_process.update({
+            "wrong_exe": {"exe": "/usr/bin/python"},
+            "wrong_profile": {"profile": str(tmp_path / "other")},
+            "wrong_uid": {"uid": os.getuid() + 1},
+            "other_listener": {"owns_listener": False},
+        }[change])
+        assert launcher.running_instance(str(tmp_path)) is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.platforms("linux")
+def test_cdp_probe_rejects_proxy_redirect_and_foreign_endpoint(tmp_path, monkeypatch, chromium_process):
+    from tools import browser_launcher as launcher
+
+    server = _devtools_server()
+    try:
+        _fake_running_instance(tmp_path, os.getpid(), server.server_port)
+        monkeypatch.setenv("HTTP_PROXY", "http://foreign.example:1234")
+        assert launcher.running_instance(str(tmp_path)) is not None
+        server.endpoint = f"ws://127.0.0.1:{server.server_port}@foreign.example/devtools/browser/abc"
+        assert launcher.running_instance(str(tmp_path)) is None
+        server.endpoint = f"ws://127.0.0.1:{server.server_port}/devtools/browser/abc"
+        server.redirect = True
+        assert launcher.running_instance(str(tmp_path)) is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("unverified", ["other_listener", "wrong_profile"])
+def test_native_session_recovers_marker_loss_and_refuses_unverified_occupied_profile(
+    tmp_path, monkeypatch, chromium_process, unverified,
+):
+    """The session route used by browser_exec inherits the launcher's safe attach decision."""
+    from tools import browser_launcher as launcher, browser_session as session
+    from tools.bot_desktop import placement
+
+    server = _devtools_server()
+    try:
+        (tmp_path / "SingletonLock").symlink_to(f"{socket.gethostname()}-{os.getpid()}")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        monkeypatch.setattr(launcher, "_shared_state_dir", lambda _dir: None)
+        monkeypatch.setattr(launcher, "_browsers", {})
+        monkeypatch.setattr(launcher, "_procs", {})
+        monkeypatch.setattr(runtime, "tool_placement", lambda: placement.GATEWAY)
+        monkeypatch.setattr(session, "ensure_screen_for_headed_chromium", lambda: None)
+        monkeypatch.setattr(session, "_bot_desktop_target", lambda: (
+            f"profile:{tmp_path}", {"executable": "/usr/bin/chromium", "user_data_dir": str(tmp_path),
+                                     "ephemeral": False}))
+        monkeypatch.setattr(launcher, "_launch_owned", lambda *a, **k: pytest.fail("must not launch over a lock"))
+        info = session._create_chromium_session("marker-recovery")
+        assert info["cdp_url"] == f"ws://127.0.0.1:{server.server_port}/devtools/browser/abc"
+        assert info["shared_profile"] is True
+
+        launcher._browsers.clear()
+        if unverified == "other_listener":
+            chromium_process["owns_listener"] = False
+        else:
+            chromium_process["profile"] = str(tmp_path / "other")
+        monkeypatch.setattr(launcher, "_UNRESPONSIVE_WAIT_S", 0)
+        with pytest.raises(RuntimeError, match="in use by Chromium"):
+            session._create_chromium_session("occupied")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.platforms("linux")
+def test_browser_exec_receives_recovered_native_cdp_and_refuses_unverified_owner(
+    tmp_path, monkeypatch, chromium_process,
+):
+    from tools import browser_launcher as launcher, browser_session as session, browser_use_cli as bu_cli
+    from tools import browser_session_cdp, browser_session_cloud, browser_session_lifecycle
+    from tools import browser_lightpanda, browser_session_real_profile
+    from tools.bot_desktop import placement
+
+    server = _devtools_server()
+    try:
+        (tmp_path / "SingletonLock").symlink_to(f"{socket.gethostname()}-{os.getpid()}")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        monkeypatch.setattr(launcher, "_shared_state_dir", lambda _dir: None)
+        monkeypatch.setattr(launcher, "_browsers", {})
+        monkeypatch.setattr(launcher, "_procs", {})
+        monkeypatch.setattr(launcher, "_launch_owned", lambda *a, **k: pytest.fail("occupied profile relaunched"))
+        monkeypatch.setattr(runtime, "tool_placement", lambda: placement.GATEWAY)
+        monkeypatch.setattr(session, "ensure_screen_for_headed_chromium", lambda: None)
+        monkeypatch.setattr(session, "_bot_desktop_target", lambda: (
+            f"profile:{tmp_path}", {"executable": "/usr/bin/chromium", "user_data_dir": str(tmp_path),
+                                     "ephemeral": False}))
+        for name in ("_active_sessions", "_session_last_activity", "_session_owner_homes", "_cleanup_failures"):
+            monkeypatch.setattr(session, name, {})
+        monkeypatch.setattr(browser_session_lifecycle, "start_cleanup_thread", lambda: None)
+        monkeypatch.setattr(browser_session_cdp, "get_cdp_override", lambda: "")
+        monkeypatch.setattr(browser_session_cloud, "get_cloud_provider", lambda: None)
+        monkeypatch.setattr(browser_session_cloud, "use_real_profile", lambda: False)
+        monkeypatch.setattr(browser_session_real_profile, "real_profile_cdp", lambda: (None, None))
+        monkeypatch.setattr(browser_lightpanda, "using_lightpanda_engine", lambda: False)
+        monkeypatch.setattr(session, "run_fenced", lambda _info, dispatch: dispatch())
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["browser-use"])
+        monkeypatch.setattr(bu_cli, "_base_subprocess_env", dict)
+        monkeypatch.setattr(bu_cli, "_read_browser_cfg", dict)
+        monkeypatch.setattr(bu_cli, "_live_generation", lambda: 0)
+        monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda *a: None)
+        monkeypatch.setattr(bu_cli, "_workspace_dir", lambda _task: None)
+        monkeypatch.setattr(bu_cli, "_driven_daemons", {})
+        monkeypatch.setattr(bu_cli, "_exec_route_is_sidecar", {})
+        harness_envs = []
+
+        def harness(_cmd, _code, env, _timeout):
+            harness_envs.append(dict(env))
+            return subprocess.CompletedProcess([], 0, "ran", "")
+
+        monkeypatch.setattr(bu_cli, "_run_cli_killing_process_group", harness)
+        assert json.loads(bu_cli.browser_exec("print(1)", session="recovered"))["success"] is True
+        assert harness_envs[0]["BU_CDP_WS"] == (
+            f"ws://127.0.0.1:{server.server_port}/devtools/browser/abc")
+
+        launcher._browsers.clear()
+        chromium_process["owns_listener"] = False
+        monkeypatch.setattr(launcher, "_UNRESPONSIVE_WAIT_S", 0)
+        refused = json.loads(bu_cli.browser_exec("print(1)", session="unverified"))
+        assert "in use by Chromium" in refused["error"]
+        assert len(harness_envs) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_agent_attaches_to_human_started_browser(tmp_path, monkeypatch):

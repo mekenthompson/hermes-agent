@@ -255,24 +255,23 @@ def _resolve_bedrock_runtime(requested_provider: str, model_cfg: dict[str, Any],
 
 
 def _is_external_process_provider(provider: str) -> bool:
-    """Keyed on the registered provider's auth_type (CLI registry first, then the profile registry
-    so the check works before the CLI registry has been extended)."""
+    """Whether a provider selects the external-process auth lane."""
     name = (provider or "").strip().lower()
     if not name:
         return False
     try:
-        pconfig = _rp().PROVIDER_REGISTRY.get(name)
-        if pconfig is not None:
-            return pconfig.auth_type == "external_process"
-    except Exception:
-        pass
-    try:
-        from providers import get_provider_profile
+        _rp().auth_mod._external_process_provider_config(name)
+    except _rp().AuthError as exc:
+        if "conflicting authentication metadata" in str(exc):
+            raise
+        try:
+            from providers import get_provider_profile
 
-        profile = get_provider_profile(name)
-    except Exception:
-        return False
-    return profile is not None and getattr(profile, "auth_type", "") == "external_process"
+            profile = get_provider_profile(name)
+        except Exception:
+            return False
+        return getattr(profile, "auth_type", None) == "external_process"
+    return True
 
 
 def _resolve_external_process_runtime(provider: str, requested_provider: str) -> dict[str, Any]:

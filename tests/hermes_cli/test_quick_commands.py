@@ -78,7 +78,7 @@ class TestGatewayQuickCommands:
     """Test quick command dispatch in GatewayRunner._handle_message."""
 
     def _make_event(self, command, args=""):
-        event = MagicMock()
+        event = MagicMock(structured_control=None)
         event.get_command.return_value = command
         event.get_command_args.return_value = args
         event.text = f"/{command} {args}".strip()

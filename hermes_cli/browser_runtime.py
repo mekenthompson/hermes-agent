@@ -72,6 +72,83 @@ def chromium_executable(*, allow_override: bool = True) -> str | None:
     return _system_executable() if _pm_has_no_chromium() else None
 
 
+def chromium_sandbox_required() -> bool:
+    """Whether this profile forbids automatic Chromium sandbox bypass."""
+    from hermes_cli.config import cfg_get, load_config_readonly
+
+    return cfg_get(load_config_readonly(), "browser", "sandbox_required", default=False) is True
+
+
+def validate_chromium_sandbox_args(argv) -> None:
+    """Refuse explicit sandbox-disabling switches under the profile's required policy."""
+    if not chromium_sandbox_required():
+        return
+    forbidden = {
+        "--no-sandbox", "--disable-setuid-sandbox", "--disable-seccomp-filter-sandbox",
+        "--disable-namespace-sandbox", "--single-process", "--no-zygote",
+        "--disable-gpu-sandbox", "--in-process-gpu",
+    }
+    if any(str(arg).split("=", 1)[0] in forbidden for arg in argv):
+        raise ValueError("browser.sandbox_required forbids sandbox-disabling Chromium flags; "
+                         "remove those flags and configure the container's sandbox policy.")
+
+
+def _verify_existing_renderer_sandbox(process) -> None:
+    """Require kernel evidence, not merely the absence of disabling argv switches.
+
+    Linux /proc exposes PID namespace depth and the renderer's additional seccomp
+    filters. Missing/unreadable evidence (including other platforms) refuses reuse.
+    This checks a local Chromium process, not a remote endpoint or hostile host.
+    """
+    def status(pid):
+        text = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+        return {key: value.strip() for line in text.splitlines()
+                if ":" in line for key, value in [line.split(":", 1)]}
+
+    parent = status(process.pid)
+    parent_filters = int(parent["Seccomp_filters"])
+    parent_depth = len(parent["NSpid"].split())
+    renderers = []
+    for child in process.children(recursive=True):
+        argv = " ".join(child.cmdline()).split()
+        if "--type=renderer" not in argv:
+            continue
+        validate_chromium_sandbox_args(argv)
+        observed = status(child.pid)
+        if not (observed["Uid"].split() == parent["Uid"].split()
+                and "0" not in observed["Uid"].split()
+                and observed["NoNewPrivs"] == "1"
+                and observed["Seccomp"] == "2"
+                and int(observed["Seccomp_filters"]) > parent_filters
+                and int(observed["CapEff"], 16) == 0
+                and len(observed["NSpid"].split()) > parent_depth
+                and child.is_running()):
+            raise ValueError("existing renderer sandbox evidence is insufficient")
+        renderers.append(child.pid)
+    if not renderers or not process.is_running():
+        raise ValueError("existing browser has no verifiable sandboxed renderer; close it normally and retry")
+
+
+def chromium_existing_sandbox_error(pid: int | None, *, foreign: bool = False) -> str | None:
+    """Do not adopt an unverifiable or explicitly unsandboxed existing browser."""
+    if not chromium_sandbox_required():
+        return None
+    import psutil
+
+    if pid is None or foreign:
+        return "browser.sandbox_required: cannot verify the existing browser; leave it running and close it normally."
+    try:
+        process = psutil.Process(pid)
+        argv = process.cmdline()
+        if not argv:
+            raise ValueError("browser.sandbox_required: existing browser command line is unavailable.")
+        validate_chromium_sandbox_args(argv)
+        _verify_existing_renderer_sandbox(process)
+    except (psutil.Error, OSError, ValueError, KeyError) as exc:
+        return f"browser.sandbox_required: refusing existing browser without changing its profile: {exc}"
+    return None
+
+
 def chromium_missing_hint() -> str:
     """One actionable line for "no Chromium" on this machine. Never suggests npm."""
     from hermes_platform.host.runtime import is_termux

@@ -577,6 +577,11 @@ def preflight_db_writability(db_path: Path, *, db_label: str = "state.db", direc
     for p, is_dir in [(db_path.parent, True), *files]:
         if (is_dir and not p.is_dir()) or _rw_or_vanished(p):
             continue
+        # A concurrent quarantine renames the file between the is_file() snapshot
+        # and this check. os.access() reports a missing path as no access, which
+        # is not a read-only file. The opener creates a fresh DB.
+        if not is_dir and not p.exists():
+            continue
         x = "x" if is_dir else ""
         in_scope = False
         with contextlib.suppress(OSError, ValueError):

@@ -42,7 +42,7 @@ env:
 jobs:
   windows-x64:
     name: Hermes-Setup.exe (windows x64, signed)
-    runs-on: blacksmith-2vcpu-windows-2025
+    runs-on: windows-latest
     environment: release-signing
     timeout-minutes: 90
     steps:
@@ -154,7 +154,7 @@ jobs:
 
   macos-arm64:
     name: Hermes-Setup.dmg (macos arm64, signed + notarized)
-    runs-on: blacksmith-12vcpu-macos-latest
+    runs-on: macos-latest
     environment: release-signing
     timeout-minutes: 90
     steps:

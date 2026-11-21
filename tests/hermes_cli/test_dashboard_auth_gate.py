@@ -20,6 +20,41 @@ from starlette.websockets import WebSocketDisconnect
 from hermes_cli import web_server
 
 
+@pytest.fixture(autouse=True)
+def _isolate_dashboard_public_url(monkeypatch):
+    """Keep local-only cases independent of operator public-URL settings.
+
+    Individual external-URL cases set ``HERMES_DASHBOARD_PUBLIC_URL`` after
+    this fixture runs, so they continue to exercise the real resolver's env
+    precedence.  Config is pinned empty here too: this file's loopback cases
+    assert bind behavior, not a developer's dashboard.public_url setting.
+    """
+    from hermes_cli.dashboard_auth import prefix
+
+    monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
+    monkeypatch.setattr(prefix, "_load_dashboard_section", dict)
+
+
+@pytest.fixture
+def client_loopback():
+    # Pin the bound-host state for host_header_middleware so requests with
+    # default Host: testclient pass the DNS-rebinding check.  TestClient
+    # sends Host: testserver by default, but our middleware accepts the
+    # loopback aliases when bound_host is loopback.
+    prev_host = getattr(web_server.app.state, "bound_host", None)
+    prev_port = getattr(web_server.app.state, "bound_port", None)
+    web_server.app.state.bound_host = "127.0.0.1"
+    web_server.app.state.bound_port = 9119
+    client = TestClient(web_server.app, base_url="http://127.0.0.1:9119")
+    yield client
+    web_server.app.state.bound_host = prev_host
+    web_server.app.state.bound_port = prev_port
+
+
+
+
+
+
 # ---------------------------------------------------------------------------
 # should_require_auth predicate (Task 0.2)
 # ---------------------------------------------------------------------------
@@ -103,6 +138,9 @@ def _stub_uvicorn_run(monkeypatch):
         async def shutdown(self, sockets=None):
             pass
 
+    # These tests stub the server rather than binding a socket. Keep unrelated
+    # local gateway processes from turning auth configuration checks into exits.
+    monkeypatch.setattr(web_server, "_port_bind_conflict", lambda host, port: False)
     monkeypatch.setattr(uvicorn, "Config", _FakeConfig)
     # Nothing binds here: never let a live dashboard on the host's 9119 trip the pre-bind probe.
     monkeypatch.setattr(web_server, "_port_bind_conflict", lambda *a, **k: False)

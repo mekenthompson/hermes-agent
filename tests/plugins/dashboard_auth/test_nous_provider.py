@@ -485,7 +485,7 @@ class TestVerifySession:
         token = _mint_token(rsa_keypair)
         # Replace the patched client so it raises.
         bad_client = MagicMock()
-        bad_client.get_signing_key_from_jwt.side_effect = jwt.PyJWKClientError(
+        bad_client.get_signing_key_from_jwt.side_effect = jwt.PyJWKClientConnectionError(
             "fetch failed"
         )
         provider._jwks_client = bad_client

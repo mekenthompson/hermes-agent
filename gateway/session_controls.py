@@ -289,6 +289,8 @@ class AuthorityConnection:
         handlers['session.prune'] = partial(prune, self)
         from gateway.session_usage import account_usage, stats
         handlers['session.stats'] = partial(stats, self)
+        from gateway.session_delivery_handle import delivery_handle
+        handlers['session.delivery_handle'] = partial(delivery_handle, self)
         handlers['session.account_usage'] = partial(account_usage, self)
         from gateway.session_active_list import active_list
         handlers['session.active_list'] = partial(active_list, self)
@@ -361,7 +363,8 @@ class AuthorityConnection:
         original_params = dict(params)
         contract = contract or METHODS.get(method)
         authority = self.authority
-        if (isinstance(ref.session_id, str) and ref.session_id and not getattr(authority, 'retiring', False)
+        if (method != 'session.delivery_handle'
+                and isinstance(ref.session_id, str) and ref.session_id and not getattr(authority, 'retiring', False)
                 and ref.profile_id == getattr(authority, 'profile_id', None)
                 and ref.session_id not in getattr(authority, 'sessions', {ref.session_id: None})):
             # A first read of a session recovery never restored: its compression catch-up (#140060)
@@ -591,10 +594,16 @@ class AuthorityConnection:
 
     async def info(self, ref, params):
         from gateway.session_local_inventory import snapshot_info
-        if set(params) != {'session_id'}:
+        from gateway.session_execution_progress import execution_info, execution_progress
+        if (set(params) - {'session_id', 'execution_only'} or 'session_id' not in params
+                or ('execution_only' in params and type(params['execution_only']) is not bool)):
             raise AuthorityRefusal('invalid_params')
         await self.authority.resolve(self.actor, ref)
-        return await snapshot_info(self.authority, ref)
+        if params.get('execution_only'):
+            return execution_info(self.authority, ref)
+        info = await snapshot_info(self.authority, ref)
+        info['execution_progress'] = execution_progress(self.authority, ref)
+        return info
 
     async def list_sessions(self, ref, params):
         if 'session:read' not in self.actor.capabilities:

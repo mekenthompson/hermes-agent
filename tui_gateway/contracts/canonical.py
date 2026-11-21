@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, StrictBool
 
 from .base import JsonValue, Params, Result
 from .common import McpServerStatus, OpenModel, PlanGauge, ProfileParams, ProjectRef, Usage
@@ -150,6 +150,13 @@ canonical_method("command.observe", params=CommandObserveParams, result=CommandO
 
 class CanonicalSessionInfoParams(Params):
     session_id: str
+    execution_only: StrictBool = False
+
+
+class ExecutionProgress(Result):
+    execution_generation: int
+    tool: str
+    progress_at: float
 
 
 class SessionInventoryFields(Result):
@@ -194,6 +201,7 @@ class CanonicalSessionInfo(SessionInventoryFields, OpenModel):
     profile_id: str
     desktop_protocol: str
     profile_name: str
+    execution_progress: ExecutionProgress | None = None
     cwd: str | None = None
     # An ACP session's edit approval policy (``session.mutate edit_policy``): ask / workspace_session / session.
     edit_approval_policy: Literal["ask", "workspace_session", "session"] | None = None
@@ -219,7 +227,8 @@ class CanonicalSessionInfo(SessionInventoryFields, OpenModel):
 
 
 canonical_method("session.info", params=CanonicalSessionInfoParams, result=CanonicalSessionInfo,
-                 doc="Frozen launch policy projection of one local session.")
+                 doc="Frozen launch policy projection of one local session. execution_only skips inventory "
+                     "and returns a minimal session envelope with the current execution's tool summary.")
 
 
 class SessionStatsParams(Params):

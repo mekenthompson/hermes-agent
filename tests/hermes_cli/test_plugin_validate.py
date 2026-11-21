@@ -79,6 +79,42 @@ BASE_MANIFEST = {
 }
 
 
+def test_validate_cli_probes_synced_environment_python(tmp_path, monkeypatch):
+    """Validation must use the PM environment selected by sync, not this process's old interpreter."""
+    from hermes_cli import plugin_validate, plugins_cmd_catalog
+    import pm
+    import pm.environments as pm_environments
+    import pm.paths as pm_paths
+
+    plugin_dir = _make_plugin(tmp_path, manifest=dict(BASE_MANIFEST))
+    selected_python = tmp_path / "selected" / "bin" / "python"
+    selected_python.parent.mkdir(parents=True)
+    selected_python.touch()
+    monkeypatch.setattr(pm, "sync_venv", lambda **kwargs: None)
+    monkeypatch.setattr(pm_environments, "project_python", lambda _root: selected_python)
+    monkeypatch.setattr(pm_environments, "selected_venv", lambda _root: selected_python.parent.parent)
+    monkeypatch.setattr(pm_environments, "venv_command", lambda _root, _venv: [str(selected_python)])
+    monkeypatch.setattr(pm_environments, "activation_environment", lambda _root: {"VIRTUAL_ENV": "selected"})
+    monkeypatch.setattr(pm_paths, "repo_root", lambda: tmp_path)
+    probed = {}
+
+    def record_probe(_plugin_dir, _manifest, probe=None):
+        probed["probe"] = probe
+        return {}, ""
+
+    monkeypatch.setattr(plugin_validate, "_run_capability_probe", record_probe)
+    try:
+        plugins_cmd_catalog.cmd_validate(str(plugin_dir), as_json=True, install_deps=True)
+    except SystemExit as exc:
+        assert exc.code == 0
+    else:
+        raise AssertionError("cmd_validate should exit with the validation report")
+    probe = probed.get("probe")
+    assert isinstance(probe, tuple)
+    assert probe[0] == [str(selected_python)]
+    assert probe[1]["VIRTUAL_ENV"] == "selected"
+
+
 def test_requires_hermes_spec_is_validated(tmp_path):
     manifest = dict(BASE_MANIFEST, description="café", requires_hermes=">=0.21")
     d = _make_plugin(tmp_path, manifest=manifest)
@@ -149,6 +185,31 @@ class TestCapabilityProbe:
         d = _make_plugin(tmp_path, manifest=manifest, init_py=init)
         report = validate_plugin_dir(d)
         assert report.ok
+
+    def test_capability_probe_uses_supplied_environment_python(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from hermes_cli import plugin_validate
+
+        d = _make_plugin(tmp_path, manifest=dict(BASE_MANIFEST))
+        selected_python = tmp_path / "selected" / "bin" / "python"
+        calls = {}
+
+        def fake_run(command, **kwargs):
+            calls["command"] = command
+            return SimpleNamespace(
+                stdout=f"{plugin_validate._PROBE_SENTINEL}{{}}\n",
+                stderr="",
+                returncode=0,
+            )
+
+        monkeypatch.setattr(plugin_validate.subprocess, "run", fake_run)
+        recorded, error = plugin_validate._run_capability_probe(
+            d, dict(BASE_MANIFEST), selected_python
+        )
+
+        assert calls["command"][0] == str(selected_python)
+        assert recorded == {}
+        assert not error
 
     def test_declared_but_not_registered_warns(self, tmp_path):
         manifest = dict(BASE_MANIFEST, provides_tools=["phantom_tool"])

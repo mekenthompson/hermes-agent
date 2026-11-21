@@ -70,7 +70,28 @@ const mountTree = (tree: React.ReactElement, { interactive = false } = {}) => {
     clear: () => {
       output = ''
     },
-    output: () => stripAnsi(output)
+    output: () => stripAnsi(output),
+    /**
+     * Resolve on the frame that satisfies `predicate`, rather than guessing
+     * how long React's MessageChannel scheduler needs under CI load.
+     */
+    waitForOutput: (predicate: (next: string) => boolean) =>
+      new Promise<void>(resolve => {
+        if (predicate(stripAnsi(output))) {
+          resolve()
+
+          return
+        }
+
+        const onData = () => {
+          if (predicate(stripAnsi(output))) {
+            stdout.off('data', onData)
+            resolve()
+          }
+        }
+
+        stdout.on('data', onData)
+      })
   }
 }
 
@@ -303,10 +324,12 @@ describe('status-chrome timers under an occluding overlay', () => {
     // Five minutes of wall clock elapse while the overlay covers the rule.
     nowSpy.mockReturnValue(T0 + 300_000)
     rule.clear()
+    const revealed = rule.waitForOutput(next => next.includes('6m 0s') && next.includes('✓ 5m 5s'))
     resetOverlayState()
     // Poll for the reveal frame instead of a fixed tick: under CI load the
     // store-driven re-render can land well after one 20ms scheduler turn.
     await vi.waitFor(() => expect(rule.output()).toContain('6m 0s'), { interval: 10, timeout: 5_000 })
+    await revealed
 
     const resumed = rule.output()
 

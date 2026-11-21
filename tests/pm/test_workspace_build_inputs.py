@@ -285,8 +285,7 @@ def test_nested_dist_travels_but_root_dist_stays_out(tmp_path):
 
 
 def test_tool_store_inside_a_package_stays_out_of_the_snapshot(tmp_path):
-    """The container image keeps PM's tool store in the ``tools`` package directory; each dependency
-    generation copied its interpreters, browser and media binaries (~1.5 GB) into its workspace."""
+    """Published store facts exclude payloads, not ordinary names that resemble them."""
     core = tmp_path / "core"
     tools = core / "tools"
     (tools / "environments").mkdir(parents=True)
@@ -294,6 +293,8 @@ def test_tool_store_inside_a_package_stays_out_of_the_snapshot(tmp_path):
     for entry in ("python-3.14.7-linux-x64", "chromium-1208", "fetch-abc123"):
         (tools / entry / "bin").mkdir(parents=True)
         (tools / entry / "bin" / "payload").write_text("BINARY\n", encoding="utf-8")
+    (tools / "ordinary-chromium-named").mkdir()
+    (tools / "ordinary-chromium-named" / "kept.txt").write_text("KEPT\n", encoding="utf-8")
     (tools / "__init__.py").write_text("", encoding="utf-8")
     (tools / "environments" / "__init__.py").write_text("", encoding="utf-8")
     (tools / "wakewords" / "hey.onnx").write_text("DATA\n", encoding="utf-8")
@@ -302,17 +303,14 @@ def test_tool_store_inside_a_package_stays_out_of_the_snapshot(tmp_path):
         "venv": {"entry": None}, "escape": {"entry": "../environments"}}}), encoding="utf-8")
     (core / "pyproject.toml").write_text(
         '[project]\nname="core"\nversion="1"\nrequires-python=">=3.11"\n'
-        '[tool.setuptools.packages.find]\ninclude=["tools", "tools.*"]\n',
-        encoding="utf-8",
-    )
-
+        '[tool.setuptools.packages.find]\ninclude=["tools", "tools.*"]\n', encoding="utf-8")
     destination = tmp_path / "stage"
     workspace._copy_core_inputs(core, destination)
-
     assert (destination / "tools/environments/__init__.py").is_file()
-    assert (destination / "tools/wakewords/hey.onnx").read_text(encoding="utf-8") == "DATA\n"
+    assert (destination / "tools/wakewords/hey.onnx").read_text() == "DATA\n"
+    assert (destination / "tools/ordinary-chromium-named/kept.txt").read_text() == "KEPT\n"
     for entry in ("python-3.14.7-linux-x64", "chromium-1208", "fetch-abc123"):
-        assert not (destination / "tools" / entry).exists(), f"store entry {entry} copied into the snapshot"
+        assert not (destination / "tools" / entry).exists()
 
 
 @pytest.mark.parametrize("find_section", [
@@ -350,14 +348,27 @@ def test_a_facts_file_without_published_entries_hides_nothing(tmp_path):
     (core / "agent" / "facts.json").write_text('{"schema": 1}', encoding="utf-8")
     (core / "pyproject.toml").write_text(
         '[project]\nname="core"\nversion="1"\nrequires-python=">=3.11"\n'
-        '[tool.setuptools.packages.find]\ninclude=["agent"]\n',
-        encoding="utf-8",
-    )
-
+        '[tool.setuptools.packages.find]\ninclude=["agent"]\n', encoding="utf-8")
     destination = tmp_path / "stage"
     workspace._copy_core_inputs(core, destination)
+    assert (destination / "agent/chromium-1208/kept.txt").read_text() == "KEPT\n"
 
-    assert (destination / "agent/chromium-1208/kept.txt").read_text(encoding="utf-8") == "KEPT\n"
+
+def test_repair_snapshot_drops_runtime_payloads(tmp_path):
+    """A recorded workspace already containing store payloads must not copy them forward."""
+    replay = tmp_path / "replay"
+    tools = replay / "tools"
+    (tools / "node-26.7.0-linux-x64").mkdir(parents=True)
+    (tools / "approval.py").write_text("MODULE\n", encoding="utf-8")
+    (tools / "facts.json").write_text(json.dumps({"packages": {
+        "node": {"entry": "node-26.7.0-linux-x64"}}}), encoding="utf-8")
+    (replay / "pyproject.toml").write_text("name\n", encoding="utf-8")
+    (replay / "uv.lock").write_text("lock\n", encoding="utf-8")
+    fresh = tmp_path / "fresh"
+    shutil.copytree(replay, fresh, symlinks=True, ignore=workspace._member_ignored)
+    assert (fresh / "tools/approval.py").read_text() == "MODULE\n"
+    assert (fresh / "pyproject.toml").is_file()
+    assert not (fresh / "tools/node-26.7.0-linux-x64").exists()
 
 
 def test_a_package_root_named_in_where_travels_into_the_snapshot(tmp_path):

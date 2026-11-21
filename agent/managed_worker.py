@@ -109,7 +109,7 @@ def encode_frame(frame):
 
 
 def validate_bootstrap(frame):
-    if set(frame) - {'attachments_v1'} != BOOTSTRAP_FIELDS or frame['version'] != 1:
+    if set(frame) - {'attachments_v1', 'approval_task_v1'} != BOOTSTRAP_FIELDS or frame['version'] != 1:
         raise ValueError('invalid_managed_worker_bootstrap')
     scope = frame['scope']
     fields = {'profile_id', 'session_id', 'execution_id', 'generation', 'pid', 'birth', 'secret', 'epoch'}
@@ -124,6 +124,13 @@ def validate_bootstrap(frame):
     from agent.turn_author import parse_turn_author
     if frame['turn_author'] is not None and (not isinstance(frame['turn_author'], dict)
                                             or parse_turn_author(frame['turn_author']) is None):
+        raise ValueError('invalid_managed_worker_bootstrap')
+    task = frame.get('approval_task_v1')
+    if task is not None and (not isinstance(task, dict)
+            or set(task) != {'text', 'identity', 'profile', 'session', 'admission', 'generation'}
+            or any(not isinstance(task[k], str) for k in ('text', 'identity', 'profile', 'session', 'admission'))
+            or not isinstance(task['generation'], int) or task['profile'] != frame['home']
+            or task['session'] != frame['route'] or task['generation'] != scope['generation']):
         raise ValueError('invalid_managed_worker_bootstrap')
     return frame
 
@@ -246,47 +253,85 @@ class WorkerControls:
         self.channel, self.route = channel, route
         self.agent = None
         self.stopped = threading.Event()
+        self.stop_processes_requested = False
         self.finish = threading.Event()
         self.clarifications = {}
+        self.task_checks = {}
         self.lock = threading.Lock()
         self.reader = threading.Thread(target=self.read, name='managed-controls', daemon=True)
         self.reader.start()
 
-    def stop(self):
+    def stop(self, *, processes=False):
         self.stopped.set()
+        self.stop_processes_requested = self.stop_processes_requested or processes
         if self.agent is not None:
             from agent.interrupt_compat import request_hard_interrupt
             request_hard_interrupt(self.agent)  # parity with the canonical Stop (SessionAuthority.interrupt)
+            if self.stop_processes_requested:
+                self.retry_process_stop()
         with self.lock:
+            for state in self.task_checks.values():
+                state['event'].set()
             for state in self.clarifications.values():
                 state['answer'] = _INTERRUPTED
                 state['event'].set()
 
+    def stop_processes(self):
+        """A worker owns one admission; only its conversation's raw owners and route match.
+
+        Snapshot before signalling, as in the in-process owner. Explicit Stop reaches
+        persisted jobs too; ordinary turn retirement keeps its existing persistence policy.
+        """
+        from tools.process_registry import process_registry
+        from tools.process_registry_handoff import ownership_identity
+        if not process_registry.refresh_ownership():
+            raise RuntimeError('process_stop_unknown')
+        owners = set(getattr(self.agent, '_process_owner_task_ids', ()))
+        owners.add(getattr(self.agent, 'session_id', None))
+        owners.discard(None)
+        owners.discard('')
+        parents = {getattr(self, 'session_id', None), getattr(self.agent, 'session_id', None)} - {None, ''}
+        with process_registry._lock:
+            targets = {p.id: ownership_identity(p) for p in (*process_registry._running.values(), *process_registry._finished.values())
+                       if p.session_key == self.route and (p.parent_session_id in parents if p.parent_session_id
+                                                          else p.owner_task_id in owners)
+                       and (not p.exited or p._scope_stop_pending or p.systemd_unit
+                            or (p.notify_on_complete and not process_registry.is_completion_consumed(p.id)))}
+        results = [process_registry.kill_process(pid, source='session.interrupt', consume_output=True, expected_ownership=targets[pid])
+                   for pid in targets]
+        if any(r.get('status') not in {'killed', 'already_exited', 'ownership_changed'} or 'scope_stop_failed' in r for r in results):
+            raise RuntimeError('process_stop_unknown')
+
+    def retry_process_stop(self):
+        """Physical uncertainty holds the owner's Stop fence, not a known turn result."""
+        try:
+            self.stop_processes()
+        except RuntimeError as exc:
+            if str(exc) != 'process_stop_unknown':
+                raise
+            return False
+        return True
+
     def read(self):
-        from tools.approval import resolve_gateway_approval
         try:
             while True:
                 frame = read_frame(sys.stdin.buffer)
-                if frame == {'type': 'stop'}:
-                    self.stop()
+                if frame in ({'type': 'stop'}, {'type': 'stop', 'processes': True}):
+                    self.stop(processes=frame.get('processes', False))
                     continue
                 if frame == {'type': 'finish'}:
                     self.finish.set()
                     return
-                if (set(frame) != {'type', 'prompt_id', 'value'} or frame['type'] not in {'approval', 'clarify'}
-                        or not isinstance(frame['prompt_id'], str) or not isinstance(frame['value'], str)
-                        or len(frame['value']) > 16384):
-                    raise ValueError('invalid_managed_control')
-                if frame['type'] == 'approval':
-                    if frame['value'] not in {'once', 'deny', 'session', 'always'}:
-                        raise ValueError('invalid_managed_control')
-                    resolve_gateway_approval(self.route, frame['value'], request_id=frame['prompt_id'])
-                else:
+                if (frame.get('type') == 'approval_task_check'
+                        and set(frame) == {'type', 'request_id', 'current'}
+                        and isinstance(frame['request_id'], str) and type(frame['current']) is bool):
                     with self.lock:
-                        state = self.clarifications.get(frame['prompt_id'])
+                        state = self.task_checks.get(frame['request_id'])
                         if state is not None:
-                            state['answer'] = frame['value']
+                            state['current'] = frame['current']
                             state['event'].set()
+                    continue
+                self.prompt_control(frame)
         except (EOFError, OSError, ValueError) as exc:
             self.stop()
             # The owner is gone (EOF/OSError) — before the hard-exit SIGKILLs this process group, give
@@ -297,11 +342,54 @@ class WorkerControls:
             if not isinstance(exc, ValueError):
                 _die_with_owner()
 
+    def prompt_control(self, frame):
+        """Only the owner of this worker pipe may settle its exact pending prompt.
+        Cancellation has no answer payload and cannot satisfy another prompt.
+        """
+        if frame.get('type') == 'clarify_cancel':
+            if set(frame) != {'type', 'prompt_id'} or not isinstance(frame['prompt_id'], str) or not frame['prompt_id']:
+                raise ValueError('invalid_managed_control')
+            self._settle_clarification(frame['prompt_id'], _INTERRUPTED)
+            return
+        if (set(frame) != {'type', 'prompt_id', 'value'} or frame['type'] not in {'approval', 'clarify'}
+                or not isinstance(frame['prompt_id'], str) or not isinstance(frame['value'], str)
+                or len(frame['value']) > 16384):
+            raise ValueError('invalid_managed_control')
+        if frame['type'] == 'approval':
+            from tools.approval import resolve_gateway_approval
+            if frame['value'] not in {'once', 'deny', 'session', 'always'}:
+                raise ValueError('invalid_managed_control')
+            resolve_gateway_approval(self.route, frame['value'], request_id=frame['prompt_id'])
+        else:
+            self._settle_clarification(frame['prompt_id'], frame['value'])
+
+    def _settle_clarification(self, prompt_id, answer):
+        with self.lock:
+            state = self.clarifications.get(prompt_id)
+            if state is not None:
+                state['answer'] = answer
+                state['event'].set()
+
     def approval(self, data):
         from tools.approval import ack_gateway_approval
         fields = {'request_id', 'command', 'description', 'allow_session', 'allow_permanent', 'smart_denied', 'edit'}
         self.channel.send('approval', data={k: v for k, v in data.items() if k in fields})
         ack_gateway_approval(self.route, data['request_id'])
+
+    def task_current(self):
+        import uuid
+        request_id = uuid.uuid4().hex
+        state = {'event': threading.Event(), 'current': False}
+        with self.lock:
+            if self.stopped.is_set():
+                return False
+            self.task_checks[request_id] = state
+        try:
+            self.channel.send('approval_task_check', request_id=request_id)
+            return state['event'].wait(10) and state['current'] and not self.stopped.is_set()
+        finally:
+            with self.lock:
+                self.task_checks.pop(request_id, None)
 
     def clarify(self, questions):
         """clarify_tool's batch contract: ``callback(questions) -> {answers, outcome, notice?}``.
@@ -310,7 +398,11 @@ class WorkerControls:
         ``-z``, bound by worker_turn_scope) answers headless at once: its viewer cannot answer."""
         from gateway.session_finite import finite_clarify_reply, finite_turn_required
         if finite_turn_required() is True:
-            return finite_clarify_reply()
+            from gateway.session_policy import active_policy
+            policy = active_policy()
+            context = json.loads(policy.kanban_json or '{}') if policy else {}
+            if not context.get('prompt_consumer_admission_id'):
+                return finite_clarify_reply()
         answers = {}
         reply = {'answers': answers, 'outcome': 'submitted'}
         for entry in questions:
@@ -433,6 +525,9 @@ def execute(frame, channel):
     from gateway.session_worker_construct import checkpoint_agent_kwargs, construct_kwargs, routing_agent_kwargs
     construct = {'ephemeral_system_prompt': policy.skills_prompt, **construct_kwargs(frame)}
     controls = WorkerControls(channel, frame['route'])
+    controls.session_id = scope['session_id']
+    from gateway.session_kanban import watch_worker_task
+    watch_worker_task(frame, lambda: channel.send('kanban_stop'))
     register_gateway_notify(frame['route'], controls.approval)
     agent = None
     turn_done = threading.Event()  # ends forward_activity
@@ -480,9 +575,21 @@ def execute(frame, channel):
             before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
                       getattr(agent, 'session_completion_tokens', 0) or 0)
             # Most failed results name no provider or model; the owner's error card needs the agent's.
-            result = {'provider': getattr(agent, 'provider', None), 'model': getattr(agent, 'model', None),
-                      **run_worker_turns(agent, frame, history)}
-            turn_done.set()
+            from contextlib import nullcontext
+            from tools.approval_context import approval_task_context
+            task = frame.get('approval_task_v1')
+            task_scope = (approval_task_context(
+                task['text'], identity=task['identity'], profile=task['profile'], session=task['session'],
+                task_id=task['admission'], run_id=str(task['generation']), is_current=controls.task_current)
+                if task is not None else nullcontext())
+            with task_scope:
+                try:
+                    result = {'provider': getattr(agent, 'provider', None), 'model': getattr(agent, 'model', None),
+                              **run_worker_turns(agent, frame, history)}
+                    turn_done.set()
+                finally:
+                    if getattr(controls, 'stop_processes_requested', False):
+                        controls.retry_process_stop()  # a spawn may have crossed the first Stop snapshot
             result['_turn_input_tokens'] = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
             result['_turn_output_tokens'] = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
             retire_agent(agent)

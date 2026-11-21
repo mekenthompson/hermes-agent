@@ -1,0 +1,11 @@
+{
+  "email": "gh-dispatch@users.noreply.github.com",
+  "commits": [
+    {
+      "sha": "be2dcf50e114d0f8774d5fe88c9dc133e63becaf",
+      "name": "gh-dispatch",
+      "source_url": "https://github.com/NousResearch/hermes-agent/commit/be2dcf50e114d0f8774d5fe88c9dc133e63becaf",
+      "reason": "Official Nous commit API reports no linked author account. Preserve the exact upstream git author; this declaration does not cover any other commit with this email."
+    }
+  ]
+}

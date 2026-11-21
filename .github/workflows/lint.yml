@@ -42,7 +42,7 @@ jobs:
     name: Python lints
     # A frontend-only push has nothing to check here (the ratchet is PR-only).
     if: inputs.python || inputs.event_name == 'pull_request'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout code
@@ -208,7 +208,9 @@ jobs:
       # parent (current main), so an improvement that lands on main is locked in at once.
       - name: Ratchet the PR against the base branch tip
         if: ${{ !cancelled() && steps.tools.outcome == 'success' && inputs.event_name == 'pull_request' }}
-        run: just check --only health --base HEAD^1
+        env:
+          CI_PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: python scripts/check --only health --base HEAD^1
 
       # ── Advisory ruff + ty diff (pull requests, python lane) ──────────────────────────────
 

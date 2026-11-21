@@ -42,7 +42,7 @@ def _workspace_sandbox(sandbox: Path, cwd: Path) -> Path:
 
 
 @pytest.fixture
-def sandboxes(monkeypatch, tmp_path):
+def sandboxes(monkeypatch, tmp_path, absent_container_host_paths):
     """A persistent Docker backend with three ``/workspace`` copies: this session's, another
     session's, and the shared profile sandbox. The cwd mount is off, so the per-workspace copies
     are leftovers until a test turns it on (:func:`_mount_cwd`). ``sess-ws`` belongs to the default profile,

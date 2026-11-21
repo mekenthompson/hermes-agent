@@ -150,13 +150,16 @@ def _get_profiles(port, token, proc, log, timeout=60):
     pytest.fail(f"serve never answered (exit={proc.poll()}): {log.read_text(errors='replace')}")
 
 
+_TOKEN = "isolated-scope-test-token-0123456789abcdef"  # the dashboard needs at least 32 characters
+
+
 def test_real_profile_flag_isolated_serve_lists_only_its_profile(tmp_path):
     root = tmp_path / "hermes"
     for home in (root, root / "profiles" / "worker"):
         home.mkdir(parents=True)
         (home / "config.yaml").write_text("{}\n", encoding="utf-8")
     env = {**os.environ, "HERMES_HOME": str(root), "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
-           "HERMES_DASHBOARD_SESSION_TOKEN": "isolated-scope-test-token"}
+           "HERMES_DASHBOARD_SESSION_TOKEN": _TOKEN}
     for key in ("HERMES_DESKTOP", "HERMES_PARENT_PID", "HERMES_PARENT_START_MARKER", "HERMES_SPAWN"):
         env.pop(key, None)
     port = _free_port()
@@ -167,7 +170,7 @@ def test_real_profile_flag_isolated_serve_lists_only_its_profile(tmp_path):
              "--host", "127.0.0.1", "--port", str(port)],
             env=env, stdout=out, stderr=subprocess.STDOUT)
     try:
-        body = _get_profiles(port, "isolated-scope-test-token", proc, log)
+        body = _get_profiles(port, _TOKEN, proc, log)
     finally:
         if proc.poll() is None:
             family = [*psutil.Process(proc.pid).children(recursive=True), psutil.Process(proc.pid)]

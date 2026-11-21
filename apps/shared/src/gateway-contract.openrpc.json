@@ -799,6 +799,24 @@
       }
     },
     {
+      "name": "display.clipboard.read",
+      "summary": "Copy out: the screen's text clipboard, to the viewer holding the lease only (5300, code viewer_mismatch / not_in_control / not_running / unavailable / timeout / too_large). Never broadcast.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/DisplayClipboardReadParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/DisplayClipboardReadResult"
+        }
+      }
+    },
+    {
       "name": "display.install",
       "summary": "Run the distro package install on the gateway host; progress streams as display.install.log/.done.",
       "params": [
@@ -10629,6 +10647,17 @@
             "title": "Profile Name",
             "type": "string"
           },
+          "execution_progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionProgress"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "cwd": {
             "anyOf": [
               {
@@ -10855,6 +10884,11 @@
           "session_id": {
             "title": "Session Id",
             "type": "string"
+          },
+          "execution_only": {
+            "default": false,
+            "title": "Execution Only",
+            "type": "boolean"
           }
         },
         "required": [
@@ -11039,6 +11073,32 @@
           "running"
         ],
         "title": "CanonicalSessionListRow",
+        "type": "object"
+      },
+      "CanonicalSessionParams": {
+        "additionalProperties": false,
+        "properties": {
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "CanonicalSessionParams",
         "type": "object"
       },
       "CanonicalSessionRef": {
@@ -17314,6 +17374,61 @@
         "title": "DelegationStatusResult",
         "type": "object"
       },
+      "DeliveryHandleResult": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "stored_session_id": {
+            "title": "Stored Session Id",
+            "type": "string"
+          },
+          "profile_id": {
+            "title": "Profile Id",
+            "type": "string"
+          },
+          "instance_id": {
+            "title": "Instance Id",
+            "type": "string"
+          },
+          "authority_epoch": {
+            "title": "Authority Epoch",
+            "type": "integer"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "execution_generation": {
+            "title": "Execution Generation",
+            "type": "integer"
+          },
+          "execution_state": {
+            "enum": [
+              "idle",
+              "running",
+              "waiting",
+              "terminal"
+            ],
+            "title": "Execution State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "stored_session_id",
+          "profile_id",
+          "instance_id",
+          "authority_epoch",
+          "revision",
+          "execution_generation",
+          "execution_state"
+        ],
+        "title": "DeliveryHandleResult",
+        "type": "object"
+      },
       "DiagnosticsShareNousParams": {
         "additionalProperties": false,
         "properties": {
@@ -17465,6 +17580,46 @@
         ],
         "title": "DispatchType",
         "type": "string"
+      },
+      "DisplayClipboardReadParams": {
+        "additionalProperties": false,
+        "properties": {
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "viewer_id": {
+            "title": "Viewer Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "viewer_id"
+        ],
+        "title": "DisplayClipboardReadParams",
+        "type": "object"
+      },
+      "DisplayClipboardReadResult": {
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "DisplayClipboardReadResult",
+        "type": "object"
       },
       "DisplayImageSwitch": {
         "additionalProperties": false,
@@ -18799,6 +18954,30 @@
           "retryable"
         ],
         "title": "ErrorSurface",
+        "type": "object"
+      },
+      "ExecutionProgress": {
+        "additionalProperties": false,
+        "properties": {
+          "execution_generation": {
+            "title": "Execution Generation",
+            "type": "integer"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          },
+          "progress_at": {
+            "title": "Progress At",
+            "type": "number"
+          }
+        },
+        "required": [
+          "execution_generation",
+          "tool",
+          "progress_at"
+        ],
+        "title": "ExecutionProgress",
         "type": "object"
       },
       "FailedDelegation": {
@@ -51191,6 +51370,24 @@
       }
     },
     {
+      "name": "session.delivery_handle",
+      "summary": "Read an already mounted local owner without adoption, attach or policy refresh.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/CanonicalSessionParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/DeliveryHandleResult"
+        }
+      }
+    },
+    {
       "name": "session.detach",
       "summary": "Drop this connection's subscription; a stale subscription id answers detached=false. end_reason (snake_case): the viewer is closing the conversation; the last viewer leaving an idle local session ends its row with that reason.",
       "params": [
@@ -51246,7 +51443,7 @@
     },
     {
       "name": "session.info",
-      "summary": "Frozen launch policy projection of one local session.",
+      "summary": "Frozen launch policy projection of one local session. execution_only skips inventory and returns a minimal session envelope with the current execution's tool summary.",
       "params": [
         {
           "name": "params",

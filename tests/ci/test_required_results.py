@@ -21,14 +21,14 @@ import pytest
 
 
 @pytest.mark.parametrize("release", [False, True])
-@pytest.mark.parametrize("job", ["tests", "osv-scanner", "repo-guards", "e2e-desktop"])
+@pytest.mark.parametrize("job", ["tests", "osv-scanner", "repo-guards", "review-labels", "e2e-desktop", "native-install-tests"])
 @pytest.mark.parametrize("result,ordinary,excluded", [
     ("success", True, True), ("skipped", False, True), ("failure", False, False),
     ("cancelled", False, False), ("with-status", False, False),
     ("action_required", False, False), ("unknown", False, False), (None, False, False),
 ])
 def test_status_policy(job, result, ordinary, excluded, release):
-    expected = excluded if job == "e2e-desktop" else ordinary
+    expected = excluded if job in ("review-labels", "e2e-desktop", "native-install-tests") else ordinary
     if result == "skipped" and not release:
         expected = True
     verdict = evaluate_gate({job: {} if result is None else {"result": result}}, release=release)
@@ -60,9 +60,7 @@ def test_selected_update_consumers_must_succeed(lane, jobs, result):
 
 
 def test_release_exclusion_policy():
-    # The PR-only checks are steps of repo-guards, which runs on every event: a release run
-    # where it skipped never ran them at all, so only the deferred Desktop E2E may skip.
-    assert required_results.EXCLUDED_JOBS == {"e2e-desktop"}
+    assert required_results.EXCLUDED_JOBS == {"review-labels", "e2e-desktop", "native-install-tests"}
 
 
 @pytest.mark.parametrize("needs", [{}, None])

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.scripts.test_release_r2 import r2_server as r2_server  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
+pytest_plugins = ["tests.scripts.test_release_r2"]
 from scripts.releases.draft_warning import (
     WARNING_CLOSE, WARNING_OPEN, strip_draft_warning,
 )

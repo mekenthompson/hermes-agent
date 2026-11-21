@@ -103,15 +103,67 @@ def resolve_login(email: str) -> tuple[str, str] | None:
     return None
 
 
+def verified_unlinked_author(email: str, sha: str, *, repo: Path = REPO_ROOT) -> bool:
+    """Accept only an explicitly declared immutable source author, never an email wildcard.
+
+    An upstream author without a linked GitHub account retains their raw git
+    name in release notes. This declaration is not added to AUTHOR_MAP.
+    """
+    if not re.fullmatch(r"[^/\\\s]+@[^/\\\s]+", email) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return False
+    path = repo / "contributors" / "unlinked" / f"{email}.json"
+    try:
+        if path.is_symlink():
+            return False
+        declaration = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not isinstance(declaration, dict) or declaration.get("email") != email:
+            return False
+        records = declaration.get("commits")
+        if not isinstance(records, list) or not records:
+            return False
+        if any(not isinstance(item, dict) for item in records):
+            return False
+        declared = [item.get("sha") for item in records]
+        if any(not isinstance(value, str) for value in declared) or len(set(declared)) != len(declared):
+            return False
+        matches = [item for item in records if item.get("sha") == sha]
+        if len(matches) != 1:
+            return False
+        record = matches[0]
+        if record.get("source_url") != f"https://github.com/NousResearch/hermes-agent/commit/{sha}":
+            return False
+        if not isinstance(record.get("reason"), str) or not record["reason"].strip():
+            return False
+        identity = subprocess.run(
+            ["git", "show", "-s", "--format=%ae%x00%an", sha],
+            cwd=repo, capture_output=True, text=True, check=True,
+        ).stdout.rstrip("\n").split("\0")
+        return len(identity) == 2 and identity == [email, record.get("name")]
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return False
+
+
+def unlinked_email_is_verified(email: str) -> bool:
+    base = run("git", "merge-base", "origin/main", "HEAD")
+    authors = run("git", "log", f"{base}..HEAD", "--format=%H%x09%ae", "--no-merges")
+    commits = [line.split("\t", 1)[0] for line in authors.splitlines()
+               if "\t" in line and line.split("\t", 1)[1] == email]
+    return bool(commits) and all(verified_unlinked_author(email, sha) for sha in commits)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fix", action="store_true",
                         help="auto-create contributors/emails/ mapping files")
+    parser.add_argument("--verify-unlinked-email",
+                        help="CI seam: every commit for this exact email must have a verified declaration")
     args = parser.parse_args()
+    if args.verify_unlinked_email is not None:
+        return 0 if unlinked_email_is_verified(args.verify_unlinked_email) else 1
 
-    unmapped = [e for e in new_emails() if not is_mapped(e)]
+    unmapped = [e for e in new_emails() if not is_mapped(e) and not unlinked_email_is_verified(e)]
     if not unmapped:
-        print("✅ All contributor emails on this branch are mapped.")
+        print("✅ All contributor emails are mapped or verified unlinked source identities.")
         return 0
 
     failed = []

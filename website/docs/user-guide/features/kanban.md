@@ -411,6 +411,30 @@ hermes kanban unblock  t_abc t_def
 hermes kanban block    t_abc "need input" --ids t_def t_hij
 ```
 
+### Guarded controls for integrations
+
+`show --json` and `kanban_show` include `latest_event_id` and an `id` on each
+event. An integration can pass that observed token to the existing block or
+unblock operation: `--expected-event-id` on the CLI, `expected_event_id` on
+the tools or Python API. The transition checks the task's latest event in
+its write transaction and refuses a stale request without changing state.
+Guarded CLI operations target one task; their reason comment is recorded
+only after an accepted transition. Ordinary unguarded commands keep their
+existing behavior.
+
+Retain the original token when retrying an activation. Reading a new token
+after a newer Stop is a new resume decision, not a safe retry. A guarded
+`needs_input` block records a fresh Stop even when the task is already
+blocked, preserving its existing block classification and counters.
+`needs_input` can also stop dependency-waiting, scheduled, and queued review
+work. Unblocking still rechecks dependencies and preserves the review phase.
+
+The token is concurrency control, not authorization or proof that external
+effects have stopped. Worker run ownership, board scope, and normal
+operator permissions still apply. Stopping a running card ends its native
+run; inspect retained process and effect evidence before replacing its
+executor.
+
 :::note Where an unblocked task lands
 `unblock` restores the safe source phase: **`review`** for reviewer-origin work
 whose parents are complete, **`ready`** for implementation work whose parents
@@ -429,6 +453,13 @@ survives each unblock (it resets only on a successful `complete`). To keep an
 unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
 parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
+
+Once you have answered it, `hermes kanban unblock <id>` (or `kanban_unblock`)
+returns a task the breaker sent to `triage` to `ready`, or `todo` while a parent
+is open, without editing its spec. Leaving triage this way restarts the
+recurrence count, so the task's next distinct block lands in `blocked`, not
+straight back in `triage`. A task filed into `triage` for specification still
+goes through `specify`.
 :::
 
 ## Enabling tools for a chat profile
@@ -467,7 +498,7 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes when an incomplete parent finishes; with no open parent it is recorded as `needs_input` instead, since the wait could never be satisfied), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
-| `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
+| `kanban_comment` | Append an internal durable note, or publish an explicit human checkpoint. | `task_id`, `body`; optional `human_checkpoint: true`, stable `request_id` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
 | `kanban_attach_url` | Attach a file to a task by URL. | `url` |
 | `kanban_attachments` | List a task's attachments. | — |
@@ -965,7 +996,7 @@ hermes kanban diagnostics [--json]                     # board health snapshot (
 hermes kanban link <parent_id> <child_id>
 hermes kanban unlink <parent_id> <child_id>
 hermes kanban claim <id> [--ttl SECONDS]
-hermes kanban comment <id> "<text>" [--author NAME]
+hermes kanban comment <id> "<text>" [--author NAME] [--human-checkpoint --request-id ID]
 
 # Bulk verbs — accept multiple ids:
 hermes kanban complete <id>... [--result "..."] [--force]
@@ -1131,7 +1162,11 @@ Built-in decomposition also inherits its root's durable session. Session lineage
 `session_id` does not replace existing subscriptions; use `notify-subscribe` and
 `notify-unsubscribe` to change where events are delivered.
 
-A chat-originated auto-subscribe is created in `notify+wake` mode: on a terminal event the destination agent both receives the passive message **and** takes a real turn, so it can read the board context and reply in its own voice. See [Delivery modes](#delivery-modes) below.
+A chat-originated auto-subscribe is created in `wake` mode: on a terminal event the destination agent takes a real turn, reads the board context and replies in its own voice. That reply is the one completion message in the chat; no separate template ping is sent (checkpoints and a handoff's files are still delivered as-is). See [Delivery modes](#delivery-modes) below.
+
+An explicit human checkpoint on `kanban_comment` also reaches subscribed chats and Desktop sessions. Set `human_checkpoint: true` and supply a stable `request_id`; the same ID and exact body can be retried without a second event, while reusing the ID with different content is refused. The body retains Markdown whitespace. Ordinary comments and heartbeats remain internal. A checkpoint is delivered passively even for a `notify+wake` subscription; review, block and completion events still wake the agent. A successful `kanban_unblock` tool call or `hermes kanban unblock` command from an authenticated conversation subscribes that origin in the same guarded task transaction, without replacing earlier subscribers. A failed or stale unblock adds no destination. The CLI checkpoint equivalent is `hermes kanban comment <id> '<Markdown>' --human-checkpoint --request-id <stable-id>`; `--max-len` is refused for checkpoints.
+
+For external sends, the subscription records a checkpoint attempt before calling the transport. A confirmed send advances its receipt; a send that may have reached the destination but lost its response stays marked uncertain and is not resent automatically. Other subscriptions and work continue. Inspect the task event and destination before reconciling an uncertain receipt.
 
 ### Output truncation in messaging
 
@@ -1300,8 +1335,8 @@ may store the thread's own id as `chat_id`, so it still needs `--parent-chat-id`
 | Mode | Passive message | Wakes the agent | Use it when |
 |------|-----------------|-----------------|-------------|
 | `notify` | yes | no | You just want a heads-up message in the chat (default). |
-| `notify+wake` | yes | yes | You also want the destination agent to take a real turn — read the board context and reply in its own voice. Chat-originated auto-subscribes use this. |
-| `wake` | no | yes | You only want the agent to act on the event, with no separate ping. |
+| `notify+wake` | yes | yes | You also want the destination agent to take a real turn — read the board context and reply in its own voice, plus a separate ping. |
+| `wake` | no | yes | You only want the agent to act on the event, with no separate ping. Chat-originated auto-subscribes use this. Checkpoints and a handoff's files are still delivered. |
 
 For `notify+wake`, delivery completes only once the wake is admitted to the adapter's turn queue as well as the passive ping being sent. Missing handlers, rejected routes, and full queues are retried on later notifier ticks without expiring the subscription. Sent pings are checkpointed separately in SQLite, so a rejected wake does not repeat an already checkpointed ping. `notify` remains passive and never starts a turn. Admission is not a guarantee of model execution or a successful reply; normal turn gates still apply. This is not exactly-once delivery: a process crash between a send and its checkpoint can repeat the ping, and the existing claim-before-delivery cursor is not a crash-recoverable queue.
 
@@ -1478,7 +1513,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |
 | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) AND no `kanban_heartbeat` arrived in the last hour. Dispatcher SIGTERM'd the host-local worker (if any), reset the task to `ready` for re-dispatch. Does NOT tick the failure counter (stale is dispatcher-side absence detection, not a worker fault). Workers running long operations should call `kanban_heartbeat` at least once an hour to avoid this. |
 | `reconciled` | `{reason, claim_lock, claim_expires, worker_pid}` | Orphaned-card reconciliation: the card was `running` with broken claim bookkeeping (`claim_lock` or `claim_expires` NULL — crash mid-claim, manual SQL, DB restore) and no live worker, so none of the TTL/crash/stale paths could ever recover it. The dispatcher requeued it to `ready` with an explanatory comment. Gated by `kanban.reconcile_orphans` in config.yaml (default `true`). |
-| `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `infrastructure_cooldown` (the host refused the last spawn — no restart-safe systemd scope — and the cooldown has not elapsed; never counted against the card), `rate_limit_cooldown` (the last run hit a quota wall; same cooldown, never counted), `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
+| `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `infrastructure_cooldown` (the host refused the last spawn — no restart-safe systemd scope — and the cooldown has not elapsed; never counted against the card), `rate_limit_cooldown` (the last run hit a quota wall; same cooldown, never counted), `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR; lifted once GitHub reports every linked PR closed, and kept when GitHub cannot be asked). A ready card held by `active_pr` is parked in `blocked` as "waiting for PR #N to merge"; the dispatcher releases it by itself when the PR closes, the comment ages out or the card is handed off, and the park never pings or wakes a subscriber. The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
 | `skipped_nonspawnable` | `{assignee}` | Dispatcher refused to spawn because the assignee profile does not exist in this home (or is not in `kanban.dispatch_profiles`). Written once per card — repeated only when another event landed in between — so `show`/`tail` name the missing profile without a row per tick. The card stays in `ready`; reassign it or install the profile. |
 | `protocol_violation` | `{pid, claimer, exit_code, protocol_violation, worker_output?}` | Worker exited successfully while the task was still `running`, usually because it answered without a terminal board call (`kanban_complete`, `kanban_request_review` or `kanban_block`). Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. `worker_output` carries the worker's own last printed text (usually its explanation of why it stopped), also folded into `last_failure_error` and shown to the retry worker as the prior-attempt error. |

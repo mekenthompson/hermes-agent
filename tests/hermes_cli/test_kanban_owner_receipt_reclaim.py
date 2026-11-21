@@ -28,6 +28,7 @@ from pathlib import Path
 import psutil
 import pytest
 
+from gateway.drain_control import current_instantiation_epoch
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
@@ -46,7 +47,9 @@ from hermes_cli.kanban_owner_recovery import (
 
 NOW = int(time.time())
 HOST = kb._claimer_id().split(":", 1)[0]
-FINGERPRINT = "6a232414-2dbf-40ab-a534-d9b71db05658:116|4162240"
+# A worker of THIS instantiation: these cards lose their worker while its instance keeps running.
+# Another instantiation's fingerprint reads as the whole instance restarting (``owner_instance_replaced``).
+FINGERPRINT = f"{current_instantiation_epoch() or '6a232414-2dbf-40ab-a534-d9b71db05658:116'}|4162240"
 
 
 def _absent_pid(base: int = 3_500_000) -> int:
@@ -66,7 +69,6 @@ class _Board:
         self.conn = kbc.connect(self.path)
         self.ledger = root / "state.db"
         self.store = open_persistence(profile_scope(home=root), eager=True)
-        seed_session(self.store, "sess-1", "cli")
 
     def close(self) -> None:
         self.conn.close()
@@ -108,7 +110,10 @@ class _Board:
         else:
             spawned = {}
         self.event(tid, run, "spawned", spawned, started)
-        payload = {"db": str(self.ledger), "session_id": "sess-1", "pid": owner_pid,
+        # One session per attempt: an admission seeder needs a session with no other open admission.
+        session = f"sess-{tid}-{run}"
+        seed_session(self.store, session, "cli")
+        payload = {"db": str(self.ledger), "session_id": session, "pid": owner_pid,
                    "request_id": f'kanban:["default","{tid}",1]'}
         if owner_birth is not None:
             payload["birth"] = owner_birth
@@ -118,7 +123,7 @@ class _Board:
                        {"pid": worker_pid, "claim_lock": lock, "started_at": worker_fingerprint},
                        started + 60)
         if admission:
-            seed_admission(self.store, "sess-1", payload["request_id"], *admission)
+            seed_admission(self.store, session, payload["request_id"], *admission)
         self.conn.commit()
         return run
 
@@ -340,3 +345,200 @@ def test_an_earlier_runs_live_pid_does_not_hide_the_current_dead_run(board):
     board.event("t_ghost", run - 1, "spawned", {"pid": os.getpid()}, NOW - 100_000)
     board.conn.commit()
     assert [d.kind for d in board.diagnostics("t_ghost") if d.kind == "stale_running"] == ["stale_running"]
+
+
+# --- a planned gateway stop/restart is not a systemic failure ------------------------------
+# 2026-11-01 00:40Z: a routine restart interrupted 5 running Kanban workers. Each owner admission
+# settled ``interrupted``, each submitter exited 130 with the same error, and the crash sweep read
+# 3+ identical errors as a systemic failure: all 5 were parked ``gave_up`` (sticky) until a human
+# said "do all". The owner Stopped those turns on its own way out, so the cards did nothing wrong.
+
+def _interrupted_by_stop(board, tid, *, exit_code=130, admission=("terminal", "interrupted"), **kw):
+    """A dead managed attempt whose bound interpreter recorded ``exit_code`` before it went."""
+    worker = _absent_pid(base=3_700_000 + sum(map(ord, tid)) * 10)
+    run = board.dead_attempt(tid, worker_pid=worker, worker_bound=True, admission=admission,
+                             dead_hours=0, expires_age_seconds=-3600, **kw)
+    lock = board.state(tid)["claim_lock"]
+    board.event(tid, run, "worker_result",
+                {"pid": worker, "claim_lock": lock, "exit_code": exit_code, "last_output": ""}, NOW)
+    board.conn.commit()
+    return run
+
+
+def test_workers_interrupted_by_a_planned_restart_all_go_back_to_ready(board):
+    tids = [f"t_restart{i}" for i in range(5)]
+    for tid in tids:
+        _interrupted_by_stop(board, tid)
+
+    assert sorted(kbd.detect_crashed_workers(board.conn)) == sorted(tids)
+    assert kbd.detect_crashed_workers._last_auto_blocked == []
+    for tid in tids:
+        state = board.state(tid)
+        assert state["status"] == "ready", tid
+        assert state["consecutive_failures"] == 0     # a restart never spends the card's budget
+        assert "gateway stop or restart" in state["last_failure_error"]
+        kinds = [e["kind"] for e in board.events(tid)]
+        assert "gave_up" not in kinds
+        crashed = [json.loads(e["payload"]) for e in board.events(tid) if e["kind"] == "crashed"]
+        assert crashed[-1]["owner_stopped"] is True
+        assert kbd.check_respawn_guard(board.conn, tid) is None   # the dispatcher picks it up again
+
+
+def test_a_second_restart_mid_retry_still_does_not_give_up(board):
+    """DEFAULT_FAILURE_LIMIT is 2: two counted restarts in a row would have parked the card."""
+    for _ in range(kbd.DEFAULT_FAILURE_LIMIT + 1):
+        board.conn.execute("DELETE FROM tasks WHERE id='t_twice'")
+        board.conn.commit()
+        _interrupted_by_stop(board, "t_twice")
+        kbd.detect_crashed_workers(board.conn)
+        assert board.state("t_twice")["status"] == "ready"
+    assert board.state("t_twice")["consecutive_failures"] == 0
+
+
+@pytest.mark.parametrize("exit_code,flagged", [(130, False), (1, True)], ids=["planned-stop", "worker-crash"])
+def test_repeated_crash_diagnostic_skips_planned_stops(board, exit_code, flagged):
+    """Two rollouts in a row must not light up the board's repeated-crash alarm either."""
+    for _ in range(2):
+        board.conn.execute("DELETE FROM tasks WHERE id='t_rolled'")
+        board.conn.commit()
+        _interrupted_by_stop(board, "t_rolled", exit_code=exit_code)
+        kbd.detect_crashed_workers(board.conn)
+    runs = kb.list_runs(board.conn, "t_rolled")
+    assert [r.outcome for r in runs] == ["crashed", "crashed"]
+    diagnostics = kd.compute_task_diagnostics(
+        board.state("t_rolled"), board.events("t_rolled"), runs, now=NOW,
+        config={"crash_threshold": 2, "failure_threshold": 99})
+    assert ("repeated_crashes" in {d.kind for d in diagnostics}) is flagged
+
+
+@pytest.mark.parametrize("exit_code,held", [(130, False), (1, True)], ids=["planned-stop", "worker-crash"])
+def test_a_planned_stop_does_not_park_the_card_on_its_own_pr(board, monkeypatch, exit_code, held):
+    """HF-740: the release card that opened and drives its own sync PR was interrupted by a
+    gateway restart, and the respawn guard parked it as "waiting for PR #250 to merge" until a
+    human unblocked it. A planned stop now hands the card straight back to its assignee; a real
+    crash still keeps the duplicate-PR protection."""
+    import hermes_cli.profiles as profmod
+    from hermes_cli import kanban_db_pr_state as prs
+
+    monkeypatch.setattr(prs, "fetch_pr_closed", lambda owner, repo, number: False)  # the PR is open
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    prs.clear_cache()
+    _interrupted_by_stop(board, "t_release", exit_code=exit_code)
+    kb.add_comment(board.conn, "t_release", author="default",
+                   body="The upstream sync is open as https://github.com/switchroom/hermes-agent/pull/250.")
+    kbd.detect_crashed_workers(board.conn)
+    assert board.state("t_release")["status"] == "ready"
+    assert [r.outcome for r in kb.list_runs(board.conn, "t_release")] == ["crashed"]
+
+    spawned: list[str] = []
+    kbd.dispatch_once(board.conn, spawn_fn=lambda task, workspace, board=None: spawned.append(task.id))
+    parks = [json.loads(e["payload"]) for e in board.events("t_release") if e["kind"] == "blocked"]
+    if held:
+        assert spawned == []
+        assert [p["reason"] for p in parks] == ["waiting for PR #250 to merge"]
+    else:
+        assert spawned == ["t_release"]
+        assert parks == []
+    prs.clear_cache()
+
+
+@pytest.mark.parametrize("admission", [
+    ("terminal", "failed"),
+    # A killed owner: its interpreters die without an interrupted result and the successor
+    # settles each lost card turn ``interrupted`` at boot. Not a planned stop.
+    ("terminal", "interrupted"),
+], ids=["worker-crash", "owner-killed"])
+def test_genuine_same_error_crashes_still_trip_the_systemic_breaker(board, admission):
+    tids = [f"t_crash{i}" for i in range(3)]
+    for tid in tids:
+        _interrupted_by_stop(board, tid, exit_code=1, admission=admission)
+
+    kbd.detect_crashed_workers(board.conn)
+    assert sorted(kbd.detect_crashed_workers._last_auto_blocked) == sorted(tids)
+    for tid in tids:
+        assert board.state(tid)["status"] == "blocked"
+        gave_up = [json.loads(e["payload"]) for e in board.events(tid) if e["kind"] == "gave_up"]
+        assert gave_up and gave_up[-1]["sticky"] is True
+
+
+def test_an_interrupt_while_the_owner_stays_up_is_still_counted(board):
+    """A user's Stop leaves the owner running: not a planned stop, so the breaker still counts it."""
+    me = psutil.Process(os.getpid())
+    _interrupted_by_stop(board, "t_user_stop", owner_pid=os.getpid(), owner_birth=worker_birth(me))
+
+    kbd.detect_crashed_workers(board.conn)
+    state = board.state("t_user_stop")
+    assert state["status"] == "ready"
+    assert state["consecutive_failures"] == 1
+    assert "gateway stop or restart" not in state["last_failure_error"]
+
+
+# --- a restart of the whole instance is not the card failing either ------------------------
+# HF-617 (2026-11-02): ``docker compose restart`` killed the managed interpreter before the gateway
+# could Stop it (the owner recorded ``worker_lost``, its admission ``unknown``) and then the gateway
+# itself. Neither #200's planned-stop shape nor a settled result was left, so the restart was charged
+# to the card and its respawn's refusal used up the rest of the budget: ``gave_up``.
+
+OLD_INSTANCE = "00000000-0000-4000-8000-000000000000:1|4162240"  # a worker of an earlier instantiation
+
+
+def _lost_in(board, tid, fingerprint, *, admission=("unknown", None), failures=0):
+    """A dead managed attempt whose owner saw its worker die (``worker_lost``) and then died too."""
+    board.conn.execute("DELETE FROM tasks WHERE id=?", (tid,))
+    worker = _absent_pid(base=3_710_000 + sum(map(ord, tid)) * 10)
+    run = board.dead_attempt(tid, worker_pid=worker, worker_fingerprint=fingerprint, worker_bound=True,
+                             admission=admission, dead_hours=0, expires_age_seconds=-3600)
+    board.conn.execute("UPDATE tasks SET consecutive_failures=? WHERE id=?", (failures, tid))
+    board.event(tid, run, "worker_lost", {"reason": "EOFError", "claim_lock": board.state(tid)["claim_lock"],
+                                          "run_id": run, "pid": worker, "bound": True}, NOW)
+    board.conn.commit()
+
+
+@pytest.mark.parametrize("admission", [("unknown", None), ("terminal", "interrupted")],
+                         ids=["before-successor-settles", "successor-settled"])
+def test_a_worker_lost_to_a_restart_of_its_instance_requeues_without_counting(board, admission):
+    for attempt in range(kbd.DEFAULT_FAILURE_LIMIT + 1):  # DEFAULT_FAILURE_LIMIT restarts used to park it
+        _lost_in(board, "t_restarted", OLD_INSTANCE, admission=admission,
+                 failures=board.state("t_restarted")["consecutive_failures"] if attempt else 0)
+        assert kbd.detect_crashed_workers(board.conn) == ["t_restarted"]
+        state = board.state("t_restarted")
+        assert state["status"] == "ready" and state["consecutive_failures"] == 0
+        assert "gateway stop or restart" in state["last_failure_error"]
+    assert "gave_up" not in [e["kind"] for e in board.events("t_restarted")]
+
+
+def test_a_card_that_keeps_taking_its_instance_down_still_gives_up(board):
+    """Uncounted restarts are bounded: past RESTART_REQUEUE_LIMIT in a row each one is charged."""
+    limit = kanban_owner_recovery.RESTART_REQUEUE_LIMIT
+    for attempt in range(limit + kbd.DEFAULT_FAILURE_LIMIT):
+        state = board.state("t_oom") if attempt else {"consecutive_failures": 0}
+        _lost_in(board, "t_oom", OLD_INSTANCE, failures=state["consecutive_failures"])
+        kbd.detect_crashed_workers(board.conn)
+        state = board.state("t_oom")
+        assert state["consecutive_failures"] == max(0, attempt + 1 - limit), attempt
+    assert state["status"] == "blocked"
+    assert "times in a row" in state["last_failure_error"]
+    assert "gave_up" in [e["kind"] for e in board.events("t_oom")]
+
+
+def test_a_worker_lost_while_its_instance_keeps_running_still_gives_up(board):
+    """Same evidence, but the worker was of THIS instantiation: a real crash, charged every time."""
+    _lost_in(board, "t_crashing", FINGERPRINT)
+    kbd.detect_crashed_workers(board.conn)
+    assert board.state("t_crashing")["consecutive_failures"] == 1
+    _lost_in(board, "t_crashing", FINGERPRINT, failures=1)
+    kbd.detect_crashed_workers(board.conn)
+    assert board.state("t_crashing")["status"] == "blocked"
+    assert "gave_up" in [e["kind"] for e in board.events("t_crashing")]
+
+
+@pytest.mark.parametrize("shape", ["live-owner", "unreadable-fingerprint", "settled-failed"])
+def test_restart_evidence_that_is_not_proof_is_still_counted(board, shape):
+    me = psutil.Process(os.getpid())
+    owner = dict(owner_pid=os.getpid(), owner_birth=worker_birth(me)) if shape == "live-owner" else {}
+    fingerprint = "unreadable" if shape == "unreadable-fingerprint" else OLD_INSTANCE
+    admission = ("terminal", "failed") if shape == "settled-failed" else ("unknown", None)
+    worker = _absent_pid(base=3_720_000)
+    board.dead_attempt("t_unproven", worker_pid=worker, worker_fingerprint=fingerprint, worker_bound=True,
+                       admission=admission, dead_hours=0, expires_age_seconds=-3600, **owner)
+    assert not kanban_owner_recovery.owner_instance_replaced(board.conn, "t_unproven")

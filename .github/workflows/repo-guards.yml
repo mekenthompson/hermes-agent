@@ -59,14 +59,21 @@ on:
         type: boolean
         default: false
 
+    outputs:
+      critical_findings:
+        description: Whether the narrow scan requires maintainer review.
+        value: ${{ jobs.guards.outputs.critical_findings }}
+
 permissions:
   contents: read
 
 jobs:
   guards:
     name: Repository guards
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      critical_findings: ${{ steps.scan.outputs.found }}
     steps:
       - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:
@@ -287,6 +294,7 @@ jobs:
         if: ${{ !cancelled() && inputs.event_name == 'pull_request' && inputs.scan }}
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_REVIEWED: ${{ contains(github.event.pull_request.labels.*.name, 'ci-reviewed') }}
           _HERMES_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           _HERMES_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: python3 scripts/ci/scan_supply_chain.py patterns
@@ -298,11 +306,6 @@ jobs:
           FOUND: ${{ steps.scan.outputs.found }}
         run: python3 scripts/ci/review_status.py emit supply-chain-scan
 
-      - name: Fail on critical supply-chain findings
-        if: ${{ !cancelled() && steps.scan.outputs.found == 'true' }}
-        run: |
-          echo "::error::CRITICAL supply chain risk patterns detected in this PR. See the review comment for details."
-          exit 1
 
       - name: Check for unbounded PyPI deps
         id: bounds

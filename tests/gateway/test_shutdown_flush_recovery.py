@@ -65,12 +65,13 @@ def make_store(tmp_path, monkeypatch):
 
 def _beside(db):
     """The storage handle over a fake store: ``messages.append`` lands on its ``append_message`` as the live
-    writer's row, ``search.rebuild_search_index`` on its ``rebuild_fts``."""
+    writer's row, ``search.rebuild_search_index`` on its ``rebuild_fts``, ``sessions.get`` on its ``get_session``."""
     from gateway.session_transcript import transcript_append_kwargs
     fields = transcript_append_kwargs("", {}).keys() - {"session_id"}
     return SimpleNamespace(
         capabilities=SimpleNamespace(full_text_search=hasattr(db, "rebuild_fts")),
         search=SimpleNamespace(rebuild_search_index=lambda: db.rebuild_fts()),
+        sessions=SimpleNamespace(get=lambda sid: db.get_session(sid)),
         messages=SimpleNamespace(append=lambda sid, message: db.append_message(
             session_id=sid, **{k: getattr(message, k) for k in fields})),
         close=lambda: None)
@@ -302,6 +303,30 @@ def test_live_write_waits_while_held_back_files_still_fail_to_drain(flush_dir, m
     assert _contents(mock_db) == ["old0", "old0", "old0", "old1", "new-live", "new-live-2"]
     assert not list(flush_dir.glob("*.json"))
     assert not store._dirty_transcripts
+
+
+def test_missing_session_spool_is_explicitly_held_without_append(flush_dir, tmp_path, caplog):
+    from gateway.shutdown_flush import recover_pending_spool
+
+    db = open_persistence(profile_scope(home=tmp_path))
+    try:
+        orphan = _write_spool(flush_dir, "pending-orphan.json", "missing-session",
+                              {"role": "user", "content": "private-sentinel"}, ts=100, seq=0)
+        original = orphan.read_bytes()
+        seed_session(db, "valid-session", "telegram")
+        _write_spool(flush_dir, "pending-valid.json", "valid-session",
+                     {"role": "user", "content": "valid"}, ts=101, seq=1)
+        with patch.object(db.messages, "append", wraps=db.messages.append) as append:
+            assert recover_pending_spool(db) == (1, {"missing-session"})
+            assert [call.args[0] for call in append.call_args_list] == ["valid-session"]
+            assert recover_pending_spool(db) == (0, {"missing-session"})
+            assert append.call_count == 1
+        assert orphan.read_bytes() == original
+        assert db.sessions.get("missing-session") is None
+        assert "orphan transcript spool held" in caplog.text
+        assert "private-sentinel" not in caplog.text
+    finally:
+        db.close()
 
 
 def test_a_poisoned_spool_row_does_not_stop_later_live_rows(flush_dir, tmp_path, make_store, boot_db):

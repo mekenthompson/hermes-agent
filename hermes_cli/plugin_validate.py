@@ -384,29 +384,32 @@ def _probe_options(manifest: dict) -> dict:
 
 
 def _run_capability_probe(
-    plugin_dir: Path, manifest: dict, probe: Optional[tuple[list[str], dict[str, str]]] = None,
+    plugin_dir: Path,
+    manifest: dict,
+    probe: Optional[tuple[list[str] | Path | str, dict[str, str]] | Path | str] = None,
 ) -> tuple[Optional[dict], str]:
     """Run the recording probe in a scratch subprocess.
 
-    *probe* is ``(python argv prefix, env)`` of the dependency environment to import the plugin
-    from (``pm.environments.venv_command``); None probes this interpreter.
+    *probe* is ``(python argv prefix, env)`` or a legacy interpreter path.
+    None probes this interpreter.
 
     Returns ``(recorded, error)`` — exactly one is meaningful: *recorded*
     is the ``{tools, hooks, middleware, commands, providers}`` dict on
     success, and *error* is a human-readable failure description otherwise.
     """
+    probe_environment = probe if isinstance(probe, tuple) else None
     with tempfile.TemporaryDirectory(prefix="hermes-validate-") as scratch:
-        env = dict(probe[1] if probe else os.environ)
+        env = dict(probe_environment[1] if probe_environment else os.environ)
         env["HERMES_HOME"] = scratch
         # The probe imports this tree's ``providers``; name the tree instead of relying on the cwd.
         repo_root = project_root_str()
         env["PYTHONPATH"] = os.pathsep.join(p for p in (repo_root, env.get("PYTHONPATH", "")) if p)
-        python, *options = probe[0] if probe else [sys.executable]
+        python, *options = probe_environment[0] if probe_environment else [probe or sys.executable]
         try:
             result = subprocess.run(
                 [
                     # -P: ``-c`` would put the user's cwd ahead of Hermes and the plugin's imports.
-                    python, "-P", *options,
+                    str(python), "-P", *[str(option) for option in options],
                     "-c",
                     _PROBE_SCRIPT,
                     str(plugin_dir),
@@ -450,7 +453,7 @@ def _declared_list(manifest: dict, key: str) -> list[str]:
 
 def _check_capabilities(
     report: ValidationReport, manifest: dict, plugin_dir: Path,
-    probe: Optional[tuple[Path, dict[str, str]]] = None,
+    probe: Optional[tuple[list[str] | Path | str, dict[str, str]] | Path | str] = None,
 ) -> Optional[dict]:
     """Probe actual registrations and diff against declared capabilities.
 
@@ -544,10 +547,20 @@ def _check_builtin_collisions(
 
 
 def validate_plugin_dir(
-    plugin_dir: Path, probe: Optional[tuple[list[str], dict[str, str]]] = None,
+    plugin_dir: Path,
+    probe: Optional[tuple[list[str] | Path | str, dict[str, str]] | Path | str] = None,
+    *,
+    probe_python: Optional[Path | str] = None,
 ) -> ValidationReport:
-    """Run every admission check against *plugin_dir* and return the report. *probe* is
-    ``(python argv prefix, env)`` for the capability probe (see ``_run_capability_probe``)."""
+    """Run every admission check against *plugin_dir* and return the report.
+
+    *probe* is ``(python argv prefix, env)`` or a legacy interpreter path.
+    ``probe_python`` remains a keyword compatibility bridge.
+    """
+    if probe_python is not None:
+        if probe is not None:
+            raise ValueError("pass either probe or probe_python, not both")
+        probe = probe_python
     report = ValidationReport()
     plugin_dir = Path(plugin_dir)
 

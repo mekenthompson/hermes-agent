@@ -115,12 +115,16 @@ def test_classifier_maps_transport_failure_to_provider_error():
     "exc",
     [
         jwt.DecodeError("Not enough segments"),
-        jwt.PyJWKSetError("The JWK Set did not contain any keys"),
         jwt.InvalidTokenError("bad"),
     ],
 )
 def test_classifier_maps_unverifiable_token_to_invalid_code(exc):
     assert isinstance(classify_jwks_lookup_error(exc), InvalidCodeError)
+
+
+def test_classifier_keeps_empty_key_set_as_provider_fault():
+    """House KEN-333: a reachable JWKS with no usable keys is an IdP fault (503), not "not ours"."""
+    assert isinstance(classify_jwks_lookup_error(jwt.PyJWKSetError("no keys")), ProviderError)
 
 
 def test_classifier_keeps_bare_jwk_client_error_as_provider_fault():
@@ -134,9 +138,11 @@ def test_opaque_bearer_with_healthy_portal_is_not_unreachable(empty_jwks_server)
     assert provider.verify_session(access_token=OPAQUE_PEER_KEY) is None
 
 
-def test_foreign_kid_jwt_with_healthy_portal_is_not_unreachable(empty_jwks_server):
+def test_foreign_kid_jwt_with_empty_jwks_is_provider_error(empty_jwks_server):
+    """House KEN-333: an empty key set cannot prove the kid is foreign, so it stays an IdP fault."""
     provider = _nous(empty_jwks_server)
-    assert provider.verify_session(access_token=FOREIGN_KID_JWT) is None
+    with pytest.raises(ProviderError):
+        provider.verify_session(access_token=FOREIGN_KID_JWT)
 
 
 def test_unknown_kid_against_populated_jwks_is_not_unreachable(portal):

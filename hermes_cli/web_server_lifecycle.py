@@ -535,6 +535,7 @@ def _uvicorn_console_logging() -> None:
     """
     from uvicorn.config import LOGGING_CONFIG
     from uvicorn.logging import AccessFormatter, DefaultFormatter
+    from hermes_cli.dashboard_auth.log_redaction import GatewayCredentialFilter
 
     formats = LOGGING_CONFIG["formatters"]
     for name, stream, formatter in (
@@ -547,6 +548,9 @@ def _uvicorn_console_logging() -> None:
             handler = logging.StreamHandler(stream)
             handler.setFormatter(formatter)
             logger.addHandler(handler)
+        for handler in logger.handlers:
+            if not any(isinstance(f, GatewayCredentialFilter) for f in handler.filters):
+                handler.addFilter(GatewayCredentialFilter())
     # LOGGING_CONFIG's level for the parent; uvicorn.Config sets only the child loggers' levels.
     logging.getLogger("uvicorn").setLevel(logging.INFO)
 

@@ -222,10 +222,13 @@ def build_auto_tts_output_path(platform) -> str:
     """
     from tools.tts_tool import OPUS_VOICE_PLATFORMS
     ext = "ogg" if _platform_name(platform) in OPUS_VOICE_PLATFORMS else "mp3"
-    audio_path = os.path.join(
-        tempfile.gettempdir(), "hermes_voice", f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}")
-    os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-    return audio_path
+    # Use Hermes' normal per-profile audio cache. Passing a /tmp path back
+    # into the public TTS tool triggers its protected-path guard, which made
+    # /voice tts silently fall back to text-only delivery. The cache is both
+    # user-writable and cleaned up by the normal gateway maintenance task.
+    audio_dir = get_hermes_dir("cache/audio", "audio_cache")
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    return str(audio_dir / f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}")
 
 
 def utf16_len(s: str) -> int:
@@ -447,6 +450,8 @@ from gateway.platforms.base_exec_approval import (
 from gateway.platforms.base_streaming_tts import (
     AudioFormat, StreamingTTSHandle, streaming_tts_should_skip_whole_file, streaming_tts_turn_key)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.platforms.base_processing import ProcessingLifecycleMixin
+from gateway.platforms.auto_tts_delivery import run_auto_tts, run_deferred_voice_reply, should_auto_tts_for_source
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
 from hermes_cli.home_data_layout import CREDENTIAL_STORE_DIRS, HOME_ENV_FILES, SECRET_CACHE_STORES
@@ -1777,7 +1782,7 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
-class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
+class BasePlatformAdapter(ProcessingLifecycleMixin, _SessionModelSettingsMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
@@ -1800,6 +1805,11 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
     # adapters (API server). Propagated to ``HERMES_SESSION_ASYNC_DELIVERY`` so tools never promise
     # a delivery they can't keep.
     supports_async_delivery: bool = True
+    # A provider inbox is acknowledged only after native admission. Opting in
+    # commits/dedupes input before busy effects; on_message_admitted gets the
+    # durable receipt. This is adapter-owned transport behavior, never a grant
+    # or event-selected flag. Existing transports retain their busy semantics.
+    requires_durable_input_ack: bool = False
     # ``send()`` chunks natively via ``truncate_message()`` -> the router skips its truncation.
     splits_long_messages: bool = False
     # Prefix users can always TYPE for Hermes commands ("!" where the client eats a leading "/").
@@ -3369,37 +3379,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         self._post_delivery_callbacks.pop(session_key, None)
         return callback if callable(callback) else None
 
-    # ── Processing lifecycle hooks (Discord 👀/✅/❌ reactions). Adapters exposing
-    # ``_add_reaction(chat_id, message_id, emoji)`` / ``_remove_reaction(chat_id, message_id)``
-    # can just set the emoji attributes; left ``None`` the hook is a no-op.
-    _ACK_EMOJI: Optional[str] = None
-    _OK_EMOJI: Optional[str] = None
-    _FAIL_EMOJI: Optional[str] = None
-
-    async def on_processing_start(self, event: MessageEvent) -> None:
-        """Hook called when background processing begins."""
-
-    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Hook called when background processing completes. Default: opt-in reaction ack — with
-        ``_OK_EMOJI``/``_FAIL_EMOJI`` set and ``_add_reaction``/``_remove_reaction`` present, swap
-        the in-progress reaction for the outcome one. Remove-then-add is deterministic whether the
-        platform replaces or stacks a sender's reactions. CANCELLED leaves it unreacted."""
-        if self._OK_EMOJI is None and self._FAIL_EMOJI is None:
-            return
-        add: Any = getattr(self, "_add_reaction", None)
-        remove: Any = getattr(self, "_remove_reaction", None)
-        enabled = getattr(self, "_reactions_enabled", None)
-        chat_id = getattr(event.source, "chat_id", None)
-        message_id = getattr(event, "message_id", None)
-        if (not callable(add) or not callable(remove) or (callable(enabled) and not enabled())
-                or not chat_id or not message_id):
-            return
-        await remove(chat_id, message_id)
-        emoji = {ProcessingOutcome.SUCCESS: self._OK_EMOJI,
-                 ProcessingOutcome.FAILURE: self._FAIL_EMOJI}.get(outcome)
-        if emoji:
-            await add(chat_id, message_id, emoji)
-
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
         hook = getattr(self, hook_name, None)
@@ -3852,16 +3831,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         if release_guard:
             self._release_session_guard(session_key)
 
-    async def _drain_pending_after_session_command(
-        self, session_key: str, command_guard: asyncio.Event) -> None:
-        """Tail of /stop, /new, /reset: release the command-scoped guard, then
-        spawn a fresh processing task for any follow-up queued meanwhile."""
-        await self._flush_text_debounce_now(session_key)
-        pending_event = self._pending_messages.pop(session_key, None)
-        self._release_session_guard(session_key, guard=command_guard)
-        if pending_event is not None:
-            self._start_session_processing(pending_event, session_key)
-
     async def _dispatch_active_session_command(self, event: MessageEvent, session_key: str, cmd: str) -> None:
         """/stop, /new, /reset on a busy session: cancel only on the runner's verdict (#136759)."""
         from gateway.platforms.base_session_command import dispatch_active_session_command
@@ -3881,6 +3850,8 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                              "discarded.", self.name)
             return
 
+        from gateway.platforms.event import require_structured_control
+        require_structured_control(event, self)
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.
@@ -3897,8 +3868,12 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
+        if event.structured_control is not None:
+            await self._dispatch_inline_reply(event)
+            return
         from gateway.session_ingress_burst import burst_gate
-        behind_burst = await burst_gate(self, event, session_key)  # a serial reader's command waits too
+        behind_burst = (False if self.requires_durable_input_ack is True
+                        else await burst_gate(self, event, session_key))
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
@@ -3935,8 +3910,12 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         commands / clarify replies dispatch inline, everything else is queued."""
         # The shared runtime's durable FIFO replaces the adapter's busy-message slot.
         if self._shared_runtime_owns_input(event):
-            from gateway.session_ingress_burst import dispatch_busy_burst
-            await dispatch_busy_burst(self, event, session_key)  # main's photo/text burst merge
+            if self.requires_durable_input_ack is True:
+                from gateway.session_ingress import dispatch_shared_busy
+                await dispatch_shared_busy(self, event, session_key)
+            else:
+                from gateway.session_ingress_burst import dispatch_busy_burst
+                await dispatch_busy_burst(self, event, session_key)  # main's photo/text burst merge
             return
         # Bypass commands run inline (queued, /new would leak as user text and /approve, /deny deadlock on
         # Event.wait); never via _process_message_background, whose cleanup races the running task (#4926).
@@ -4050,7 +4029,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         skipped when streaming TTS already delivered audio this turn."""
         generation = getattr(interrupt_event, "_hermes_run_generation", None)
         return bool(
-            self._should_auto_tts_for_chat(event.source.chat_id)
+            should_auto_tts_for_source(self, event.source)
             and event.message_type == MessageType.VOICE and text_content and not media_files
             and not self._streaming_tts_turn_completed(session_key, generation, event=event))
 
@@ -4373,23 +4352,14 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
-                _tts_paths, _tts_requested_path = [], None
-                if self._wants_auto_tts(
-                        event, session_key, interrupt_event, text_content, media_files):
-                    _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content, event.source)
-                # TTS plays before text; generated files are removed afterwards.
-                _tts_caption_delivered = False
-                for _tts_index, _tts_path in enumerate(_tts_paths):
-                    try:
-                        _tts_caption_delivered |= await self._play_tts_file(
-                            event, text_content, _tts_path, _tts_index == 0, _final_thread_metadata,
-                            _record_delivery)
-                    finally:
-                        with contextlib.suppress(OSError):
-                            os.remove(_tts_path)
-                if not _tts_paths and _tts_requested_path is not None:
-                    with contextlib.suppress(OSError):
-                        os.remove(_tts_requested_path)
+                _tts_paths, _tts_caption_delivered = [], False
+                _tts_wanted = self._wants_auto_tts(
+                    event, session_key, interrupt_event, text_content, media_files)
+                # Text goes first everywhere; only Telegram synthesizes first (audio caption = text).
+                _tts_first = _tts_wanted and self.platform == Platform.TELEGRAM
+                if _tts_first:
+                    _tts_caption_delivered, _tts_paths = await run_auto_tts(
+                        self, event, text_content, _final_thread_metadata, _record_delivery)
                 # Suspend the typing refresh before the first delivery attempt, not just in
                 # the turn's finally (#117300): if the final send stalls (platform accepted it
                 # but the HTTP ack never returns), control never reaches the finally, and
@@ -4410,6 +4380,10 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
+                if _tts_wanted and not _tts_first:
+                    await run_auto_tts(
+                        self, event, text_content, _final_thread_metadata, _record_delivery)
+                await run_deferred_voice_reply(event)
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.

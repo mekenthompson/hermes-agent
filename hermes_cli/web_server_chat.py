@@ -201,6 +201,38 @@ def _ws_request_view(ws: WebSocket, app) -> Request:
     })
 
 
+def _ws_gated_access_token(ws, app, token, webapp, reject, stamp):
+    """Gated ``?token=``: explicit operator token, else a provider session token."""
+    from hermes_cli import webapp_sign_in
+    from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+    from hermes_cli.dashboard_auth.base import ProviderError
+    from hermes_cli.dashboard_auth.middleware import _verify_access_token
+    from hermes_cli.web_server import _SESSION_TOKEN, _SESSION_TOKEN_IS_EXPLICIT, _explicit_session_token_session
+
+    if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+        if not _SESSION_TOKEN_IS_EXPLICIT:
+            reject("generated process token")
+            return "token_mismatch", "token"
+        session = _explicit_session_token_session()
+        stamp({"user_id": getattr(session, "user_id", None), "provider": getattr(session, "provider", None)})
+        return None, "explicit-token"
+    view = _ws_request_view(ws, app)
+    try:
+        session = (_verify_access_token(view, access_token=token, audit=False)
+                   if not webapp or webapp_sign_in.access_token_works_alone(view, token) else None)
+    except ProviderError:
+        reject("session token verify unavailable")
+        return "token_unavailable", "token"
+    ip = ws.client.host if ws.client else ""
+    if session is None:
+        audit_log(AuditEvent.TOKEN_AUTH_FAILURE, reason="session_token_invalid", ip=ip, path=ws.url.path)
+        return "token_invalid", "token"
+    stamp({"user_id": getattr(session, "user_id", None), "provider": getattr(session, "provider", None)})
+    audit_log(AuditEvent.TOKEN_AUTH_SUCCESS, provider=getattr(session, "provider", None),
+              user_id=getattr(session, "user_id", None), ip=ip, path=ws.url.path)
+    return None, "token"
+
+
 def _ws_auth_reason(ws: WebSocket, *, allow_internal: bool = False,
                     socket: Optional[str] = None) -> tuple[Optional[str], str]:
     """Validate WS-upgrade auth; return ``(reason, credential)``.
@@ -220,12 +252,11 @@ def _ws_auth_reason(ws: WebSocket, *, allow_internal: bool = False,
     opens only the sockets that pass *allow_internal*), or ``?token=`` holding a
     user session access token (verified against the dashboard auth session
     providers — the same ``verify_session`` seam the native bearer REST leg
-    uses — e.g. a token-mode Remote desktop connection; on the gateway's Webapp
-    only a token that listener gave a native app's sign-in or the deployment
-    session token, as for the bearer header,
-    ``webapp_sign_in.access_token_works_alone``). The legacy in-process
-    ``_SESSION_TOKEN`` is rejected in gated mode: a leaked ``_SESSION_TOKEN``
-    must not grant access.
+    uses — e.g. a token-mode Remote desktop connection). Generated in-process
+    tokens are rejected in gated mode; an explicitly configured operator token
+    retains its validated compatibility path. On the gateway's Webapp only a
+    token that listener gave a native app's sign-in or the registered deployment
+    session token works alone, as for the bearer header.
 
     Either mode: a local Desktop (no static token) presents the private one-use
     ``X-Hermes-Gateway-Ticket`` grant its REST calls use (``authenticate_native_ws``).
@@ -237,15 +268,14 @@ def _ws_auth_reason(ws: WebSocket, *, allow_internal: bool = False,
     in its gateway subprotocol (``redeem_audio_ws``), stamped on ``_hermes_native_grant``.
     """
     from hermes_cli.dashboard_auth.native_http import HEADER, authenticate_native_ws, redeem_audio_ws
-    from hermes_cli.web_server import _SESSION_TOKEN, app
+    from hermes_cli.web_server import (
+        _SESSION_TOKEN, _SESSION_TOKEN_IS_EXPLICIT, _explicit_session_token_session, app)
     from hermes_cli.browser_credential import generation_of
     from hermes_cli.web_session_sockets import OWN_TICKET_SOCKETS, track
     auth_required = bool(getattr(app.state, "auth_required", False))
-    # The Webapp's own rules (socket tickets on the loopback gate, the server's credential only where
-    # its spawned clients dial) apply on its listener; the standalone dashboard and serve keep main's.
+    # Webapp sockets use scoped tickets; browser login access tokens cannot stand alone.
     webapp = getattr(app.state, "ui_surface", None) == "webapp"
     if socket in OWN_TICKET_SOCKETS:
-        # No standing credential (the session token, a native grant, a login's access token) opens it.
         reject = functools.partial(_audit_ws_rejection, ws) if auth_required else _ignore_rejection
         return _consume_ws_ticket(ws, reject, socket, auth_required=auth_required) or ("no_credential", "none")
     if HEADER in ws.headers:
@@ -280,6 +310,23 @@ def _ws_auth_reason(ws: WebSocket, *, allow_internal: bool = False,
                 ws._hermes_auth_identity["issuer"] = info["issuer"]
 
         internal = ws.query_params.get("internal", "")
+        query_ticket = ws.query_params.get("ticket", "")
+        token = ws.query_params.get("token", "")
+        protocol_ticket, protocol_reason = _gateway_ws_ticket_from_subprotocol(ws)
+        if protocol_reason == "invalid":
+            _reject("invalid ticket subprotocol")
+            return "ticket_invalid", "ticket-subprotocol"
+        # Never let a token select precedence over another credential. In
+        # particular, do not consume a ticket until ambiguity is ruled out.
+        query_items = (
+            ws.query_params.multi_items()
+            if hasattr(ws.query_params, "multi_items") else ws.query_params.items()
+        )
+        credential_count = sum(key in {"internal", "ticket", "token"} for key, _ in query_items)
+        if credential_count + bool(protocol_ticket) > 1:
+            _reject("multiple credentials")
+            return "credential_conflict", "multiple"
+
         if internal:
             if webapp and not allow_internal:
                 _reject("internal: endpoint not allowed")
@@ -291,62 +338,14 @@ def _ws_auth_reason(ws: WebSocket, *, allow_internal: bool = False,
                 _reject(f"internal: {exc}")
                 return "internal_invalid", "internal"
 
-        consumed = _consume_ws_ticket(ws, _reject, socket, auth_required=True)
-        if consumed is not None:
-            return consumed
+        ticket = protocol_ticket or query_ticket
+        if ticket:
+            consumed = _consume_ws_ticket(ws, _reject, socket, auth_required=True)
+            if consumed is not None:
+                return consumed
 
-        # A user session access token (``?token=``) is verified against the
-        # dashboard auth session providers — the SAME ``verify_session`` seam
-        # the native bearer REST leg uses (``_verify_access_token``). A
-        # token-mode Remote desktop connection bakes its stored session token
-        # into the WS URL (buildGatewayWsUrl), so before this leg existed the
-        # only credentials gated mode accepted were browser-minted tickets and
-        # the WS upgrade 403'd forever. The legacy in-process
-        # ``_SESSION_TOKEN`` never reaches this check: gated mode falls
-        # through to the explicit rejection below (leaked-constant safety),
-        # and a provider-verified token is accepted on identity merit. On the
-        # gateway's Webapp it follows the bearer header's rule: only a token this
-        # listener gave a native app's sign-in works on its own, so a browser
-        # login's tokens work only as its cookies, which sign-out ends.
-        token = ws.query_params.get("token", "")
         if token:
-            from hermes_cli import webapp_sign_in
-            from hermes_cli.dashboard_auth.base import ProviderError
-            from hermes_cli.dashboard_auth.middleware import _verify_access_token
-
-            view = _ws_request_view(ws, app)
-            try:
-                # On the gateway's Webapp a browser login's tokens work only as its cookies, which
-                # sign-out ends; only a token this listener gave a native app's sign-in works alone.
-                session = (_verify_access_token(view, access_token=token, audit=False)
-                           if webapp_sign_in.access_token_works_alone(view, token) else None)
-            except ProviderError as exc:
-                # All providers unreachable (IDP outage) — reject without
-                # crashing the upgrade; the REST bearer leg answers 503, and
-                # the WS accept path has no status channel, only close codes.
-                _reject(f"session token verify unavailable: {exc}")
-                return "token_unavailable", "token"
-            if session is not None:
-                _stamp_identity({
-                    "user_id": getattr(session, "user_id", None),
-                    "provider": getattr(session, "provider", None),
-                })
-                audit_log(
-                    AuditEvent.TOKEN_AUTH_SUCCESS,
-                    provider=getattr(session, "provider", None),
-                    user_id=getattr(session, "user_id", None),
-                    ip=(ws.client.host if ws.client else ""),
-                    path=ws.url.path,
-                )
-                return None, "token"
-            audit_log(
-                AuditEvent.TOKEN_AUTH_FAILURE,
-                reason="session_token_invalid",
-                ip=(ws.client.host if ws.client else ""),
-                path=ws.url.path,
-            )
-            return "token_invalid", "token"
-
+            return _ws_gated_access_token(ws, app, token, webapp, _reject, _stamp_identity)
         return "no_credential", "none"
 
     # Loopback: on the Webapp a one-use ticket ``/api/webapp/socket-ticket`` minted for the

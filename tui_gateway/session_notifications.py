@@ -145,7 +145,11 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 
 # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds (archived/unblocked) too so the cursor advances
 # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
-_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "checkpoint")
+
+
+class _PassiveKanbanCheckpoint(str):
+    """A human update for the UI, without a synthetic agent turn."""
 # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
 # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
 _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0
@@ -182,18 +186,19 @@ def _notif_log_failure(what: str, exc: BaseException) -> None:
     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
-def _notif_unowned_event(sid: str, evt: dict, deferred) -> None:
+def _notif_unowned_event(sid: str, evt: dict, deferred) -> bool:
     """Dispose of an addressed event this session cannot prove it owns (never adopt an orphan): park it for its
     owner's return (``notification_park``). One the park refuses: a delegation is dropped at WARNING with its offer
     cleared (``return_completion_offer``; the row stays pending) or, during a shutdown drain, goes onto ``deferred``
-    to be requeued; anything else drops."""
+    to be requeued; anything else drops. True when the event was parked."""
     evt_type, is_delegation = evt.get("type", "completion"), evt.get("type") == "async_delegation"
     origin, key = str(evt.get("origin_ui_session_id") or ""), str(evt.get("session_key") or "")
     from tui_gateway import notification_park
     if notification_park.park(evt):
         logger.debug("Parked unowned %s notification (origin=%r key=%r) until its owner returns",
                      evt_type, origin, key)
-    elif deferred is not None:
+        return True
+    if deferred is not None:
         if is_delegation:
             deferred.append(evt)
         else:
@@ -209,6 +214,7 @@ def _notif_unowned_event(sid: str, evt: dict, deferred) -> None:
         if is_delegation:
             from tools.async_delegation import return_completion_offer
             return_completion_offer(evt)
+    return False
 
 
 # A retried notice the canonical ledger refuses (SESSION_NOT_OWNED persists while a gateway owns the
@@ -462,6 +468,12 @@ _KANBAN_EVENT_FORMATTERS = {
 def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
     """Single-line notification text for one kanban event; wording mirrors gateway/kanban_watchers.py (reads the same
     as on Telegram). None for silent kinds."""
+    if getattr(ev, "kind", "") == "checkpoint":
+        from agent.redact import redact_sensitive_text
+
+        return _PassiveKanbanCheckpoint(redact_sensitive_text(
+            str((getattr(ev, "payload", None) or {}).get("body") or ""),
+            force=True, redact_url_credentials=True))
     if (entry := _KANBAN_EVENT_FORMATTERS.get(getattr(ev, "kind", ""))) is None:
         return None
     glyph, fmt = entry
@@ -612,8 +624,9 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
         from gateway.warning_notifications import DiagnosticText, render_notification
         render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": text}),
                             platform="tui", diagnostic=isinstance(text, DiagnosticText))
-    if texts:
-        session.setdefault("_kanban_pending", []).extend(texts)
+    active_texts = [text for text in texts if not isinstance(text, _PassiveKanbanCheckpoint)]
+    if active_texts:
+        session.setdefault("_kanban_pending", []).extend(active_texts)
     if not session.get("_kanban_pending") or not _notif_claim_turn(session):
         return
     with session["history_lock"]:
@@ -674,6 +687,13 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
     from agent.notification_presentation import diagnostic_process_event
     if diagnostic_process_event(evt):
         kwargs.setdefault("display_metadata", {})["notification_category"] = "diagnostic"
+    if evt_type == 'async_delegation':
+        from gateway.session_approval_completion import completion_reservation_for_event
+        from hermes_constants import get_process_hermes_home
+        profile = str(session.get('profile_home') or get_process_hermes_home())
+        kwargs['approval_reservations'] = (
+            completion_reservation_for_event(evt, str(session.get('session_key') or ''), profile),)
+        kwargs['approval_completion_events'] = (evt,)
     try:
         if not _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
                              "notification poller dispatch failed", report_ownership_refusal=False, **kwargs):
@@ -704,12 +724,21 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
             time.sleep(0.1)
         return True
     if not owned and _notification_event_requires_owner(evt) and not _session_owns_notification_event(sid, session, evt):
-        _notif_unowned_event(sid, evt, deferred)
+        if not _notif_unowned_event(sid, evt, deferred) and evt_type == "completion":
+            # Dropped, not parked: settle its producer's approval-task reservation (a parked copy
+            # keeps it for the owner's own turn; the park settles it if it lets the copy go).
+            from gateway.session_approval_completion import release_completion_event_reservation
+            release_completion_event_reservation(evt)
         return True
     if evt_type == "completion" and registry.is_completion_consumed(evt.get("session_id", "")):
+        from gateway.session_approval_completion import release_completion_event_reservation
+        release_completion_event_reservation(evt)
         return True
     text = fmt(evt)
     if not text:
+        if evt_type == "completion":
+            from gateway.session_approval_completion import release_completion_event_reservation
+            release_completion_event_reservation(evt)
         return True
     # Emit once per dedup key: a re-queued completion would otherwise re-emit every 0.5s while the session is busy,
     # while distinct watch_match events from one process must stay visible.
@@ -726,11 +755,15 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     if evt_type != "async_delegation" and _background_notifications_off(session):
         # The user opted out of process-driven agent wakes: the status row above is the whole
         # delivery. Subagent results are not process notifications and still land.
+        if evt_type == 'completion':
+            from gateway.session_approval_completion import release_completion_event_reservation
+            release_completion_event_reservation(evt)
         return True
     if evt_type == "completion" and completions is not None:
         completions.append((evt, text))
         return True
     if not _notif_claim_turn(session):
+        _notif_settle_stopped_completions(session, [(evt, text)])
         queue.put(evt)
         if deferred is not None:
             return False
@@ -740,13 +773,39 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     return True
 
 
+def _notif_group_completions(notifications, route):
+    """Keep separate admitted requests out of the same synthetic turn."""
+    from gateway.session_approval_completion import completion_batch_origin_for_event
+    groups = []
+    for event, event_text in notifications:
+        origin = completion_batch_origin_for_event(event, route)
+        if not groups or groups[-1][0] != origin:
+            groups.append((origin, []))
+        groups[-1][1].append((event, event_text))
+    return groups
+
+
+def _notif_settle_stopped_completions(session, notifications):
+    if not session.get("_turn_cancel_requested"):
+        return
+    from gateway.session_approval_completion import release_completion_event_reservation
+    for event, _text in notifications:
+        release_completion_event_reservation(event)
+
+
 def _notif_dispatch_completions(sid, session, notifications, registry, deferred):
     from tools.process_registry_notifications import PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
 
     if not notifications:
         return
+    groups = _notif_group_completions(notifications, str(session.get('session_key') or ''))
+    if len(groups) > 1:
+        for _origin, group in groups:
+            _notif_dispatch_completions(sid, session, group, registry, deferred)
+        return
     if not _notif_claim_turn(session):
+        _notif_settle_stopped_completions(session, notifications)
         for event, _text in notifications:
             (deferred.append if deferred is not None else registry.completion_queue.put)(event)
         if deferred is None:
@@ -767,12 +826,22 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
         return
     if text is None:
         _notif_release_turn(session)
+        from gateway.session_approval_completion import release_completion_event_reservation
+        for event, _event_text, _claim in claimed:
+            release_completion_event_reservation(event)
     try:
         if text is not None:
+            from gateway.session_approval_completion import completion_reservation_for_event
+            from hermes_constants import get_process_hermes_home
+            profile = str(session.get('profile_home') or get_process_hermes_home())
+            reservations = tuple(completion_reservation_for_event(event,
+                str(session.get('session_key') or ''), profile) for event, _event_text, _claim in claimed)
             if not _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
                                  "completion batch dispatch failed", display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
+                                 display_metadata={"display_text": batch.display_text(registry)},
+                                 approval_reservations=reservations,
                                  report_ownership_refusal=False,
-                                 display_metadata={"display_text": batch.display_text(registry)}):
+                                 approval_completion_events=tuple(event for event, _text, _claim in claimed)):
                 for event, _text, claim in claimed:
                     _notif_defer_event(event, claim,
                         deferred.append if deferred is not None else registry.completion_queue.put)

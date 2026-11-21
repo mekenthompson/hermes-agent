@@ -10,7 +10,6 @@ import logging
 import os
 import re
 import time
-import unicodedata
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, ClassVar, Collection, Dict, Optional, Any, Tuple, List
 
@@ -171,81 +170,16 @@ _SLACK_SPECIAL_MENTION_RE = re.compile(r"<!(?:everyone|channel|here)(?:\|[^>\n]*
 _THREAD_ROOT_IMAGE_MAX = 4
 
 
-# GFM tables: Slack mrkdwn shows pipe tables as literal pipes, so they are wrapped in ```
-# fences (monospace) and cells padded to per-column display width (CJK-wide aware).
-
-_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*){1,}\|?\s*$")
-
-
-def _is_table_row(line: str) -> bool:
-    """Return True if *line* could plausibly be a table data row."""
-    stripped = line.strip()
-    return bool(stripped) and "|" in stripped
-
-
-def _disp_width(s: str) -> int:
-    """Monospace display width: East-Asian Wide / Full-width chars count as 2."""
-    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
-
-
-def _pad(cell: str, width: int) -> str:
-    """Right-pad *cell* with spaces until its display width equals *width*."""
-    return cell + " " * max(width - _disp_width(cell), 0)
-
-
-def _split_table_row(line: str) -> list[str]:
-    """Split a ``| a | b | c |`` row into trimmed cells (outer pipes optional)."""
-    s = line.strip()
-    s = s.removeprefix("|")
-    s = s.removesuffix("|")
-    return [c.strip() for c in s.split("|")]
-
-
-def _align_table(rows: list[str]) -> list[str]:
-    """Re-emit a markdown table padded to per-column display width. rows[1] is the GFM separator
-    (regenerated); short rows are padded to a uniform column count first."""
-    if len(rows) < 2:
-        return rows
-    parsed = [_split_table_row(r) for r in rows]
-    n_cols = max(len(r) for r in parsed)
-    parsed = [r + [""] * (n_cols - len(r)) for r in parsed]
-    parsed[1] = ["---"] * n_cols  # placeholder; regenerated below
-    widths = [max(_disp_width(r[c]) for r in parsed) for c in range(n_cols)]
-    out: list[str] = []
-    for idx, row in enumerate(parsed):
-        cells = ["-" * widths[c] if idx == 1 else _pad(row[c], widths[c]) for c in range(n_cols)]
-        out.append("| " + " | ".join(cells) + " |")
-    return out
-
-
-def _wrap_markdown_tables(text: str) -> str:
-    """Wrap GFM pipe tables in ``` fences and align columns; tables already in fences are left alone."""
-    if not text or "|" not in text or "-" not in text:
-        return text
-    lines = text.split("\n")
-    out: list[str] = []
-    in_fence = False
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
-        elif (
-            not in_fence and "|" in line and i + 1 < len(lines)
-            and _TABLE_SEPARATOR_RE.match(lines[i + 1])):
-            block = [line, lines[i + 1]]
-            j = i + 2
-            while j < len(lines) and _is_table_row(lines[j]):
-                block.append(lines[j])
-                j += 1
-            out.append("```")
-            out.extend(_align_table(block))
-            out.append("```")
-            i = j
-            continue
-        out.append(line)
-        i += 1
-    return "\n".join(out)
+try:  # sibling module; support package and flat plugin-dir imports
+    from .markdown_tables import (
+        _align_table, _disp_width, _is_table_row, _pad, _split_table_row,
+        _wrap_markdown_tables,
+    )
+except ImportError:  # pragma: no cover - plugin loaded outside package context
+    from markdown_tables import (
+        _align_table, _disp_width, _is_table_row, _pad, _split_table_row,
+        _wrap_markdown_tables,
+    )  # type: ignore
 
 
 # Slash invoker's user_id: set in _handle_slash_command, read in send() to pick the right stashed
@@ -991,10 +925,19 @@ def _is_transient_transport_error(e: BaseException) -> bool:
         and not is_permanent_tls_error)
 
 
-class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformAdapter):
+try:  # support package and flat plugin-directory imports
+    from .adapter_thread_titles import AssistantThreadTitles
+except ImportError:  # pragma: no cover
+    from adapter_thread_titles import AssistantThreadTitles
+
+
+class SlackAdapter(AssistantThreadTitles, SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformAdapter):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
     mention-gated channels, threads, attachments, slash commands, status text."""
+
+    _session_title_method = staticmethod(_session_title_method)
+    _session_status_method = staticmethod(_session_status_method)
 
     MAX_MESSAGE_LENGTH = 39000  # Slack API allows 40,000 chars; leave margin
     supports_code_blocks = True  # Slack mrkdwn renders fenced code blocks
@@ -1105,6 +1048,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         self._native_task_card_streams: dict[tuple[str, str, str], _NativeTaskCardStream] = {}
         # Guard: set the Slack AI thread title once per DM thread, not per reply.
         self._titled_assistant_threads: set = set()
+        self._semantically_titled_assistant_threads: set = set()
         # Slash-command contexts so send() can route the first reply ephemerally. Keyed
         # (team_id, channel_id, user_id), two-part when no team id → {"response_url", "ts"}.
         self._slash_command_contexts: dict[tuple[str, ...], dict[str, Any]] = {}
@@ -2733,15 +2677,6 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         _status = _status or self._default_status_text(_status_started)
         await self._set_thread_status(chat_id, team_id, thread_ts, _status, "failed")
 
-    async def _set_thread_status(
-        self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str) -> None:
-        """``assistant.threads.setStatus`` (empty ``status`` clears); failures are debug-logged."""
-        try:
-            _set_status = _session_status_method(self._get_client(chat_id, team_id=team_id))
-            await _set_status(channel_id=chat_id, thread_ts=thread_ts, status=status)
-        except Exception as e:
-            logger.debug("[Slack] assistant.threads.setStatus %s: %s", fail_label, e)
-
     @staticmethod
     def _default_status_text(started: Optional[float]) -> str:
         """Fallback status label: after 30s show elapsed progress so long turns don't read
@@ -3725,36 +3660,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         except Exception as e:
             logger.debug("[Slack] assistant.threads.setSuggestedPrompts failed: %s", e)
 
-    def _assistant_thread_title_enabled(self) -> bool:
-        raw = self.config.extra.get("assistant_thread_titles", True)
-        if isinstance(raw, str):
-            return raw.strip().lower() not in {"0", "false", "no", "off"}
-        return bool(raw)
 
-    async def _set_assistant_thread_title(
-        self, channel_id: str, thread_ts: str, title_source: str, *, team_id: str = "") -> None:
-        """Best-effort title for visible Slack AI DM threads."""
-        if (
-            not self._app or not channel_id or not thread_ts or not title_source
-            or not self._assistant_thread_title_enabled()):
-            return
-        key = self._workspace_thread_key(team_id, channel_id, thread_ts)
-        if not key or key in self._titled_assistant_threads:
-            return
-        title = re.sub(r"\s+", " ", title_source).strip()
-        if not title or title.startswith("/"):
-            return
-        title = title[:77].rstrip() + "..." if len(title) > 80 else title
-        try:
-            _set_title = _session_title_method(self._get_client(channel_id, team_id=team_id))
-            await _set_title(channel_id=channel_id, thread_ts=thread_ts, title=title)
-        except Exception as e:
-            logger.debug("[Slack] session title set failed: %s", e)
-            return
-        self._titled_assistant_threads.add(key)
-        # Evict oldest thread_ts first so recently titled threads keep their guard.
-        self._evict_oldest_by_ts(
-            self._titled_assistant_threads, self._TITLED_ASSISTANT_THREADS_MAX, lambda e: e[2])
 
     async def _seed_dm_session(
         self, metadata: dict[str, str], *, thread_ts: Optional[str], fail_log: tuple[Any, ...]
@@ -4192,8 +4098,11 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
                     strip_bot_mention=False)
                 if parent_text and f"<@{bot_uid}>" in parent_text:
                     # Remember so later replies skip the fetch.
-                    if not self._slack_strict_mention():
-                        self._register_mentioned_thread(event_thread_ts)
+                    if (
+                        not self._slack_strict_mention()
+                        or channel_id in self._slack_thread_participation_channels()
+                    ):
+                        self._register_mentioned_thread(event_thread_ts, team_id=team_id)
                     return True
         return False
 
@@ -4260,11 +4169,27 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             logger.debug(
                 "[Slack] Ignoring message addressed to another user in channel %s", channel_id)
             return False
-        thread_gated = self._slack_thread_require_mention() and is_thread_reply and not is_mentioned
+        participation_only_thread = (
+            not is_dm
+            and is_thread_reply
+            and not is_mentioned
+            and channel_id in self._slack_thread_participation_channels()
+        )
+        thread_gated = (
+            self._slack_thread_require_mention()
+            and is_thread_reply
+            and not is_mentioned
+            and not participation_only_thread
+        )
         if force_process:
             return True
         free_channel = self._slack_is_free_channel(channel_id)
-        if not free_channel and self._slack_strict_mention() and not is_mentioned:
+        if (
+            not free_channel
+            and self._slack_strict_mention()
+            and not is_mentioned
+            and not participation_only_thread
+        ):
             return False  # Strict mode: ignore until @-mentioned again
         if thread_gated:
             logger.debug(
@@ -4272,6 +4197,11 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
                 "(thread_require_mention=true): channel=%s thread_ts=%s", channel_id,
                 event_thread_ts)
             return False
+        if participation_only_thread:
+            return await self._should_wake_on_unmentioned_message(
+                event_thread_ts=event_thread_ts, channel_id=channel_id, user_id=user_id,
+                team_id=team_id, is_thread_reply=is_thread_reply,
+                chat_type="dm" if is_dm else "group")
         if free_channel:
             return True
         if not is_mentioned:
@@ -4280,6 +4210,26 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
                 team_id=team_id, is_thread_reply=is_thread_reply,
                 chat_type="dm" if is_dm else "group")
         return True
+
+    @staticmethod
+    def _is_thread_parent_bookkeeping_change(event: dict, updated_message: dict, edited_ts: str) -> bool:
+        """True for a ``message_changed`` of a thread root that is NOT a genuine human edit."""
+        ts = str(updated_message.get("ts") or "")
+        is_parent = bool(ts) and (
+            str(updated_message.get("thread_ts") or "") == ts
+            or any(updated_message.get(k) for k in ("reply_count", "latest_reply", "reply_users")))
+        if not is_parent:
+            return False
+        if not edited_ts:
+            return True
+        previous = event.get("previous_message")
+        if isinstance(previous, dict) and "text" in previous:
+            return previous.get("text") == updated_message.get("text")
+        # No previous_message: an edit stamp that is not fresh predates this event.
+        try:
+            return abs(float(event.get("event_ts") or event.get("ts") or 0) - float(edited_ts)) > 120
+        except (TypeError, ValueError):
+            return True
 
     def _normalize_changed_message(self, event: dict) -> Optional[dict]:
         """Turn a ``message_changed`` envelope into a plain message event.
@@ -4294,6 +4244,13 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         edited = updated_message.get("edited")
         edited_ts = str(edited.get("ts") or "") if isinstance(edited, dict) else ""
         outer_event_ts = str(event.get("ts") or "")
+        # Slack re-emits ``message_changed`` for a thread PARENT whenever a reply lands (reply_count /
+        # latest_reply / reply_users bookkeeping) with the root's unchanged text. The in-memory
+        # ``_processed_message_ts`` guard above forgets after a restart or LRU eviction, so a weeks-old root
+        # would be re-admitted as a fresh user turn and re-answered. Only a real human edit may re-admit one.
+        if self._is_thread_parent_bookkeeping_change(event, updated_message, edited_ts):
+            logger.debug("[Slack] Dropping thread-parent message_changed bookkeeping ts=%s", original_message_ts)
+            return None
         changed_event_ts = (
             str(event.get("event_ts") or edited_ts or "")
             or (outer_event_ts if outer_event_ts != original_message_ts else "")
@@ -4634,7 +4591,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
 
     def _apply_bot_mention(
         self, text: str, original_text: str, command_probe_text: str, is_command_text: bool,
-        bot_uid: str, thread_ts: Optional[str], team_id: str) -> tuple[str, str, str, bool]:
+        bot_uid: str, thread_ts: Optional[str], team_id: str, channel_id: str,
+    ) -> tuple[str, str, str, bool]:
         """Strip our mention, re-probe for a command hidden behind it, remember the thread.
         Returns updated ``(text, original_text, command_probe_text, is_command_text)``."""
         text = text.replace(f"<@{bot_uid}>", "").strip()
@@ -4651,9 +4609,13 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         # Remember the thread so follow-ups auto-trigger (skipped under strict_mention /
         # thread_require_mention, which it would defeat). Session-scoped ``thread_ts`` because a
         # top-level @mention STARTS a thread whose replies must trigger too.
-        if (
-            thread_ts and not self._slack_strict_mention()
-            and not self._slack_thread_require_mention()):
+        if thread_ts and (
+            (
+                not self._slack_strict_mention()
+                and not self._slack_thread_require_mention()
+            )
+            or channel_id in self._slack_thread_participation_channels()
+        ):
             self._register_mentioned_thread(thread_ts, team_id=team_id)
         return text, original_text, command_probe_text, is_command_text
 
@@ -4755,7 +4717,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         if is_mentioned:
             text, original_text, command_probe_text, is_command_text = self._apply_bot_mention(
                 text, original_text, command_probe_text, is_command_text, bot_uid, thread_ts,
-                team_id)
+                team_id, channel_id)
         # Thread history stays out of ``text``: prepending would push a command off char zero.
         (
             channel_context, thread_root_media_urls, thread_root_media_types,
@@ -5517,30 +5479,54 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
                 chat_id=chat_id, question=question, choices=choices, clarify_id=clarify_id,
                 session_key=session_key, metadata=metadata)
 
+        def _escape(char: str) -> str:
+            return {"&": "&amp;", "<": "&lt;", ">": "&gt;"}.get(char, char)
+
+        labels = [str(choice).strip() or f"Option {idx + 1}" for idx, choice in enumerate(choices)]
+        prompt_parts = ["❓ "]
+        prompt_parts.extend(_escape(char) for char in (question or ""))
+        prompt_parts.append("\n\n")
+        for idx, label in enumerate(labels, start=1):
+            if idx > 1:
+                prompt_parts.append("\n")
+            prompt_parts.append(f"{idx}. ")
+            prompt_parts.extend(_escape(char) for char in label)
+
+        # Split escaped source atoms, not an already-rendered string, so HTML
+        # entities never straddle Slack's 3,000-character section boundary.
+        sections: list[str] = []
+        section = ""
+        for part in prompt_parts:
+            if section and len(section) + len(part) > 3000:
+                sections.append(section)
+                section = ""
+            section += part
+        if section:
+            sections.append(section)
+        body = "".join(sections)
+
+        # Block Kit allows 50 blocks and Slack truncates top-level text above
+        # 40,000 characters. Use the established numbered typed-answer send
+        # fallback rather than silently clipping any part of a choice.
+        action_block_count = (len(labels) + 5) // 5
+        if len(body) > 40000 or len(sections) + action_block_count > 50:
+            return await super().send_clarify(
+                chat_id=chat_id, question=question, choices=choices, clarify_id=clarify_id,
+                session_key=session_key, metadata=metadata)
+
         def _build() -> tuple[str, list]:
-            # Escape mrkdwn control chars so the question renders literally;
-            # budget against the 3000-char section cap.
-            def _esc(text: str) -> str:
-                return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            # Slack clips button labels well under its 75-char API cap (narrower still on
-            # mobile) with no tooltip, so a long option is unreadable as a label (#78115):
-            # render the full numbered list in the body and label the buttons positionally.
-            body, numbered = clarify_text_with_choices(
-                f"❓ {_esc(question or '')}", choices, limit=3000, max_label_cols=48, escape=_esc)
-            # Slack caps an actions block at 5 elements; clarify caps choices at 4 (+ Other) but
-            # chunk anyway so larger lists degrade gracefully instead of 400ing.
-            elements = []
-            for idx, choice in enumerate(choices):
-                label = str(idx + 1) if numbered else (str(choice).strip() or t("platform.slack.clarify.option_n", n=str(idx + 1)))
-                elements.append(
-                    self._button(
-                        label[:75], f"hermes_clarify_choice_{idx}",
-                        f"{clarify_id}|{idx}", emoji=True))
+            elements = [
+                self._button(str(idx + 1), f"hermes_clarify_choice_{idx}", f"{clarify_id}|{idx}", emoji=True)
+                for idx in range(len(labels))
+            ]
             elements.append(
                 self._button(t("platform.slack.clarify.other")[:75], "hermes_clarify_other",
                              f"{clarify_id}|other", emoji=True)
             )
-            blocks: list = [{"type": "section", "text": {"type": "mrkdwn", "text": body}}]
+            blocks: list = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": text}, "expand": True}
+                for text in sections
+            ]
             for start in range(0, len(elements), 5):
                 blocks.append({"type": "actions", "elements": elements[start : start + 5]})
             return body, blocks
@@ -5646,12 +5632,36 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
                 break
         return original_text[:limit] if limit is not None else original_text
 
+    @staticmethod
+    def _clarify_section_texts(message: dict) -> list[str]:
+        """Every clarify prompt section, split again if Slack re-escaped its text."""
+        sections: list[str] = []
+        for block in message.get("blocks", []):
+            if block.get("type") != "section":
+                continue
+            text = (block.get("text") or {}).get("text", "")
+            section = ""
+            for atom in re.findall(r"&(?:amp;|lt;|gt;)|.", text, re.DOTALL):
+                if section and len(section) + len(atom) > 3000:
+                    sections.append(section)
+                    section = ""
+                section += atom
+            if section:
+                sections.append(section)
+        return sections
+
     async def _finalize_interactive_message(
-        self, channel_id: str, msg_ts: str, original_text: str, decision_text: str,
+        self, channel_id: str, msg_ts: str, original_text: str | list[str], decision_text: str,
         placeholder: str, label: str, team_id: Optional[str] = None, sanitize: bool = True) -> None:
         """Rewrite a button prompt to show the outcome and drop the buttons."""
+        original_sections = original_text if isinstance(original_text, list) else [original_text]
         updated_blocks = [
-            {"type": "section", "text": {"type": "mrkdwn", "text": original_text or placeholder}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}, "expand": True}
+            for text in original_sections if text
+        ] or [
+            {"type": "section", "text": {"type": "mrkdwn", "text": placeholder}, "expand": True},
+        ]
+        updated_blocks += [
             {"type": "context", "elements": [{"type": "mrkdwn", "text": decision_text}]}]
         try:
             await self._get_client(channel_id, team_id=team_id).chat_update(
@@ -5763,7 +5773,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             "Command approval request", "approval", team_id or None)
 
     async def _update_clarify_message(
-        self, channel_id: str, msg_ts: str, question_text: str, decision_text: str) -> None:
+        self, channel_id: str, msg_ts: str, question_text: list[str], decision_text: str) -> None:
         """Rewrite a clarify message to show the outcome and drop the buttons."""
         await self._finalize_interactive_message(
             channel_id, msg_ts, question_text, decision_text, "Clarification", "clarify", sanitize=False
@@ -5800,7 +5810,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         # Double-click guard — atomic pop (mirrors approval).
         if self._clarify_resolved.pop(msg_ts, True):
             return
-        original_text = self._section_text(message, limit=None)
+        original_text = self._clarify_section_texts(message)
         from tools import clarify_gateway as _clarify_mod
         # "Other" → text-capture mode: mark_awaiting_text flips the entry and the
         # gateway's text-intercept resolves it from the user's next message.
@@ -6516,6 +6526,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         "ignore_other_user_mentions", "SLACK_IGNORE_OTHER_USER_MENTIONS")
     _slack_thread_require_mention = _extra_or_env_flag_getter(
         "thread_require_mention", "SLACK_THREAD_REQUIRE_MENTION")
+    _slack_thread_participation_channels = _extra_or_env_channel_set_getter(
+        "thread_participation_channels", "SLACK_THREAD_PARTICIPATION_CHANNELS", coerce_scalar=True)
     _slack_disable_dms = _extra_or_env_flag_getter("disable_dms", "SLACK_DISABLE_DMS", strip=True)
 
     def _slack_message_addressed_to_other_user(self, text: str, self_uids: set) -> bool:
@@ -7031,6 +7043,7 @@ _YAML_BRIDGE = (  # (yaml key, env var, kind) for apply_yaml_bridge
     ("thread_followup_silence", "SLACK_THREAD_FOLLOWUP_SILENCE", "lower"),
     ("reactions", "SLACK_REACTIONS", "lower"), ("disable_dms", "SLACK_DISABLE_DMS", "lower"),
     ("free_response_channels", "SLACK_FREE_RESPONSE_CHANNELS", "csv"),
+    ("thread_participation_channels", "SLACK_THREAD_PARTICIPATION_CHANNELS", "csv"),
     ("require_mention_channels", "SLACK_REQUIRE_MENTION_CHANNELS", "csv"),
     ("reaction_triggers", "SLACK_REACTION_TRIGGERS", "csv"), ("reaction_trigger_target", "SLACK_REACTION_TRIGGER_TARGET", "str"),
     ("allowed_channels", "SLACK_ALLOWED_CHANNELS", "csv"), ("ignored_channels", "SLACK_IGNORED_CHANNELS", "csv"),

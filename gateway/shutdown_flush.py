@@ -404,6 +404,13 @@ def _recover_one_payload(persistence, path: Path, payload: dict[str, Any], *,
             # leave it for the next start.
             blocked_sessions[spooled_sid] += 1
             return False
+        if persistence.sessions.get(spooled_sid) is None:
+            # Missing ownership is not a malformed message and cannot be repaired
+            # by retrying an INSERT. Keep original bytes and hold later rows too.
+            blocked_sessions[spooled_sid] = 1
+            logger.warning("orphan transcript spool held: session %s is absent; preserved %s; "
+                           "requires verified owner recovery", spooled_sid, path)
+            return False
         try:
             fields = transcript_append_kwargs(spooled_sid, message, fallback_ts=payload.get("ts"))
             del fields["session_id"]

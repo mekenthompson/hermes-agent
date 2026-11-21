@@ -23,12 +23,14 @@ from persistence.authority.admissions import (
     TurnBoundary,
     UnheldMedia,
 )
+from persistence.authority.native_control import NativeStopFence
 from persistence.core.errors import PermanentStoreError
 
 from .._backend import SQLiteStore, register_repository
 from . import _admission_media as media
 from . import _admission_owner as owner
 from . import _admission_store as store
+from . import _native_control as native
 from ._runtime import refused, retry_terminal_admission
 
 if TYPE_CHECKING:
@@ -62,12 +64,15 @@ class SQLiteAdmissionRepository:
               intent: Literal["queue", "steer", "redirect"] = "queue", gate: AdmissionGate = None,
               replaces: QueuedReplacement | None = None, supersedes: str | None = None,
               api_target: ApiTargetClaim | None = None, rewrite: TranscriptRewrite | None = None,
-              hosted: HostedMemberGuard | None = None, fold: QueuedFold | None = None) -> tuple[AdmissionRecord, bool]:
+              hosted: HostedMemberGuard | None = None, fold: QueuedFold | None = None,
+              native_stop: bool = False, stop_fence: NativeStopFence | None = None,
+              completion_guard: Sequence[str] = ()) -> tuple[AdmissionRecord, bool]:
         with refused():
             row, created = store.admit_session_input(
                 self._store.holder(), epoch=epoch, principal_id=principal_id, session_id=session_id,
                 request_id=request_id, payload=payload, intent=intent, gate=gate, replaces=replaces,
-                supersedes=supersedes, api_target=api_target, rewrite=rewrite, hosted=hosted, fold=fold)
+                supersedes=supersedes, api_target=api_target, rewrite=rewrite, hosted=hosted, fold=fold,
+                native_stop=native_stop, stop_fence=stop_fence, completion_guard=tuple(completion_guard))
         return _record(row), created
 
     def claim(self, *, epoch: int, session_id: str, gate: AdmissionGate = None,
@@ -250,6 +255,56 @@ class SQLiteAdmissionRepository:
     def retired_candidates(self, kind: Literal["media", "spillover"]) -> list[tuple[str, Any]]:
         with refused():
             return media.retired_candidates(self._store.holder(), kind)
+
+    # House native controls (persistence.authority.native_control.NativeControlAdmissions)
+
+    def native_stop_watermark(self, *, session_id: str | None = None, route: str | None = None) -> int:
+        with refused():
+            return native.native_stop_watermark(self._store.holder(), session_id, route=route)
+
+    def consume_native_stop(self, *, epoch: int, admission_id: str) -> AdmissionRecord | None:
+        with refused():
+            return _record(native.consume_native_stop(self._store.holder(), epoch=epoch, admission_id=admission_id))
+
+    def interrupt_steer(self, *, epoch: int, admission_id: str, generation: int) -> bool:
+        with refused():
+            return native.interrupt_steer_input(self._store.holder(), epoch=epoch, admission_id=admission_id,
+                                                generation=generation)
+
+    def process_stop_pending(self, session_id: str) -> str | None:
+        with refused():
+            return native.process_stop_pending(self._store.holder(), session_id)
+
+    def record_process_stop(self, *, epoch: int, session_id: str, generation: int) -> str:
+        with refused():
+            return native.record_process_stop(self._store.holder(), epoch=epoch, session_id=session_id,
+                                              generation=generation)
+
+    def clear_process_stop(self, *, epoch: int, session_id: str, token: str) -> None:
+        with refused():
+            native.clear_process_stop(self._store.holder(), epoch=epoch, session_id=session_id, token=token)
+
+    def check_epoch(self, *, epoch: int, reopen: bool = True) -> None:
+        with refused():
+            native.check_epoch(self._store.holder(), epoch=epoch, reopen=reopen)
+
+    def native_receipts(self, *, epoch: int, principal_id: str,
+                        request_id: str) -> list[tuple[AdmissionRecord | None, str]]:
+        with refused():
+            return [(_record(row), digest) for row, digest in native.native_receipts(
+                self._store.holder(), epoch=epoch, principal_id=principal_id, request_id=request_id)]
+
+    def completion_cancelled(self, *, session_id: str, identity: str | None = None,
+                             process_id: str | None = None) -> bool:
+        with refused():
+            return native.completion_cancelled(self._store.holder(), session_id=session_id, identity=identity,
+                                               process_id=process_id)
+
+    def cancel_process_completions(self, *, epoch: int, session_id: str,
+                                   completions: Sequence[tuple[str, str]]) -> None:
+        with refused():
+            native.cancel_process_completions(self._store.holder(), epoch=epoch, session_id=session_id,
+                                              completions=list(completions))
 
 
 register_repository("admissions", SQLiteAdmissionRepository, {"durable_admissions": True})

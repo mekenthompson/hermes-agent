@@ -1,0 +1,217 @@
+"""Real filesystem integration coverage for the live admission adapters."""
+from __future__ import annotations
+
+import os
+import sqlite3
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from hermes_cli.admission import AdmissionController, AdmissionLimits
+from hermes_cli.admission_contract import AdmissionCaller, AdmissionErrorCode
+from hermes_cli.admission_runtime import admit_writer, cancel_admission_request, ledger_path, release_admission
+
+
+def _git(path: Path, *args: str) -> str:
+    completed = subprocess.run(["git", "-C", str(path), *args], text=True, capture_output=True, check=True)
+    return completed.stdout.strip()
+
+
+def _worktrees(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    _git(repo, "config", "user.name", "Test")
+    (repo / "README").write_text("base\n")
+    _git(repo, "add", "README")
+    _git(repo, "commit", "-m", "base")
+    _git(repo, "remote", "add", "origin", str(repo))
+    # The adapter deliberately requires an advertised main-line base.
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    first, second, third, fourth = (tmp_path / name for name in ("first", "second", "third", "fourth"))
+    _git(repo, "worktree", "add", "-b", "worker/first", str(first), "HEAD")
+    _git(repo, "worktree", "add", "-b", "worker/second", str(second), "HEAD")
+    _git(repo, "worktree", "add", "-b", "worker/third", str(third), "HEAD")
+    _git(repo, "worktree", "add", "-b", "worker/fourth", str(fourth), "HEAD")
+    return repo, first, second, third, fourth
+
+
+def _admit(request_id: str, caller: AdmissionCaller, workspace: Path, *, priority: int = 0, **kwargs):
+    return admit_writer(
+        request_id=request_id,
+        caller=caller,
+        workspace=str(workspace),
+        priority=priority,
+        writer_id=f"{caller.value}:{request_id}",
+        delegate_cap=2,
+        **kwargs,
+    )
+
+
+def test_temp_home_shares_delegate_capacity_priority_and_writer_reservations(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _repo, first, second, third, fourth = _worktrees(tmp_path)
+
+    first_delegate = _admit("delegate-first", AdmissionCaller.DELEGATE, first, priority=10)
+    delegate = _admit("delegate-1", AdmissionCaller.DELEGATE, second, priority=20)
+    queued_low = _admit("low", AdmissionCaller.DELEGATE, third, priority=10)
+    queued_high = _admit("high", AdmissionCaller.DELEGATE, fourth, priority=90)
+
+    assert first_delegate.state == delegate.state == "running"
+    assert queued_low.state == queued_high.state == "queued"
+    assert queued_low.reason == "capacity"
+    assert release_admission(first_delegate.lease_id) is None
+
+    connection = sqlite3.connect(ledger_path(), isolation_level=None)
+    try:
+        controller = AdmissionController(connection, AdmissionLimits(running={"gateway": 2}, queued={"gateway": 2}))
+        promoted = controller.promote_next()
+        assert promoted is not None
+        assert promoted.request_id == "high"
+        assert promoted.state == "running"
+    finally:
+        connection.close()
+
+    # Both delegates used the same common directory but distinct branch targets;
+    # non-overlapping writers are valid.  An exact branch overlap is rejected.
+    conflict = _admit("same-branch", AdmissionCaller.DELEGATE, second)
+    assert conflict.state == "rejected"
+    assert conflict.reason == AdmissionErrorCode.CONFLICTING_WRITER.value
+
+
+def test_idle_ledger_adopts_new_configured_capacity_but_live_work_blocks_migration(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _repo, first, second, third, _fourth = _worktrees(tmp_path)
+
+    old = _admit("old", AdmissionCaller.DELEGATE, first)
+    assert old.state == "running"
+    assert release_admission(old.lease_id) is None
+    with sqlite3.connect(ledger_path()) as connection:
+        assert connection.execute("SELECT count(*) FROM admission_requests WHERE state IN ('queued', 'running')").fetchone()[0] == 0
+
+    changed = admit_writer(
+        request_id="changed", caller=AdmissionCaller.DELEGATE, workspace=str(second), priority=0,
+        writer_id="delegate:changed", delegate_cap=4,
+    )
+    assert changed.state == "running"
+    with sqlite3.connect(ledger_path()) as connection:
+        assert connection.execute("SELECT limits_json FROM admission_configuration").fetchone()[0] == (
+            '{"queued":{"gateway":4},"running":{"gateway":4}}'
+        )
+    # A concurrent worker still owns a lease. Never silently resize its ledger.
+    with pytest.raises(ValueError, match="identical limits"):
+        admit_writer(
+            request_id="unsafe", caller=AdmissionCaller.DELEGATE, workspace=str(third), priority=0,
+            writer_id="delegate:unsafe", delegate_cap=3,
+        )
+    assert release_admission(changed.lease_id) is None
+
+    # An abandoned lease past its expiry is not live work. Reap it under the
+    # same writer lock before deciding whether the changed cap is safe.
+    abandoned = admit_writer(
+        request_id="abandoned", caller=AdmissionCaller.DELEGATE, workspace=str(third), priority=0,
+        writer_id="delegate:abandoned", delegate_cap=4,
+    )
+    assert abandoned.state == "running"
+    with sqlite3.connect(ledger_path()) as connection:
+        connection.execute("UPDATE admission_requests SET lease_expires_at = 1 WHERE request_id = 'abandoned'")
+    recovered = admit_writer(
+        request_id="recovered", caller=AdmissionCaller.DELEGATE, workspace=str(second), priority=0,
+        writer_id="delegate:recovered", delegate_cap=3,
+    )
+    assert recovered.state == "running"
+    with sqlite3.connect(ledger_path()) as connection:
+        assert connection.execute("SELECT state FROM admission_requests WHERE request_id = 'abandoned'").fetchone()[0] == "expired"
+    release_admission(recovered.lease_id)
+
+
+def test_temp_home_rejects_unisolated_delegate_and_records_durable_reason(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    rejected = admit_writer(
+        request_id="delegate-no-worktree", caller=AdmissionCaller.DELEGATE, workspace=None,
+        priority=0, writer_id="delegate:delegate-no-worktree", delegate_cap=2,
+    )
+    assert rejected.state == "rejected"
+    assert rejected.reason == AdmissionErrorCode.UNSUPPORTED_PATH.value
+    connection = sqlite3.connect(ledger_path())
+    try:
+        row = connection.execute(
+            "SELECT caller, reason FROM admission_rejections WHERE request_id = ?", ("delegate-no-worktree",)
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row == ("delegate", AdmissionErrorCode.UNSUPPORTED_PATH.value)
+
+
+def test_profile_scope_a_b_a_uses_each_runtime_home_ledger(tmp_path, monkeypatch):
+    _repo, first, second, _third, _fourth = _worktrees(tmp_path)
+    home_a, home_b = tmp_path / "home-a", tmp_path / "home-b"
+    home_a.mkdir()
+    home_b.mkdir()
+
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    a_first = _admit("a-first", AdmissionCaller.DELEGATE, first)
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    b_first = _admit("b-first", AdmissionCaller.DELEGATE, second)
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    a_second = _admit("a-second", AdmissionCaller.DELEGATE, second)
+
+    assert a_first.state == b_first.state == "running"
+    assert a_second.state == "running"
+    assert ledger_path() == home_a / "admission.db"
+    assert (home_b / "admission.db").exists()
+
+
+def test_dependencies_do_not_consume_running_capacity(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _repo, first, second, _third, _fourth = _worktrees(tmp_path)
+    blocked = _admit(
+        "blocked", AdmissionCaller.DELEGATE, first,
+        dependencies=("parent",), unresolved_dependencies=("parent",),
+    )
+    admitted = _admit("ready", AdmissionCaller.DELEGATE, second)
+
+    assert blocked.state == "queued"
+    assert blocked.reason == AdmissionErrorCode.DEPENDENCIES_UNSATISFIED.value
+    assert admitted.state == "running"
+
+
+def test_capacity_blocked_retries_are_cancelled_without_queued_occupancy(tmp_path, monkeypatch):
+    """Immediate pre-spawn callers cannot strand capacity-one queue entries."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _repo, first, second, third, fourth = _worktrees(tmp_path)
+
+    running = admit_writer(
+        request_id="delegate-running", caller=AdmissionCaller.DELEGATE, workspace=str(first), priority=0,
+        writer_id="delegate:delegate-running", delegate_cap=1,
+    )
+    assert running.state == "running"
+    for request_id, caller, workspace in (
+        ("delegate-queued", AdmissionCaller.DELEGATE, second),
+        ("delegate-retry-first", AdmissionCaller.DELEGATE, third),
+        ("delegate-retry", AdmissionCaller.DELEGATE, fourth),
+    ):
+        queued = admit_writer(
+            request_id=request_id, caller=caller, workspace=str(workspace), priority=0,
+            writer_id=f"{caller.value}:{request_id}", delegate_cap=1,
+        )
+        assert queued.state == "queued"
+        assert cancel_admission_request(queued.request_id) is True
+        assert cancel_admission_request(queued.request_id) is False
+        with sqlite3.connect(ledger_path(), isolation_level=None) as connection:
+            controller = AdmissionController(
+                connection, AdmissionLimits(running={"gateway": 1}, queued={"gateway": 1}),
+            )
+            assert controller.usage("queued") == {"gateway": 0}

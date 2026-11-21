@@ -21,6 +21,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from tests.fixtures.storage_read import conversation
@@ -68,24 +69,6 @@ def _build_agent_with_db(db, session_id: str, **compressor_kwargs):
     return agent
 
 
-def _timeout_after_entry(monkeypatch, started):
-    """Start the real timeout wait after the engine reached its blocking point."""
-    from agent import conversation_compression as cc
-
-    wait = cc._await_worker_within_budget
-    futures = []
-
-    def after_entry(future, fence, **_kwargs):
-        futures.append(future)
-        assert started.wait(timeout=10)
-        fence.touch_progress()
-        return wait(future, fence, idle=0.1, ceiling=1.0, wait_started=time.monotonic())
-
-    monkeypatch.setattr(cc, "resolve_context_compression_timeouts", lambda cfg=None: (30, 60))
-    monkeypatch.setattr(cc, "_await_worker_within_budget", after_entry)
-    return futures
-
-
 def test_f3_mutating_engine_cannot_touch_live_transcript_after_timeout(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -100,10 +83,15 @@ def test_f3_mutating_engine_cannot_touch_live_transcript_after_timeout(
     agent = _build_agent_with_db(db, session_id)
     agent._cached_system_prompt = "sys"
 
+    # Fast host timeout for the owned wrapper.
+    monkeypatch.setattr(
+        "agent.conversation_compression.resolve_context_compression_timeouts",
+        lambda cfg=None: (0.6, 1.2),
+    )
+
     engine_started = threading.Event()
     release_engine = threading.Event()
     mutated_lists = []
-    futures = _timeout_after_entry(monkeypatch, engine_started)
 
     def _mutating_engine(msgs, **_kwargs):
         # Legacy/plugin-engine contract: mutate the input list IN PLACE.
@@ -137,8 +125,6 @@ def test_f3_mutating_engine_cannot_touch_live_transcript_after_timeout(
         assert live == baseline
     finally:
         release_engine.set()
-        for future in futures:
-            future.result(timeout=10)
     # After the late worker finishes, the live transcript must STILL be
     # untouched (publication only on admitted commit — which was cancelled).
     deadline = time.time() + 5
@@ -174,13 +160,39 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
     seed_session(db, session_id, "cli")
     agent = _build_agent_with_db(db, session_id)
     agent._cached_system_prompt = "sys"
+    # A loaded CI shard can delay dispatching this worker beyond the real 50/100ms
+    # budgets. Keep the host clock at zero until the provider has actually started,
+    # then advance it past the total ceiling. This exercises the real timeout,
+    # cancellation, and admission-release paths without treating scheduler delay as
+    # provider silence.
+    clock_lock = threading.Lock()
+    clock_now = [0.0]
+
+    def _monotonic() -> float:
+        with clock_lock:
+            return clock_now[0]
+
+    def _advance_clock(seconds: float) -> None:
+        with clock_lock:
+            clock_now[0] += seconds
+
+    monkeypatch.setattr(
+        cc,
+        "time",
+        SimpleNamespace(monotonic=_monotonic, sleep=time.sleep, time=time.time),
+    )
+    monkeypatch.setattr(
+        "agent.conversation_compression.resolve_context_compression_timeouts",
+        # Allow provider-thread startup under the parallel runner before timing out.
+        lambda cfg=None: (2.0, 4.0),
+    )
 
     provider_started = threading.Event()
     release_provider = threading.Event()
-    futures = _timeout_after_entry(monkeypatch, provider_started)
 
     def _blocked_provider(_kwargs):
         provider_started.set()
+        _advance_clock(4.1)
         assert release_provider.wait(timeout=30)
         return "late-provider-result"
 
@@ -196,10 +208,10 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
             live, "sys", approx_tokens=120_000
         )
         assert returned is live
-        assert provider_started.wait(timeout=10)
+        assert provider_started.wait(timeout=5)
         assert not release_provider.is_set()
 
-        deadline = time.time() + 10
+        deadline = time.time() + 5
         while time.time() < deadline:
             with cc._compress_admission_lock:
                 if cc._compress_admitted_count == 0:
@@ -212,8 +224,6 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
             )
     finally:
         release_provider.set()
-        for future in futures:
-            future.result(timeout=10)
         deadline = time.time() + 5
         while time.time() < deadline:
             with cc._compress_admission_lock:

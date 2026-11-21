@@ -88,6 +88,28 @@ def test_secret_failure_never_echoes_the_script(page):
     assert out["success"] is False and SECRET not in raw
 
 
+@pytest.mark.platforms("linux")
+def test_plugin_secret_write_readmits_display_lease(page, monkeypatch):
+    from hermes_constants import hermes_home_key
+    from tools import browser_session, browser_vault_tool
+    from tools.bot_desktop import lease, runtime
+
+    fake, _meta = page
+    home = hermes_home_key()
+    monkeypatch.setattr(browser_session, "session_for_task", lambda task_id: {
+        "home_key": home, "features": {"local": True}})
+    monkeypatch.setattr(runtime, "published_env", lambda: {"DISPLAY": ":37"})
+    lease.acquire("viewer", profile_key=home)
+    try:
+        out = browser_vault_tool._eval_js_secret("task", SECRET)
+        assert out.get("code") == "human_has_control"
+        assert fake.calls == []
+    finally:
+        lease.release("viewer", profile_key=home)
+    assert browser_vault_tool._eval_js_secret("task", SECRET)["success"] is True
+    assert len(fake.calls) == 1 and fake.calls[0][1] is True
+
+
 # The bound page, whose controls throw when a vault script touches them, and which defines a ``then``
 # that answers for any object it can reach: a backend that awaits results (Electron's
 # executeJavaScript, a Playwright-style evaluate) would resolve the core's failure marker through it.

@@ -144,8 +144,12 @@ def _register_completion_watcher(process_registry, proc_session, session_key) ->
     }
     runner_ref = getattr(sys.modules.get("gateway.run"), "_gateway_runner_ref", None)
     runner = runner_ref() if callable(runner_ref) else None
-    if runner is not None and runner.arm_process_watcher(watcher):
-        return
+    if runner is not None:
+        try:
+            if runner.arm_process_watcher(watcher):
+                return
+        except Exception:
+            logger.exception('Process watcher arming failed; retaining pending descriptor')
     process_registry.pending_watchers.append(watcher)
 
 
@@ -175,10 +179,12 @@ def spawn_background_process(
     )
 
     effective_cwd = _resolve_command_cwd(
-        workdir=workdir, default_cwd=cwd, session_key=cwd_key or session_key, env_type=env_type,
+        workdir=workdir, default_cwd=cwd, session_key=cwd_key or session_key, env_type=env_type, task_id=task_id,
         mounted_host=mounted_host if mounted_host is not None else getattr(env, "host_cwd", None),
         env=env,
     )
+    from tools.approval_context import reserve_background_approval_task, release_background_approval_task
+    reservation = reserve_background_approval_task() if notify_on_complete else None
     try:
         proc_session = _spawn(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
@@ -186,6 +192,9 @@ def spawn_background_process(
             effective_pty=effective_pty, persist_on_release=persist_on_release,
             allow_cwd_fallback=not workdir,  # a named workdir is refused, never swapped for a parent
         )
+        # This is process-owned in-memory evidence. Checkpoint recovery deliberately
+        # omits it, so an owner restart cannot recreate a human grant from IDs.
+        proc_session.approval_task_reservation = reservation
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
         if persist_on_release:
@@ -212,6 +221,9 @@ def spawn_background_process(
 
         notify_on_complete, watch_patterns = _apply_async_support(
             proc_session, result_data, notify_on_complete, watch_patterns)
+        if not notify_on_complete:
+            release_background_approval_task(reservation)
+            proc_session.approval_task_reservation = None
         watch_patterns, conflict_note = _resolve_notification_flag_conflict(
             notify_on_complete=bool(notify_on_complete), watch_patterns=watch_patterns, background=True,
         )
@@ -240,6 +252,7 @@ def spawn_background_process(
             result_data["watch_patterns"] = proc_session.watch_patterns
         return json.dumps(result_data, ensure_ascii=False)
     except Exception as e:
+        release_background_approval_task(reservation)
         return json.dumps({
             "output": "", "exit_code": -1,
             "error": _redact_terminal_error_text(f"Failed to start background process: {e}"),
@@ -273,17 +286,56 @@ def yield_to_background_handler(
     if env_type != "local":
         return None
 
-    def _handler(proc, output_so_far: str) -> dict:
+    def _prepare_local():
         from tools.process_registry import process_registry
-        session = process_registry.adopt_local(
-            proc, command=command, cwd=cwd, task_id=effective_task_id,
-            owner_task_id=task_id or effective_task_id, session_key=session_key,
-            output_so_far=output_so_far)
-        _stamp_routing_if_gateway(process_registry, session, session_key)
+        from gateway.session_context import get_session_env
+        session = process_registry._new_session(
+            command, effective_task_id, task_id or effective_task_id, session_key, cwd,
+            persist_on_release=True)
+        # Foreground output is delivered inline. Only an actual yield activates
+        # completion delivery; ordinary service launches retain their lifetime.
+        session.notify_on_complete = False
+        _stamp_gateway_routing(session, get_session_env)
+        return session
+
+    def _handler(proc, output_so_far: str) -> dict:
+        from tools.process_registry import ProcessSession, process_registry
+        from tools.approval_context import reserve_background_approval_task, release_background_approval_task
+        reservation = reserve_background_approval_task()
+        try:
+            native = isinstance(getattr(proc, '_hermes_job_session', None), ProcessSession)
+            if native:
+                from copy import copy
+                session = copy(proc._hermes_job_session)
+                session.persist_on_release, session.notify_on_complete = False, True
+            else:
+                session = process_registry.adopt_local(
+                    proc, command=command, cwd=cwd, task_id=effective_task_id,
+                    owner_task_id=task_id or effective_task_id, session_key=session_key,
+                    output_so_far=output_so_far)
+            session.approval_task_reservation = reservation
+            _stamp_routing_if_gateway(process_registry, session, session_key)
+            if not session.notify_on_complete:
+                release_background_approval_task(reservation)
+                session.approval_task_reservation = None
+            if native:
+                from tools.process_registry_chat_execution import adopt_foreground
+                session = adopt_foreground(process_registry, proc, command=command, cwd=cwd,
+                    task_id=effective_task_id, owner_task_id=task_id or effective_task_id,
+                    session_key=session_key, notify_on_complete=session.notify_on_complete,
+                    prepared=vars(session))
+            else:
+                process_registry._write_checkpoint()
+        except BaseException:
+            release_background_approval_task(reservation)
+            raise
+        if session.notify_on_complete and session.watcher_platform:
+            _register_completion_watcher(process_registry, session, session_key)
         logger.info("foreground command yielded to background as %s (pid %s)", session.id, session.pid)
         return {
             "output": output_so_far, "returncode": None, "yielded_session_id": session.id, "pid": session.pid,
         }
+    _handler.prepare_local = _prepare_local
     return _handler
 
 
@@ -295,4 +347,4 @@ def _stamp_routing_if_gateway(process_registry, session, session_key) -> None:
         return
     _stamp_gateway_routing(session, get_session_env)
     if session.watcher_platform:
-        _register_completion_watcher(process_registry, session, session_key)
+        session.watcher_interval = 5  # Durable intent precedes live arming after adoption.

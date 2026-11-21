@@ -80,6 +80,20 @@ class TestResolutionOrder:
     
 
 
+class TestRuntimeProfileAlias:
+    """Container profile names can name the current custom HERMES_HOME."""
+
+    def test_runtime_profile_name_resolves_to_current_home_without_named_dir(
+        self, mock_runner, discord_source, monkeypatch
+    ):
+        discord_source.profile = "klanker"
+        monkeypatch.setenv("HERMES_PROFILE", "klanker")
+        with patch("hermes_constants.get_hermes_home", return_value=Path("/opt/data")), \
+             patch("hermes_cli.profiles.profile_exists", return_value=False) as exists:
+            assert mock_runner._resolve_profile_home_for_source(discord_source) == Path("/opt/data")
+        exists.assert_not_called()
+
+
 class TestMissingProfileWarning:
     """Tests for warning when a profile doesn't exist on disk."""
     
@@ -353,6 +367,17 @@ class TestAdapterToSessionKeyIntegration:
         assert key.startswith("agent:coder:"), key
         # A default-profile key would land in agent:main — must differ.
         assert key != build_session_key(source, profile=None)
+
+    def test_single_profile_runtime_does_not_stamp_source_profile(self, monkeypatch):
+        """Execution identity is exported later, not repurposed for routing."""
+        monkeypatch.setenv("HERMES_PROFILE", "overlord")
+        monkeypatch.delenv("HERMES_AGENT_PROFILE", raising=False)
+        runner = GatewayRunner(GatewayConfig(multiplex_profiles=False))
+        adapter = _stub_adapter(Platform.SLACK, runner)
+
+        source = adapter.build_source(chat_id="C123", chat_type="group")
+
+        assert source.profile is None
 
     def test_adapter_preserves_numeric_zero_user_id_for_routing(self, mock_runner):
         mock_runner.config.profile_routes = [

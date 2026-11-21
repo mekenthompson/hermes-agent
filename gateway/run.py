@@ -769,7 +769,7 @@ def _approval_send_outcome(future, timeout: float) -> str:
         return "sent"
     # P5(b): a connector DECLINE is not a lane failure. The connector authorized the destination and refused it;
     # re-sending the same content as plain text into that same chat is the exfiltration the egress guard exists
-    # to stop. `failed` is the cue to fall back, so a decline needs its own verdict — callers must surface it 
+    # to stop. `failed` is the cue to fall back, so a decline needs its own verdict — callers must surface it
     # and send nothing further.
     #
     # CLASSIFY THE STRUCTURED RESPONSE, NOT THE ERROR STRING. The adapter
@@ -2164,6 +2164,7 @@ from gateway.run_notifications import GatewayNotificationsMixin
 from gateway.run_inbound import GatewayInboundMixin
 from gateway.run_goals import GatewayGoalsMixin
 from gateway.run_agent_cache import GatewayAgentCacheMixin
+from gateway.run_plugin_services import GatewayPluginServicesMixin
 from gateway.run_profile_reconcile import GatewayProfileReconcileMixin
 from gateway.run_plugin_rewire import GatewayPluginRewireMixin
 from gateway.platforms.base import (
@@ -2227,7 +2228,7 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 
 # Placed into _running_agents *before* any await so a second message can't slip past the "already
 # running" guard before the agent exists.
-_AGENT_PENDING_SENTINEL = object()
+from gateway.session_state import AGENT_PENDING_SENTINEL as _AGENT_PENDING_SENTINEL
 
 # Conversation-scoped per-session state registry (legacy contract). State lives in
 # ``SessionState.conversation`` (cleared via ``ConversationState.clear()``); this list remains for
@@ -2573,8 +2574,7 @@ _INTERRUPT_REASON_EVICTED = "Session ended while the turn was running"
 _INTERRUPT_TOOL_REASON_EVICTED = "session evicted"
 _INTERRUPT_TOOL_REASON_GATEWAY_SHUTDOWN = "gateway shutdown"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
-_INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
-_INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
+from gateway.session_state import _INTERRUPT_REASON_GATEWAY_SHUTDOWN, _INTERRUPT_REASON_GATEWAY_RESTART
 
 
 def _reap_gateway_turn_processes(
@@ -3283,6 +3283,8 @@ def _instantiate_builtin_adapter(platform: Platform, config: Any) -> Optional[Ba
     return adapter_cls(config)
 
 
+from gateway.execution_lifecycle import GatewayExecutionLifecycleMixin
+from gateway.chat_stop import GatewayChatStopMixin
 from gateway.run_runtime_init import GatewayRuntimeInitMixin
 
 
@@ -3291,7 +3293,8 @@ class GatewayRunner(
     GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
     GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
-    GatewayAgentCacheMixin, GatewayRuntimeInitMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin):
+    GatewayAgentCacheMixin, GatewayExecutionLifecycleMixin, GatewayChatStopMixin, GatewayPluginServicesMixin,
+    GatewayRuntimeInitMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     def _adapter_for_source(self, source):
@@ -3323,6 +3326,8 @@ class GatewayRunner(
     _systemd_watchdog: Optional[Any] = None
     _startup_restore_in_progress: bool = False
     _startup_warmup_task: Optional[asyncio.Task] = None
+    _profile_service_stop: Optional[asyncio.Event] = None
+    _profile_service_tasks: list[asyncio.Task] = []
 
     # Legacy per-session dict attrs as LIVE views over ``self._sessions``; new code: _session_state(key)
     _running_agents = legacy_dict_property("_running_agents")
@@ -3894,11 +3899,21 @@ class GatewayRunner(
         # Can async tools wake a later turn here? Default True (CLI/unknown); api_server declares False.
         _adapter = (getattr(self, "adapters", None) or {}).get(source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-        # #98619: an admitted API turn carries its session-id provenance; other platforms leave it unset.
-        from gateway.session_api_turn import api_session_vars
+        source_profile = str(getattr(context.source, "profile", "") or "").strip()
+        multiplex = bool(getattr(getattr(self, "config", None), "multiplex_profiles", False))
+        if not source_profile and multiplex:
+            from gateway.session_identity import identity_of
+            identity = identity_of(context.source)
+            source_profile = identity.runtime_profile if identity is not None else ""
+        if not source_profile and not multiplex:
+            source_profile = getattr(self, "_configured_runtime_profile_name", None) or ""
+        from gateway.session_api_turn import api_session_vars, bind_api_transfer_session
         _history_delivery = api_session_vars().get("session_history_delivery")
-        return set_session_vars(
+        from gateway.session_policy import policy_for_source
+        policy = policy_for_source(self, context.source)
+        return bind_api_transfer_session(set_session_vars(
             platform=source.platform.value,
+            source=policy.platform if policy is not None else "",
             chat_id=source.chat_id,
             chat_type=str(source.chat_type) if source.chat_type else "",
             chat_name=source.chat_name or "",
@@ -3914,8 +3929,17 @@ class GatewayRunner(
             # (and a command it yields to the background) must still see its own session.
             session_id=context.session_id or "",
             message_id=str(source.message_id) if source.message_id else "",
-            profile=getattr(source, "profile", "") or "",
-            async_delivery=_async_delivery, cron_session="", session_history_delivery=_history_delivery)
+            profile=source_profile,
+
+            async_delivery=_async_delivery,
+            cron_session="", session_history_delivery=_history_delivery), context)
+
+    def _set_turn_session_env(self, context: SessionContext, run_generation: int) -> list:
+        """Bind the claimed turn generation with its tool identity."""
+        from gateway.session_context import set_session_run_generation
+        tokens = self._set_session_env(context)
+        set_session_run_generation(run_generation)
+        return tokens
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
@@ -4230,13 +4254,6 @@ def _housekeeping_channel_directory(adapters, loop) -> None:
             fut.result(timeout=30)
 
 
-def _housekeeping_paste_sweep() -> None:
-    from hermes_cli.debug import _sweep_expired_pastes
-    deleted, remaining = _sweep_expired_pastes()
-    if deleted:
-        logger.info("Paste sweep: deleted %d expired paste(s), %d pending", deleted, remaining)
-
-
 def _housekeeping_misfire_catch_up(cron_provider, adapters, loop) -> None:
     """External cron providers only: fire jobs whose time passed with no external fire delivered (dead
     loopback hop). No-op for the built-in ticker; enforces misfire_grace_minutes; CAS claim de-dupes."""
@@ -4389,7 +4406,8 @@ def _start_gateway_housekeeping(
     Cadences are ticks of ``interval``; inner gates own the real cadence."""
     from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch, wait_for_next_tick
     from gateway.run_profile_reconcile import _mcp_config_reconciler, profile_scoped_chore
-    from gateway.run_housekeeping_disk import housekeeping_media_caches, maybe_post_auto_prune_prompt
+    from gateway.run_housekeeping_disk import (
+        housekeeping_media_caches, housekeeping_paste_sweep, maybe_post_auto_prune_prompt)
     from hermes_cli.plugins_idle_tasks import IdleTaskFence
     chores: list[tuple[int, str, Any]] = [
         # First every tick: re-stamp ``updated_at`` in gateway_state.json so it is a real heartbeat.
@@ -4404,7 +4422,7 @@ def _start_gateway_housekeeping(
     chores += [
         (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop)),
         (60, "Media cache cleanup", housekeeping_media_caches),
-        (60, "Paste sweep", _housekeeping_paste_sweep)]
+        (60, "Paste sweep", housekeeping_paste_sweep)]
     # Low disk + auto-prune undecided: ask on the home channel (two syscalls; snoozed per post).
     chores.append((1, "Auto-prune low-disk prompt", lambda: maybe_post_auto_prune_prompt(runner, loop)))
     if cron_provider is not None:

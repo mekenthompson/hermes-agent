@@ -96,7 +96,9 @@ def installation_command(repo_root: Path, args=(), *, module: str = "hermes_cli.
     prefix = [] if module == "hermes_cli.main" else ["--run-module", module]
     if (sealed := sealed_service_launcher(root)) is not None:
         return [str(sealed), *prefix, *args]
-    if resolve_store_python(root) is None:
+    # A sealed payload (the Docker image, desktop bundles) ships its own launchers (``libexec/``) and never
+    # publishes ``.hermes/bin/hermes``; naming it there fails with exit 127 on every run.
+    if resolve_store_python(root) is None or payload_command_dir(root) is not None:
         return runtime_command(root, args, module=module, python=python, home=home)
     return [str(root / ".hermes" / "bin" / "hermes"), *prefix, *args]
 

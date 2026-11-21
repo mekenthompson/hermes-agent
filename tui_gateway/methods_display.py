@@ -173,6 +173,33 @@ def _(rid, params: dict) -> dict:
         return _err(rid, _DISPLAY_ERR, str(e))
 
 
+@method("display.clipboard.read")
+@_profile_scoped
+def _(rid, params: dict) -> dict:
+    """Copy out. Xvnc runs ``-SendCutText=0`` so a watcher is never sent the holder's clipboard; the holder
+    pulls it here instead. Answered only to the viewer this connection minted AND the lease names (holder
+    human); a watcher or an agent-held screen gets a refusal. The lease is re-read after the (blocking)
+    selection read: a takeover that landed meanwhile means the text may be the new holder's, so it is dropped.
+    The text is never logged."""
+    from tools.bot_desktop import clipboard as _bd_clipboard, lease as _bd_lease
+    viewer_id = str(params.get("viewer_id") or "").strip()
+    if (refused := _foreign_viewer_id(rid, viewer_id)) is not None:
+        return refused
+    not_in_control = _err(rid, _DISPLAY_ERR, "only the viewer in control of this screen can copy from it",
+                          data={"code": "not_in_control"})
+    before = _bd_lease.get()
+    if not (before.holder == _bd_lease.HUMAN and before.viewer_id == viewer_id):
+        return not_in_control
+    try:
+        text = _bd_clipboard.read_text()
+    except _bd_clipboard.ClipboardError as e:
+        return _err(rid, _DISPLAY_ERR, str(e), data={"code": e.code})
+    after = _bd_lease.get()
+    if after.epoch != before.epoch:
+        return not_in_control
+    return _ok(rid, {"text": text})
+
+
 @method("display.switchSandboxImage")
 @_profile_scoped
 def _(rid, params: dict) -> dict:

@@ -200,6 +200,8 @@ class GatewayTurnProgressMixin:
     def progress_callback(self, event_type: str, tool_name: str | None = None, preview: str | None = None, args: dict | None = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        if ctx.internal_plugin_execution_id is not None:
+            self._runner._observe_internal_plugin_tool_event(ctx.internal_plugin_execution_id, event_type)
         if local_viewer_turn(self):
             try:
                 from gateway import local_viewer_events
@@ -349,6 +351,7 @@ class GatewayTurnProgressMixin:
         try:
             adapter = self._runner._delivery_adapter_for(ctx.source)
         except Exception:
+            logger.debug("Progress adapter resolution failed", exc_info=True)
             adapter = None
         code_full, code_short = self._progress_terminal_blocks(adapter, tool_name, args, emoji)
         verbose = ctx.progress_mode == "verbose"
@@ -418,6 +421,7 @@ class GatewayTurnProgressMixin:
         # dynamically so the state is visible where it lives.
         publication_suppressed: bool = False
         anonymous_seq: int = 0
+        title: str = "Hermes is working"
 
         @staticmethod
         def _compact(value: Any, limit: int = 120) -> str:
@@ -433,7 +437,7 @@ class GatewayTurnProgressMixin:
                       "error": t("gateway.progress.task_status_error")}
             lines = [t("gateway.progress.task_line", title=task["title"], status=labels.get(task["status"], task["status"]))
                      for task in self.visible_tasks()]
-            return t("gateway.progress.task_card_title") + "\n" + "\n".join(lines)
+            return self.title + "\n" + "\n".join(lines)
 
         def _upsert(self, call_id: str, title: str) -> dict[str, str]:
             if call_id not in self.tasks:
@@ -510,7 +514,7 @@ class GatewayTurnProgressMixin:
                 return
         if not st.native_failed:
             result = await st.adapter.send_native_task_card_progress(
-                chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title=t("gateway.progress.task_card_title"),
+                chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title=st.title,
                 reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata, fallback_text=st.fallback_text(),
             )
             if getattr(result, "success", False):
@@ -586,7 +590,9 @@ class GatewayTurnProgressMixin:
         See #29483.
         """
         ctx = self._ctx
-        st = self._TaskCardState(adapter)
+        from gateway.task_card_identity import resolve_task_card_title
+        from hermes_constants import get_hermes_home
+        st = self._TaskCardState(adapter, title=resolve_task_card_title(get_hermes_home()))
         try:
             while ctx._run_still_current():
                 try:

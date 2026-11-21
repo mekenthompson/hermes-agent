@@ -1,0 +1,12 @@
+{
+  "email": "doojiang@tencent.com",
+  "commits": [
+    {
+      "sha": "61a44e971ee8da2e5f7bdbe4c81374b8f146c51d",
+      "name": "doojiang",
+      "source_url": "https://github.com/NousResearch/hermes-agent/commit/61a44e971ee8da2e5f7bdbe4c81374b8f146c51d",
+      "source_pr": "https://github.com/NousResearch/hermes-agent/pull/102250",
+      "reason": "GitHub commit API reports no linked author account. Preserve the exact upstream git author rather than attributing it to the PR owner or committer. This is not an exception for other commits with the same email."
+    }
+  ]
+}

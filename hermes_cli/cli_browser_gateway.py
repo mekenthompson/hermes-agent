@@ -71,4 +71,3 @@ def _normalize_cdp_url(cdp_url: str):
     if parsed.path.startswith("/devtools/browser/"):
         return parsed.geturl(), port
     return parsed._replace(path="", params="", query="", fragment="").geturl(), port
-

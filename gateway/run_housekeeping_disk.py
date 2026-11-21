@@ -42,6 +42,13 @@ def housekeeping_media_caches() -> None:
         _housekeeping_chore(f"{cache_name} cache cleanup", _one)
 
 
+def housekeeping_paste_sweep() -> None:
+    from hermes_cli.debug import _sweep_expired_pastes
+    deleted, remaining = _sweep_expired_pastes()
+    if deleted:
+        logger.info("Paste sweep: deleted %d expired paste(s), %d pending", deleted, remaining)
+
+
 def maybe_post_auto_prune_prompt(runner, loop) -> None:
     """One housekeeping tick: post the prompt to every served profile that has a home channel, a
     low disk and no decision yet. Cheap when nothing is due (two syscalls + a YAML read per

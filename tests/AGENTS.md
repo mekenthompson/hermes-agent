@@ -29,6 +29,13 @@ scripts/run_tests.sh -v --tb=long                       # pytest flags pass thro
 just test tests/agent/test_foo.py -k test_x             # same runner; refuses to start with no path
 ```
 
+For restricted environments, pass `--scratch-root /short/disk/path` to select a
+writable disk-backed temporary parent. The runner creates and sweeps only its
+`hermes-pytest-<uid>` subtree there, with a fresh `r-*` directory per attempt.
+The default remains `/var/tmp` where available. Keep the selected path short,
+non-hidden and outside `HERMES_HOME`: hidden directories affect search tests,
+and long paths can exceed Unix socket limits. Nested runner probes must pass
+the option explicitly too; it is not a new environment variable.
 `just test-all` is the explicit full-suite form.
 
 - **Flake policy:** a failing FILE is retried once in a fresh subprocess (`--file-retries`;

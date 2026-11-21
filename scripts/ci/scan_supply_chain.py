@@ -61,6 +61,7 @@ INDICATORS = (
 # The workflow's ERE spelled the extras group ``\[[^\]]*\]``; in a POSIX bracket the backslash is
 # literal, so that is one non-backslash character then ``]*``. Kept as is: an extras group matches
 # only when it holds one character (``"a[b]>=2"``, not ``"pkg[extra]>=1"``).
+INSTALL_HOOK_FILES = re.compile(r"^(setup\.py|setup\.cfg|sitecustomize\.py|usercustomize\.py|__init__\.pth)$")
 UNBOUNDED_DEP = re.compile(r'"[a-zA-Z0-9_-]+(?:\[[^\\]\]*\])?>=[ 0-9.]+"')
 
 
@@ -111,6 +112,22 @@ def critical_findings(diff: str) -> str:
     return findings
 
 
+def install_hook_findings() -> str:
+    """House: root install hooks run before Hermes starts; the fork's ``ci-reviewed`` label waives them."""
+    if os.environ.get("CI_REVIEWED") == "true":
+        return ""
+    commits = f"{os.environ['_HERMES_PR_BASE_SHA']}...{os.environ['_HERMES_PR_HEAD_SHA']}"
+    result = subprocess.run(("git", "diff", "--diff-filter=d", "--name-only", commits), stdout=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, timeout=300, check=False)
+    names = result.stdout.decode("utf-8", "surrogateescape").split("\n")
+    hits = [n for n in names if INSTALL_HOOK_FILES.match(n)]
+    if not hits:
+        return ""
+    return ("\n### 🚨 CRITICAL: Install-hook file added or modified\n"
+            "These files can execute code during package installation or interpreter startup.\n\n"
+            "**Files:**\n```\n" + "\n".join(hits) + "\n```\n")
+
+
 def unbounded_dependencies(diff: str) -> list[str]:
     added = [line for line in diff.split("\n") if line.startswith("+") and not line.startswith("+++")]
     return [match for line in added for match in UNBOUNDED_DEP.findall(line)]
@@ -131,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("scan", choices=("patterns", "dependency-bounds"))
     args = parser.parse_args(argv)
     if args.scan == "patterns":
-        report = critical_findings(pr_diff(".", *LOCKFILE_EXCLUDES))
+        report = critical_findings(pr_diff(".", *LOCKFILE_EXCLUDES)) + install_hook_findings()
         report_name = "supply-chain-findings.md"
     else:
         report = "\n".join(unbounded_dependencies(pr_diff("pyproject.toml")))

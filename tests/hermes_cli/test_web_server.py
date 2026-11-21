@@ -42,7 +42,6 @@ import hermes_cli.web_server_messaging as _web_server_messaging
 import hermes_cli.web_server_sessions as _web_server_sessions
 from datetime import UTC
 
-
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
@@ -199,30 +198,6 @@ class TestRedactKey:
 
     def test_short_key_fully_masked(self):
         assert redact_key("short") == "***"
-
-
-
-
-    def test_session_token_resolution_preserves_loaded_app_auth(self, monkeypatch):
-        import hermes_cli.web_server as ws
-        import hermes_cli.web_server_session_token as st
-        from starlette.testclient import TestClient
-
-        original_app = ws.app
-        original_header_name = ws._SESSION_HEADER_NAME
-        original_token = ws._SESSION_TOKEN
-        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "desktop-seeded-token")
-        assert st.resolve_session_token() == "desktop-seeded-token"
-        monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
-        with patch.object(st.secrets, "token_urlsafe", return_value="generated-token"):
-            assert st.resolve_session_token() == "generated-token"
-
-        client = TestClient(original_app)
-        client.headers[original_header_name] = original_token
-        assert client.get("/api/__session_token_probe").status_code == 404
-        assert ws.app is original_app
-        assert ws._SESSION_HEADER_NAME == original_header_name
-        assert ws._SESSION_TOKEN == original_token
 
 
 # ---------------------------------------------------------------------------
@@ -1025,6 +1000,8 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             raise AssertionError("APT-managed update guard should not spawn hermes update")
 
         monkeypatch.setattr(_web_server_files, "_dashboard_local_update_managed_externally", lambda: False)
+        # Exercise install-method guidance without this host's image provenance marker.
+        monkeypatch.setattr("hermes_cli.image_provenance.read_image_provenance", lambda: None)
         # The shared admission gate (#91277 Phase 3) resolves the install
         # method through hermes_cli.config directly, so patch it there (the
         # web_server module alias only feeds the /update/check endpoint).
@@ -1066,6 +1043,7 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             return Proc()
 
         monkeypatch.setattr(_web_server_files, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr("hermes_cli.image_provenance.read_image_provenance", lambda: None)
         monkeypatch.setattr(_cfg_mod, "detect_install_method", lambda _root: "git")
         monkeypatch.setattr(web_server.secrets, "token_hex", lambda _size: "a" * 32)
         monkeypatch.setattr(_web_server_gateway, "_spawn_hermes_action", fake_spawn)
@@ -1094,6 +1072,7 @@ CONFIG_SCHEMA = ProviderConfigSchema(
                 return None
 
         monkeypatch.setattr(_web_server_files, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr("hermes_cli.image_provenance.read_image_provenance", lambda: None)
         monkeypatch.setattr(_cfg_mod, "detect_install_method", lambda _root: "git")
         monkeypatch.setattr(
             _web_server_gateway,

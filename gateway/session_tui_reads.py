@@ -84,8 +84,9 @@ def _context(authority, ref, live, policy, agent, arg) -> str:
     stored = _context_id(authority, ref)
     rows = []
     with contextlib.suppress(Exception):
+        # Display-only checkpoints are shown in the TUI transcript; they never enter model history.
         rows = [m.as_openai_message() for m in authority_persistence(authority).messages.read_conversation(
-            stored, ConversationRequest(include_lineage=True, include_row_ids=True))]
+            stored, ConversationRequest(include_lineage=True, include_row_ids=True, include_display_only=True))]
     from gateway.session_controls import display_projection
     messages = display_projection(rows, authority.profile_id) if rows else []
     breakdown: list[str] = []

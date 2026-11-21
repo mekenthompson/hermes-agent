@@ -7,10 +7,10 @@ name: Windows install + update E2E
 # Each file walks one journey (one install) and asserts several user-visible cells;
 # tracked bugs are message-gated xfails (tests/e2e/core/_pending_fixes.py).
 #
-# Called from tests-os.yml when a Python PR touches the install/update code
-# (the classifier's e2e_upgrade lane) and on every push to main. Pushes to
-# wine2e-install/** run it alone, for sabotage proofs and iteration without the
-# rest of CI.
+# Called from tests-os.yml when the e2e_upgrade lane is on, except on the fork:
+# windows-latest cannot finish six parallel installs, and the fleet does not
+# install with install.ps1. Pushes to wine2e-install/** still run it alone,
+# including on the fork, for a deliberate installer proof.
 
 on:
   workflow_call:
@@ -49,8 +49,9 @@ concurrency:
 jobs:
   install-update:
     name: Windows install.ps1 + hermes update E2E
-    runs-on: blacksmith-32vcpu-windows-2025
-    # A typical run is ~17 min; one slow runner took 28 min for the same work (run 36295230146).
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'windows-latest-32-core' || 'windows-latest' }}
+    # Fork windows-latest has no 32-core entitlement. Keep this journey off the
+    # fork's required path; the cheap runner needs the install wait plus suite time.
     timeout-minutes: 75
     steps:
       - name: Checkout code

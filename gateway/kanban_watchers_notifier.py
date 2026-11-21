@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 import re
 from functools import partial
 from pathlib import Path
@@ -44,10 +45,22 @@ def _pin_first():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "checkpoint")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
+# Handoff kinds whose staged files upload to the chat as native attachments.
+_ARTIFACT_KINDS = ("completed", "review_requested")
+
+
+def _board_state_event(ev) -> bool:
+    """Board state, not a decision for anyone: the respawn guard's park clears by
+    itself, and a run a planned gateway stop or restart interrupted is requeued
+    without a failure (``owner_stopped``), so neither pings nor wakes."""
+    from hermes_cli.kanban_db_guard_wait import is_park_event
+    if ev.kind == "crashed":
+        return (ev.payload or {}).get("owner_stopped") is True
+    return is_park_event(ev.kind, ev.payload)
 
 
 def diagnostic_event(ev) -> bool:
@@ -257,6 +270,9 @@ class _Collector:
         self.notifier_profiles = {notifier_profile}
         self.notifier_profiles.update(str(p).strip() for p in self.profile_adapters if str(p).strip())
         config = getattr(runner, "config", None)
+        if (not getattr(config, "multiplex_profiles", False)
+                and getattr(runner, "_standalone_transport_profile", None)):
+            self.notifier_profiles.add(runner._primary_profile_name)
         if getattr(config, "multiplex_profiles", False):
             self.notifier_profiles.update(
                 route.profile for route in config.profile_routes
@@ -408,6 +424,39 @@ def _first_line(text: str, limit: int) -> str:
     return lines[0][:limit] if lines else text[:limit]
 
 
+# Pings that name the task by title; only these consult ``kanban_task_link``.
+_TITLED_KINDS = ("completed", "review_requested")
+_LINK_URL_UNSAFE = re.compile(r"[\s()<>\[\]]")
+
+
+def _markdown_link(answer: Any) -> Optional[str]:
+    """``[text](url)`` from one ``kanban_task_link`` answer, or None when it is not a usable link.
+
+    Standard Markdown, so each adapter's own formatter renders it for its platform. Brackets
+    in the text become parentheses: Telegram and Slack end a link's text at the first ``]``.
+    """
+    if not isinstance(answer, dict):
+        return None
+    url, text = answer.get("url"), answer.get("text")
+    if not isinstance(url, str) or not url.startswith("https://") or _LINK_URL_UNSAFE.search(url):
+        return None
+    if not isinstance(text, str):
+        return None
+    text = " ".join(text.replace("[", "(").replace("]", ")").split())[:120]
+    return f"[{text}]({url})" if text else None
+
+
+def _task_link(task: Any, board: Optional[str]) -> Optional[str]:
+    """The first usable ``kanban_task_link`` answer for ``task`` (blocking: plugin stores)."""
+    from hermes_cli.plugins import has_hook, invoke_hook
+
+    if task is None or not has_hook("kanban_task_link"):
+        return None
+    answers = invoke_hook("kanban_task_link", task_id=task.id, board=board or "default",
+                          title=task.title, body=task.body or "")
+    return next((link for link in map(_markdown_link, answers) if link), None)
+
+
 def _fmt_completed(ev, n) -> tuple:
     # Prefer the run summary from the event payload; fall back to task.result for legacy rows.
     wake_handoff = None
@@ -417,7 +466,7 @@ def _fmt_completed(ev, n) -> tuple:
     elif n.task and n.task.result:
         wake_handoff = _first_line(n.task.result, 160)
     handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
-    return t("gateway.kanban.ping.completed", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
+    return t("gateway.kanban.ping.completed", head=n.head, title=n.ping_title, handoff=handoff), wake_handoff, None
 
 
 def _fmt_review_requested(ev, n) -> tuple:
@@ -430,7 +479,7 @@ def _fmt_review_requested(ev, n) -> tuple:
         summary = str(summary)
         handoff = f"\n{summary[:200]}"
         wake_handoff = _first_line(summary, 200)
-    return t("gateway.kanban.ping.review_requested", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
+    return t("gateway.kanban.ping.review_requested", head=n.head, title=n.ping_title, handoff=handoff), wake_handoff, None
 
 
 def _fmt_changes_requested(ev, n) -> tuple:
@@ -485,10 +534,18 @@ def _fmt_timed_out(ev, n) -> tuple:
     return t("gateway.kanban.ping.timed_out", head=n.head, span=span), None, None
 
 
+def _fmt_checkpoint(ev, n) -> tuple:
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(str((ev.payload or {}).get("body") or ""),
+                                 force=True, redact_url_credentials=True), None, None
+
+
 # archived / unblocked are claimed (so the cursor advances past them) but
 # intentionally silent (no formatter), and excluded from _WAKE_KINDS so they
 # never wake the creator.
 _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
+    "checkpoint": _fmt_checkpoint,
     "completed": _fmt_completed,
     "blocked": lambda ev, n: (
         t("gateway.kanban.ping.blocked", head=n.head, reason=_clip(ev, "reason", "gateway.kanban.ping.reason_suffix", 160)),
@@ -505,6 +562,10 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
 
 
 # --- Delivery of one claimed batch (one subscription, N events) ---
+
+
+class _DeliveryHeld(RuntimeError):
+    """An adapter refusal/unconfirmed receipt is not proof of a dead destination."""
 
 
 class _KanbanNotification:
@@ -527,6 +588,8 @@ class _KanbanNotification:
         self.task_id = sub["task_id"]
         self.sub_profile = sub.get("notifier_profile") or ""
         self.title = (task.title if task else sub["task_id"])[:120]
+        # Chat pings may name the task as a plugin-supplied link; the wake turn keeps the plain title.
+        self.ping_title = self.title
         self.board_tag = t("gateway.kanban.ping.board_tag", board=self.board_slug) if self.board_slug else ""
         # Attribute the ping to the worker that did the work.
         tag = t("gateway.kanban.ping.assignee_tag", assignee=task.assignee) if task and task.assignee else ""
@@ -581,7 +644,7 @@ class _KanbanNotification:
     def format_event(self, ev: Any) -> Optional[str]:
         """Render one event; accumulates wake handoff/review detail. None → silent kind."""
         formatter = _EVENT_FORMATTERS.get(ev.kind)
-        if formatter is None:
+        if formatter is None or _board_state_event(ev):
             return None
         msg, handoff, review_detail = formatter(ev, self)
         if handoff is not None:
@@ -593,8 +656,9 @@ class _KanbanNotification:
     def build_wake_text(self) -> None:
         """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
         task, sub = self.task, self.sub
-        self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
-        self.wake_diagnostic = all(diagnostic_event(ev) for ev in self.d["events"] if ev.kind in self.wake_kinds)
+        waking = [ev for ev in self.d["events"] if ev.kind in _WAKE_KINDS and not _board_state_event(ev)]
+        self.wake_kinds = {ev.kind for ev in waking} if self.wake_agent else set()
+        self.wake_diagnostic = all(diagnostic_event(ev) for ev in waking if ev.kind in self.wake_kinds)
         if not self.wake_kinds:
             return
         if self.is_push_adapter:
@@ -674,10 +738,15 @@ class _KanbanNotification:
         # ever degrades to a fresh session, never an exception.
         _delivery_meta = sub.get("delivery_metadata") or {}
         _chat_type = str(sub.get("chat_type") or _delivery_meta.get("chat_type") or "").strip()
+        # Transport ownership is not the runtime namespace of the parent chat.
+        wake_profile = self.sub_profile or None
+        if (wake_profile and not getattr(getattr(self.runner, "config", None), "multiplex_profiles", False)
+                and wake_profile == getattr(self.runner, "_standalone_transport_profile", None)):
+            wake_profile = self.runner._primary_profile_name
         _source = SessionSource(
             platform=self.plat, chat_id=sub["chat_id"], chat_type=_chat_type or "group",
             thread_id=sub.get("thread_id") or None, user_id=sub.get("user_id"), user_id_alt=sub.get("user_id_alt"),
-            profile=self.sub_profile or None, scope_id=_wake_scope_id(self.adapter, sub),
+            profile=wake_profile, scope_id=_wake_scope_id(self.adapter, sub),
             parent_chat_id=_delivery_meta.get("parent_chat_id"),
         )
         _source._transport_adapter_ref = weakref.ref(self.adapter)
@@ -696,40 +765,66 @@ class _KanbanNotification:
         """Send one text ping; raises on adapter exception or SendResult(success=False)."""
         from gateway.warning_notifications import present_notification
         sub, adapter = self.sub, self.adapter
-        delivery_metadata = sub.get("delivery_metadata")
-        metadata: dict[str, Any] = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
-        if sub.get("thread_id") and not metadata.get("thread_id"):
-            metadata["thread_id"] = sub["thread_id"]
+        metadata = self._delivery_metadata(ev)
         _send_res = None
         async def send_ping():
             nonlocal _send_res
-            _send_res = await adapter.send(sub["chat_id"], msg, metadata=metadata)
+            reply = {"reply_to": metadata["reply_to"]} if metadata.get("reply_to") else {}
+            _send_res = await adapter.send(sub["chat_id"], msg, metadata=metadata, **reply)
         if not await present_notification(send_ping, platform=self.platform_str, diagnostic=diagnostic_event(ev)):
             return False
         # SendResult(success=False) without an exception is a FAILED delivery
         # (else the event is lost); None / non-SendResult keeps the
         # "no exception == delivered" contract.
         if getattr(_send_res, "success", True) is False:
-            raise RuntimeError(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
+            if ev.kind == "checkpoint" and self.platform_str == "local":
+                from gateway.session_local import LocalSessionAdapter
+
+                if isinstance(adapter, LocalSessionAdapter):
+                    return False  # The in-process stream refused admission before delivery.
+            raise _DeliveryHeld(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
         logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
                      ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
-        # Upload artifact paths from the handoff payload / legacy result as
-        # native files. Both handoff kinds stage files for exactly this: a
-        # review-bound card's files exist precisely so the human sees them at
-        # handoff time. Retry exposure matches ``completed`` (the sub cursor is
-        # rewound only when a send failed).
-        if ev.kind in ("completed", "review_requested"):
-            try:
-                await self.runner._deliver_kanban_artifacts(
-                    adapter=adapter, chat_id=sub["chat_id"], metadata=metadata,
-                    event_payload=getattr(ev, "payload", None), task=self.task,
-                )
-            except Exception as art_exc:
-                logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
+        if ev.kind in _ARTIFACT_KINDS:
+            await self._deliver_artifacts(ev, metadata)
         return True
 
+    def _delivery_metadata(self, ev: Any) -> dict[str, Any]:
+        """Routing metadata for one event's sends (thread anchor, local checkpoint ids)."""
+        sub = self.sub
+        delivery_metadata = sub.get("delivery_metadata")
+        metadata: dict[str, Any] = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
+        if sub.get("thread_id") and not metadata.get("thread_id"):
+            metadata["thread_id"] = sub["thread_id"]
+        if ev.kind == "checkpoint" and self.platform_str == "local":
+            metadata["kanban_checkpoint_event_id"] = ev.id
+            metadata["kanban_checkpoint_task_id"] = self.task_id
+            metadata["kanban_checkpoint_board"] = self.board_slug or "default"
+        return metadata
+
+    async def _deliver_artifacts(self, ev: Any, metadata: dict[str, Any]) -> None:
+        """Upload artifact paths from the handoff payload / legacy result as
+        native files. Both handoff kinds stage files for exactly this: a
+        review-bound card's files exist precisely so the human sees them at
+        handoff time. Upload errors are logged, never raised."""
+        try:
+            await self.runner._deliver_kanban_artifacts(
+                adapter=self.adapter, chat_id=self.sub["chat_id"], metadata=metadata,
+                event_payload=getattr(ev, "payload", None), task=self.task,
+            )
+        except Exception as art_exc:  # health: allow BLE001 -- moved: a failed upload must not block the completion delivery
+            logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
+
     async def _send_pings(self) -> bool:
-        """Send every text ping; False when a send failed (claim already rewound/dropped)."""
+        """Send every text ping; False when delivery is held or failed."""
+        holds = getattr(self.runner, "_kanban_delivery_holds", None)
+        if holds is None:
+            holds = self.runner._kanban_delivery_holds = {}
+        hold_key = (self.board_slug, *self.sub_key)
+        attempts, retry_at = holds.get(hold_key, (0, 0))
+        if time.monotonic() < retry_at:
+            await self.rewind()
+            return False
         for ev in self.d["events"]:
             msg = self.format_event(ev)
             if msg is None:
@@ -744,20 +839,60 @@ class _KanbanNotification:
                     "on wake self-post instead", self.platform_str, self.task_id,
                 )
                 continue
-            if not self.send_passive:
-                # Wake-only: the wake path is the sole delivery and resolves the counter.
+            if not self.send_passive and ev.kind != "checkpoint":
+                # Wake-only: the wake path is the sole text delivery and resolves the
+                # counter. A handoff's files are not text, so they still upload once.
+                if ev.kind in _ARTIFACT_KINDS and ev.id > self.sub.get("last_ping_event_id", 0):
+                    await self._deliver_artifacts(ev, self._delivery_metadata(ev))
+                    await _to_thread_process_service(partial(
+                        self.runner._kanban_sub_op, self.board_slug, "record_notify_ping",
+                        self.sub, event_id=ev.id))
                 continue
             if ev.id <= self.sub.get("last_ping_event_id", 0):
                 continue
-            try:
-                if await self._send_event(ev, msg) is False:
-                    continue
-                await _to_thread_process_service(partial(
-                    self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,
+            if ev.kind == "checkpoint":
+                fresh = await _to_thread_process_service(partial(
+                    self.runner._kanban_sub_op, self.board_slug, "begin_checkpoint_ping", self.sub,
                     event_id=ev.id,
                 ))
+                if not fresh:
+                    continue  # An earlier send is uncertain; a human can reconcile it.
+            try:
+                if await self._send_event(ev, msg) is False:
+                    if ev.kind == "checkpoint":
+                        await _to_thread_process_service(partial(
+                            self.runner._kanban_sub_op, self.board_slug, "settle_checkpoint_ping", self.sub,
+                            event_id=ev.id, delivered=False,
+                        ))
+                        await self.rewind()
+                        return False
+                    continue
+                await _to_thread_process_service(partial(
+                    self.runner._kanban_sub_op, self.board_slug,
+                    "settle_checkpoint_ping" if ev.kind == "checkpoint" else "record_notify_ping",
+                    self.sub, event_id=ev.id,
+                    **({"delivered": True} if ev.kind == "checkpoint" else {}),
+                ))
                 self.clear_failures()
+                holds.pop(hold_key, None)
+                attempts = 0
+            except _DeliveryHeld as exc:
+                # Durable custody remains in the subscription. Only retry timing
+                # is process-local, so a restart permits one fresh authorized try.
+                self.clear_failures()
+                delay = min(300, 30 * 2 ** min(attempts, 4))
+                holds[hold_key] = (min(attempts + 1, 4), time.monotonic() + delay)
+                logger.warning("kanban notifier: delivery held for %s on %s; subscription and cursor retained; retry in %ss: %s",
+                               self.task_id, self.platform_str, delay, exc)
+                await self.rewind()
+                return False
             except Exception as exc:
+                if ev.kind == "checkpoint":
+                    logger.warning("kanban notifier: checkpoint send uncertain for %s on %s; retained for reconciliation: %s",
+                                   self.task_id, self.platform_str, exc)
+                    self.clear_failures()
+                    await self.rewind()
+                    return False
                 await self.delivery_failed(
                     "kanban notifier: send failed for %s on %s (attempt %d/%d): %s", (self.task_id, self.platform_str),
                     "kanban notifier: dropping subscription %s on %s after %d consecutive send failures", exc, False,
@@ -803,6 +938,9 @@ class _KanbanNotification:
                     "kanban notifier: dropping subscription %s on %s after %d refusals", exc, False)
             return
         async with owner_scope:
+            if self.send_passive and any(ev.kind in _TITLED_KINDS for ev in self.d["events"]):
+                # In the subscriber's scope (to_thread copies it): that profile's plugins answer.
+                self.ping_title = await asyncio.to_thread(_task_link, self.task, self.board_slug) or self.title
             if not await self._send_pings():
                 return
             # All text pings delivered (or skipped for non-push / wake-only).

@@ -520,4 +520,3 @@ def test_every_model_override_key_the_cli_sends_is_in_the_contract():
     ``_route_off_session`` (``model``/``provider``) plus ``reasoning``: each key must be declared."""
     from tui_gateway.contracts.canonical_sessions import CanonicalModelOverride
     assert {"model", "provider", "reasoning"} <= set(CanonicalModelOverride.model_fields)
-

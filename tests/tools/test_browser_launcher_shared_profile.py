@@ -18,7 +18,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.tools.browser_launcher_fakes import kill_fake, pids, write_fake_chromium
+from tests.tools.browser_launcher_fakes import (install_fake_chromium_identity, kill_fake, pids,
+                                               write_fake_chromium)
 from tests.waiting import wait_until
 from tools import browser_launcher as launcher
 
@@ -35,6 +36,9 @@ _PROFILE_USER = textwrap.dedent("""\
     from tools import browser_launcher as launcher
     launcher.needs_chromium_sandbox_bypass = lambda: False
     exe, udd = sys.argv[1], sys.argv[2]
+    from pathlib import Path
+    from tests.tools.browser_launcher_fakes import install_fake_chromium_identity
+    install_fake_chromium_identity(Path(exe))
     browser, err = launcher.launch_chromium("profile:" + udd, executable=exe, user_data_dir=udd, ephemeral=False,
                                             headed=False, env=dict(os.environ), timeout=30)
     print(f"{browser.pid} {browser.owned}" if browser else f"ERR {err}", flush=True)
@@ -126,6 +130,7 @@ def test_one_process_holding_a_profile_under_two_keys_keeps_it_until_both_let_go
     """One dir reached by two paths (a symlink) gives two launcher keys on one Chromium: dropping the key that
     launched it must not stop it, nor drop this process's lease, while the other key still drives it."""
     script = write_fake_chromium(tmp_path / "chromium")
+    install_fake_chromium_identity(script)
     udd = tmp_path / "pinned-profile"
     alias = tmp_path / "alias"
     alias.symlink_to(udd)

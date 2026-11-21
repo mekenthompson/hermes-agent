@@ -5,6 +5,7 @@ docs of config.yaml.
 """
 
 from hermes_cli.config_defaults_auxiliary import _aux
+from hermes_cli.config_defaults_browser import default_browser_config
 from hermes_cli.config_defaults_voice import VOICE_DEFAULTS
 
 #: Image every container terminal backend (docker/modal/daytona, the singularity plugin) uses unless the
@@ -408,62 +409,7 @@ DEFAULT_CONFIG = {
         "cache_exempt_hosts": [],
     },
 
-    "browser": {
-        # REMOVAL NOTE: `backend` (built-in browser_* tools vs browser_exec), `snapshot_threshold`,
-        # `record_sessions`, `allow_unsafe_evaluate` and `restrict_evaluate` left with the built-in
-        # browser tools; browser_exec is the only core browser. Config v52 drops `backend` (an `off`
-        # gets a one-time notice) and copies AGENT_BROWSER_* from .env to the keys below; other
-        # user values stay untouched.
-        "inactivity_timeout": 120,
-        # Seconds a local Chromium launch may take to open its DevTools port; a launch always waits
-        # at least 120 s (a cold first start unpacks the profile).
-        "command_timeout": 30,
-        # headed: visible Chromium window (local); skips per-turn cleanup, idle reaper still applies
-        "headed": False,
-        "allow_private_urls": False,  # legacy security.allow_private_urls; local/sidecar Chromium ignore it
-        # Local browser engine. "auto" = Chromium; "lightpanda" = `lightpanda serve` per session
-        # (faster navigation, no screenshots); "chrome" is read as "auto". Ignored while a cloud
-        # provider, cdp_url or use_real_profile is active.
-        "engine": "auto",
-        # Chromium binary for local sessions. "" = pm's chromium (`hermes pm install chromium`), the
-        # Docker image's build, else a system chromium where pm builds none (Termux).
-        "executable_path": "",
-        # Persistent Chromium profile directory shared by local sessions; "" = a fresh throwaway
-        # profile per session.
-        "user_data_dir": "",
-        "chromium_args": [],  # extra Chromium flags for local sessions, e.g. ["--lang=de"]
-        # Cloud provider: LAN/localhost URLs open in a local Chromium (ignores allow_private_urls; False refuses)
-        "auto_local_for_private_urls": True,
-        "cdp_url": "",  # persistent CDP endpoint for attaching to an existing Chromium/Chrome
-        # Consent to browse with the user's REAL logins locally: runs on a Hermes-managed SNAPSHOT
-        # of the ACTIVE default-Chromium profile (Local State -> profile.last_used; cookies, logins,
-        # prefs copied and re-synced per fresh session) driven by Hermes' packaged Chromium. The
-        # snapshot dir sidesteps Chrome 136+'s default-profile debugging block and never contends
-        # with the running browser. Turning off deletes ~/.hermes/browser-profile/ so credentials
-        # don't outlive consent. Chromium-family only; a profile that can't be copied (Firefox default,
-        # Windows browser holding its cookies) gives a fresh, signed-out browser plus a note saying why.
-        # Also gates the browser_exec `local` arg (real-profile session under a cloud backend). Desktop Settings -> Browser.
-        "use_real_profile": False,
-        # Windows only: a running Chrome/Edge/Brave locks its cookie DB (the last snapshot is reused;
-        # with none yet, a fresh browser runs). When on, the agent ASKS first; on approval it runs
-        # `hermes browser close-profile` (kills that profile's browser tree, unsaved tabs lost) so a
-        # new session can copy it; no auto-kill. No effect on macOS/Linux, where a running
-        # browser only locks the password/autofill DBs, which are skipped (cookies still copy).
-        "real_profile_autoclose": False,
-        # Pin WHICH source profile directory is snapshotted for real-profile browsing (e.g. "Profile
-        # 2"). Empty = browser's last-used profile, which on multi-profile machines can hand the
-        # agent the wrong identity. A pin naming a missing directory never falls back to another
-        # profile: the session gets a fresh browser without the user's logins.
-        "real_profile_pin": "",
-        # CDP supervisor: dialog + frame detection over a persistent WebSocket; active only with a
-        # CDP-capable backend (Browserbase, or local Chrome via /browser connect). See
-        # website/docs/developer-guide/browser-supervisor.md.
-        "dialog_policy": "must_respond",  # must_respond | auto_dismiss | auto_accept
-        "dialog_timeout_s": 300,  # safety auto-dismiss after N seconds under must_respond
-        # Read by the `camofox` catalog plugin (Camofox left core). An empty free-form mapping, so
-        # `hermes config set browser.camofox.<key>` is accepted and user values are never stripped.
-        "camofox": {},
-    },
+    "browser": default_browser_config(),
     # Stale git worktree lifecycle (`hermes -w`, `/worktree new`, subagent isolation, Desktop). The
     # sweep runs at `hermes -w` startup and every 6h from the cron ticker over every repo Hermes made
     # a worktree in. Trees idle past their tier (hermes-*/subagent-* 24h, named 72h) that are clean
@@ -1481,6 +1427,9 @@ DEFAULT_CONFIG = {
         # Env: SLACK_IGNORE_OTHER_USER_MENTIONS.
         "ignore_other_user_mentions": False,
         "thread_require_mention": False,  # require @mention in thread replies too
+        # Channel IDs where joined thread follow-ups are allowed regardless of strict_mention or
+        # thread_require_mention. This never relaxes top-level channel gating.
+        "thread_participation_channels": "",
         "channel_prompts": {},  # per-channel ephemeral system prompts
     },
 
@@ -1647,13 +1596,9 @@ DEFAULT_CONFIG = {
     "command_allowlist": [],
     # User-defined quick commands that bypass the agent loop (type: exec only).
     "quick_commands": {},
-    # Per-platform system-prompt hint overrides, keyed by platform name (whatsapp, slack, telegram,
-    # ...). Value: {"append": text} keeps the built-in hint and appends; {"replace": text}
-    # substitutes it; a bare string is shorthand for append. `replace` wins over `append` if both
-    # are given.
+    # Per-platform hint overrides (whatsapp, slack, telegram, ...): {"append": text}, {"replace": text}, or a bare string (append). `replace` wins.
     "platform_hints": {},
-    # Plugin system. `enabled`/`disabled` (`hermes plugins enable|disable`) and `disabled_by_update` (pm.plugin_eviction:
-    # plugins an update turned off, retried by later updates) are omitted so an empty default never clobbers a user's lists.
+    # Plugin enable/disable lists are omitted so an empty default never clobbers a user's lists.
     "plugins": {
         # Deadline (seconds) for one plugin Git clone, fetch or checkout. Slow repositories may
         # need more time; each network operation is capped at one hour.
@@ -2041,9 +1986,7 @@ DEFAULT_CONFIG = {
         # secret values); values are read from the environment at export time.
         "export": {"otlp": {"enabled": False, "endpoint": "", "headers_env": {}}},
     },
-    # Native hosted-room Discussion ceilings, shared by all members per discussion.
-    # Positive integers only (no unlimited/0). Read from the root owner's config at service
-    # startup for all hosted rooms; restart the owning service after changing them.
+    # Hosted-room Discussion ceilings (positive ints, no unlimited). Read at service startup; restart after changing.
     "hosted_rooms": {
         "discussion": {
             "max_rounds": 3,
@@ -2233,8 +2176,7 @@ DEFAULT_CONFIG = {
         # List delegate_task subagent runs in session lists (desktop sidebar, dashboard, session.list),
         # nested under their parent. Off by default: they are machinery, not conversations.
         "show_subagents": False,
-        # VACUUM after a prune that deleted rows (SQLite never reclaims disk on DELETE, #54189). It blocks
-        # writes (~seconds per 100MB): only at startup, only when ≥1 session went AND freelist/page_count > 25%.
+        # VACUUM after a prune that deleted rows (#54189): startup only, when a session went and freelist/page_count > 25%.
         "vacuum_after_prune": True,
         # Minimum days between VACUUM rewrites; pruning keeps its normal cadence.
         "min_vacuum_interval_days": 30,
@@ -2259,8 +2201,7 @@ DEFAULT_CONFIG = {
         # Max active messages per session for in-memory export (`hermes sessions export`); checked
         # per session, so full-DB backups of small sessions work.
         "max_export_messages": 20000,
-        # Seconds before a local session with no viewer is ended (resumable) once its turn settles; 0 = never; after a
-        # restart also >= 6h idle. Unset: dashboard.ws_orphan_reap_grace_s: 0 / startup_orphan_sweep: false opt out.
+        # Seconds before a viewerless local session is ended once its turn settles; 0 = never. After restart, also >= 6h idle.
         "orphan_end_grace_s": 300.0,
     },
     # First-touch onboarding hints (agent/onboarding.py), each latched under `seen` once shown.
@@ -2399,8 +2340,8 @@ DEFAULT_CONFIG = {
             "enabled": True,        # `op` CLI: Login items with a website URL become fillable handles.
             "account": "",          # account shorthand for `op --account`; empty = default account.
             "binary_path": "",      # absolute path to op; empty = PATH.
-            # Env var holding a service-account token (headless auth, no unlock prompt). Unset = prompt.
-            "service_account_token_env": "OP_SERVICE_ACCOUNT_TOKEN",
+            "service_account_token_env": "OP_SERVICE_ACCOUNT_TOKEN",  # headless token env, no prompt; unset = prompt
+            "vaults": [],  # vault names/ids logins come from; [] = every visible vault; no match = error
         },
         "bitwarden": {
             "enabled": True,        # `bw` CLI (Password Manager, not Secrets Manager); run `bw login` once first.

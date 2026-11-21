@@ -131,9 +131,18 @@ class TestAsyncDelegationsSchemaAgreement:
 
         from persistence.sqlite._schema_ddl import SCHEMA_SQL
 
-        legacy_sql = SCHEMA_SQL.replace(
-            "    origin_session_id TEXT NOT NULL DEFAULT ''\n", ""
-        ).replace(
+        legacy_sql = SCHEMA_SQL
+        # House: the durable stop-fence columns are additive migrations too.
+        for column in (
+            "    origin_session_id TEXT NOT NULL DEFAULT ''\n",
+            "    stop_state TEXT NOT NULL DEFAULT '',\n",
+            "    stop_reason TEXT,\n",
+            "    stop_requested_at REAL,\n",
+            "    stop_acknowledged_at REAL,\n",
+        ):
+            assert column in legacy_sql, column
+            legacy_sql = legacy_sql.replace(column, "")
+        legacy_sql = legacy_sql.replace(
             "    delivery_claimed_at REAL,\n",
             "    delivery_claimed_at REAL\n",
         )
@@ -159,13 +168,16 @@ class TestAsyncDelegationsSchemaAgreement:
         }
         assert live_indexes == expected_indexes
         row = conn.execute(
-            "SELECT delegation_id, IFNULL(origin_session_id, '<null>') FROM async_delegations WHERE delegation_id='legacy-1'"
+            "SELECT delegation_id, IFNULL(origin_session_id, '<null>'), stop_state, stop_reason, stop_requested_at,"
+            " stop_acknowledged_at FROM async_delegations WHERE delegation_id='legacy-1'"
         ).fetchone()
         if row is not None:
             # The legacy row survived and the canonical '' default
             # backfilled the added column (SQLite ADD COLUMN ... DEFAULT
             # populates existing rows with the default).
             assert row[1] == ""
+            # House stop fence: NOT NULL stop_state backfilled, nullable stop metadata stays absent.
+            assert row[2:] == ("", None, None, None)
 
     def test_fresh_session_db_then_tool(self, tmp_path):
         import sqlite3

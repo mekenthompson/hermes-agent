@@ -431,4 +431,3 @@ def test_a_retried_peer_run_is_watched_when_its_first_status_read_fails(tmp_path
     watched = driver.get_task(db, identity, placement="profile")
     assert (watched["status"], watched["execution_generation"]) == ("indeterminate", 1)
     assert {r["dispatch"]["execution_generation"] for r in peer.recoveries} == {1}
-

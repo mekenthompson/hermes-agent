@@ -199,22 +199,23 @@ class TestEnvPollerIncrementalRead:
         assert session.output_buffer == spoof
         assert session.exit_code == 5
 
-    def test_fallback_without_a_recorded_code_reports_minus_one(self, registry):
+    def test_fallback_without_a_recorded_code_reports_unknown(self, registry):
+        # House: an unreadable status is unknown (None), never a fabricated numeric exit.
         session = _make_session(sid="proc_fallback_no_code")
         session.exited = False
         self._run_poller(registry, session, [{"output": "garbage"}, {"output": "1\n"}, {"output": ""}])
-        assert session.exit_code == -1
+        assert session.exit_code is None
 
     @pytest.mark.parametrize("header", ["3 0 done", "3 0 exit:x1", "3 0", "3 0 run extra", "3 0 exit:\u00b2", "3 0 exit:\u0663",
                                         "3 0 exit:" + "9" * 5000])
     def test_unknown_status_is_an_unreadable_reply(self, header):
         assert parse_log_delta_reply(f"{header}\nabc") is None
 
-    def test_missing_exit_code_falls_back_to_minus_one(self, registry):
+    def test_missing_exit_code_stays_unknown(self, registry):
         session = _make_session(sid="proc_no_code")
         session.exited = False
         self._run_poller(registry, session, [{"output": "0 0 exit:\n"}])
-        assert session.exit_code == -1
+        assert session.exit_code is None
 
     def test_unreadable_header_falls_back_to_separate_liveness_read(self, registry):
         """A reply without the status header still detects the exit."""

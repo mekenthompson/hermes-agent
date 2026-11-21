@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import queue
 import re
+import secrets
 import socket
 import subprocess
 import threading
@@ -91,7 +92,8 @@ def _port_open(port: int) -> bool:
 
 def _spawn_serve(home: WinHome) -> subprocess.Popen:
     # Desktop spawn shape (electron/main.ts): token + desktop flag in env, stdin closed.
-    env = {"HERMES_DESKTOP": "1", "HERMES_DASHBOARD_SESSION_TOKEN": nonce("tok"),
+    # serve rejects an explicit session token shorter than 32 characters.
+    env = {"HERMES_DESKTOP": "1", "HERMES_DASHBOARD_SESSION_TOKEN": secrets.token_urlsafe(32),
            "TERMINAL_CWD": str(home.project)}
     return subprocess.Popen(
         hermes_argv("serve", "--host", "127.0.0.1", "--port", "0"), cwd=home.profile, env=home.env(env),
@@ -140,7 +142,12 @@ def test_serve_tree_kill_leaves_no_orphans_and_reboots(tmp_path: Path) -> None:
             assert first.pid in owned, f"ownership scan cannot see serve pid {first.pid} (saw {owned})"
 
             killed = taskkill_tree(first.pid)
-            assert killed.returncode == 0, killed.stderr
+            err = (killed.stderr or b"").decode("utf-8", "replace").lower()
+            # taskkill /T returns 255 when a child already exited between the tree
+            # walk and the kill. That is gone, not a survivor. The orphan check below
+            # is the contract.
+            already_gone = killed.returncode == 255 and "no running instance of the task" in err
+            assert killed.returncode == 0 or already_gone, killed.stderr
             # Ownership, not ancestry: anything the backend spawned detached (a broken
             # parent link taskkill /T cannot follow) still carries this profile's
             # HERMES_HOME / cwd, and is an orphan the Desktop quit leaves behind.

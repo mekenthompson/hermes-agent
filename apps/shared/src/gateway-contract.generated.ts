@@ -1494,6 +1494,13 @@ export interface DisplayObserveResult {
   path: string
   viewer_id: string
 }
+export interface DisplayClipboardReadParams {
+  profile?: string | null
+  viewer_id: string
+}
+export interface DisplayClipboardReadResult {
+  text: string
+}
 export interface DisplaySwitchSandboxImageParams {
   profile?: string | null
   approve?: boolean
@@ -4892,6 +4899,7 @@ export interface CommandObserveResult {
 }
 export interface CanonicalSessionInfoParams {
   session_id: string
+  execution_only?: boolean
 }
 /** ``gateway/session_local_inventory.py::snapshot_info``: ``local_session_info`` + the inventory. */
 export interface CanonicalSessionInfo {
@@ -4918,6 +4926,7 @@ export interface CanonicalSessionInfo {
   profile_id: string
   desktop_protocol: string
   profile_name: string
+  execution_progress?: ExecutionProgress | null
   cwd?: string | null
   edit_approval_policy?: 'ask' | 'workspace_session' | 'session' | null
   launch_request?: Record<string, unknown> | null
@@ -4936,6 +4945,11 @@ export interface CanonicalSessionInfo {
   credential_hint?: string | null
   config_warning?: string | null
   [key: string]: unknown
+}
+export interface ExecutionProgress {
+  execution_generation: number
+  tool: string
+  progress_at: number
 }
 /** The client a session's creator declared itself as (``session.create`` ``client``). */
 export interface CanonicalClientLabel {
@@ -5211,6 +5225,20 @@ export interface CanonicalGroupsPeerRegisterParams {
   target_profile: string
   grant: string
   catalog: Record<string, unknown>
+}
+export interface CanonicalSessionParams {
+  profile?: string | null
+  session_id: string
+}
+export interface DeliveryHandleResult {
+  session_id: string
+  stored_session_id: string
+  profile_id: string
+  instance_id: string
+  authority_epoch: number
+  revision: number
+  execution_generation: number
+  execution_state: 'idle' | 'running' | 'waiting' | 'terminal'
 }
 export interface CanonicalCreateParams {
   profile?: string | null
@@ -6475,6 +6503,8 @@ export interface RpcMethods {
   'delegation.status': { params: ProfileParams; result: DelegationStatusResult }
   /** Upload a force-redacted debug bundle to Nous-internal diagnostics storage. */
   'diagnostics.share_nous': { params: DiagnosticsShareNousParams; result: DiagnosticsShareNousResult }
+  /** Copy out: the screen's text clipboard, to the viewer holding the lease only (5300, code viewer_mismatch / not_in_control / not_running / unavailable / timeout / too_large). Never broadcast. */
+  'display.clipboard.read': { params: DisplayClipboardReadParams; result: DisplayClipboardReadResult }
   /** Run the distro package install on the gateway host; progress streams as display.install.log/.done. */
   'display.install': { params: ProfileParams; result: DisplayInstallResult }
   /** Take over: the human named by a viewer id this connection minted controls the screen. */
@@ -6962,6 +6992,7 @@ export const RPC_METHODS = [
   'delegation.pause',
   'delegation.status',
   'diagnostics.share_nous',
+  'display.clipboard.read',
   'display.install',
   'display.lease.acquire',
   'display.lease.release',
@@ -7247,12 +7278,14 @@ export interface CanonicalRpcMethods {
   /** The classic CLI's /goal, /subgoal, /loop, /heartbeat manager calls (state writes, the goal judge, quality gates), run by the owner on the session's row. */
   'session.automation': { params: SessionAutomationParams; result: SessionAutomationResult }
   'session.create': { params: CanonicalCreateParams; result: CanonicalSnapshot }
+  /** Read an already mounted local owner without adoption, attach or policy refresh. */
+  'session.delivery_handle': { params: CanonicalSessionParams; result: DeliveryHandleResult }
   /** Drop this connection's subscription; a stale subscription id answers detached=false. end_reason (snake_case): the viewer is closing the conversation; the last viewer leaving an idle local session ends its row with that reason. */
   'session.detach': { params: SessionDetachParams; result: SessionDetachResult }
   'session.events.since': { params: CanonicalEventsParams; result: CanonicalEventsResult }
   /** The /save transcript rendered for the client to write (the gateway writes nothing). */
   'session.export': { params: SessionExportParams; result: SessionExportResult }
-  /** Frozen launch policy projection of one local session. */
+  /** Frozen launch policy projection of one local session. execution_only skips inventory and returns a minimal session envelope with the current execution's tool summary. */
   'session.info': { params: CanonicalSessionInfoParams; result: CanonicalSessionInfo }
   'session.interrupt': { params: CanonicalControlParams; result: CanonicalSessionHandle }
   'session.list': { params: CanonicalListParams; result: CanonicalListResult }
@@ -7315,6 +7348,7 @@ export const CANONICAL_RPC_METHODS = [
   'session.account_usage',
   'session.automation',
   'session.create',
+  'session.delivery_handle',
   'session.detach',
   'session.events.since',
   'session.export',

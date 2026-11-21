@@ -380,6 +380,11 @@ export type BotsMessages = {
     agentControls: string
     controlTaken: string
     needsHttps: string
+    copyFromScreen: string
+    copyFromScreenHint: string
+    copiedFromScreen: string
+    copyEmpty: string
+    copyFailed: string
   }
 
   /** Bot-scoped scheduled jobs. Generic scheduling chrome (weekday names,

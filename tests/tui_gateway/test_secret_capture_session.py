@@ -79,6 +79,7 @@ def test_secret_prompt_goes_to_active_turn_not_last_wired_session(monkeypatch):
     from gateway.session_context import get_session_env
 
     server, server_requests, skills_tool = _gateway(monkeypatch)
+    server._enable_gateway_prompts()
     server._wire_callbacks("session-A")
     server._wire_callbacks("session-B")  # replaces the process-global callback
     # A live turn's UI owner is a live session record (secret admission is fenced to one;
@@ -114,6 +115,7 @@ def test_secret_prompt_without_bound_owner_is_skipped_not_guessed(monkeypatch):
     from gateway.session_context import get_session_env
 
     server, server_requests, skills_tool = _gateway(monkeypatch)
+    server._enable_gateway_prompts()
     server._wire_callbacks("only-session")
 
     tokens = server._set_session_context("ownerless-task", cwd="")

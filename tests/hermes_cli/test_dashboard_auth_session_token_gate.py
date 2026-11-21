@@ -52,15 +52,10 @@ def gated_token_app(token):
 
 
 def _fake_ws(*, query: dict, client_host: str = "203.0.113.7", path: str = "/api/ws"):
-    class _QP:
-        def __init__(self, q):
-            self._q = q
-
-        def get(self, k, default=""):
-            return self._q.get(k, default)
+    from starlette.datastructures import QueryParams
 
     return SimpleNamespace(
-        query_params=_QP(query),
+        query_params=QueryParams(query),
         headers={},
         client=SimpleNamespace(host=client_host),
         url=SimpleNamespace(path=path),

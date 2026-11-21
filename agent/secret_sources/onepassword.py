@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from hermes_platform.host.facts import os_family
+
 from agent.secret_sources._cache import CachedFetch, SecretCache, fingerprint as _fingerprint
 from agent.secret_sources.base import (
     ErrorKind, FetchResult, SecretSource, classify_cli_error, coerce_float,
@@ -43,7 +45,7 @@ _OP_ENV_ALLOWLIST = (
     "OP_ACCOUNT", "OP_CONNECT_HOST", "OP_CONNECT_TOKEN",
     # Lets a user skip op's desktop-app integration probe (which can hang with
     # no timeout on a wedged desktop container) and go straight to token auth.
-    "OP_LOAD_DESKTOP_APP_SETTINGS",
+    "OP_LOAD_DESKTOP_APP_SETTINGS", "DBUS_SESSION_BUS_ADDRESS",
 )
 
 # L1 key folds in str(home_path) so a HERMES_HOME switch inside one long-lived
@@ -132,6 +134,12 @@ def _op_child_env(token_value: str) -> dict[str, str]:
     # Shared base keeps proxy / CA-bundle vars so op works behind a corporate proxy.
     source_env = get_source_environment()
     extra = {k: v for k, v in source_env.items() if k.startswith("OP_SESSION_")}
+    # libdbus autolaunches a daemon when its address is absent. In headless
+    # Linux workers, point it at a deliberately unusable address instead; an
+    # explicit bus or graphical session remains untouched.
+    if (os_family().startswith("linux") and "DBUS_SESSION_BUS_ADDRESS" not in source_env
+            and not source_env.get("DISPLAY") and not source_env.get("WAYLAND_DISPLAY")):
+        extra["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/nonexistent"
     if token_value:
         extra["OP_SERVICE_ACCOUNT_TOKEN"] = token_value
     return build_minimal_provider_env(source_env, allow_env=_OP_ENV_ALLOWLIST, extra_env=extra)

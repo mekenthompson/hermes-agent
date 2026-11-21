@@ -91,8 +91,20 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+from pathlib import Path
+
+# CI and the routing tests execute this file, not `python -m`. The fork
+# imports live under scripts/, which is not on sys.path[0] in that mode.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.ci.list_os_marked_tests import file_gates_on
+from scripts.ci.fork_review_files import ci_review_files, review_lanes
+from scripts.ci.ci_policy import apply_fork_classification, is_fork
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from hermes_agent.compat.paths import current_path, original_path
@@ -659,12 +671,70 @@ def _slow_lanes(files: list[str]) -> dict[str, bool]:
     return lanes
 
 
-def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
+
+# Fork-only Windows installer lane retained alongside upstream bootstrap checks.
+_INSTALLER_PATHS = ("scripts/tests/",)
+_INSTALLER_FILES = {"scripts/install.ps1", "scripts/install.cmd"}
+
+# OS-specific surfaces. Upstream OS lanes ride on python; the fork consumes
+# os_tests so a Linux-only diff skips macOS and Windows runners.
+_OS_PATH_FRAGMENTS = (
+    "windows", "win32", "winpty", "win_pty", "macos", "darwin", "powershell",
+    "platform", "desktop-update", "clipboard", "keychain",
+    "launchd", "wsl", "msys", "appdata",
+)
+_OS_TESTS_FILES = {
+    "tests/conftest.py",
+    "pyproject.toml",
+    "uv.lock",
+    "scripts/ci/list_os_marked_tests.py",
+}
+_OS_MARKER_RE = re.compile(r"\b(?:windows_only|macos_only)\b")
+_SHARED_NATIVE_RUNTIME_PATHS = (
+    "hermes_cli/update_", "hermes_cli/local_runtime/", "pm/",
+    "tools/environments/", "hermes_platform/", "scripts/build/launcher",
+)
+_SHARED_NATIVE_RUNTIME_FILES = {
+    "hermes_cli/update_cmd.py", "hermes_cli/update.py",
+    "hermes_cli/_launchers.py", "hermes_cli/relaunch.py", "hermes_cli/runtime_paths.py",
+    "scripts/build/mint_launchers.py",
+}
+
+
+def _is_installer(p: str) -> bool:
+    return p.startswith(_INSTALLER_PATHS) or p in _INSTALLER_FILES
+
+
+def _is_os_marked_test(p: str, root: Path) -> bool:
+    if not (p.startswith("tests/") and p.endswith(".py")):
+        return False
+    try:
+        body = (root / p).read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return True
+    return bool(_OS_MARKER_RE.search(body)) or any(
+        file_gates_on(body, host) for host in ("macos", "windows")
+    )
+
+
+def _is_os_specific(p: str, root: Path) -> bool:
+    if (_is_installer(p) or _is_desktop_updater(p) or p in _OS_TESTS_FILES
+            or p in _SHARED_NATIVE_RUNTIME_FILES or p.startswith(_SHARED_NATIVE_RUNTIME_PATHS)):
+        return True
+    if _py_irrelevant(p):
+        return False
+    lowered = p.lower()
+    return any(fragment in lowered for fragment in _OS_PATH_FRAGMENTS) or _is_os_marked_test(p, root)
+
+
+def classify(files: list[str], run_e2e: bool = False, *, fork: bool = False, root: Path | None = None) -> dict[str, bool]:
     """Map changed paths to ``{lane: should_run}``.
 
     ``run_e2e`` is the pull request's ``run-e2e`` label: it turns every slow
-    lane on.
+    lane on. ``fork`` enables the maintained fork's narrower upgrade and
+    image gates. ``root`` is the checkout changed paths are relative to.
     """
+    root = root or Path(__file__).resolve().parents[2]
     files = [original_path(f.strip()) for f in files if f.strip()]
     catalog = any(_is_catalog_data(f) for f in files)
     code = [f for f in files if not _is_catalog_data(f)]
@@ -695,9 +765,13 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
         ),
         "desktop_updater": any(_is_desktop_updater(f) for f in files),
         "rust": any(_is_rust(f) for f in files),
+        **review_lanes(files),
         "remote_backends": any(f.startswith(_REMOTE_BACKEND_PATHS) for f in files),
         "catalog": catalog,
         **{lane: run_e2e or on for lane, on in _slow_lanes(files).items()},
+        "installer": any(_is_installer(f) for f in files),
+        "os_tests": any(_is_os_specific(f, root) for f in files),
+        "upgrade": True,
     }
     consumers = [c for f in files for c in _SHARED_FIXTURE_CONSUMERS.get(f, ())]
     if consumers:
@@ -717,10 +791,14 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
         ret["bootstrap"] = True
         ret["desktop_updater"] = True
         ret["rust"] = True
+        ret["ci_review"] = True
         ret["remote_backends"] = True
         ret["catalog"] = True
         ret.update(dict.fromkeys(_slow_lanes([]), True))
-    return ret
+        ret["installer"] = True
+        ret["os_tests"] = True
+        # explicitly skip mcp catalog here. it's not needed unless those files are modified.
+    return apply_fork_classification(files, ret) if fork else ret
 
 
 def _event_payload() -> dict:
@@ -819,7 +897,7 @@ def changed_paths(lines: list[str]) -> list[str]:
 
 def main() -> int:
     lines = sys.stdin.read().splitlines()
-    if not any(f.strip() for f in lines):
+    if not is_fork() and not any(f.strip() for f in lines):
         recovered = pull_request_changed_files()
         if recovered:
             print(
@@ -829,8 +907,19 @@ def main() -> int:
             )
             lines = recovered
     files = changed_paths(lines)
-    lanes = classify(files, run_e2e=RUN_E2E_LABEL in pull_request_labels())
-    out = "\n".join(f"{key}={str(value).lower()}" for key, value in lanes.items())
+    lanes = classify(files, run_e2e=RUN_E2E_LABEL in pull_request_labels(), fork=is_fork())
+    from scripts.ci.affected_test_plan import js_plan, python_plan
+
+    # Only pull requests narrow. Pushes, dispatch and schedule are the post-merge
+    # backstop (and gate image publication), so they always plan the full suite.
+    plan_files = files if os.environ.get("EVENT_NAME") == "pull_request" else []
+    plan = python_plan(plan_files, root=Path.cwd(), fork=is_fork(), enabled=lanes["python"])
+    plan.update(js_plan(plan_files, fork=is_fork()))
+    out = "\n".join([
+        *(f"{key}={str(value).lower()}" for key, value in lanes.items()),
+        *(f"{key}={json.dumps(value) if not isinstance(value, str) else value}" for key, value in plan.items()),
+        f"ci_review_files={json.dumps(ci_review_files(files))}",
+    ])
     if dest := os.environ.get("GITHUB_OUTPUT"):
         with open(dest, "a", encoding="utf-8") as fh:
             fh.write(out + "\n")

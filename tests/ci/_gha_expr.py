@@ -22,7 +22,8 @@ from typing import Any, Mapping
 _TOKEN = re.compile(r"""\s*(?:
     (?P<str>'(?:[^']|'')*')
   | (?P<num>-?\d+(?:\.\d+)?)
-  | (?P<op>==|!=|&&|\|\||<=|>=|[!()<>,])
+  | (?P<op>==|!=|&&|\|\||<=|>=|\[|\]|[!()<>,])
+  | (?P<prop>\.[A-Za-z_*][A-Za-z0-9_-]*)
   | (?P<path>[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_*][A-Za-z0-9_-]*)*)
 )""", re.VERBOSE)
 _TEMPLATE = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
@@ -51,6 +52,7 @@ def truthy(value: Any) -> bool:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return value != 0 and not math.isnan(value)
     if isinstance(value, str):
+        # GitHub Actions treats a non-empty string, including "false", as true.
         return value != ""
     return True
 
@@ -162,8 +164,24 @@ class _Parser:
         if text == "null":
             return None
         if self.peek() == ("op", "("):
-            return self.call(text)
-        return self.lookup(text)
+            return self.postfix(self.call(text))
+        return self.postfix(self.lookup(text))
+
+    def postfix(self, value: Any) -> Any:
+        """Index and property access after a call: ``fromJSON(...)['tests']`` and ``.tests``."""
+        while True:
+            tok = self.peek()
+            if tok == ("op", "["):
+                self.take("[")
+                key = self.or_()
+                self.take("]")
+                value = value.get(key) if isinstance(value, Mapping) else None
+            elif tok is not None and tok[0] == "prop":
+                self.take()
+                key = tok[1][1:]
+                value = value.get(key) if isinstance(value, Mapping) else None
+            else:
+                return value
 
     def call(self, name: str) -> Any:
         self.take("(")

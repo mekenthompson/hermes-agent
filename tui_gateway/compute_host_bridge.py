@@ -115,6 +115,12 @@ def _compute_host_adopt_frame_meta(session: dict, frame: dict) -> None:
     by its owner — never claimed from the child pid (authority stays singular, #103737 review)."""
     new_key = str(frame.get("session_key") or "")
     if new_key and new_key != str(session.get("session_key") or ""):
+        from gateway.chat_execution_recovery import ChatExecutionStore
+        from hermes_constants import get_process_hermes_home
+        old_key = str(session.get("session_key") or frame.get("sid") or "")
+        if not ChatExecutionStore(session.get("profile_home") or get_process_hermes_home()).link_session_keys(
+                old_key, new_key):
+            raise RuntimeError("Durable compute-host compression lineage could not be recorded")
         if not _transfer_active_session_slot(str(frame.get("sid") or ""), session, new_session_id=new_key):
             logger.warning("Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
                            frame.get("sid"), session.get("session_key"), new_key)
@@ -319,14 +325,37 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
 def _submit_prompt_to_compute_host(
     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None, display_kind: str | None = None,
-    display_metadata: dict | None = None) -> dict:
+    display_metadata: dict | None = None, chat_submit_id: str | None = None,
+    chat_submit_ids: tuple[str, ...] = (), chat_submit_key: str | None = None,
+    chat_instruction_origin=None) -> dict:
+    claim_ids = (*chat_submit_ids, *((chat_submit_id,) if chat_submit_id else ()))
+    if claim_ids:
+        session.setdefault("_chat_pending_submit_ids", set()).update(claim_ids)
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(rid, sid, session, text, image_paths=image_paths,
                                      queued_prompt_generation=queued_prompt_generation,
                                      display_kind=display_kind, display_metadata=display_metadata)
+    # The parent reserved these against the same profile journal before rewinding
+    # or reopening its transcript. The child consumes them with its real worker id.
+    if claim_ids:
+        frame["_chat_submit_ids"] = list(claim_ids)
+        frame["_chat_submit_key"] = chat_submit_key or str(session.get("session_key") or sid)
     # Caller JSON-RPC ids may repeat across sockets and turns. Use an opaque
     # dispatch lifetime token, installed before a fast child can send activity.
     turn_id = frame["turn_id"] = frame["request_id"] = uuid.uuid4().hex
+    owner = session.get("transport_owner")
+    if (isinstance(chat_instruction_origin, tuple) and len(chat_instruction_origin) == 5
+            and isinstance(owner, tuple) and len(owner) == 2
+            and chat_instruction_origin[0] == f"{owner[0]}:{owner[1]}"
+            and chat_instruction_origin[3] == text and claim_ids
+            and frame.get("source") == "desktop"):
+        # The parent verified this WebSocket and reserved the exact submitted
+        # turn. Carry instruction provenance only, never the approval task or
+        # in-process live-turn grant, across the private compute-host pipe.
+        frame["_chat_user_instruction"] = {
+            "turn_id": turn_id, "session_key": frame["session_key"],
+            "profile_home": frame["profile_home"], "submit_id": claim_ids[0],
+            "owner": list(owner), "requester": chat_instruction_origin[0], "text": text}
     with session["history_lock"]:
         session["_compute_host_turn_id"] = turn_id
         session.pop("_compute_host_activity_ns", None)
@@ -341,9 +370,12 @@ def _submit_prompt_to_compute_host(
                 session.pop("_compute_host_turn_id", None)
                 session.pop("_compute_host_activity_ns", None)
             _on_compute_host_turn_done(rid, sid, session, done)
+            session.get("_chat_pending_submit_ids", set()).difference_update(claim_ids)
     try:
         _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
     except Exception as exc:
+        for claim_id in claim_ids:
+            session.get("_chat_pending_submit_ids", set()).discard(claim_id)
         with session["history_lock"]:
             if session.get("_compute_host_turn_id") == turn_id:
                 session.pop("_compute_host_turn_id", None)

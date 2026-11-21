@@ -1145,7 +1145,7 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
                     self._revocation_monitor, timeout=_RELAY_REVOCATION_MONITOR_TEARDOWN_TIMEOUT_S
                 )
             except (TimeoutError, asyncio.CancelledError, Exception):
-                pass
+                logger.debug("relay revocation monitor teardown failed", exc_info=True)
             self._revocation_monitor = None
         if self._transport is not None:
             # Ask the connector to flip this instance to buffered-only BEFORE tearing

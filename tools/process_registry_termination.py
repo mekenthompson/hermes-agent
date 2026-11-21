@@ -20,6 +20,24 @@ class ProcessTerminationMixin:
     """The subclass supplies ``_host_pid_is_ours``, ``_is_host_pid_alive``,
     ``_detached_host_fate`` and ``_daemon_term_grace_seconds``. See ProcessRegistry."""
 
+    def _kill_hosted(self, session, source: str, consume_output: bool) -> dict:
+        """A hosted agent's process runs in its sandbox: that sandbox's own exec ends it. The host-job
+        proofs (pid, birth identity, cgroup scope) describe host processes and do not apply to it."""
+        from tools.process_registry import _completion_output
+        if not session.exited and session.env_ref and session.pid:
+            session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+        with session._lock:
+            if session.exited:
+                return self._exit_snapshot(session, "already_exited")
+            output = _completion_output(session)
+            if consume_output:
+                self._completion_consumed.add(session.id)
+            session.exited, session.exit_code = True, -15
+            session.completion_reason, session.termination_source = "killed", source
+        self._move_to_finished(session)
+        return {"status": "killed", "session_id": session.id, "completion_reason": "killed",
+                "termination_source": source, **output}
+
     @staticmethod
     def _proc_alive(proc) -> bool:
         """True if a psutil.Process is running and not a zombie (already dead, just unreaped)."""

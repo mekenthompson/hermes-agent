@@ -12,6 +12,15 @@ inputs:
     default: ${{ github.token }}
 
 outputs:
+  js_matrix:
+    description: JSON workspace check matrix.
+    value: ${{ steps.classify.outputs.js_matrix }}
+  python_files:
+    description: JSON selected test modules; empty list keeps full discovery.
+    value: ${{ steps.classify.outputs.python_files }}
+  python_matrix:
+    description: JSON shard matrix sized for the selected modules.
+    value: ${{ steps.classify.outputs.python_matrix }}
   python:
     description: Run Python tests / ruff / ty / windows-footguns.
     value: ${{ steps.classify.outputs.python }}
@@ -57,6 +66,9 @@ outputs:
   npm_lock:
     description: Post/update the semantic JS lockfile (pnpm-lock.yaml / package-lock.json) diff PR comment.
     value: ${{ steps.classify.outputs.npm_lock }}
+  installer:
+    description: Run the PowerShell installer tests on a Windows runner.
+    value: ${{ steps.classify.outputs.installer }}
   bootstrap:
     description: Run the bootstrap installer lane (install.sh sandbox + stamp verification).
     value: ${{ steps.classify.outputs.bootstrap }}
@@ -66,6 +78,21 @@ outputs:
   rust:
     description: Run `cargo test` for the Tauri bootstrap installer.
     value: ${{ steps.classify.outputs.rust }}
+  mcp_catalog:
+    description: Require MCP catalog security review label.
+    value: ${{ steps.classify.outputs.mcp_catalog }}
+  ci_review:
+    description: Require CI-sensitive file review label.
+    value: ${{ steps.classify.outputs.ci_review }}
+  ci_review_files:
+    description: JSON list of CI-sensitive files changed by the pull request.
+    value: ${{ steps.classify.outputs.ci_review_files }}
+  os_tests:
+    description: Run the macOS / Windows pytest lanes (fork consumes; upstream gates them on python).
+    value: ${{ steps.classify.outputs.os_tests }}
+  upgrade:
+    description: Run real install/upgrade and packaged Desktop update E2E on the fork unless paths are known backend-only.
+    value: ${{ steps.classify.outputs.upgrade }}
   remote_backends:
     description: Run the SSH and Docker terminal backends against a real sshd and Docker daemon.
     value: ${{ steps.classify.outputs.remote_backends }}
@@ -90,6 +117,10 @@ runs:
         EVENT_NAME: ${{ github.event_name }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        # Fork-only push scoping (scripts/ci/push_changed_files.py).
+        PUSH_BEFORE: ${{ github.event.before }}
+        PUSH_AFTER: ${{ github.sha }}
+        PUSH_FORCED: ${{ github.event.forced }}
       run: |
         set -euo pipefail
 
@@ -97,40 +128,17 @@ runs:
         # dispatch) leave CHANGED empty, so the classifier fails open and every
         # lane runs. Post-merge / on-demand validation is never weakened.
         if [ "$EVENT_NAME" = "pull_request" ]; then
-          # Use the compare endpoint with the pinned base/head SHAs from the
-          # event payload instead of the "current PR files" endpoint. The SHAs
-          # are frozen at trigger time, so the file list is deterministic even
-          # if the PR receives a new push between trigger and detect.
-          #
-          # Retried: a rate-limit blip or eventual-consistency 404 on a
-          # freshly-pushed HEAD would otherwise silently fall open (all lanes
-          # run — safe, but wasteful and it masks the API failure).
-          #
-          # `.files[]?` (null-safe): with --paginate, a PR more than 100
-          # commits ahead of its merge-base paginates the compare, and pages
-          # after the first carry `files: null` — bare `.files[]` makes jq
-          # die with "cannot iterate over: null", which fails every retry
-          # and forces the fail-open path (seen on stacked PRs). The full
-          # file list (up to the API's 300-file cap) is on page one.
-          # One line per file: the path, then the old path of a rename.
-          CHANGED=""
-          for i in 1 2 3; do
-            if CHANGED="$(gh api \
-              --paginate \
-              "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
-              --jq '.files[]? | [.filename, .previous_filename // empty] | @tsv')"; then
-              break
-            fi
-            if [ "$i" = 3 ]; then
-              echo "::warning::compare API failed after 3 attempts — failing open (all lanes run)"
-              CHANGED=""
-              break
-            fi
-            echo "::warning::compare API failed (attempt $i); retrying in 10s"
-            sleep 10
-          done
+          # Exact event SHAs, status-bearing local git diff when available;
+          # capped or incomplete compare data deliberately selects all lanes.
+          CHANGED="$(python3 -m scripts.ci.pr_changed_files)"
+        elif [ "$EVENT_NAME" = "push" ] && [ "$REPO" = "switchroom/hermes-agent" ]; then
+          # Fork only: scope a main push to the pushed range
+          # (github.event.before...github.sha). The helper prints nothing —
+          # so the classifier fails open — on a first or forced push, a
+          # non-fast-forward or truncated compare, or an API failure.
+          CHANGED="$(python3 scripts/ci/push_changed_files.py)"
         fi
 
         echo "Changed files:"
         printf '%s\n' "${CHANGED:-(none)}"
-        printf '%s\n' "${CHANGED:-}" | python3 scripts/ci/classify_changes.py
+        printf '%s\n' "${CHANGED:-}" | python3 -m scripts.ci.classify_changes

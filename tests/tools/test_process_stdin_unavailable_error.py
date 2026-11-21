@@ -59,22 +59,23 @@ def test_a_reader_that_hit_eof_says_why_it_already_exited(registry, tmp_path):
     wait_until(lambda: session.exited, what="the EOF reader to exit")
     result = registry.write_stdin(session.id, "hello\n")
     assert result["status"] == "already_exited"
-    assert "without stdin" in result["error"] and "pty=true" in result["error"]
+    assert "without stdin" in result["error"]
+    if session.output_log:
+        assert "Pass input non-interactively" in result["error"]
+    else:
+        assert "pty=true" in result["error"]
 
 
 @pytest.mark.platforms("posix")
-def test_a_failed_pty_request_is_not_told_to_retry_pty(registry, monkeypatch, tmp_path):
-    """PTY library installed but the spawn fails: spawn_local falls back to a pipe, and the error
-    names that failure instead of telling the agent to repeat the pty=true that just failed."""
-    import tools.process_registry_stdin as stdin_mod
-
-    monkeypatch.setattr(stdin_mod, "_pty_available", lambda: True)
-
+def test_a_failed_pty_request_is_not_replayed_as_a_pipe(registry, monkeypatch, tmp_path):
+    """House safety: an uncertain PTY failure cannot replay a possibly started command."""
     def _pty_fails(*args, **kwargs):
         raise OSError("openpty: out of pseudo-terminals")
 
+    def pipe_forbidden(*args, **kwargs):
+        pytest.fail("uncertain PTY command was replayed as a pipe")
+
     monkeypatch.setattr(registry, "_spawn_local_pty", _pty_fails)
-    session = registry.spawn_local("sleep 30", cwd=str(tmp_path), task_id="t-stdin-ptyfail", use_pty=True)
-    error = registry.write_stdin(session.id, "hello\n")["error"]
-    assert "out of pseudo-terminals" in error and "pty=true would not help" in error
-    assert "Relaunch it with terminal(background=true, pty=true)" not in error
+    monkeypatch.setattr("tools.process_registry_chat_execution.spawn_local_pipe", pipe_forbidden)
+    with pytest.raises(RuntimeError, match="PTY startup uncertain; original command was not retried"):
+        registry.spawn_local("sleep 30", cwd=str(tmp_path), task_id="t-stdin-ptyfail", use_pty=True)

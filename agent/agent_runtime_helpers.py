@@ -1434,8 +1434,10 @@ def anthropic_prompt_cache_policy(
 
 
 def _provider_supplied_client(agent, client_kwargs: dict) -> Any | None:
-    """Ask the registered ProviderProfile for a custom client: by provider name, then by ``base_url``
-    prefix (``acp://…``). A raising HTTP profile is skipped; a process profile's error propagates (#139807)."""
+    """Ask the registered ProviderProfile for a custom client, if any. Resolves by provider name,
+    then by ``base_url`` prefix so a URL-only runtime (``acp://…``) still reaches its profile.
+    Custom transport initialization errors propagate: only an explicit None opts
+    into the standard client path, which may use an incompatible wire protocol."""
     try:
         from providers import get_provider_profile
     except Exception:
@@ -1453,16 +1455,7 @@ def _provider_supplied_client(agent, client_kwargs: dict) -> Any | None:
             profile = _profile_for_base_url(base_url)
     if profile is None:
         return None
-    try:
-        return profile.create_client(**client_kwargs)
-    except Exception:
-        if getattr(profile, "auth_type", "") == "external_process":
-            raise
-        _ra().logger.warning(
-            "Provider profile %r failed to create a client; falling back to the standard client path",
-            getattr(profile, "name", provider_name) or "?", exc_info=True,
-        )
-        return None
+    return profile.create_client(**client_kwargs)
 
 
 def _profile_for_base_url(base_url: str) -> Any | None:

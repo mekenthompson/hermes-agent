@@ -4,6 +4,10 @@ name: JS Tests
 on:
   workflow_call:
     inputs:
+      js_matrix:
+        description: JSON selected workspace units; omitted retains full checks.
+        type: string
+        default: ''
       commit:
         description: Commit to test and build. Empty keeps the triggering commit.
         type: string
@@ -19,8 +23,18 @@ jobs:
     #
     # One larger runner installs one time. vitest, tsc and eslint each size
     # their own worker pool from the core count.
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    # Fork stays on GitHub-hosted ubuntu-latest; self-hosted validation failed.
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
     timeout-minutes: 30
+    # Fork (switchroom): on a 4-core hosted runner the desktop ``ui``
+    # vitest project alone takes ~630s (733 jsdom files; run 34088223918),
+    # and the other nine units ~360s. Split the ``ui`` project into three
+    # ``vitest --shard`` legs on their own runners and run the remaining
+    # units together, so the lane finishes in ~5 min instead of ~12.
+    # Upstream keeps its single 32-core job (``unit: all``).
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.js_matrix || (github.repository == 'switchroom/hermes-agent' && '{"unit":["checks","ui-1/3","ui-2/3","ui-3/3"]}' || '{"unit":["all"]}')) }}
     steps:
       - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:
@@ -37,7 +51,7 @@ jobs:
           test-environment: 'true'
 
       - name: Install zsh and a virtual display for Electron
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && (matrix.unit == 'all' || matrix.unit == 'checks' || startsWith(matrix.unit, 'ui-'))
         # Refresh the package index first, like every other apt step here: a
         # runner image without a populated list can't resolve zsh/libnotify4.
         run: |
@@ -61,6 +75,7 @@ jobs:
       # ``pnpm install`` is skipped on a hit, so nothing reads that cache. It only
       # makes the archive larger.
       - name: Restore node_modules
+        if: matrix.unit != 'whatsapp'
         id: node-modules-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -85,7 +100,7 @@ jobs:
       # No --trust-lockfile: this install is the gate that checks every locked
       # version against pnpm-workspace.yaml's release-age policy.
       - uses: ./.github/actions/retry
-        if: steps.node-modules-cache.outputs.cache-hit != 'true'
+        if: matrix.unit != 'whatsapp' && steps.node-modules-cache.outputs.cache-hit != 'true'
         with:
           command: just js-install
 
@@ -104,6 +119,7 @@ jobs:
         run: git diff --exit-code -- pnpm-workspace.yaml
 
       - name: Prepare locked Electron runtime before parallel checks
+        if: matrix.unit == 'all' || matrix.unit == 'checks' || startsWith(matrix.unit, 'ui-')
         run: just electron-runtime
 
       # The WhatsApp bridge is a standalone npm package, outside the root
@@ -111,10 +127,12 @@ jobs:
       # import @whiskeysockets/baileys, so install its own lockfile first;
       # --ignore-scripts because the tests need no native build.
       - name: Install WhatsApp bridge dependencies
+        if: matrix.unit == 'all' || matrix.unit == 'checks' || matrix.unit == 'whatsapp'
         uses: ./.github/actions/retry
         with:
           command: just js-install-whatsapp-bridge
       - name: Run WhatsApp bridge node tests
+        if: matrix.unit == 'all' || matrix.unit == 'checks' || matrix.unit == 'whatsapp'
         run: just test-whatsapp-bridge
 
       # Every check runs at the same time. The step fails only after all of
@@ -134,8 +152,45 @@ jobs:
       # ``check:*`` script needs no change here. An empty list is an error and
       # not an empty run, because an empty run reports green after it checks
       # nothing.
+      # Fork PRs run on four GitHub-hosted cores. Starting four check processes
+      # at once lets each Vitest process create its own worker pool, competing
+      # for the same CPUs and starving the first async UI test until its 15s
+      # deadline. Keep those forks to two check processes; each still discovers
+      # every check and the runner preserves its all-failures-at-end report.
+      # Trusted PRs and pushes retain the larger runner's automatic parallelism.
       - name: Run all workspace checks
-        run: just check-js-ci
+        if: matrix.unit != 'whatsapp'
+        env:
+          CI_FORK: ${{ github.repository != 'NousResearch/hermes-agent' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
+          CHECK_UNIT: ${{ matrix.unit }}
+        run: |
+          if [ "$CI_FORK" = "true" ]; then
+            export WORKSPACE_CHECK_CONCURRENCY=2
+          fi
+          # ``all`` is the upstream single job. The fork matrix runs the
+          # desktop ``ui`` project (``check:test:ui`` == ``vitest run
+          # --project ui``) as N shards and every other unit in ``checks``.
+          case "$CHECK_UNIT" in
+            web)
+              npm run --prefix web check
+              ;;
+            tui)
+              npm run --prefix ui-tui check
+              ;;
+            all)
+              node .github/scripts/run-workspace-checks.mjs
+              ;;
+            checks)
+              node .github/scripts/run-workspace-checks.mjs --skip 'apps/desktop :: check:test:ui'
+              ;;
+            ui-*)
+              npm run --prefix apps/desktop test:ui -- --shard="${CHECK_UNIT#ui-}"
+              ;;
+            *)
+              echo "::error::unknown check unit: $CHECK_UNIT"
+              exit 1
+              ;;
+          esac
       - name: Check the checkout is clean
         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
         # leaves an untracked or modified file in the checkout is reported here. Runs only when

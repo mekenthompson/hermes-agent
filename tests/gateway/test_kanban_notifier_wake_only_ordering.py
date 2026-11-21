@@ -201,3 +201,30 @@ def test_wake_only_failure_cap_drops_subscription(tmp_path, monkeypatch):
     assert runner._kanban_sub_fail_counts == {}, (
         "counter entry must clear when the subscription is dropped"
     )
+
+
+def test_wake_only_completion_still_uploads_artifacts_once(tmp_path, monkeypatch):
+    """Wake-only skips the text ping, not the handoff's files: they upload once,
+    and a wake retry does not upload them again."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-artifacts.db"))
+    kb.init_db()
+    tid = _make_completed_task("wake")
+
+    adapter = FailingWakeAdapter()
+    runner = _make_runner(adapter)
+    uploads = []
+
+    async def record_upload(**kwargs):
+        uploads.append(kwargs)
+
+    runner._deliver_kanban_artifacts = record_upload
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == [], "wake-only mode must not send a text ping"
+    assert len(uploads) == 1 and uploads[0]["chat_id"] == "chat-1"
+    assert len(_unseen_terminal_events(tid)) == 1, "failed wake is retried"
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.handled) == 2, "wake retried"
+    assert len(uploads) == 1, "artifacts must not re-upload on a wake retry"

@@ -31,7 +31,8 @@ def test_silent_child_failure_reports_exit_code(tmp_path, monkeypatch):
     child = SimpleNamespace(pid=123, returncode=23, communicate=lambda **kwargs: ("", None))
     monkeypatch.setattr(mod.subprocess, "Popen", lambda *args, **kwargs: child)
     monkeypatch.setattr(mod, "_kill_tree", lambda *args, **kwargs: None)
-    _, code, output, counts, _ = mod._run_one_file_once(tmp_path / "test.py", [], tmp_path, 30)
+    _, code, output, counts, _ = mod._run_one_file_once(
+        tmp_path / "test.py", [], tmp_path, 30, scratch_root=str(tmp_path))
     assert code == 23
     assert "23" in output and "no output" in output.lower()
     assert counts == {}

@@ -35,7 +35,7 @@ from gateway.run_inbound_unauthorized import (
     UnauthorizedOwnerNotifier, pairing_code_reply, pairing_profile_arg, pairing_rate_limited_reply,
     unauthorized_owner_hint,
 )
-from gateway.session import SessionSource, build_session_context, label_shared_sender
+from gateway.session import SessionSource, build_session_context, is_system_injection, label_shared_sender
 from gateway.turn_lease import TurnLeaseTimeoutError
 from hermes_cli.observability.shared_metrics_busy import (
     note_busy_admitting, note_busy_outcome, settle_busy_arrival, stamp_busy_arrival)
@@ -154,6 +154,7 @@ class GatewayInboundMixin(
         """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
         (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
         from gateway.run import _is_slack_ignored_channel
+        from gateway.platforms.event import require_structured_control
         source = event.source
         # getattr(self, ...) throughout: bare test runners build GatewayRunner via object.__new__.
         _config = getattr(self, "config", None)
@@ -182,6 +183,8 @@ class GatewayInboundMixin(
             return None
 
         is_internal = bool(getattr(event, "internal", False))  # e.g. background-process notifications
+        if event.structured_control is not None:
+            require_structured_control(event, self._intake_adapter_for(source))
 
         # Ignored-channel guard runs FIRST — before startup-restore queueing, plugin hooks, auth,
         # and session setup — so an ignored channel can never reach pairing/auth/session state.
@@ -246,6 +249,8 @@ class GatewayInboundMixin(
             else:
                 logger.warning("Unauthorized user: %s on %s", source.user_id, source.platform.value)
             return None
+        if event.structured_control is not None:
+            require_structured_control(event, self._intake_adapter_for(source))
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
         if not getattr(event, "_bot_loop_admitted", False) and not (
                 self._admit_bot_message_for_source(source) and self._admit_bot_chain(event)):
@@ -257,6 +262,9 @@ class GatewayInboundMixin(
         running work or control traffic — recognized slash commands (incl. /pause off, the in-band
         resume) and replies owned by in-flight work (pending update prompt, running session,
         pending slash-confirm, dangerous-command approval) all pass through."""
+        if event.structured_control is not None:
+            from gateway.platforms.event import valid_structured_stop
+            return valid_structured_stop(event, self._intake_adapter_for(source))
         with suppress(Exception):
             _estop_cmd = event.get_command()
             if _estop_cmd:
@@ -1298,16 +1306,29 @@ class GatewayInboundMixin(
         # The message handler entered the routed profile's scope; its authority owns this turn.
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
+        if event.structured_control is not None:
+            from gateway.platforms.event import require_structured_control
+            require_structured_control(event, self._intake_adapter_for(source))
+        if event.structured_control is not None and authority is None:
+            from persistence.core.errors import AuthorityRefusal
+            reason = 'profile_mismatch' if getattr(self, 'session_authority', None) is not None else 'not_found'
+            raise AuthorityRefusal(reason, field='native_control')
         if authority is not None and not event.get_command() and not is_internal:
             from gateway.session_ingress import executing_admission
             if not executing_admission.get():
+                intake = getattr(self, '_intake_adapter_for', lambda _source: None)(source)
+                durable_inbox = getattr(intake, 'requires_durable_input_ack', False) is True
+                if event.structured_control is not None and not durable_inbox:
+                    from persistence.core.errors import AuthorityRefusal
+                    raise AuthorityRefusal('invalid_params', field='structured_control')
                 # A message the adapter saw as idle still waits when an earlier queued turn runs
                 # outside its session guard: the running-turn check is the busy test that counts.
                 busy = self._is_session_running(_quick_key) and not getattr(event, "_fifo_only", False)
                 if busy:
                     stamp_busy_arrival(self._delivery_adapter_for(source), event)
                 try:
-                    return await self._hm_admit_to_fifo(authority, event, source, _quick_key, busy)
+                    return await self._hm_admit_to_fifo(authority, event, source, _quick_key, busy,
+                                                        durable_inbox=durable_inbox)
                 finally:
                     settle_busy_arrival(event)  # never admitted, refused or dropped: its fate is known
         if (authority is None and not is_internal and not event.get_command()
@@ -1319,6 +1340,7 @@ class GatewayInboundMixin(
 
     async def _hm_admit_to_fifo(
         self, authority: Any, event: MessageEvent, source: SessionSource, _quick_key: str, busy: bool,
+        durable_inbox: bool = False,
     ) -> tuple[bool, Optional[str]]:
         """The authority-owned path of ``_hm_authority_admission`` (not inside a FIFO execution)."""
         from gateway.session_ingress import admit_message
@@ -1329,12 +1351,15 @@ class GatewayInboundMixin(
         # A bare "yes"/"no" to a blocking dangerous-command approval answers it (#46866):
         # never an interrupt (read as deny) nor a queued turn (auto-deny deadlock).
         # A turn a slash command produced (``/queue yes``) is never live typing.
-        if busy and (await self._route_plaintext_approval_while_busy(event, _quick_key)
-                     or await self._hm_busy_preempt(event, source, _quick_key)):
+        # Existing channels keep their live voice/approval behavior. Durable-inbox adapters
+        # declare the stronger commit-before-busy contract; event metadata can never opt into it.
+        if busy and not durable_inbox and (await self._route_plaintext_approval_while_busy(event, _quick_key)
+                                           or await self._hm_busy_preempt(event, source, _quick_key)):
             return True, None
-        _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)
-        if _consumed:
-            return True, _consumer_reply
+        if not durable_inbox:
+            _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)
+            if _consumed:
+                return True, _consumer_reply
         if getattr(event, "_fifo_only", False) and event._stop_epoch != self._route_stop_epoch(_quick_key):
             return True, None  # a /stop or /new came after its command, as it clears the slot
         # A failed admit stays the authority's answer (refusal notice or turn error), never a
@@ -1343,11 +1368,20 @@ class GatewayInboundMixin(
             # The FIFO turn restores a fresh event: it reuses the transcript and echo paid above.
             from gateway.run_inbound_transcription import hand_prepared_voice_to_turn
             await asyncio.to_thread(hand_prepared_voice_to_turn, event)
+        # Admission/dedupe precedes every busy effect, including a bare
+        # approval answer. An exact retry must never steer a later turn.
         note_busy_admitting(event)
         notice = pending_setup_busy_notice(self, _quick_key, source) if busy else None
         if notice is not None:  # sent now: the admission below waits until this follow-up has run
             await self._send_busy_ack_reply(event, self._delivery_adapter_for(source), notice)
-        return True, await admit_message(authority, event)
+        return True, await admit_message(authority, event,
+            busy=durable_inbox and not getattr(event, "_fifo_only", False))
+
+    @staticmethod
+    def _hm_record_external_slash_command(event: MessageEvent, is_internal: bool) -> None:
+        if not is_internal:
+            from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
+            record_gateway_slash_command(event)
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
@@ -1357,9 +1391,7 @@ class GatewayInboundMixin(
         if _admitted is None:
             return None
         event, source, is_internal = _admitted
-        if not is_internal:
-            from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
-            record_gateway_slash_command(event)
+        self._hm_record_external_slash_command(event, is_internal)
         # TERMINAL-DECLINE LATCH TEARDOWN. Deliberately placed AFTER admission,
         # not on the adapter's raw inbound: profile routing, the ignored-channel
         # guard, plugin hooks and user authorization all reject events above,
@@ -1427,7 +1459,13 @@ class GatewayInboundMixin(
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
         start_reply_clock(source, internal=is_internal)
         self._persist_active_agents()
-        _run_generation = self._begin_session_run_generation(_quick_key)
+        _run_generation = self._reserve_ordinary_session_run_generation(_quick_key, source)
+        if _run_generation is None:
+            self._release_running_agent_state(_quick_key)
+            self._release_turn_lease(_quick_key, self._current_session_run_generation(_quick_key))
+            return t("gateway.busy.another_turn_running")
+        _claim_state.persistent.run_generation = _run_generation
+        event._approval_run_generation = _run_generation
 
         try:
             from gateway.session_moa_turn import arm_admitted_moa
@@ -1475,43 +1513,12 @@ class GatewayInboundMixin(
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
 
-    def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
-        """Restore the per-session model override captured by ``/model --once`` or ``/moa``.
-
-        With ``run_generation`` (the turn finalizer) the restore happens only while that generation
-        is still current; a stop/reset/eviction has already settled the snapshot itself (see
-        ``_invalidate_session_run_generation``), so the displaced finalizer finds nothing to do.
-        Without it (the settlement paths) the restore is unconditional."""
-        if not session_key:
-            return
-        try:
-            _otr_state = self._peek_session_state(session_key)
-            if _otr_state is None or not _otr_state.conversation.one_turn_restore:
-                return
-            if run_generation is not None and not self._is_session_run_current(session_key, run_generation):
-                return
-            snapshot = _otr_state.conversation.one_turn_restore
-            _otr_state.conversation.one_turn_restore = None
-            self._restore_session_model_override(session_key, snapshot)
-            # The one-turn switch note was persisted with the temporary turn. Add a
-            # one-shot counterpart so the next model does not treat that historical
-            # note as its current identity. The restored model may come from config,
-            # so avoid guessing its display name here.
-            pending_notes = getattr(self, "_pending_model_notes", None)
-            if not isinstance(pending_notes, dict):
-                pending_notes = self._pending_model_notes = {}
-            pending_notes[session_key] = (
-                "[Note: the one-turn model override has ended. The temporary model "
-                "no longer applies; use the current model and provider in your instructions.]"
-            )
-        except Exception:
-            logger.debug("Failed to restore one-turn model override", exc_info=True)
-
     def _prefix_inbound_sender_context(self, event: MessageEvent, source: SessionSource, message_text: str) -> str:
         """Attribute the sender in shared multi-user sessions and prepend history-backfill channel context."""
-        message_text = label_shared_sender(
-            source, message_text, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False))
+        if not is_system_injection(event):  # self-injected turns keep their system header, no human label
+            message_text = label_shared_sender(
+                source, message_text, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
+                thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False))
         # After the sender-prefix so the prefix applies only to the trigger message, not the backfill.
         if getattr(event, "channel_context", None):
             message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"

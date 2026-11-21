@@ -1,0 +1,353 @@
+name: Fork Agent Image
+
+# Intentional release only. Pull requests and pushes do not build or publish.
+# Dispatch this workflow on main: publish=false runs the credential-free
+# preflight; publish=true publishes that exact commit after the image CI gate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the exact selected main commit to GHCR
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+  actions: read # inspect the image CI aggregate for the exact selected commit
+
+concurrency:
+  # One publication per commit. A later dispatch of the same SHA queues.
+  # Never cancel an in-progress publish.
+  group: fork-agent-image-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_REPOSITORY: ghcr.io/switchroom/hermes-agent
+  TEST_IMAGE: ghcr.io/switchroom/hermes-agent:sha-${{ github.sha }}
+
+jobs:
+  detect:
+    # Classify the diff once so a change that cannot alter the image (docs,
+    # tests/, website/, CI workflows — all in .dockerignore) neither builds
+    # nor republishes it. Pushes are scoped to the pushed range and PRs to
+    # the PR diff; a dispatch, a forced or first push, or an unreadable diff
+    # fail open (``docker=true``). See scripts/ci/classify_changes.py.
+    name: Detect image inputs
+    if: github.repository == 'switchroom/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      docker: ${{ steps.classify.outputs.docker }}
+    steps:
+      - name: Checkout exact workflow revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Classify changed files
+        id: classify
+        uses: ./.github/actions/detect-changes
+        with:
+          github-token: ${{ github.token }}
+
+  preflight:
+    # publish=false dispatches only. Publication builds and scans its own candidate.
+    needs: detect
+    if: >-
+      needs.detect.outputs.docker == 'true' &&
+      github.repository == 'switchroom/hermes-agent' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.publish != 'true'
+    # ubuntu-latest (26.04) uses the containerd image store, so the exported
+    # image ID no longer equals the pushed config digest the handoff binds to.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact workflow revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      # GITHUB_SHA is the runner's exact checkout identity, passed as quoted data.
+      # .dockerignore drops only root-level __pycache__; bytecode this step
+      # wrote into pm/ changed `COPY pm/ pm/` and rebuilt every dependency stage.
+      - name: Write exact source install stamp
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: >-
+          python3 scripts/write_install_stamp.py --output install-stamp.json
+          --commit "$GITHUB_SHA" --distribution docker --source ci
+          --update-mechanism external
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build complete Agent image without publishing
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.TEST_IMAGE }}
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+            HERMES_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
+          cache-from: type=gha,scope=fork-agent-amd64
+          # mode=min: measured equal on unchanged, app and frontend changes, and
+          # 99-202s faster on empty and pm/ changes (smaller cache upload).
+          cache-to: type=gha,mode=min,scope=fork-agent-amd64,ignore-error=true
+
+      - name: Verify baked revision and runtime command
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+          EXPECTED_IMAGE_IDENTITY: ${{ env.IMAGE_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          docker run --rm --env EXPECTED_REVISION --env EXPECTED_IMAGE_IDENTITY --entrypoint python3 "$TEST_IMAGE" -c '
+          import importlib.metadata as metadata
+          import json, os, pathlib
+          marker = pathlib.Path("/etc/hermes/image-provenance.json")
+          data = json.loads(marker.read_text(encoding="utf-8"))
+          assert data["revision"] == os.environ["EXPECTED_REVISION"], data
+          stamp = json.loads(pathlib.Path("/opt/hermes/install-stamp.json").read_text())
+          assert stamp["commit"] == os.environ["EXPECTED_REVISION"], stamp
+          assert data["image"] == os.environ["EXPECTED_IMAGE_IDENTITY"], data
+          assert data["version"] == metadata.version("hermes-agent"), data
+          '
+          docker run --rm --entrypoint hermes "$TEST_IMAGE" --version
+
+      - name: Verify OAuth recovery in the exact built image
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --entrypoint python3 \
+            --env PYTHONPATH=/opt/hermes \
+            --mount type=bind,src="$PWD/scripts/verify-dashboard-oauth-image.py",dst=/tmp/verify-dashboard-oauth-image.py,readonly \
+            "$TEST_IMAGE" /tmp/verify-dashboard-oauth-image.py
+
+      # Syft (SBOM) and Trivy (critical scan, exit 1) read the same loaded
+      # image ID at the same time: ~60s + ~40s became max() not sum. Both are
+      # gates; the step fails if either fails or the image ID changes.
+      - name: Generate image SBOM and scan critical vulnerabilities
+        uses: ./.github/actions/image-evidence
+        with:
+          image: ${{ env.TEST_IMAGE }}
+          sbom-output: agent-image.spdx.json
+          scan-output: trivy-image.json
+
+      - name: Create bounded package SBOM for attestation
+        run: |
+          set -euo pipefail
+          python3 scripts/compact-spdx-sbom.py \
+            --input agent-image.spdx.json \
+            --output agent-image.attestation.spdx.json \
+            --max-bytes 16777216
+
+      - name: Upload pre-publication evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fork-agent-image-evidence-${{ github.sha }}
+          path: |
+            agent-image.spdx.json
+            agent-image.attestation.spdx.json
+            trivy-image.json
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    # Explicit main dispatch only. A push to main does not publish.
+    needs: detect
+    if: >-
+      needs.detect.outputs.docker == 'true' &&
+      github.repository == 'switchroom/hermes-agent' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.publish == 'true'
+    # ubuntu-latest (26.04) uses the containerd image store, so the exported
+    # image ID no longer equals the pushed config digest the handoff binds to.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: agent-image-publish
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout exact pushed commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      # GITHUB_SHA is the runner's exact checkout identity, passed as quoted data.
+      # .dockerignore drops only root-level __pycache__; bytecode this step
+      # wrote into pm/ changed `COPY pm/ pm/` and rebuilt every dependency stage.
+      - name: Write exact source install stamp
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: >-
+          python3 scripts/write_install_stamp.py --output install-stamp.json
+          --commit "$GITHUB_SHA" --distribution docker --source ci
+          --update-mechanism external
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build exact main candidate without publishing
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.TEST_IMAGE }}
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+            HERMES_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
+          cache-from: type=gha,scope=fork-agent-amd64
+          # mode=min: measured equal on unchanged, app and frontend changes, and
+          # 99-202s faster on empty and pm/ changes (smaller cache upload).
+          cache-to: type=gha,mode=min,scope=fork-agent-amd64,ignore-error=true
+
+      - name: Verify exact scanned candidate runtime
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+          EXPECTED_IMAGE_IDENTITY: ${{ env.IMAGE_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          docker run --rm --env EXPECTED_REVISION --env EXPECTED_IMAGE_IDENTITY --entrypoint python3 "$TEST_IMAGE" -c '
+          import importlib.metadata as metadata
+          import json, os, pathlib
+          data = json.loads(pathlib.Path("/etc/hermes/image-provenance.json").read_text(encoding="utf-8"))
+          assert data["revision"] == os.environ["EXPECTED_REVISION"], data
+          stamp = json.loads(pathlib.Path("/opt/hermes/install-stamp.json").read_text())
+          assert stamp["commit"] == os.environ["EXPECTED_REVISION"], stamp
+          assert data["image"] == os.environ["EXPECTED_IMAGE_IDENTITY"], data
+          assert data["version"] == metadata.version("hermes-agent"), data
+          '
+          docker run --rm --entrypoint hermes "$TEST_IMAGE" --version
+
+      - name: Verify OAuth recovery in the exact scanned candidate
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --entrypoint python3 \
+            --env PYTHONPATH=/opt/hermes \
+            --mount type=bind,src="$PWD/scripts/verify-dashboard-oauth-image.py",dst=/tmp/verify-dashboard-oauth-image.py,readonly \
+            "$TEST_IMAGE" /tmp/verify-dashboard-oauth-image.py
+
+      # Syft (SBOM) and Trivy (critical scan, exit 1) read the same loaded
+      # image ID at the same time: ~60s + ~40s became max() not sum. Both are
+      # gates; the step fails if either fails or the image ID changes.
+      - name: Generate image SBOM and scan critical vulnerabilities
+        uses: ./.github/actions/image-evidence
+        with:
+          image: ${{ env.TEST_IMAGE }}
+          sbom-output: agent-image.spdx.json
+          scan-output: trivy-image.json
+
+      - name: Create bounded package SBOM for attestation
+        run: |
+          set -euo pipefail
+          python3 scripts/compact-spdx-sbom.py \
+            --input agent-image.spdx.json \
+            --output agent-image.attestation.spdx.json \
+            --max-bytes 16777216
+
+      # The build, runtime checks, SBOM, and scan above need no registry
+      # credentials (base images are public), so they overlap with CI. Nothing
+      # below this gate may log in to or write GHCR until the exact-SHA main
+      # image CI aggregate has passed; other products' tests continue in CI.
+      # Missing, failed or stale aggregate proof blocks publication.
+      - name: Verify exact main image CI gate before registry access
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-exact-main-ci.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow "ci.yaml" \
+            --sha "$GITHUB_SHA" \
+            --workflow-path ".github/workflows/ci.yaml" \
+            --required-job "Image required checks pass" \
+            --wait \
+            --timeout-minutes 30 \
+            --interval-seconds 20
+
+      - name: Log in to GHCR after scan and image CI gate
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Push unique scanned candidate and verify immutable handoff
+        id: publish
+        run: |
+          set -euo pipefail
+          CANDIDATE_IMAGE="$IMAGE_REPOSITORY:candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker tag "$TEST_IMAGE" "$CANDIDATE_IMAGE"
+          digest=$(docker push "$CANDIDATE_IMAGE" 2>&1 | tee /dev/stderr | python3 scripts/extract-image-push-digest.py)
+          immutable_ref="$IMAGE_REPOSITORY@$digest"
+          local_image_id=$(docker image inspect --format '{{.Id}}' "$TEST_IMAGE")
+          docker buildx imagetools inspect --raw "$immutable_ref" > remote-manifest.json
+          python3 scripts/verify-remote-image-config.py --image-id "$local_image_id" --manifest remote-manifest.json
+          docker buildx imagetools create --prefer-index=false --tag "$TEST_IMAGE" "$immutable_ref"
+          promoted_digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$TEST_IMAGE")
+          test "$promoted_digest" = "$digest"
+          python3 scripts/emit-image-manifest.py \
+            --repository "$IMAGE_REPOSITORY" \
+            --revision "${{ github.sha }}" \
+            --digest "$digest" \
+            --output agent-image-manifest.json
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest published digest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_REPOSITORY }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest published SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE_REPOSITORY }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          sbom-path: agent-image.attestation.spdx.json
+          push-to-registry: true
+
+      - name: Upload publication evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fork-agent-image-publication-evidence-${{ github.sha }}
+          path: |
+            agent-image.spdx.json
+            agent-image.attestation.spdx.json
+            trivy-image.json
+            remote-manifest.json
+          retention-days: 30
+
+      - name: Upload Fleet handoff manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: agent-image-manifest-${{ github.sha }}
+          path: agent-image-manifest.json
+          if-no-files-found: error
+          retention-days: 90

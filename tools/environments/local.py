@@ -822,6 +822,10 @@ def _path_env_key(run_env: dict) -> str | None:
     return next((k for k in run_env if k.upper() == "PATH"), None) if _IS_WINDOWS else "PATH"
 
 
+# What a running Bot Desktop contributes to terminal children: where GUI apps open, nothing else.
+_BOT_DESKTOP_ROUTING_KEYS = ("DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS")
+
+
 def routed_terminal_base() -> dict:
     """The process env a served profile's terminal children start from. The process env is the
     LAUNCH profile's; under a routed home override its ``.env`` residue is dropped first
@@ -861,14 +865,17 @@ def _make_run_env(env: dict) -> dict:
     # plain ``ls`` must not keep the screen alive past idle_stop_minutes; empty for a screen inside the
     # terminal backend), and it wins over the login snapshot's seat DISPLAY; a user who wants their own
     # seat uses an inline ``DISPLAY=:0 cmd`` prefix, which bash applies after this env. Empty (or module
-    # missing) → the seat env passes through untouched.
+    # missing) → the seat env passes through untouched. Only the display-routing keys ride along: the
+    # launcher also publishes its private XDG_* dirs for the GUI children it spawns, and a terminal
+    # command that inherits them reads gh/git/pip config from the desktop's xfconf home, not the profile's.
     try:
         from tools.bot_desktop.runtime import host_published_env
         published = host_published_env()
     except Exception:
         published = {}
-    if published:
-        run_env.update(published)
+    routing = {k: published[k] for k in _BOT_DESKTOP_ROUTING_KEYS if k in published}
+    if routing:
+        run_env.update(routing)
         run_env.pop("WAYLAND_DISPLAY", None)  # X11 desktop; a leaked Wayland socket flips GTK/Chromium backends
     return run_env
 
@@ -932,7 +939,7 @@ def _prepend_shell_init(cmd_string: str, files: list[str]) -> str:
     return "\n".join(prelude) + "\n" + cmd_string
 
 
-def _append_dropped_path_entries(cmd_string: str, parent_path: str) -> str:
+def _append_dropped_path_entries(cmd_string: str, parent_path: str, *, prefer_parent: bool = False) -> str:
     """Prepend a line that re-appends *parent_path* dirs the login profile dropped.
 
     A login profile can reset PATH outright (Debian's ``/etc/profile``, so every
@@ -942,8 +949,9 @@ def _append_dropped_path_entries(cmd_string: str, parent_path: str) -> str:
     the login PATH in parent order, so a command that resolved before still resolves
     to the same binary (the user's nvm/pyenv keep precedence); only commands that had
     no match gain one. Present entries are never duplicated; missing absolute dirs are skipped.
-    Background commands (``ProcessRegistry.spawn_local``, ``bash -lic``, no snapshot) use
-    this same prelude so the two paths cannot diverge."""
+    Background commands (``ProcessRegistry.spawn_local``, ``bash -lic``, no snapshot) retain
+    that default. Login snapshots set prefer_parent to preserve the explicitly selected
+    session toolchain, deduplicating the combined PATH while retaining init-only tools."""
     if _IS_WINDOWS:
         return cmd_string  # native PATH stays ``;``-joined; bash sees a converted copy
     # Relative entries resolve against the shell's cwd, not ours, so only absolute ones are checked.
@@ -951,6 +959,14 @@ def _append_dropped_path_entries(cmd_string: str, parent_path: str) -> str:
                if d and (not os.path.isabs(d) or os.path.isdir(d))]
     if not entries:
         return cmd_string
+    if prefer_parent:
+        restore = (
+            f"__hermes_path={shlex.quote(':'.join(entries))}:\"$PATH\"; "
+            'PATH=""; while IFS= read -r -d : __hermes_p; do '
+            'case ":$PATH:" in *":$__hermes_p:"*) ;; *) PATH="${PATH:+$PATH:}$__hermes_p" ;; esac; '
+            'done <<< "${__hermes_path}:"; unset __hermes_p __hermes_path; export PATH'
+        )
+        return restore + "\n" + cmd_string
     restore = (f"for __hermes_p in {' '.join(shlex.quote(d) for d in entries)}; do "
                'case ":$PATH:" in *":$__hermes_p:"*) ;; *) PATH="${PATH:+$PATH:}$__hermes_p" ;; esac; '
                "done; unset __hermes_p; export PATH")
@@ -1226,8 +1242,14 @@ class LocalEnvironment(BaseEnvironment):
         and read a different file. On Windows ``_resolve_safe_cwd`` also normalises ``/c/...``."""
         return _resolve_safe_cwd(self.cwd)
 
+    def _spawn_command(self, command, *, yield_handler=None, **kwargs):
+        prepare = getattr(yield_handler, 'prepare_local', None)
+        if sys.platform == 'linux' and callable(prepare):
+            return self._run_bash(command, native_session=prepare(), **kwargs)
+        return self._run_bash(command, **kwargs)
+
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
-                  stdin_data: str | None = None) -> subprocess.Popen:
+                  stdin_data: str | None = None, native_session=None) -> subprocess.Popen:
         bash = _find_bash()
         run_env = _make_run_env(self.env)
         handoff = getattr(self, "_secret_handoff", None)  # absent on bare test doubles (__new__)
@@ -1247,13 +1269,23 @@ class LocalEnvironment(BaseEnvironment):
             generation = handoff.new_generation()
             secret_fd, secret_reader = handoff.start_reader(self._snapshot_write_path(login), generation)
             cmd_string = cmd_string.replace(token, str(secret_fd)).replace(_secret_gen_token(session_id), generation)
-        # Login invocations (init_session's env snapshot) source the user's rc /
-        # custom init files so nvm/asdf/pyenv land on PATH in the snapshot; then the
-        # spawn env's dirs a resetting profile dropped are re-appended (#56634).
+        # Login init contributes its tools, but must not replace the selected
+        # session toolchain's precedence in the persisted snapshot.
         if login:
-            cmd_string = _append_dropped_path_entries(cmd_string, run_env.get("PATH", ""))
+            cmd_string = _append_dropped_path_entries(cmd_string, run_env.get("PATH", ""), prefer_parent=True)
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
+        secret_fds = tuple(fd for fd in (secret_fd, source_fd, restore_fd) if fd >= 0)
+        if native_session is not None:  # the native job helper hands the secret pipes on to bash
+            from tools.process_registry_chat_execution import spawn_foreground
+            try:
+                proc = spawn_foreground(native_session, args, run_env, self._spawn_cwd(), stdin_data,
+                                        pass_fds=secret_fds)
+            finally:
+                for fd in secret_fds:
+                    os.close(fd)
+            proc._hermes_secret_reader = secret_reader
+            return proc
         # Not spawn_owned: an awaited command needs no spawn-ledger entry; own_process_groups below hands
         # its group to the owner-death supervisor and _wait_for_process releases it.
         try:
@@ -1263,12 +1295,10 @@ class LocalEnvironment(BaseEnvironment):
                 stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
                 # detached-spawn: ok — owned via own_process_groups right below
                 start_new_session=True, cwd=self._spawn_cwd(),
-                pass_fds=tuple(fd for fd in (secret_fd, source_fd, restore_fd) if fd >= 0),
-                creationflags=windows_hide_flags() if _IS_WINDOWS else 0)
+                pass_fds=secret_fds, creationflags=windows_hide_flags() if _IS_WINDOWS else 0)
         finally:
-            for fd in (secret_fd, source_fd, restore_fd):
-                if fd >= 0:
-                    os.close(fd)  # the child holds its copy; the reader sees EOF once it is gone
+            for fd in secret_fds:
+                os.close(fd)  # the child holds its copy; the reader sees EOF once it is gone
         proc._hermes_secret_reader = secret_reader
         if not _IS_WINDOWS:
             # The command dies with this process however it dies: a SIGKILLed / OOM-killed host left a
@@ -1321,6 +1351,8 @@ class LocalEnvironment(BaseEnvironment):
 
     def _kill_process(self, proc):
         """Kill the entire process group (all children)."""
+        if getattr(proc, '_hermes_native_foreground', False) is True:
+            return proc.kill()
         try:
             (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
         except OSError:  # ProcessLookupError / PermissionError included
@@ -1329,6 +1361,8 @@ class LocalEnvironment(BaseEnvironment):
 
     def _force_kill_process(self, proc):
         """SIGKILL the whole group with no TERM grace or wait: the caller os._exit()s next."""
+        if getattr(proc, '_hermes_native_foreground', False) is True:
+            return proc.kill()  # Never kill the native job's only surviving reaper.
         if _IS_WINDOWS:  # already a forced tree kill
             return self._kill_process(proc)
         with contextlib.suppress(OSError):

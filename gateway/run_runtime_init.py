@@ -5,6 +5,24 @@ import logging
 
 logger = logging.getLogger("gateway.run")  # log-record parity with gateway/run.py
 
+def _standalone_transport_owner(launch: str) -> str | None:
+    """Use the subscription writer's identity without relabeling a named home."""
+    from hermes_cli.profiles import current_profile_name, normalize_profile_name, validate_profile_name
+
+    owner = normalize_profile_name(current_profile_name(launch) or launch)
+    try:
+        validate_profile_name(owner)
+    except ValueError:
+        # Preserve ordinary startup's invalid-pin handling: no transport alias
+        # and no legacy fallback. Local ownership remains scoped to its home.
+        if launch in {"default", "custom"}:
+            return None
+        raise
+    if launch not in {"default", "custom"} and owner != launch:
+        raise ValueError("Standalone transport owner conflicts with the named profile home")
+    return owner
+
+
 class GatewayRuntimeInitMixin:
     def _init_runtime_settings(self) -> None:
         """Load ephemeral per-call config (prefill, reasoning, busy modes, timeouts, routing)."""
@@ -145,10 +163,28 @@ class GatewayRuntimeInitMixin:
         # host's primary map is always the default profile, even when a named profile launched
         # the process (that launcher is a secondary adapter owner).
         launch = self._active_profile_name()
-        self._kanban_notifier_profile = launch
-        self._primary_profile_name = (
-            "default" if getattr(self.config, "multiplex_profiles", False) else launch
+        multiplex = getattr(self.config, "multiplex_profiles", False)
+        self._primary_profile_name = "default" if multiplex else launch
+        # A standalone launch can pin a transport owner while keeping its local
+        # task/session namespace at default. Never export this alias to routing.
+        self._standalone_transport_profile = None if multiplex else _standalone_transport_owner(launch)
+        self._kanban_notifier_profile = self._standalone_transport_profile or launch
+        from gateway.run import asyncio, os
+        # Execution identity is snapshotted at launch. Routing remains owned by
+        # SessionSource.profile and must never be changed by this export value.
+        configured_runtime_profile = (
+            os.getenv("HERMES_PROFILE") or os.getenv("HERMES_AGENT_PROFILE") or ""
         )
+        try:
+            from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+            configured_runtime_profile = normalize_profile_name(configured_runtime_profile)
+            validate_profile_name(configured_runtime_profile)
+        except (ImportError, ValueError):
+            configured_runtime_profile = ""
+        self._configured_runtime_profile_name = configured_runtime_profile or None
+        self._profile_service_stop = asyncio.Event()
+        self._profile_service_tasks = []
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None

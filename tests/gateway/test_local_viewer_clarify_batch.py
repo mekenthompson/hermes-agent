@@ -113,4 +113,3 @@ def test_a_tui_turn_that_asked_for_the_batch_gets_the_batch_panel(monkeypatch):
     runner._ask_clarify_question = lambda *a, **k: (_ for _ in ()).throw(AssertionError('per-card path used'))
     with session_cli_turn.cli_turn_scope('adm-1', {'clarify_batch': True}):
         assert runner._clarify_callback_sync(QUESTIONS) == {'answers': {'q0': 'red'}, 'outcome': 'submitted'}
-

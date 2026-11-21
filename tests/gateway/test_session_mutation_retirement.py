@@ -6,7 +6,7 @@ import sqlite3
 import httpx
 import pytest
 from websockets.asyncio.client import connect
-from tests.gateway.test_native_http_auth import daemon, ticket, headers
+from tests.gateway.test_native_http_auth import DASHBOARD_TEST_TOKEN, daemon, ticket, headers
 
 
 async def create(home, descriptor):
@@ -46,9 +46,12 @@ def test_native_delete_exact_retry_survives_owner_restart(tmp_path):
         absent = {'ok': True, 'already_absent': True}
         fresh = client.delete(path, params=params | {'request_id': 'different'}, headers=headers(ticket(home, descriptor)))
         assert fresh.status_code == 200 and fresh.json() == absent, fresh.text
-        # The dashboard login is the owner, so its exact retry replays the owner's receipt.
-        login = client.delete(path, params=params, headers={'Authorization': 'Bearer normal-http-owner'})
+
+        # The configured dashboard login is the machine owner, so its exact retry replays the
+        # owner's receipt. The bearer is the disposable token the daemon was launched with.
+        login = client.delete(path, params=params, headers={'Authorization': f'Bearer {DASHBOARD_TEST_TOKEN}'})
         assert login.status_code == 200 and login.json() == receipt, login.text
+
     print(json.dumps({'native_delete_restart': receipt, 'changed_retry': changed.json(),
                       'fresh_request_status': fresh.status_code, 'login_status': login.status_code}))
 

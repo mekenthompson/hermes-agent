@@ -1,0 +1,11 @@
+{
+  "email": "noreply@vet402.com",
+  "commits": [
+    {
+      "sha": "65a1b850eefd11970495018bdb963149d9e51878",
+      "name": "vet402",
+      "source_url": "https://github.com/NousResearch/hermes-agent/commit/65a1b850eefd11970495018bdb963149d9e51878",
+      "reason": "Official Nous commit API reports no linked author account. Preserve the exact upstream git author; this declaration does not cover any other commit with this email."
+    }
+  ]
+}

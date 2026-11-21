@@ -37,6 +37,38 @@ def test_store_offers_every_core_session_db_call(name):
     assert hasattr(RuntimeSessionStore, name), f'RuntimeSessionStore lacks {name}'
 
 
+def test_checkpoint_display_reads_match_owner_and_legacy_payload(tmp_path):
+    from persistence.conversation.messages import ConversationRequest
+
+    db = open_persistence(profile_scope(home=tmp_path))
+    try:
+        seed_session(db, 's', 'cli')
+        seed_messages(db, 's', {'role': 'user', 'content': 'q'})
+        db.messages.append_display_checkpoint('s', 'checkpoint-1', '# Update\n\nEvidence.', board='default', task_id='t_1')
+        epoch = db.runtime.begin_epoch(instance_id='fixture')
+        scope = dict(epoch=epoch, execution_id='w', session_id='s', generation=0)
+        db.worker_executions.register(**scope, kind='compute', adoption_secret='secret')
+        store = RuntimeSessionStore(lambda method, **p: db.worker_executions.persist_operation(**p), scope,
+                                    tmp_path / 'outbox')
+
+        def owner(display):
+            return [(m['role'], m['content']) for m in (r.as_openai_message() for r in db.messages.read_conversation(
+                's', ConversationRequest(include_display_only=display)))]
+        try:
+            for display in (False, True):
+                worker = store.get_messages_as_conversation('s', include_display_only=display)
+                assert [(m['role'], m['content']) for m in worker] == owner(display)
+            assert len(owner(True)) == 2 and owner(False) == [('user', 'q')]
+            # A worker built before the display flag sends five flags: checkpoints stay out of history.
+            legacy = store._apply('compression.history', dict(target='s', include_ancestors=False,
+                include_inactive=False, repair_alternation=False, include_row_ids=False, include_compacted=False))
+            assert [(row['role'], row['content']) for row in legacy['messages']] == [('user', 'q')]
+        finally:
+            store.close()
+    finally:
+        db.close()
+
+
 def test_tail_reads_answer_like_the_owner(tmp_path):
     db = open_persistence(profile_scope(home=tmp_path))
     try:

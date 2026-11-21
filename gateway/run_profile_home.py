@@ -1,6 +1,7 @@
 """Which profile's HERMES_HOME serves an inbound source (``GatewayRunner._resolve_profile_home_for_source``)."""
 
 import logging
+import os
 from pathlib import Path
 
 logger = logging.getLogger("gateway.run")
@@ -36,6 +37,10 @@ def resolve_profile_home_for_source(runner, source) -> Path:
         explicit_profile = name or None
         if not name:
             name = get_active_profile_name() or "default"
+        runtime_profile = (
+            os.getenv("HERMES_PROFILE") or os.getenv("HERMES_AGENT_PROFILE") or "").strip()
+        if explicit_profile and name == runtime_profile:
+            return get_hermes_home()
         profile_dir = get_profile_dir(name)
         if explicit_profile and multiplexed and (
                 not profile_exists(name) or normalize_profile_name(name) not in _served_names(config)):

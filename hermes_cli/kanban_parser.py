@@ -282,6 +282,8 @@ _SPECS = [
         _arg("text", nargs="+", help="Comment body"),
         _arg("--author", help="Author name (default: $HERMES_PROFILE or 'user')"),
         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
+        _arg("--human-checkpoint", action="store_true", help="Deliver this exact Markdown body to subscribed humans"),
+        _arg("--request-id", help="Stable ID required for an explicit human checkpoint"),
     ], help="Append a comment"),
     _cmd("attach", [
         _TASK_ID,
@@ -316,6 +318,8 @@ _SPECS = [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
         _bulk_ids("block"),
+        _arg("--expected-event-id", type=int,
+             help="Only change this single task if its latest event still matches show --json."),
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
              help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
                   "parents finish, no human); 'needs_input'/'capability' go to "
@@ -331,7 +335,9 @@ _SPECS = [
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
-    ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+        _arg("--expected-event-id", type=int,
+             help="Only resume this single task if its latest event still matches show --json."),
+    ], help="Return blocked/scheduled tasks (or block-loop triage) to ready, or todo while parents remain open"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

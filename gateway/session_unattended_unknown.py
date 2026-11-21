@@ -48,6 +48,9 @@ def settle_recovered_unattended(store, epoch) -> int:
     from persistence.core.errors import AuthorityRefusal
     settled = 0
     for row in _unattended_unknown(store.admissions.list_unknown()):
+        from gateway.session_ancillary import process_stop_pending
+        if process_stop_pending(store, row['target_session_id']) is not None:
+            continue  # a native process Stop still fences it: its owner reconciles (settle_replaced_card_attempts)
         try:
             store.admissions.resolve_unknown(epoch=epoch, admission_id=row['admission_id'],
                                              generation=row['generation'], notice=AUTOMATION_INTERRUPTED_NOTICE)

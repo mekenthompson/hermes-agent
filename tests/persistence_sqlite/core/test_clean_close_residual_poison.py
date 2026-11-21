@@ -27,7 +27,7 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
     create_session(db, "synthetic", "cli")
     conn = db._conn
     assert db._db_sidecar_identity and path.with_name(path.name + "-wal").exists()
-    lock, close, guard = db._lock, db._close_connection_quietly, db._raise_if_db_replaced
+    lock, close, guard = db._lock, db._close_connection_cleanly, db._raise_if_db_replaced
     closed, progress, second = threading.Event(), threading.Event(), threading.Event()
     calls = 0
     errors = []
@@ -73,7 +73,7 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
             assert progress.wait(10), "writer reached neither guard nor lock"
 
     monkeypatch.setattr(db, "_lock", ObservedLock())
-    monkeypatch.setattr(db, "_close_connection_quietly", paused_close)
+    monkeypatch.setattr(db, "_close_connection_cleanly", paused_close)
     monkeypatch.setattr(db, "_raise_if_db_replaced", observed_guard)
     if entry == "vacuum":  # the store admin's vacuum runs on the registry's writer for the file: lend it this handle
         monkeypatch.setattr(_registry, "acquire", lambda _path: db)

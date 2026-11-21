@@ -73,9 +73,38 @@ def real_profile_key() -> str:
 
 
 def terminate_real_profile_browser() -> None:
-    """Stop this profile's real-profile browser if this process launched it (idempotent)."""
+    """Stop this caller's real-profile browser; consent cleanup handles retained copies."""
     from tools.browser_launcher import stop_browser
-    stop_browser(real_profile_key())
+    stop_browser(real_profile_key(), force=True)
+
+
+def retire_profile_snapshots(home) -> None:
+    """Delete each inactive copy under its launch lock; never sweep a newly active tree."""
+    import errno
+    from tools.browser_launcher import retire_shared_profile
+    from tools.browser_launcher_lifecycle import cleanup_guard
+
+    root = home / 'browser-profile'
+    if root.is_symlink() or not root.is_dir():
+        return
+    for directory in root.iterdir():
+        if directory.is_dir() and not directory.is_symlink():
+            retire_shared_profile(str(directory), profile_home=str(home))
+        else:
+            with cleanup_guard(str(home)) as admitted:
+                if admitted:
+                    directory.unlink(missing_ok=True)
+    with cleanup_guard(str(home)) as admitted:
+        if not admitted:
+            return
+        try:
+            root.rmdir()  # only empty: a concurrent launch may have created another copy
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if exc.errno != errno.ENOTEMPTY:
+                raise
+            logger.info("real-profile: snapshot cleanup deferred while a copy remains in use")
 
 
 def _consent_revoked() -> tuple[None, None]:

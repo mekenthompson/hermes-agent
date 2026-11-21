@@ -154,5 +154,3 @@ def settle_interrupted_claim() -> bool:
     mark_machine_used()
     logger.info("Nous free tier: an interrupted welcome-trial claim was settled")
     return True
-
-

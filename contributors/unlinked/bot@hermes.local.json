@@ -1,0 +1,11 @@
+{
+  "email": "bot@hermes.local",
+  "commits": [
+    {
+      "sha": "97ac7cae9c4532c475d743f26c0095bbcff8856c",
+      "name": "beads-mechanic",
+      "source_url": "https://github.com/NousResearch/hermes-agent/commit/97ac7cae9c4532c475d743f26c0095bbcff8856c",
+      "reason": "Official Nous commit API reports no linked author account. Preserve the exact upstream git author; this declaration does not cover any other commit with this email."
+    }
+  ]
+}

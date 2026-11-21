@@ -1222,12 +1222,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
-                # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
-                # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation never reaches
-                # ``_record_task_failure`` (which stamps this column), yet the
-                # board UI and retry worker need the corrective message.
+            owner_stopped = bool(dead.event_payload.get("owner_stopped"))  # a planned gateway stop: never counted
+            if dead.rate_limited or dead.protocol_violation or owner_stopped:
+                # Stamp last_failure_error WITHOUT touching ``consecutive_failures``: a rate-limited requeue
+                # must show ``check_respawn_guard`` a quota blocker; the others never reach
+                # ``_record_task_failure`` (which stamps it), yet the board UI and retry worker need the message.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),
@@ -1236,7 +1235,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 sweep.rate_limited.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
-                sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+                if not owner_stopped:
+                    sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
     return sweep
 
 
@@ -1642,18 +1642,18 @@ def check_respawn_guard(
     #    Exception: a handoff AFTER the newest PR comment (operator reassign,
     #    reviewer changes_requested, review reopen) names the profile that must
     #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
-    pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
-                                          cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
-    if pr_times:
+    #    duplicate implementation (#111910). A crash/reclaim is not a handoff and
+    #    stays guarded; a planned gateway stop is lifted in ``pr_wait_lifted``.
+    pr_hits = [(t, _RESPAWN_GUARD_PR_URL_RE.findall(_kb._lossy_text(c["body"]) or "")) for t, c in _rows_since(
+        conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW, cols=", body", unreadable=now)]
+    if pr_times := [t for t, urls in pr_hits if urls]:  # unreadable time: duplicate-PR risk, fail closed
         # Strictly after: a same-second tie stays guarded (fail closed).
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
                 conn, "task_events", task_id, max(pr_times),
                 "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
             return None
-        return "active_pr"
+        lifted = _guard_wait.pr_wait_lifted(conn, task_id, [u for _, urls in pr_hits for u in urls])
+        return None if lifted else "active_pr"
 
     return None
 
@@ -2100,16 +2100,8 @@ def _dispatch_lane_task(
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
-        # Event so ``hermes kanban tail`` shows why the task looks stuck.
-        # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
-        # operator-configured fallback exists, persist the assignment and proceed. This removes the
-        # dashboard footgun where a task created without an assignee parks in 'ready' forever even though
-        # the operator's intent ("default") was perfectly clear (#27145). Mutating the row (not just the
-        # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
-        # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
         if not dry_run:
-            with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+            _guard_wait.record_respawn_guard(conn, task_id, guard_reason, lane=lane)
         return False
 
     def _count_spawn(name: str) -> None:
@@ -2199,6 +2191,7 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    result.promoted += _guard_wait.release_parked(conn)
 
 
 def _tick_spawn_budget(
@@ -2903,3 +2896,4 @@ from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_default_assignee as _kbda
 from hermes_cli import kanban_db_workspace as _kbw
+from hermes_cli import kanban_db_guard_wait as _guard_wait

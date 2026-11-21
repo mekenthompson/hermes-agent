@@ -52,3 +52,17 @@ def test_nonpositive_clarify_timeout_waits_unbounded(tmp_path, monkeypatch, body
     monkeypatch.setattr(worker.threading, 'Event', _Event)
     assert _controls()._ask('q?', [], False) is None
     assert waits == [None]
+
+
+def test_private_cancellation_is_exact_and_never_an_answer():
+    from agent import managed_worker as worker
+    controls = _controls()
+    state = {'event': threading.Event(), 'answer': None}
+    controls.clarifications['current'] = state
+    controls.prompt_control({'type': 'clarify_cancel', 'prompt_id': 'older'})
+    assert not state['event'].is_set()
+    with pytest.raises(ValueError, match='invalid_managed_control'):
+        controls.prompt_control({'type': 'clarify_cancel', 'prompt_id': 'current', 'value': 'Blue'})
+    assert not state['event'].is_set()
+    controls.prompt_control({'type': 'clarify_cancel', 'prompt_id': 'current'})
+    assert state['event'].is_set() and state['answer'] is worker._INTERRUPTED

@@ -157,6 +157,53 @@ def cleanup_single_session(cache_key: str) -> None:
         logger.debug("Closed browser session %s", cache_key)
 
 
+def detach_shared_browsers(profile_home: Optional[str] = None) -> int:
+    """Disconnect this process's local persistent sessions, retaining their browser.
+
+    Short-lived native clients call this before their normal process exit.
+    Shared tabs, cookies and human control outlive that client's connections.
+    Cloud, sandbox and throwaway browser lifecycles remain unchanged.
+    """
+    from tools.browser_launcher import detach_browser, get_browser
+    from tools.browser_session_cdp import stop_cdp_supervisor
+    from hermes_constants import hermes_home_key
+
+    bs = _bs()
+    home_key = hermes_home_key(profile_home) if profile_home else hermes_home_key()
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    SUPERVISOR_REGISTRY.stop_shared_home(home_key)
+    with bs._cleanup_lock:
+        sessions = list(bs._active_sessions.items())
+    other_keys = {info.get('launcher_key') for _key, info in sessions if info.get('home_key') != home_key}
+    detached_keys = set()
+    count = 0
+    for key, info in sessions:
+        if info.get("home_key") != home_key:
+            continue
+        launcher_key = info.get("launcher_key")
+        if not launcher_key or not (info.get("features") or {}).get("local"):
+            continue
+        browser = get_browser(launcher_key)
+        if launcher_key not in detached_keys and (browser is None or browser.ephemeral):
+            continue
+        stop_cdp_supervisor(key)
+        if launcher_key not in detached_keys:
+            from tools.browser_launcher_lifecycle import retain_shared_browser
+            release = retain_shared_browser if launcher_key in other_keys else detach_browser
+            if not release(launcher_key):
+                continue
+            detached_keys.add(launcher_key)
+        with bs._cleanup_lock:
+            if bs._active_sessions.get(key) is info:
+                bs._active_sessions.pop(key)
+        _forget_session_tracking(key)
+        count += 1
+    # Consented browser_exec resolves its real-profile launcher directly and
+    # never publishes an _active_sessions row. It still belongs to this caller.
+    from tools.browser_launcher_lifecycle import detach_profile_browsers
+    return count + detach_profile_browsers(home_key, keep_keys=other_keys, skip_keys=detached_keys)
+
+
 def cleanup_browser(task_id: Optional[str] = None) -> None:
     """Close the sessions serving ``task_id``: its exact key, its hybrid ``::local`` sidecar, and the
     served-profile-tagged keys browser_exec builds for it (``<task>@<home>``). Per-turn cleanup calls this

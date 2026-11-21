@@ -475,7 +475,7 @@ platforms:
 | `platforms.slack.extra.feedback_buttons` | `false` | When `true` with `rich_blocks`, appends Slack-native feedback controls to final replies. |
 | `platforms.slack.extra.native_task_cards` | `false` | When `true`, renders live tool calls as Slack-native plan/task cards. Cards work with Slack's built-in default `tool_progress: off`; an explicitly configured `display.tool_progress: off` (global or `display.platforms.slack`; `/verbose` writes the same key) disables cards too. Cards need a thread: when the card lane is active and the chat has no thread to anchor on (a top-level DM with `reply_in_thread: false`), Hermes shows no tool progress instead of text bubbles, unless you explicitly set `tool_progress: new`/`all`, which falls back to editable text progress there. Recoverable native API failures fall back to one continuously edited text update. |
 | `platforms.slack.extra.suggested_prompts` | `[]` | Up to four `{title, message}` prompts for Agent/Assistant DM entry points; accepts either a list or `{title, prompts}`. |
-| `platforms.slack.extra.assistant_thread_titles` | `true` | When `true`, names Agent/Assistant DM threads from the first user message. |
+| `platforms.slack.extra.assistant_thread_titles` | `true` | When `true`, initially names supported Agent/Assistant DM threads from the first user message, then replaces that provisional title once with a generated session title when available. If Slack has not opened an agent session yet, Hermes creates one before renaming. Requires auxiliary title generation for the generated title; manually named Hermes sessions are not forwarded through this automatic lane. Ordinary channel threads are not renamed. |
 | `platforms.slack.extra.allow_bots` | `"none"` | Controls messages from other Slack bots: `"none"` ignores them, `"mentions"` accepts a bot message only when **that message itself** @mentions Hermes, and `"all"` accepts all of them. Use `"mentions"` for the safest bot-to-bot collaboration mode. See [Accepting messages from other bots](#accepting-messages-from-other-bots-allow_bots). |
 | `platforms.slack.extra.api_human_users` | `[]` | Slack user IDs whose **Web-API (user-token) posts count as human**. Such posts carry the posting `app_id` and no `client_msg_id`, so by default they are dropped as app traffic; allowlist your own front-end's users here instead of `allow_bots: all`. See [Treating your own app's user-token posts as human](#treating-your-own-apps-user-token-posts-as-human-api_human_users). |
 | `platforms.slack.extra.cron_continuable_surface` | `"thread"` | Delivery surface for [continuable cron jobs](../features/cron.md#flat-in-channel-continuation-slack). `"thread"` opens a dedicated thread per delivery (default); `"in_channel"` delivers flat into the channel timeline. Pair `in_channel` with `reply_in_thread: false` (and `require_mention: false`) so a plain channel reply continues the job. |
@@ -649,6 +649,15 @@ slack:
   # Opt-in; default off. Env: SLACK_THREAD_REQUIRE_MENTION.
   thread_require_mention: false
 
+  # In listed channels, retain automatic follow-ups only after this bot has
+  # been mentioned, has an active session, or authored the thread root. This
+  # explicit per-channel opt-in takes precedence over strict_mention and
+  # thread_require_mention for those FOLLOW-UPS, never top-level messages.
+  # This keeps separate agents from joining each other's threads.
+  # Comma-separated IDs or a list.
+  # Env: SLACK_THREAD_PARTICIPATION_CHANNELS.
+  thread_participation_channels: ""
+
   # Let a bare silence marker stand on unaddressed replies in a channel
   # thread the bot follows. Without it, when a human in that thread talks
   # to someone else without @mentioning them and the model answers with
@@ -703,10 +712,11 @@ The gating options compose — each answers a different question:
 | `free_response_channels` | Which channels are exempt from `require_mention`? | none | Listed channels |
 | `require_mention_channels` | Which channels ALWAYS need an @mention, even when `require_mention` is `false` or the channel is free-response? Wins over both. | none | Listed channels |
 | `thread_require_mention` | Do **thread replies** need an @mention, even when top-level messages don't? Mentioned threads are not remembered. | `false` | Threads only |
+| `thread_participation_channels` | Which channels opt into follow-ups only for threads this bot already participates in? Takes precedence over `strict_mention` and `thread_require_mention` for those follow-ups; never changes top-level gating. | none | Listed channel threads |
 | `strict_mention` | Does **every** channel message (top-level and thread) need a fresh @mention? Disables all auto-follow: mentioned-thread memory, bot-reply follow-ups, active-session resume. | `false` | All channels + threads |
 | `ignore_other_user_mentions` | Should a message that **opens by @mentioning someone else** (`@rasha can you take this?`) be skipped? Overrides free-response and thread auto-follow; mid-sentence references still reach the bot. | `false` | Channels + group DMs |
 
-Rules of thumb: `strict_mention` is the broadest hammer; `thread_require_mention` quiets busy threads without touching top-level gating; `require_mention_channels` re-tightens individual channels on an otherwise free-response bot; `ignore_other_user_mentions` only skips messages explicitly addressed to another person. 1:1 DMs always respond and are unaffected by all of these.
+Precedence: `thread_participation_channels` is an explicit, narrow exception. In a listed channel, an unmentioned **thread reply** is considered only when Hermes already participates (a prior mention, active session, or bot-authored root); it then wins over `strict_mention` and `thread_require_mention`. It does not make Hermes answer top-level messages, uninvited threads, or threads in unlisted channels. Outside listed channels, the legacy `strict_mention` and `thread_require_mention` rules apply unchanged. `ignore_other_user_mentions` still wins and skips messages explicitly addressed to another person. 1:1 DMs always respond and are unaffected by all of these.
 
 ### Accepting messages from other bots (`allow_bots`)
 

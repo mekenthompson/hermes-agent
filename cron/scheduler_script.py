@@ -445,7 +445,9 @@ def _script_argv(
 
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
-    cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None,
+    execution_id: Optional[str] = None,
+    interpreter: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -498,6 +500,12 @@ def _run_job_script(
         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
+        # Scripts may inspect their own durable execution without guessing from
+        # a shared scheduler PID. Never inherit a stale value from the gateway.
+        if execution_id:
+            env["HERMES_CRON_EXECUTION_ID"] = execution_id
+        else:
+            env.pop("HERMES_CRON_EXECUTION_ID", None)
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -584,6 +592,17 @@ def _run_job_script_with_claim_heartbeat(
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    raw_execution_id = job.get("execution_id")
+    # Persisted execution IDs are opaque strings. Do not coerce malformed values:
+    # scripts must see the exact durable ID or no execution context at all.
+    execution_id = raw_execution_id if isinstance(raw_execution_id, str) and raw_execution_id else None
+
+    def run() -> tuple[bool, str]:
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event,
+            execution_id=execution_id, interpreter=job.get("interpreter"),
+        )
+
     if not (isinstance(schedule, dict) and schedule.get("kind") == "once" and owner):
         return run()
 

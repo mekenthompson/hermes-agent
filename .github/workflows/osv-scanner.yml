@@ -22,6 +22,12 @@ name: OSV-Scanner
 # vulnerabilities in pinned deps that we may need to patch deliberately.
 
 on:
+  workflow_call:
+    inputs:
+      commit:
+        description: Commit to test and build. Empty keeps the triggering commit.
+        type: string
+        default: ''
   schedule:
     # Weekly scan against main — catches CVEs published after merge for
     # deps that haven't changed since.

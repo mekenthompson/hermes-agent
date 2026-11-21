@@ -127,6 +127,40 @@ _GUARDS = {
 _DIFF_GUARDS = {"blob-size": ["scripts/ci/check_blob_size.py"]}
 _CHECKS = (*_GUARDS, *_DIFF_GUARDS, "ruff", "health")
 
+# Narrow exception for this authorized reconciliation only. Both commits must be
+# ancestors of the tested head; callers cannot supply alternative exemption refs.
+_ALIGNMENT_BRANCH = "house/reconcile-nous-c9b20d7bc08dec1e10779a06d7d9073bc6e7e418"
+_ALIGNMENT_PARENTS = ("f6ac86b0ef3d5e86654132b8aba1ce6f1de45b5e",
+                     "c9b20d7bc08dec1e10779a06d7d9073bc6e7e418")
+# The fork moved from mekenthompson to switchroom; older clones keep the redirected origin.
+_FORK_REPOSITORIES = ("switchroom/hermes-agent", "mekenthompson/hermes-agent")
+_FORK_ORIGINS = tuple(url for repo in _FORK_REPOSITORIES
+                      for url in (f"https://github.com/{repo}.git", f"https://github.com/{repo}",
+                                  f"git@github.com:{repo}.git", f"git@github.com:{repo}"))
+
+
+def _alignment_parents(head: str | None) -> tuple[str, ...]:
+    branch = os.environ.get("GITHUB_HEAD_REF") or gitio.git(REPO, "branch", "--show-current").strip()
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    origin = gitio.git(REPO, "remote", "get-url", "origin", check=False).strip().lower()
+    if branch != _ALIGNMENT_BRANCH or repository not in ("", *_FORK_REPOSITORIES):
+        return ()
+    if repository and os.environ.get("CI_PR_HEAD_REPOSITORY") != repository:
+        return ()
+    if origin not in _FORK_ORIGINS:
+        return ()
+    target = head or "HEAD"
+    for parent in _ALIGNMENT_PARENTS:
+        resolved = gitio.commit_or_none(REPO, parent)
+        if not resolved:
+            raise RuntimeError(f"authorized alignment parent is missing: {parent}")
+        proc = subprocess.run(["git", "merge-base", "--is-ancestor", resolved, target],
+                              cwd=REPO, stdin=subprocess.DEVNULL, capture_output=True,
+                              timeout=60, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(f"authorized alignment parent is not an ancestor: {resolved}")
+    return _ALIGNMENT_PARENTS
+
 
 @dataclass
 class _Job:
@@ -174,7 +208,8 @@ def _tree_snapshot(tree: str) -> Iterator[tuple[Path, dict[str, str]]]:
 
 
 def _jobs(names: list[str], base: str | None, head: str | None,
-          root: Path = REPO, env: dict[str, str] | None = None) -> dict[str, _Job]:
+          root: Path = REPO, env: dict[str, str] | None = None,
+          inherited: tuple[str, ...] = ()) -> dict[str, _Job]:
     jobs: dict[str, _Job] = {}
     for name in names:  # built only when selected: `--only shebangs` needs no ruff
         if name in _GUARDS:
@@ -193,6 +228,8 @@ def _jobs(names: list[str], base: str | None, head: str | None,
             health = [sys.executable, "-m", "scripts.code_health"]
             health += ["--base", base] if base else []
             health += ["--head", head] if head else []
+            for parent in inherited:
+                health += ["--inherited-base", parent]
             jobs[name] = _Job(health, root, env)
     return jobs
 
@@ -204,7 +241,8 @@ def _run_jobs(jobs: dict[str, _Job]) -> dict[str, tuple[int, str]]:
 
 def _run_all(args: argparse.Namespace) -> dict[str, tuple[int, str]]:
     if not (args.staged or args.commit):
-        return _run_jobs(_jobs(args.only, args.base, None))
+        return _run_jobs(_jobs(args.only, args.base, None,
+                               inherited=_alignment_parents(None)))
     # Hooks judge the bytes being committed or pushed, never the working tree. Without --base the
     # ratchet derives the base from the head (a commit's own merge-base) and the switch from main.
     if args.staged:
@@ -213,7 +251,8 @@ def _run_all(args: argparse.Namespace) -> dict[str, tuple[int, str]]:
         head = gitio.resolve_rev(REPO, args.commit)
         tree = gitio.resolve_tree(REPO, head)
     with _tree_snapshot(tree) as (root, env):
-        return _run_jobs(_jobs(args.only, args.base, head, root, env))
+        inherited = _alignment_parents(head)
+        return _run_jobs(_jobs(args.only, args.base, head, root, env, inherited))
 
 
 def _hooks_dir() -> Path:

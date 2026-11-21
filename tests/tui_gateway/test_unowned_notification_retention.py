@@ -42,8 +42,9 @@ def _delegation(delegation_id: str = "deleg_owner1", **extra) -> dict:
 
 
 def _registry() -> SimpleNamespace:
+    # ``get``: the house approval-reservation lookup reads the producer from the registry.
     return SimpleNamespace(completion_queue=queue.Queue(), is_completion_consumed=lambda _sid: False,
-                           restore_completions=lambda: 0)
+                           restore_completions=lambda: 0, get=lambda _sid: None)
 
 
 def _parked() -> list:

@@ -526,6 +526,8 @@ class ConversationRequest:
     include_lineage: bool = False
     repair_alternation: bool = False
     include_row_ids: bool = False
+    #: House: keep display-only ``kanban_checkpoint`` rows (the DISPLAY view always keeps them); never model input.
+    include_display_only: bool = False
 
 
 # Replay dict keys after role, content and the born-durable marker, in emission order, with the record field each maps to.

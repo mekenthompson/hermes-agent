@@ -15,7 +15,7 @@ from pathlib import Path
 
 def resolve_session_token() -> str:
     env_token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN")
-    if not env_token:
+    if env_token is None:
         return secrets.token_urlsafe(32)
     # A "file:" prefix means the value is a token-file path, not a token:
     # deployment managers (agenix, sops-nix, systemd credentials) hand a
@@ -34,5 +34,7 @@ def resolve_session_token() -> str:
             raise SystemExit(
                 f"HERMES_DASHBOARD_SESSION_TOKEN names an empty token file ({token_file})"
             )
-        return token
+        env_token = token
+    if len(env_token) < 32:
+        raise ValueError("HERMES_DASHBOARD_SESSION_TOKEN must be at least 32 characters")
     return env_token

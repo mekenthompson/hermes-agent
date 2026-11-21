@@ -226,6 +226,7 @@ app.include_router(_memory_oauth_router)
 # web_server_session_token sibling; it dies with the process and is injected
 # into the SPA HTML so only the web UI can use it.
 _SESSION_TOKEN = resolve_session_token()
+_SESSION_TOKEN_IS_EXPLICIT = "HERMES_DASHBOARD_SESSION_TOKEN" in os.environ
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _SSH_OWNER_NONCE: Optional[str] = None
 _SSH_RUNTIME_PURELIB: Optional[tuple[str, int, int]] = None
@@ -312,11 +313,37 @@ def _has_valid_session_token(request: Request) -> bool:
     return hmac.compare_digest(auth.encode(), f"Bearer {_SESSION_TOKEN}".encode())
 
 
+def _has_valid_explicit_session_token(request: Request) -> bool:
+    """True only when the operator configured the matching dashboard token."""
+    if not _SESSION_TOKEN_IS_EXPLICIT:
+        return False
+    session_header = request.headers.get(_SESSION_HEADER_NAME, "")
+    return bool(session_header) and hmac.compare_digest(
+        session_header.encode(), _SESSION_TOKEN.encode()
+    )
+
+
+def _explicit_session_token_session():
+    """Return the stable synthetic identity for an explicit dashboard token."""
+    from hermes_cli.dashboard_auth.base import Session
+
+    return Session(
+        user_id="dashboard-session-token",
+        email="",
+        display_name="Dashboard session token",
+        org_id="",
+        provider="dashboard-session-token",
+        expires_at=2**63 - 1,
+        access_token="",
+        refresh_token="",
+    )
+
+
+# Routes that may also authenticate via ``?token=`` (download links opened by
+# the OS shell / a new tab, where no header can be set). Kept narrow.
 # Routes that may also authenticate via ``?token=`` for Electron's remote
 # "open externally" download link. Browser pages use path-bound file tickets
-# instead (``web_server_file_tickets``), so the session token never lands in
-# their download history or a copyable media URL. The OAuth gate still requires
-# its session cookie; query credentials are only accepted by the loopback gate.
+# instead, so session credentials never land in browser download URLs.
 _QUERY_TOKEN_API_PATHS: frozenset[str] = frozenset({"/api/files/download"})
 
 
@@ -1026,14 +1053,15 @@ def _configure_auth_gate(
         )
 
     if app.state.auth_required:
-        # No escape hatch serves a gated dashboard without a provider.
+        # A configured administrator token is a valid remote credential; a
+        # generated process token is deliberately not.
         from hermes_cli.dashboard_auth import list_providers
-        if not list_providers():
+        if not list_providers() and not _SESSION_TOKEN_IS_EXPLICIT:
             raise SystemExit(_no_auth_provider_message(host))
         _log.info(
             "Dashboard binding to %s with auth gate enabled. Providers: %s",
             host,
-            ", ".join(p.name for p in list_providers()),
+            ", ".join(p.name for p in list_providers()) or "explicit dashboard session token",
         )
 
 
@@ -1085,6 +1113,7 @@ def _build_uvicorn_server(host: str, port: int, *, ssh_isolated: bool = False):
     _uvicorn_console_logging()  # log_config=None: uvicorn's dictConfig would close every live handler
     config = uvicorn.Config(
         served_app, host=host, port=port, log_level="warning", log_config=None,
+        access_log=False,
         # Off by default so _ws_client_is_allowed sees the real peer, not
         # X-Forwarded-For. Gated mode runs behind a TLS terminator and needs
         # X-Forwarded-Proto for cookie Secure flags.

@@ -59,7 +59,9 @@ from persistence.sqlite._state.dbfile import (
 from persistence.sqlite._state.repair import _claim_repair_attempt, preflight_db_writability, repair_state_db_schema
 from persistence.conversation.messages import ReadCheck
 from persistence.core.errors import CompressionInProgress, DeclarativeDrift
-from sqlite_support import _on_disk_journal_mode, apply_database_pragmas, apply_wal_with_fallback
+from sqlite_support import (
+    _on_disk_journal_mode, apply_database_pragmas, apply_wal_with_fallback, disable_close_time_wal_reset,
+)
 from storage_errors import is_malformed_db_error, is_sqlite_lock_error
 from storage_user_copy import set_last_init_error
 
@@ -285,13 +287,86 @@ class StoreHolder:
         if conn is None:
             return
         try:
+            disable_close_time_wal_reset(conn)
             conn.close()
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
+    def _retire_failed_init_wal(self, conn: Optional[sqlite3.Connection]) -> None:
+        """House: a failed first open must not strand the -wal/-shm it just created.
+
+        The failed handle closes with close-time reset disabled (another process may hold the
+        generation), so its sidecars would outlive it. Leaving WAL is SQLite's exclusive,
+        lock-aware last-holder check: it fails while anyone else holds the generation and removes
+        the sidecars when none does. The next opener re-applies the configured journal mode.
+        """
+        if conn is None:
+            return
+        try:
+            if _stat_sqlite_sidecar_identity(self.db_path):
+                conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+        except sqlite3.Error as exc:
+            logger.debug("WAL sidecar retirement after a failed open deferred for %s: %s", self.db_path, exc)
+
+    def _close_connection_cleanly(self, conn: Optional[sqlite3.Connection]) -> bool:
+        """House: protect close-time reset, then retire an empty WAL generation through SQLite.
+
+        SQLite's close-time reset is unsafe while another process holds the generation, so arm
+        NO_CKPT_ON_CLOSE first. Before closing this handle, the finalizer uses SQLite's exclusive
+        journal-mode transition to remove sidecars only when the generation is quiescent.
+        """
+        if conn is None:
+            return False
+        disable_close_time_wal_reset(conn)
+        finalized = self._finalize_clean_close_wal_generation(conn)
+        if finalized:
+            # Publish the completed generation transition before any lock-free guard can observe it.
+            self._db_sidecar_identity = {}
+        try:
+            conn.close()
+        except Exception:  # health: allow BLE001 -- a failed close is logged; the generation identity is kept
+            logger.debug("Could not close a SessionDB connection", exc_info=True)
+            return False
+        return finalized
+
+    def _finalize_clean_close_wal_generation(self, conn: sqlite3.Connection) -> bool:
+        """House: safely retire clean-close sidecars without unlinking a live WAL generation.
+
+        Switching WAL -> DELETE is SQLite's exclusive, lock-aware last-holder check: it fails while
+        a transaction is active and removes the sidecars when the generation is quiescent. Restore
+        WAL before returning; the live connection still carries the close-time reset guard.
+        """
+        expected_identity = self._db_file_identity
+        if expected_identity is None or _stat_db_file_identity(self.db_path) != expected_identity:
+            return False
+        if not _stat_sqlite_sidecar_identity(self.db_path):
+            return True
+        try:
+            if _state_holders.in_process_state_db_holders(self.db_path, exclude=self):
+                return False
+        except Exception:  # health: allow BLE001 -- an uninspectable holder set defers finalization
+            logger.debug("Could not inspect in-process state.db holders for WAL finalization", exc_info=True)
+            return False
+        try:
+            if _stat_db_file_identity(self.db_path) != expected_identity:
+                return False
+            mode = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+            if not mode or str(mode[0]).lower() != "delete":
+                return False
+            mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            if not mode or str(mode[0]).lower() != "wal":
+                logger.warning("Could not restore WAL mode after clean-close finalization for %s", self.db_path)
+                return False
+        except sqlite3.Error as exc:
+            logger.debug("WAL sidecar finalization deferred for %s: %s", self.db_path, exc)
+            return False
+        return (_stat_db_file_identity(self.db_path) == expected_identity
+                and not _stat_sqlite_sidecar_identity(self.db_path))
+
     def _close_conn_logged(self, conn, label: str) -> None:
         """Close *conn*; a failing close leaks a tracked fd: logged at WARNING, never swallowed."""
         try:
+            disable_close_time_wal_reset(conn)
             conn.close()
         except Exception as exc:  # health: allow BLE001 -- a failed close is logged at WARNING, never raised
             logger.warning("%s close failed for %s: %s", label, self.db_path, exc)
@@ -392,6 +467,7 @@ class StoreHolder:
         finally:
             if not initialization_complete:
                 conn, self._conn = self._conn, None
+                self._retire_failed_init_wal(conn)
                 self._close_connection_quietly(conn)
             else:
                 # Only a successfully opened handle owns a writer connection. Failed
@@ -1389,10 +1465,12 @@ class StoreHolder:
                     self._conn = None
                 else:
                     conn, self._conn = self._conn, None
-                    self._close_connection_quietly(conn)
-                    # Only a clean close ends the generation; retain the recorded
-                    # identity when retiring an unsafe handle.
-                    self._db_sidecar_identity = {}
+                    if generation_lost or quarantine_reason is not None or self.read_only:
+                        self._close_connection_quietly(conn)
+                    elif self._close_connection_cleanly(conn):
+                        # A clean close ends the generation only when the lock-aware finalizer
+                        # removed its sidecars; otherwise preserve identity for the next opener.
+                        self._db_sidecar_identity = {}
         self._read_budget.unregister(self)  # idempotent: a never-registered (failed-init) handle is a no-op
 
     def __del__(self) -> None:

@@ -11,8 +11,8 @@ name: OS-specific tests
 # reproducing any of the OS behaviour that branch exists for. This workflow
 # is where those markers actually execute:
 #
-#   macos    → ``-m platforms``    on blacksmith-12vcpu-macos-latest
-#   windows  → ``-m platforms``    on blacksmith-32vcpu-windows-2025 and windows-latest-32-arm-core
+#   macos    → ``-m platforms``    on macos-latest
+#   windows  → ``-m platforms``    on windows-latest-32-core and windows-latest-32-arm-core
 #
 # (tests/conftest.py's ``pytest_collection_modifyitems`` hook skips
 # foreign-OS ``platforms(...)`` markers on each host, so one shared ``-m
@@ -76,35 +76,13 @@ concurrency:
 jobs:
   os-tests:
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ startsWith(matrix.runner, 'windows-') && (github.repository != 'NousResearch/hermes-agent' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'windows-latest' || matrix.runner }}
     timeout-minutes: ${{ matrix.timeout || 30 }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # Two slices: on the old free standard runner (3 cores, 3 workers) one lane ran
-          # ~7.5 min and became the slowest required job once the Linux suite split.
-          - name: macOS-only tests (1/2)
-            runner: blacksmith-12vcpu-macos-latest
-            marker: macos
-            slice: 1/2
-          - name: macOS-only tests (2/2)
-            runner: blacksmith-12vcpu-macos-latest
-            marker: macos
-            slice: 2/2
-          - name: Windows-only tests
-            runner: blacksmith-32vcpu-windows-2025
-            marker: windows
-          - name: Windows-only tests (arm64, 1/2)
-            runner: windows-latest-32-arm-core
-            marker: windows
-            timeout: 60
-            slice: 1/2
-          - name: Windows-only tests (arm64, 2/2)
-            runner: windows-latest-32-arm-core
-            marker: windows
-            timeout: 60
-            slice: 2/2
+      # The fork's larger-runner fallback made the ARM row a second x64 job.
+      # Run x64 once in the fork; preserve upstream's native ARM64 coverage.
+      matrix: ${{ fromJSON(github.repository == 'switchroom/hermes-agent' && '{"include":[{"name":"macOS-only tests (1/2)","runner":"macos-latest","marker":"macos","slice":"1/2"},{"name":"macOS-only tests (2/2)","runner":"macos-latest","marker":"macos","slice":"2/2"},{"name":"Windows-only tests","runner":"windows-latest-32-core","marker":"windows"}]}' || '{"include":[{"name":"macOS-only tests (1/2)","runner":"macos-latest","marker":"macos","slice":"1/2"},{"name":"macOS-only tests (2/2)","runner":"macos-latest","marker":"macos","slice":"2/2"},{"name":"Windows-only tests","runner":"windows-latest-32-core","marker":"windows"},{"name":"Windows-only tests (arm64)","runner":"windows-latest-32-arm-core","marker":"windows","timeout":60}]}') }}
     steps:
       - name: Checkout code
         uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
@@ -211,8 +189,9 @@ jobs:
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '16' || '16') || '' }}
-          HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
+          # Use 8 only on the trusted 32-core upstream runner; a fork/untrusted
+          # PR falls back to the shared Windows runner and stays at 2 workers.
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '2' || (github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '8') || '2') || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
           OPENROUTER_API_KEY: ''
@@ -231,8 +210,10 @@ jobs:
     # host (tests/e2e/core/windows_update): fresh install, gateway across the update,
     # interpreter selection, non-ASCII profile paths and tool ACLs, partial-clone fetch and
     # venv holders. Its own workflow so wine2e-install/** pushes can run it alone.
+    # Fork: not a required CI job. windows-latest cannot finish six parallel
+    # installs; upstream still runs this inside tests-os on its 32-core runner.
     name: Windows install + update E2E
-    if: inputs.e2e_upgrade
+    if: github.repository != 'switchroom/hermes-agent'
     uses: ./.github/workflows/windows-install-update-e2e.yml
     with:
       commit: ${{ inputs.commit }}
@@ -252,11 +233,13 @@ jobs:
     # Windows race that passes on retry is still a race. Tracked Windows bugs are strict
     # xfails (per-file KNOWN tables), so a fix turns this job red until the entry goes.
     name: Windows E2E (real processes)
+    # Fork has no larger-runner entitlement. A bare windows-latest-32-core
+    # label queues forever. Same trust guard as the Linux e2e jobs.
     if: inputs.e2e
     # 32-core like os-tests' Windows row: seven files run in parallel and each spawns
     # process trees; on the 4-vCPU image the suite step took 153-171 s (job 4.7-5.6 min),
     # here 124 s (job 3.1 min), with headroom against scheduling-starved timeouts.
-    runs-on: blacksmith-32vcpu-windows-2025
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'windows-latest-32-core' || 'windows-latest' }}
     timeout-minutes: 25
     steps:
       - name: Checkout code

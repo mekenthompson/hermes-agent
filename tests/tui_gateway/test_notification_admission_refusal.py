@@ -20,9 +20,10 @@ def test_refused_notification_retains_result_without_spending_attempts(tmp_path,
 
     event = pending('owned', 'refused-notification') if kind == 'async_delegation' else {
         'type': 'completion', 'session_id': 'owned-process', 'session_key': 'owned'}
-    session = {'history_lock': threading.RLock(), '_closing': True, 'running': True}
+    session = {'history_lock': threading.RLock(), '_closing': True, 'running': True,
+               'session_key': 'owned', 'profile_home': tmp_path}
     emitted = []
-    namespace = dict(time=time, logger=logging.getLogger(__name__),
+    namespace = dict(time=time, threading=threading, logger=logging.getLogger(__name__),
         _emit=lambda *args: emitted.append(args),
         _session_turn_admission=_session_turn_admission,
         _ensure_active_session_slot=lambda *args: None,
@@ -30,7 +31,8 @@ def test_refused_notification_retains_result_without_spending_attempts(tmp_path,
     for module, names in [(prompt_turn, ('_admit_prompt_turn', '_run_prompt_submit')),
                           (session_notifications, ('_notif_submit', '_notif_claim_turn', '_notif_release_turn',
                            '_notif_release_claim',
-                           '_notif_dispatch_event', '_notif_dispatch_completions', '_async_delegation_display_metadata'))]:
+                           '_notif_dispatch_event', '_notif_group_completions', '_notif_dispatch_completions',
+                           '_async_delegation_display_metadata'))]:
         for name in names:
             namespace[name] = rebind(getattr(module, name), namespace)
     # Also bind the retry helper when present; old code must fail on the receipt, not an absent test import.

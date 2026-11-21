@@ -61,7 +61,8 @@ async def test_real_loop_silence_delivery(monkeypatch, tmp_path, real_loop, plat
     entry = runner.session_store.get_or_create_session.return_value
     entry.session_key, entry.session_id, entry.platform, entry.chat_type = key, real_loop.sid, platform, "dm"
     event = MessageEvent(text="when is my meeting?", source=source, message_id="m1", reply_expected=True)
-    reply = await runner._handle_message_with_agent(event, source, key, 1)
+    generation = runner._begin_session_run_generation(key)
+    reply = await runner._handle_message_with_agent(event, source, key, generation)
     sent = [call["content"] for call in adapter.sent]
     if housekeeping:
         assert not any(WARNING in text for text in sent + [reply or ""])

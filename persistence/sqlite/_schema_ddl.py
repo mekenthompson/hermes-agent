@@ -398,6 +398,13 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     owner_pid INTEGER,
     owner_started_at INTEGER,
     task_json TEXT,
+    -- House: a stop request is a durable intent, written before signalling children.
+    -- It closes the crash-after-action-before-ack gap: a late successful child
+    -- return must not resurrect cancelled work after restart or cleanup.
+    stop_state TEXT NOT NULL DEFAULT '',
+    stop_reason TEXT,
+    stop_requested_at REAL,
+    stop_acknowledged_at REAL,
     -- Owner-side execution fence (unified runtime).
     owner_execution_id TEXT,
     delivery_claim TEXT,

@@ -212,6 +212,76 @@ def _save_discovery_cache(cache: dict[str, list]) -> None:
         logger.debug("Could not write tool discovery cache %s: %s", path, e)
 
 
+@dataclass(frozen=True, slots=True)
+class ToolInvocationContext:
+    """Immutable host-owned identity for a tool's originating session.
+
+    Values come from task-local gateway context, never model arguments. Empty
+    values mean this execution path has no authenticated gateway field; plugins
+    that need identity must fail closed when their required fields are empty.
+    """
+
+    profile: str = ""
+    platform: str = ""
+    user_id: str = ""
+    chat_id: str = ""
+    chat_type: str = ""
+    thread_id: str = ""
+    scope_id: str = ""
+    session_id: str = ""
+    session_key: str = ""
+    run_generation: int | None = None
+    message_id: str = ""
+    # Desktop browser-control ticket subject. These are copied only from the
+    # authenticated WebSocket transport by tui_gateway.server; tool arguments
+    # cannot populate them.
+    browser_control_provider: str = ""
+    browser_control_subject: str = ""
+    user_message: str = ""
+    ui_session_id: str = ""
+    api_control_principal: str = ""
+    api_control_transport_family: str = ""
+    api_conversation_key: str = ""
+
+
+def _current_tool_invocation_context() -> ToolInvocationContext:
+    """Snapshot task-local gateway identity for one tool invocation."""
+    try:
+        from gateway.session_context import (browser_control_identity, get_api_transfer_identity,
+                                             get_session_env, get_session_run_generation,
+                                             get_turn_user_message, get_ui_session_id)
+    except Exception:
+        return ToolInvocationContext()
+
+    def value(name: str) -> str:
+        return str(get_session_env(name, "") or "")
+
+    browser_control_provider, browser_control_subject = browser_control_identity()
+    api_principal, api_family, api_conversation = get_api_transfer_identity()
+    from agent.delegation_context import is_delegated_child_process_context
+    delegated_child = is_delegated_child_process_context()
+    return ToolInvocationContext(
+        profile=value("HERMES_SESSION_PROFILE"),
+        platform=value("HERMES_SESSION_PLATFORM"),
+        user_id=value("HERMES_SESSION_USER_ID"),
+        chat_id=value("HERMES_SESSION_CHAT_ID"),
+        chat_type=value("HERMES_SESSION_CHAT_TYPE"),
+        thread_id=value("HERMES_SESSION_THREAD_ID"),
+        scope_id=value("HERMES_SESSION_SCOPE_ID"),
+        session_id=value("HERMES_SESSION_ID"),
+        session_key=value("HERMES_SESSION_KEY"),
+        run_generation=get_session_run_generation(),
+        message_id=value("HERMES_SESSION_MESSAGE_ID"),
+        browser_control_provider="" if delegated_child else browser_control_provider,
+        browser_control_subject="" if delegated_child else browser_control_subject,
+        user_message="" if delegated_child else get_turn_user_message(),
+        ui_session_id="" if delegated_child else get_ui_session_id(),
+        api_control_principal="" if delegated_child else api_principal,
+        api_control_transport_family="" if delegated_child else api_family,
+        api_conversation_key="" if delegated_child else api_conversation,
+    )
+
+
 @dataclass(eq=False, slots=True)
 class ToolEntry:
     """Metadata for one registered tool (identity semantics: restore/CAS paths compare ``is``)."""
@@ -229,6 +299,7 @@ class ToolEntry:
     # Zero-arg callable whose dict is shallow-merged onto the schema at every get_definitions()
     # — for fields tracking runtime config (delegate_task's description reflects limits).
     dynamic_schema_overrides: Optional[Callable] = None
+    inject_invocation_context: bool = False
     execution_timeout: float | None = None
     # Argument names the handler accepts that the schema does not advertise (legacy call
     # shapes, wrong-tool guards). tools/arg_validation.py never flags them, and a call that
@@ -844,10 +915,15 @@ class ToolRegistry:
         dynamic_schema_overrides: Callable | None = None, override: bool = False,
         scope: Optional[str] = None, execution_timeout: float | None = None,
         compat_args: Iterable[str] = (), self_checked_args: Iterable[str] = (),
-        deadline_floor: Callable | None = None):
+        deadline_floor: Callable | None = None, *, inject_invocation_context: bool = False):
         """Register a tool (called at import time by each tool file). ``override=True`` is an
         explicit opt-in for plugins replacing a built-in implementation (e.g. a headed-Chrome
-        browser backend); without it, cross-toolset shadowing is rejected."""
+        browser backend); without it, cross-toolset shadowing is rejected.
+
+        ``inject_invocation_context=True`` passes an immutable,
+        host-owned :class:`ToolInvocationContext` keyword to the handler. The
+        snapshot comes from task-local gateway state, never tool arguments.
+        """
         # Reject malformed schemas at registration, not at request time: a non-dict
         # ``parameters`` (e.g. a list) serializes into every provider request and 400s the
         # whole turn far from the offending plugin. Failing here names the culprit instead.
@@ -911,7 +987,7 @@ class ToolRegistry:
                 max_result_size_chars=max_result_size_chars, execution_timeout=execution_timeout,
                 dynamic_schema_overrides=dynamic_schema_overrides, compat_args=frozenset(compat_args),
                 self_checked_args=frozenset(self_checked_args),
-                deadline_floor=deadline_floor)
+                deadline_floor=deadline_floor, inject_invocation_context=inject_invocation_context)
             self._generation += 1
 
     def deregister(self, name: str, *, scope: Optional[str] = None) -> None:
@@ -1088,6 +1164,10 @@ class ToolRegistry:
         if refusal is not None:
             return refusal
         try:
+            if entry.inject_invocation_context:
+                # Overwrite rather than setdefault: callers on internal dispatch
+                # paths cannot spoof this host-owned identity keyword.
+                kwargs["invocation_context"] = _current_tool_invocation_context()
             # Plugin contract (plugins/AGENTS.md): optional context kwargs (task_id, session_id, user_task,
             # parent_agent, ...) are signature-inspected like hook payloads, so a narrow ``handle(args)``
             # plugin handler is not broken by every field the dispatcher injects (#68318).

@@ -411,7 +411,12 @@ const en: BotsMessages = {
     otherControls: 'Another viewer is in control',
     agentControls: 'Bot is in control',
     controlTaken: 'Another viewer took control. Watching only.',
-    needsHttps: 'Bot screens need a secure connection. Open the Webapp over HTTPS, or through an SSH tunnel to 127.0.0.1, to view this one.'
+    needsHttps: 'Bot screens need a secure connection. Open the Webapp over HTTPS, or through an SSH tunnel to 127.0.0.1, to view this one.',
+    copyFromScreen: 'Copy from screen',
+    copyFromScreenHint: 'Copy the text selected on the screen to your own clipboard. Only the viewer in control can do this.',
+    copiedFromScreen: 'Copied',
+    copyEmpty: 'Nothing is copied on the screen',
+    copyFailed: 'Could not copy from the screen'
   },
   cron: {
     untitled: 'Untitled job',
@@ -848,7 +853,12 @@ const ja: BotsMessages = {
     otherControls: '別のビューアが操作中',
     agentControls: 'ボットが操作中',
     controlTaken: '別のビューアが操作を引き継ぎました。閲覧のみ。',
-    needsHttps: 'ボットの画面には安全な接続が必要です。表示するには、Webapp を HTTPS か 127.0.0.1 への SSH トンネル経由で開いてください。'
+    needsHttps: 'ボットの画面には安全な接続が必要です。表示するには、Webapp を HTTPS か 127.0.0.1 への SSH トンネル経由で開いてください。',
+    copyFromScreen: '画面からコピー',
+    copyFromScreenHint: '画面上でコピーしたテキストを、あなた自身のクリップボードにコピーします。画面を操作中のビューアのみ利用できます。',
+    copiedFromScreen: 'コピーしました',
+    copyEmpty: '画面上でコピーされたテキストはありません',
+    copyFailed: '画面からコピーできませんでした'
   },
   cron: {
     untitled: '無題のジョブ',
@@ -1268,7 +1278,12 @@ const zh: BotsMessages = {
     otherControls: '另一位查看者正在控制',
     agentControls: '机器人正在控制',
     controlTaken: '另一位查看者已接管控制。仅可观看。',
-    needsHttps: '机器人屏幕需要安全连接。请通过 HTTPS 或到 127.0.0.1 的 SSH 隧道打开 Webapp 后查看。'
+    needsHttps: '机器人屏幕需要安全连接。请通过 HTTPS 或到 127.0.0.1 的 SSH 隧道打开 Webapp 后查看。',
+    copyFromScreen: '从屏幕复制',
+    copyFromScreenHint: '把屏幕上复制的文本复制到你自己的剪贴板。仅控制屏幕的查看者可用。',
+    copiedFromScreen: '已复制',
+    copyEmpty: '屏幕上没有复制任何文本',
+    copyFailed: '无法从屏幕复制'
   },
   cron: {
     untitled: '未命名任务',
@@ -1688,7 +1703,12 @@ const zhHant: BotsMessages = {
     otherControls: '另一位檢視者正在控制',
     agentControls: '機器人正在控制',
     controlTaken: '另一位檢視者已接手控制。僅可觀看。',
-    needsHttps: '機器人螢幕需要安全連線。請透過 HTTPS 或到 127.0.0.1 的 SSH 通道開啟 Webapp 後檢視。'
+    needsHttps: '機器人螢幕需要安全連線。請透過 HTTPS 或到 127.0.0.1 的 SSH 通道開啟 Webapp 後檢視。',
+    copyFromScreen: '從螢幕複製',
+    copyFromScreenHint: '把螢幕上複製的文字複製到你自己的剪貼簿。僅控制螢幕的檢視者可用。',
+    copiedFromScreen: '已複製',
+    copyEmpty: '螢幕上沒有複製任何文字',
+    copyFailed: '無法從螢幕複製'
   },
   cron: {
     untitled: '未命名工作',

@@ -698,6 +698,8 @@ async def recover_gateway_native_sessions(runner):
         with owner_scope(authority):
             await recover_local_sessions_async(authority, schedule=True)
             await recover_webhook_finalizations(authority)
+            from gateway.session_kanban_stop import settle_replaced_card_attempts
+            await settle_replaced_card_attempts(authority)
         results.update(await recover_profile_native_sessions(runner, authority))
     return results
 

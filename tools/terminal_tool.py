@@ -172,7 +172,7 @@ def _check_all_guards(command: str, env_type: str,
                                   has_host_access=has_host_access)
 
 
-from tools.environments.base import EnvironmentConnectionError
+from tools.environments.base import CommandExecutionUnknown, EnvironmentConnectionError
 
 
 # Tool description for LLM
@@ -282,6 +282,58 @@ def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
     callers decide what an absent record means. None/empty keys read ``"default"``."""
     with _session_cwd_lock:
         return _session_cwd.get(_qualify_task_key(str(session_key or "default")))
+
+
+def resolve_recorded_session_cwd(task_id: Optional[str] = None) -> Optional[str]:
+    """Cwd recorded for this execution.
+
+    A delegate child's own ``task_id`` record wins. Children inherit the
+    parent's gateway session key via ``copy_context``; preferring that key
+    would run the child in the parent's checkout. The session key is only the
+    fallback for a gateway parent whose shell recorded under that key and
+    whose Hermes session id has no record yet. No ``TERMINAL_CWD`` fallback.
+    Empty keys are skipped so a miss does not read the shared ``default``
+    bucket.
+    """
+    from tools.approval_context import get_current_session_key
+
+    task = str(task_id).strip() if task_id else ""
+    if task:
+        recorded = get_session_cwd(task)
+        if recorded:
+            return recorded
+    session_key = get_current_session_key(default="") or ""
+    if session_key and session_key != task:
+        return get_session_cwd(session_key)
+    return None
+
+
+def _is_delegated_child_task(task_id: str) -> bool:
+    """True when *task_id* is a delegate child sharing the parent's container."""
+    if not task_id:
+        return False
+    with _container_alias_lock:
+        return task_id in _container_aliases
+
+
+def record_execution_cwd(task_id: Optional[str], cwd: Optional[str]) -> None:
+    """Record a completed command's cwd for the identity that ran it.
+
+    ``task_id`` is the executing Hermes session or delegate child. A gateway
+    parent also updates the platform session key, because that is the key the
+    shell historically recorded under. A delegate child inherits that key via
+    ``copy_context`` and must not move the parent's directory.
+    """
+    from tools.approval_context import get_current_session_key
+
+    task = str(task_id).strip() if task_id else ""
+    if task:
+        record_session_cwd(task, cwd)
+    live = get_current_session_key(default="") or ""
+    if live and live != task and not _is_delegated_child_task(task):
+        record_session_cwd(live, cwd)
+    elif not task and not live:
+        record_session_cwd(None, cwd)
 
 
 def clear_session_cwd(session_key: str) -> None:
@@ -1089,28 +1141,24 @@ def _resolve_command_cwd(
     default_cwd: str,
     session_key: Optional[str] = None,
     env_type: Optional[str] = None,
+    task_id: Optional[str] = None,
     mounted_host: Optional[str] = None,
     env=None,
 ) -> str:
-    """cwd for a command: explicit ``workdir`` > the session's own cwd record >
-    ``default_cwd``.
+    """Resolve workdir > execution cwd record > default cwd.
 
-    The record is written after every completed command of THIS session, so
-    it is the session's ``cd`` state with no shared-env ambiguity. On
-    container backends a recorded HOST path (a desktop/TUI surface registering
-    its workspace) is unusable in the sandbox — ``cd <host path>`` fails with
-    exit 126 — so it is discarded in favor of ``default_cwd``.
-
-    A recorded cwd that IS the host directory mounted at ``/workspace`` is
-    classified unusable before the ``/Users`` / ``/home`` / drive-letter
-    heuristic (``/mnt/...``, ``/srv/...`` are absolute and miss that heuristic)
-    and remapped to ``/workspace`` so the session wrapper does not ``cd`` to it.
-
-    Same guard class as the env-creation sanitizers (#50636, #54447); this is the per-command sibling site.
+    A delegate task's own record wins and never falls through to an inherited
+    session key. Without a task id, use the explicit platform session key.
+    Container backends discard unmounted host paths and remap a mounted host
+    workspace to ``/workspace``.
     """
     if workdir:
-        return coerce_ssh_remote_cwd(_container_visible_cwd(workdir, env_type, env), env_type)
-    recorded = get_session_cwd(session_key)
+        visible = _container_visible_cwd(workdir, env_type, env)
+        return coerce_ssh_remote_cwd(visible, env_type)
+
+    recorded = get_session_cwd(task_id) if task_id else None
+    if recorded is None and not task_id and session_key:
+        recorded = get_session_cwd(session_key)
     if recorded and _is_container_backend(env_type) and _is_unusable_container_cwd(
         recorded, mounted_host=mounted_host
     ) and not _in_sandbox_home(recorded, env):
@@ -1119,18 +1167,23 @@ def _resolve_command_cwd(
             return visible
         if _is_mounted_host_cwd(recorded, mounted_host):
             logger.info(
-                "Remapping recorded session cwd %r for %s backend "
-                "(mounted host directory). Using '/workspace' instead.",
-                recorded, env_type,
+                "Remapping recorded session cwd %r for %s backend (mounted host directory). Using '/workspace' instead.",
+                recorded,
+                env_type,
             )
             return "/workspace"
         logger.info(
-            "Ignoring recorded session cwd %r for %s backend "
-            "(host/relative path won't work in sandbox). Using %r instead.",
-            recorded, env_type, default_cwd,
+            "Ignoring recorded session cwd %r for %s backend (host/relative path won't work in sandbox). Using %r instead.",
+            recorded,
+            env_type,
+            default_cwd,
         )
         return _container_visible_default(default_cwd, env_type, env)
-    return coerce_ssh_remote_cwd(recorded or _container_visible_default(default_cwd, env_type, env), env_type)
+    if recorded:
+        return coerce_ssh_remote_cwd(recorded, env_type)
+    return coerce_ssh_remote_cwd(
+        _container_visible_default(default_cwd, env_type, env), env_type
+    )
 
 
 def _error_json(error: str, *, exit_code: int = -1, status: Optional[str] = None, **extra) -> str:
@@ -1293,20 +1346,14 @@ def _plan_execution(
     image = _select_image(env_type, overrides, config)
 
     cwd = coerce_ssh_remote_cwd(
-        overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"], env_type)
+        overrides.get("cwd") or resolve_recorded_session_cwd(task_id) or config["cwd"], env_type)
     host_cwd = _resolve_task_host_cwd(config, task_id)
-    # config["cwd"] was sanitized for container backends in _get_env_config
-    # but an override / session record is raw: a host path would reach
-    # `docker run -w` and fail with exit 125. Re-apply the guard to the
-    # resolved cwd; when the host path IS this session's mounted workspace,
-    # remap to /workspace instead of discarding it. Mount equality is part of
-    # the unusable check so /mnt and /srv are not left as the container cwd.
+    # Re-apply the container cwd guard to per-task and session overrides.
     if _is_container_backend(env_type) and _is_unusable_container_cwd(cwd, mounted_host=host_cwd):
-        remapped = "/workspace" if host_cwd else config["cwd"]
+        remapped = "/workspace" if _is_mounted_host_cwd(cwd, host_cwd) else config["cwd"]
         if cwd != remapped:
             logger.info(
-                "Remapping host/relative cwd override %r for %s backend "
-                "(won't exist in sandbox). Using %r instead.",
+                "Remapping host/relative cwd override %r for %s backend (won't exist in sandbox). Using %r instead.",
                 cwd, env_type, remapped,
             )
         cwd = remapped
@@ -1439,7 +1486,7 @@ def _run_foreground(
     for retry_count in range(max_retries + 1):
         try:
             command_cwd = _resolve_command_cwd(
-                workdir=workdir, default_cwd=plan.cwd, session_key=cwd_key, env_type=env_type,
+                workdir=workdir, default_cwd=plan.cwd, session_key=cwd_key, env_type=env_type, task_id=task_id,
                 mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
                 env=env,
             )
@@ -1455,6 +1502,9 @@ def _run_foreground(
                                 task_id=task_id, session_key=session_key),
             )
             break
+        except CommandExecutionUnknown as error:
+            return _error_json(str(error), exit_code=None, status='execution_unknown',
+                               session_id=error.session_id, retryable=False)
         except Exception as e:
             # A backend exception (e.g. an SSH connect timeout) never reached an exit status, so it
             # is not a terminal outcome; Hermes' own deadline arrives as ``hermes_timed_out``.
@@ -1511,7 +1561,7 @@ def _refuse_missing_local_workdir(workdir: str, env: Any) -> None:
 
 def _pre_exec_block(
     command: str, *, env: Any, env_type: str, cwd: str,
-    workdir: Optional[str], session_key: str,
+    workdir: Optional[str], session_key: str, task_id: Optional[str] = None,
 ) -> None:
     """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
 
@@ -1519,7 +1569,8 @@ def _pre_exec_block(
     then the dangerous-workdir check, then the self-repo guard (local only).
     """
     blocked = gateway_lifecycle_block(
-        command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+        command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir,
+        session_key=session_key, task_id=task_id,
     )
     if blocked:
         raise _Rejected(blocked)
@@ -1531,8 +1582,9 @@ def _pre_exec_block(
             raise _Rejected(_error_json(workdir_error, status="blocked"))
         _refuse_missing_local_workdir(workdir, env)
     if env_type == "local":
-        blocked = (self_repo_block(command=command, cwd=cwd, workdir=workdir, session_key=session_key)
-                   or locked_skill_block(command=command, cwd=cwd, workdir=workdir, session_key=session_key))
+        blocked = (
+            self_repo_block(command=command, cwd=cwd, workdir=workdir, session_key=session_key, task_id=task_id)
+            or locked_skill_block(command=command, cwd=cwd, workdir=workdir, session_key=session_key))
         if blocked:
             raise _Rejected(blocked)
 
@@ -1645,6 +1697,7 @@ def terminal_tool(
             from agent.deadline import run_bounded_sync
             from tools.interrupt import acting_for_tid
 
+
             # The guard chain runs on the deadline worker; keep it answerable to /stop
             # aimed at this tool thread (a remote-backend script read polls is_interrupted()).
             guard_timeout = max(plan.effective_timeout, _PRE_EXEC_GUARD_MIN_TIMEOUT_S)
@@ -1668,6 +1721,13 @@ def terminal_tool(
             # Pre-exec security checks (floors + dangerous command detection);
             # force=True means the user already confirmed.
             verdict = _run_approval_guards(command, env_type, plan.config, force=force)
+            from tools.approval_context import approval_task_denial_message, approval_task_revoked
+            if approval_task_revoked():
+                raise _Rejected(_error_json(
+                    approval_task_denial_message("The originating task was stopped or completed before execution."),
+                    status="error",
+                ))
+
 
             pty_disabled = pty and _command_requires_pipe_stdin(command)
             if plan.promoted_from_foreground_timeout is not None:

@@ -22,7 +22,12 @@ def test_recovery_payload_memory_does_not_scale_with_backlog(
         def append(self, session_id: str, message) -> None:
             assert message.content == content
 
+    class Sessions:
+        def get(self, session_id: str):
+            return object()  # owner exists; recovery holds orphan rows otherwise
+
     class Sink:
+        sessions = Sessions()
         messages = Messages()
 
     tracemalloc.start()

@@ -27,6 +27,7 @@ from session_rules.turns import (
 from .._backend import SQLiteStore, register_repository
 from .._holder import StoreHolder
 from ._store.api_content import set_latest_user_api_content, set_message_api_content
+from ._store.checkpoint import DISPLAY_CHECKPOINT_KIND, persist_local_checkpoint
 from ._store.compression import (
     clear_compression_failure_cooldown, get_compression_failure_cooldown_row, record_compression_failure_cooldown,
     restore_compression_failure_cooldown_row,
@@ -538,7 +539,16 @@ class SQLiteMessageRepository:
                 session_id, include_ancestors=request.include_lineage,
                 include_inactive=request.view is TranscriptView.ALL, repair_alternation=request.repair_alternation,
                 include_row_ids=request.include_row_ids, include_compacted=request.view is TranscriptView.DISPLAY)
+        if not (request.include_display_only or request.view is TranscriptView.DISPLAY):
+            messages = [m for m in messages if m.get("display_kind") != DISPLAY_CHECKPOINT_KIND]
         return _conversation(messages)
+
+    def append_display_checkpoint(self, session_id: SessionId, key: str, body: str, *, board: str,
+                                  task_id: str) -> int:
+        """House: the stable row of one passive Kanban checkpoint, display-only (never model history)."""
+        holder = self._store.holder()
+        with _refusals(holder, session_id):
+            return persist_local_checkpoint(holder, session_id, key, body, board=board, task_id=task_id)
 
     def read_resume_conversations(self, session_id: SessionId) -> ResumeConversations:
         holder = self._store.holder()

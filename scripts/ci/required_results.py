@@ -41,9 +41,11 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
-# The deferred Desktop E2E: the only skip a strict run tolerates.
+# Consolidated repo-guards always runs. Only the PR review lane, the deferred
+# Desktop E2E and the fork's separate PR-only native installation lane may skip.
+PR_ONLY_JOBS = ("review-labels",)
 DEFERRED_JOBS = ("e2e-desktop",)
-EXCLUDED_JOBS = frozenset(DEFERRED_JOBS)
+EXCLUDED_JOBS = frozenset((*PR_ONLY_JOBS, *DEFERRED_JOBS, "native-install-tests"))
 
 NEEDS_JSON_OUTPUT = "needs-json"
 

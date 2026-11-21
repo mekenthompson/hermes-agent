@@ -328,8 +328,7 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) -> 
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False, "session_key": key, "show_reasoning": _load_show_reasoning(), "source": source,
             "slash_worker": None, "tool_progress_mode": _load_tool_progress_mode(), "tool_started_at": {},
-            "transport": current_transport() or _stdio_transport,
-            "auth_user_id": _transport_auth_user_id(current_transport())}
+            **_session_transport_stamps(current_transport())}
         _register_session_cwd(_sessions[sid])
         if idem_key is not None:
             _idempotency_keys[idem_key] = (sid, now)
@@ -614,6 +613,8 @@ def _resume_live_unpersisted(ctx: _Resume, live_sid: str, live: dict) -> dict:
     if ctx.owns_db:
         _release_db(ctx.db)
     with _session_resume_lock:
+        if (ownership_error := _session_attachment_error(ctx.rid, live, current_transport())) is not None:
+            return ownership_error
         if (refusal := _reattach_refusal(ctx.rid, live_sid, live)) is not None:
             return refusal
         live["last_active"] = time.time()
@@ -773,6 +774,8 @@ def _resume_reuse_live(ctx: _Resume, sid: str, session: dict) -> dict:
 
 def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
     """Reuse with _session_resume_lock already held (including the eager double-check)."""
+    if (ownership_error := _session_attachment_error(ctx.rid, session, current_transport())) is not None:
+        return ownership_error
     if (refusal := _reattach_refusal(ctx.rid, sid, session)) is not None:
         return refusal
     _cancel_ws_orphan_reap(sid)  # unconditionally: the fast path must never race the reap Timer
@@ -1058,6 +1061,8 @@ def _(rid, params: dict, session: dict) -> dict:
     # Only the rebind is atomic with grace expiry; the payload (a DB history read unless
     # ``omit_messages``) must not hold the process-wide resume lock.
     with _session_resume_lock:
+        if (ownership_error := _session_attachment_error(rid, session, current_transport())) is not None:
+            return ownership_error
         if (refusal := _reattach_refusal(rid, sid, session)) is not None:
             return refusal
         with session["history_lock"]:

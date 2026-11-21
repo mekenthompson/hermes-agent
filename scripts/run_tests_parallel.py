@@ -88,7 +88,7 @@ def _rmtree_force(path: str) -> None:
             pass
     shutil.rmtree(path, onerror=_chmod_retry)
 
-def _runner_scratch_root() -> str:
+def _runner_scratch_root(base: str | None = None) -> str:
     """Per-run temp roots live on DISK, never the system temp dir: a full-suite run writes
     gigabytes of tmp_path fixtures and /tmp is RAM-backed tmpfs on many Linux hosts. /var/tmp is
     the FHS disk-backed temp root and is used because the alternatives fail tests that assume
@@ -102,7 +102,9 @@ def _runner_scratch_root() -> str:
     back that does not need root. Keying by uid means no run is blocked by another's leftovers.
     """
     name = "hermes-pytest" + (f"-{os.getuid()}" if hasattr(os, "getuid") else "")
-    if os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
+    if base is not None:
+        root = os.path.join(os.path.abspath(base), name)
+    elif os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
         root = os.path.join(tempfile.gettempdir(), name)
     else:
         root = f"/var/tmp/{name}"  # no-tmp: ok — /var/tmp is disk-backed by FHS, never tmpfs
@@ -559,6 +561,7 @@ def _run_one_file(
     repo_root: Path,
     file_timeout: float,
     retries: int = 0,
+    scratch_root: str | None = None,
 ) -> tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -593,7 +596,7 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
+        file, pytest_args, repo_root, file_timeout, scratch_root
     )
     attempt = 0
     # A worker killed by signal (OOM, SIGKILL) or the file timeout is a runaway, not a flake:
@@ -604,7 +607,7 @@ def _run_one_file(
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
+            file, pytest_args, repo_root, file_timeout, scratch_root
         )
         subproc_wall += subproc_wall2
         if rc == 0:
@@ -632,6 +635,7 @@ def _run_one_file_once(
     pytest_args: list[str],
     repo_root: Path,
     file_timeout: float,
+    scratch_root: str | None = None,
 ) -> tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
 
@@ -652,7 +656,7 @@ def _run_one_file_once(
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
     env = os.environ.copy()
-    temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
+    temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root(scratch_root))
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
     # Every tempfile.* call inside the test process lands in the same per-run root, so the
     # parent's cleanup of ``temproot`` removes them too instead of leaving them in /tmp.
@@ -1010,13 +1014,20 @@ def _slice_files(
     slice_count: int,
     durations: dict[str, float],
     repo_root: Path,
+    *,
+    by_durations: bool = False,
 ) -> list[Path]:
     """Return the subset of *files* belonging to slice *slice_index*.
 
-    Every slice job computes the partition on its own, so it must come only from
-    the checkout: a duration cache restored separately per job can differ (a main
-    push saves a newer one in between) and silently drop or double-run files.
-    Sorted round-robin balances within seconds of timed LPT at this suite size.
+    Every slice job computes the partition on its own, so by default it comes
+    only from the checkout: a duration cache restored separately per job can
+    differ (a main push saves a newer one in between) and silently drop or
+    double-run files.
+
+    ``by_durations`` (``--slice-by-durations``) runs timed LPT on *durations*
+    instead. Pass it only when every slice job is guaranteed the byte-identical
+    cache (CI pins one immutable cache key for the whole run); with that
+    guarantee the partition is still the same in every slice.
 
     ``slice_index`` is 1-indexed (1..slice_count) for ergonomics —
     ``--slice 1/4`` reads more naturally than ``--slice 0/4``.
@@ -1030,7 +1041,9 @@ def _slice_files(
         )
         sys.exit(2)
 
-    bucket_files = _compute_lpt_slices(sorted(files), slice_count, {}, repo_root)
+    bucket_files = _compute_lpt_slices(
+        sorted(files), slice_count, durations if by_durations else {}, repo_root
+    )
 
     target = bucket_files[slice_index - 1]
     target_dur = sum(_estimated_duration(f, durations, repo_root) for f in target)
@@ -1039,7 +1052,8 @@ def _slice_files(
     )
     print(
         f"Slice {slice_index}/{slice_count}: {len(target)} files "
-        f"(~{target_dur:.0f}s estimated of {total_dur:.0f}s total)",
+        f"(~{target_dur:.0f}s estimated of {total_dur:.0f}s total, "
+        f"partition by {'durations' if by_durations else 'file count'})",
         flush=True,
     )
 
@@ -1244,8 +1258,7 @@ def _summary_notes(
     return notes
 
 
-def main() -> int:
-    _make_stdio_glyph_safe()
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1253,6 +1266,12 @@ def main() -> int:
     parser.add_argument("-j", "--jobs", type=int,
                         default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4)),
                         help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count)")
+    parser.add_argument(
+        "--scratch-root",
+        metavar="PATH",
+        help=("Disk-backed temporary parent; uses only its hermes-pytest-<uid> subtree. "
+              "Choose a short, non-hidden path outside HERMES_HOME. Default: /var/tmp on POSIX."),
+    )
     parser.add_argument(
         "--paths",
         default=os.environ.get("HERMES_TEST_PATHS", ":".join(_DEFAULT_ROOTS)),
@@ -1301,6 +1320,15 @@ def main() -> int:
             "so each slice takes roughly equal wall time. "
             "Without a duration cache, files are distributed by count. "
             "Env: HERMES_TEST_SLICE (format: I/N)."
+        ),
+    )
+    parser.add_argument(
+        "--slice-by-durations",
+        action="store_true",
+        help=(
+            "With --slice, balance slices by the per-file durations in "
+            "test_durations.json (timed LPT) instead of by file count. Only "
+            "safe when every slice job reads the identical cache file."
         ),
     )
     parser.add_argument(
@@ -1358,6 +1386,12 @@ def main() -> int:
             "separator is passed through to each per-file pytest invocation."
         ),
     )
+    return parser
+
+
+def main() -> int:
+    _make_stdio_glyph_safe()
+    parser = _build_parser()
     # Split argv into "our flags + positional paths" vs "pytest passthrough".
     #
     # Two ways to pass args through to the per-file pytest invocation:
@@ -1377,7 +1411,7 @@ def main() -> int:
     OUR_FLAGS = {
         "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
-        "--files-from", "--fail-on-skip", "--require-paths",
+        "--files-from", "--fail-on-skip", "--scratch-root", "--slice-by-durations", "--require-paths",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -1529,7 +1563,7 @@ def main() -> int:
     # Apply slicing if requested (partition from the checkout alone; see _slice_files).
     if slice_index is not None:
         durations = _load_durations(repo_root)
-        files = _slice_files(files, slice_index, slice_count, durations, repo_root)
+        files = _slice_files(files, slice_index, slice_count, durations, repo_root, by_durations=args.slice_by_durations)
         # Recount after slicing.
         test_counts = {f: test_counts[f] for f in files if f in test_counts}
         approx_total_tests = sum(test_counts.values())
@@ -1627,7 +1661,7 @@ def main() -> int:
 
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    _sweep_killed_run_roots(_runner_scratch_root())
+    _sweep_killed_run_roots(_runner_scratch_root(args.scratch_root))
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         # Duration cache for the timeout scaler: known-slow files get
@@ -1643,6 +1677,7 @@ def main() -> int:
                     file, repo_root, args.file_timeout, timeout_durations
                 ),
                 args.file_retries,
+                args.scratch_root,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)

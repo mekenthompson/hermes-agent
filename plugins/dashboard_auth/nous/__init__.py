@@ -143,6 +143,10 @@ class NousDashboardAuthProvider(JwtOAuthProvider):
         return claims
 
 
+    def _verify_jwt(self, access_token: str) -> dict[str, Any]:
+        """Retain the direct verifier seam used by the offline image gate."""
+        return self._claims_for(access_token)
+
     def _session(self, access_token: str, refresh_token: str, claims: dict[str, Any]) -> Session:
         # Contract C4: no email / display_name in tokens.
         return session_from_claims(

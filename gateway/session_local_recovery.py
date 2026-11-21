@@ -291,10 +291,12 @@ RESUME_HISTORY_BYTES = 3 * 1024 * 1024
 
 
 def _live_rows(store, target):
-    """The live transcript of physical *target* as replay dicts, each with its ``_row_id``."""
+    """The live transcript of physical *target* as replay dicts, each with its ``_row_id``.
+
+    Display-only Kanban checkpoints are included so the live-id fence and the shown transcript see them."""
     from persistence.conversation.messages import ConversationRequest
     return [row.as_openai_message() for row in store.messages.read_conversation(
-        target, ConversationRequest(include_row_ids=True))]
+        target, ConversationRequest(include_row_ids=True, include_display_only=True))]
 
 
 def display_rows(store, target):

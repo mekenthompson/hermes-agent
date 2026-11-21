@@ -1,0 +1,96 @@
+name: Image SBOM and critical vulnerability scan
+description: >-
+  Generate the SPDX image SBOM (Syft) and run the critical vulnerability scan
+  (Trivy) against one locally loaded image at the same time, so the step takes
+  max(sbom, scan) instead of their sum. Both stay gates: the step fails if
+  either tool fails, if the image ID behind the tag changes while they run, or
+  if an expected output is missing. Each tool's log is printed in full.
+
+  Tool versions and invocations match the actions this replaces:
+  anchore/sbom-action@v0.24.2 (`syft scan <image> -o spdx-json`, Syft 1.51.1)
+  and aquasecurity/trivy-action@v0.36.0 (Trivy v0.70.0, same DB cache key).
+  Both binaries come from their pinned release archives, verified by size and
+  sha256 (fetch-pinned-release-asset.sh) before use.
+
+inputs:
+  image:
+    description: Local Docker image reference to SBOM and scan
+    required: true
+  sbom-output:
+    description: Path of the SPDX JSON SBOM to write
+    required: true
+  scan-output:
+    description: Path of the Trivy JSON report to write
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # Same Syft 1.51.1 and Trivy 0.70.0 binaries the replaced installers
+    # (anchore/sbom-action/download-syft v0.24.2, aquasecurity/setup-trivy
+    # v0.2.6) installed, fetched through GitHub's REST asset API first and the
+    # github.com release URL second, and used only after the archive matches
+    # its pinned size and sha256 (the release's published asset digest).
+    - name: Install pinned Syft
+      id: syft
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SYFT_ASSET_ID: "532610151"
+        SYFT_SIZE: "29203595"
+        SYFT_SHA256: 8fcb33017a0dc1058298c923c436d19dfa68ae93968e0b423248542e3afb9fc3
+      run: |
+        set -euo pipefail
+        dir="$RUNNER_TEMP/syft-bin"
+        mkdir -p "$dir"
+        bash "$GITHUB_ACTION_PATH/fetch-pinned-release-asset.sh" \
+          anchore/syft "$SYFT_ASSET_ID" "$SYFT_SIZE" "$SYFT_SHA256" \
+          https://github.com/anchore/syft/releases/download/v1.51.1/syft_1.51.1_linux_amd64.tar.gz \
+          "$RUNNER_TEMP/syft.tar.gz"
+        tar --extract --gzip --file "$RUNNER_TEMP/syft.tar.gz" --directory "$dir" syft
+        chmod 0755 "$dir/syft"
+        "$dir/syft" version
+        echo "cmd=$dir/syft" >> "$GITHUB_OUTPUT"
+
+    - name: Install pinned Trivy
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TRIVY_ASSET_ID: "398381981"
+        TRIVY_SIZE: "47748408"
+        TRIVY_SHA256: 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
+      run: |
+        set -euo pipefail
+        dir="$RUNNER_TEMP/trivy-bin"
+        mkdir -p "$dir"
+        bash "$GITHUB_ACTION_PATH/fetch-pinned-release-asset.sh" \
+          aquasecurity/trivy "$TRIVY_ASSET_ID" "$TRIVY_SIZE" "$TRIVY_SHA256" \
+          https://github.com/aquasecurity/trivy/releases/download/v0.70.0/trivy_0.70.0_Linux-64bit.tar.gz \
+          "$RUNNER_TEMP/trivy.tar.gz"
+        tar --extract --gzip --file "$RUNNER_TEMP/trivy.tar.gz" --directory "$dir" trivy
+        chmod 0755 "$dir/trivy"
+        "$dir/trivy" --version
+        echo "$dir" >> "$GITHUB_PATH"
+
+    - name: Get current date
+      id: date
+      shell: bash
+      run: echo "date=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+    # Same path and keys as trivy-action@v0.36.0, so the DB cache is shared.
+    - name: Restore Trivy DB from cache
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ${{ github.workspace }}/.cache/trivy
+        key: cache-trivy-${{ steps.date.outputs.date }}
+        restore-keys: cache-trivy-
+
+    - name: Generate SBOM and scan critical vulnerabilities concurrently
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        SBOM_OUTPUT: ${{ inputs.sbom-output }}
+        SCAN_OUTPUT: ${{ inputs.scan-output }}
+        SYFT_CMD: ${{ steps.syft.outputs.cmd }}
+        TRIVY_CACHE_DIR: ${{ github.workspace }}/.cache/trivy
+      run: bash "$GITHUB_ACTION_PATH/run.sh"

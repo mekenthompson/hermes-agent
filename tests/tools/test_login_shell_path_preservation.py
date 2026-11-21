@@ -110,10 +110,10 @@ def _exe(directory, name: str):
 
 
 @pytest.mark.platforms("posix")
-def test_dropped_spawn_path_dirs_return_after_the_login_path(tmp_path, monkeypatch):
+def test_selected_spawn_path_precedes_login_only_dirs(tmp_path, monkeypatch):
     """Any spawn-env dir a resetting profile dropped (not only Hermes' own: the gateway's
-    pm runtime, a ``docker run -e PATH=`` addition) comes back in parent order AFTER the
-    login PATH, so a command the login PATH resolves keeps resolving to the same binary."""
+    pm runtime, a ``docker run -e PATH=`` addition) keeps its selected parent order BEFORE
+    login-only dirs. The house snapshot contract must not silently switch toolchains."""
     user_bin, extra_a, extra_b, rel_bin = (tmp_path / n for n in ("user-bin", "extra-a", "extra-b", "rel-bin"))
     for d in (user_bin, extra_a, extra_b, rel_bin):
         d.mkdir()
@@ -128,11 +128,11 @@ def test_dropped_spawn_path_dirs_return_after_the_login_path(tmp_path, monkeypat
     env = LocalEnvironment(cwd=str(tmp_path), env={"PATH": f"{extra_a}:{extra_b}:rel-bin:/usr/bin:/bin"})
     try:
         entries = _snapshot_path_value(env)
-        assert entries.index(str(user_bin)) < entries.index("/usr/bin") < entries.index(str(extra_a)) \
-            < entries.index(str(extra_b)) < entries.index("rel-bin")
+        assert entries.index(str(extra_a)) < entries.index(str(extra_b)) < entries.index("rel-bin") \
+            < entries.index("/usr/bin") < entries.index(str(user_bin))
         assert entries.count("/usr/bin") == 1
         out = env.execute("only-in-parent; shared-tool; only-relative")["output"].split()
-        assert out == ["extra-b", "user-bin", "rel-bin"]
+        assert out == ["extra-b", "extra-a", "rel-bin"]
     finally:
         env.cleanup()
 

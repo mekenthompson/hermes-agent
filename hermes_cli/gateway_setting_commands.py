@@ -88,4 +88,3 @@ def run(cli, canonical, cmd):
     if mirror is not None:
         mirror(cli, arg)
     return True
-

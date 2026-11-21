@@ -250,3 +250,48 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+
+
+def _block_loop_parked_triage(conn) -> str:
+    """A worker card the needs_input loop breaker routed to triage (HF-750)."""
+    tid = kb.create_task(conn, title="worker asks twice", assignee="worker")
+    for attempt in range(kb.BLOCK_RECURRENCE_LIMIT):
+        if attempt:
+            assert kb.unblock_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(conn, tid, reason="which PR?", kind="needs_input")
+    assert kb.get_task(conn, tid).status == "triage"
+    return tid
+
+
+def test_triage_sweeps_skip_block_loop_parked_cards(kanban_home):
+    """The automatic sweep must not rewrite and re-promote a card the loop breaker
+    parked for a human; a card filed into triage for specification still goes."""
+    from hermes_cli import kanban_specify as spec
+
+    with kbc.connect() as conn:
+        parked = _block_loop_parked_triage(conn)
+        fresh = kb.create_task(conn, title="rough idea", triage=True)
+        assert {t.id for t in kb.list_tasks(conn, status="triage")} == {parked, fresh}
+    assert decomp.list_triage_ids() == [fresh]
+    assert spec.list_triage_ids() == [fresh]
+
+
+def test_operator_can_still_decompose_a_block_loop_parked_card(kanban_home):
+    with kbc.connect() as conn:
+        parked = _block_loop_parked_triage(conn)
+    payload = jsonlib.dumps({"fanout": False, "title": "answered", "body": "go", "assignee": "worker"})
+    patches = _patch_list_profiles(["orchestrator", "worker"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(payload):
+            outcome = decomp.decompose_task(parked, author="ken")
+    finally:
+        for p in patches:
+            p.stop()
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, parked).status != "triage"

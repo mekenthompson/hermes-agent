@@ -113,6 +113,19 @@ method("display.observe", params=DisplayObserveParams, result=DisplayObserveResu
        doc="Mint a single-use ticket for /api/display/ws and the server-minted viewer id for this connection.")
 
 
+class DisplayClipboardReadParams(ProfileParams):
+    viewer_id: str
+
+
+class DisplayClipboardReadResult(Result):
+    text: str  # "" when nothing is selected on the screen
+
+
+method("display.clipboard.read", params=DisplayClipboardReadParams, result=DisplayClipboardReadResult,
+       doc="Copy out: the screen's text clipboard, to the viewer holding the lease only (5300, code viewer_mismatch / "
+           "not_in_control / not_running / unavailable / timeout / too_large). Never broadcast.")
+
+
 class DisplayInstallResult(Result):
     started: bool
     command: str | None = None

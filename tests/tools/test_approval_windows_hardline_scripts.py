@@ -253,18 +253,26 @@ def test_later_list_element_below_the_root_stays_approvable(cmd):
     assert detect_dangerous_command(cmd)[0], cmd
 
 
-@pytest.mark.parametrize("command", [
-    "Get-Date" + "\r" * 8000 + "; x",
-    "Get-Date" + " \r" * 4000 + "; x",
-    "Get-Date" + "\rri -r" * 14000 + "; x",
-    "Get-Date" + "\rri x" * 16000 + "; x",
-    "Get-Date" + "\rpwsh -a" * 1500 + "; x",
+@pytest.mark.parametrize(("unit", "reps"), [
+    ("\r", 8000),
+    (" \r", 4000),
+    ("\rri -r", 14000),
+    ("\rri x", 16000),
+    ("\rpwsh -a", 1500),
 ], ids=["cr", "space-cr", "cr-delete-verb", "cr-delete-operand", "cr-launcher"])
-def test_bare_cr_runs_scan_in_linear_time(command):
+def test_bare_cr_runs_scan_in_linear_time(unit, reps):
     # A bare CR starts a PowerShell statement; a run of them must not make each CR rescan the rest of the run.
-    start = time.perf_counter()
-    assert not detect_hardline_command(command)[0]
-    assert time.perf_counter() - start < 2
+    # Compare CPU time at a quarter of the input with the full input: linear growth is ~4x, a quadratic
+    # scan is ~16x. An absolute wall-clock cap is not portable across loaded runners.
+    def cpu_seconds(count: int) -> float:
+        command = "Get-Date" + unit * count + "; x"
+        start = time.process_time()
+        assert not detect_hardline_command(command)[0]
+        return time.process_time() - start
+
+    small = cpu_seconds(reps // 4)
+    large = cpu_seconds(reps)
+    assert large < 8 * max(small, 0.05), (unit, small, large)
 
 
 @pytest.mark.parametrize("cmd", [

@@ -31,7 +31,7 @@ from tools.delegate_tool_child_run import (
 )
 from tools.delegate_tool_config import (
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_max_concurrent_children,
-    _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled,
+    _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_worktree_isolation,
     _inherit_parent_capabilities, _merge_request_overrides, _resolve_child_credential_pool,
     _resolve_child_runtime,
     _subagent_auto_approve, _subagent_auto_deny,
@@ -231,6 +231,7 @@ def _build_child_agent(
     routing_cfg: Optional[dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
+    repo_root: Optional[str] = None,
     # Per-task route from the delegation provider (tools/delegate_tool_routes.py): a reasoning
     # effort that beats delegation.reasoning_effort, and the profile home the child runs as.
     override_reasoning_effort: Any = None,
@@ -366,6 +367,24 @@ def _build_child_agent(
     child._delegate_context = context  # rides the first user turn, not the system prompt
     child._inherited_cache_scope = sibling_cache_scope(parent_agent)
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
+    # This marker comes only from the production constructor.  _run_single_child
+    # also has direct helper seams used by non-launching tests and read-only
+    # callers, which must not be mistaken for a live source writer merely
+    # because they supply a subagent-shaped test double.  Do not stamp a mocked
+    # constructor result as a writer: a production AIAgent is checked below for
+    # the source-writing tools it can actually invoke.
+    parent_cwd = None
+    with _quiet(None):
+        from tools.terminal_tool import resolve_recorded_session_cwd
+        parent_cwd = resolve_recorded_session_cwd(getattr(parent_agent, "_current_task_id", None))
+    coding_root, coding_error = resolve_delegate_coding_root(
+        repo_root, parent_cwd or _resolve_workspace_hint(parent_agent), isolate=_get_worktree_isolation(),
+    )
+    if coding_error:
+        raise ValueError(coding_error)
+    child._delegate_repo_root = coding_root
+    # Lease only when a checkout was resolved. Write tools alone are not a writer.
+    child._delegate_admission_required = bool(coding_root) and _is_concrete_source_writer(child)
     _apply_child_compression_cap(child, delegation_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
@@ -403,6 +422,77 @@ def _build_child_agent(
         )
     return child
 
+
+_SOURCE_WRITING_TOOLS = frozenset({"terminal", "execute_code", "write_file", "patch"})
+
+
+def _source_writing_tool_names(child: Any) -> set[str]:
+    """Concrete tool names exposed by a child, never mock-shaped attributes."""
+    tool_names: set[str] = set()
+    names = getattr(child, "valid_tool_names", ())
+    if isinstance(names, (list, tuple, set, frozenset)):
+        tool_names.update(name for name in names if isinstance(name, str))
+    tools = getattr(child, "tools", ())
+    if isinstance(tools, (list, tuple)):
+        for tool in tools:
+            if isinstance(tool, dict):
+                function = tool.get("function")
+                name = tool.get("name")
+                if isinstance(name, str):
+                    tool_names.add(name)
+                if isinstance(function, dict):
+                    name = function.get("name")
+                    if isinstance(name, str):
+                        tool_names.add(name)
+    return tool_names
+
+
+def _is_concrete_source_writer(child: Any) -> bool:
+    """True only for a real AIAgent that exposes a source-writing tool."""
+    try:
+        from run_agent import AIAgent
+        is_agent = isinstance(child, AIAgent)
+    except (Exception, TypeError):
+        return False
+    return is_agent and bool(_SOURCE_WRITING_TOOLS & _source_writing_tool_names(child))
+
+
+def resolve_delegate_coding_root(
+    repo_root: Optional[str], parent_cwd: Optional[str], *, isolate: bool,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(git toplevel, error)`` for a delegate that may edit source.
+
+    An explicit ``repo_root`` must be a checkout, even when the global
+    isolation flag is off. A parent cwd that is not a repo, with no
+    ``repo_root``, is not an error: that child starts with no writer lease.
+    The parent checkout is a coding root only when isolation is on.
+    """
+    from tools.subagent_worktree import resolve_repo_root
+
+    if isinstance(repo_root, str) and repo_root.strip():
+        resolved = resolve_repo_root(repo_root.strip())
+        if not resolved:
+            return None, "no repo root for a coding delegate"
+        return resolved, None
+    if not isolate or not parent_cwd:
+        return None, None
+    return resolve_repo_root(parent_cwd), None
+
+
+def _requires_writer_admission(child: Any) -> bool:
+    """Whether this launch must show a linked worktree before it starts.
+
+    Tool presence is not the signal. A Slack child with ``terminal`` and no
+    checkout must start. A production stamp, or a resolved coding root on a
+    concrete source writer, is the lease.
+    """
+    if getattr(child, "_delegate_admission_required", False) is True:
+        return True
+    if getattr(child, "_delegate_repo_root", None):
+        return _is_concrete_source_writer(child)
+    return False
+
+
 def _run_single_child(
     task_index: int, goal: str, child=None, parent_agent=None, *, owner_session_id: Optional[str] = None,
     owner_transport: Any = None, owner_session_record: Any = None, **_kwargs,
@@ -420,31 +510,83 @@ def _run_single_child(
 
     * ``"completed"``       — normal finish. See #97655.
     """
+    # Defense in depth for direct helper/eval callers that bypass
+    # delegate_task. This check runs before registration, heartbeat, workspace
+    # setup, or the child conversation.
+    from hermes_cli.admission_contract import AdmissionCaller, route_launch_path
+    launch_route = route_launch_path(
+        "delegate.child_process", AdmissionCaller.DELEGATE,
+        request_id=getattr(child, "_subagent_id", None) or f"delegate:{task_index}",
+    )
+    if launch_route.state != "routed":
+        return _fabricated_entry(
+            task_index, "error", f"admission path rejected: {launch_route.reason}", child, 0.0,
+        )
     child_progress_cb = getattr(child, "tool_progress_callback", None)
+    # Worktree creation is a preflight, not child execution.  A launch-capable
+    # source writer must show a real isolated linked worktree before
+    # heartbeat/registry/conversation startup.  In particular, do not quietly
+    # downgrade a failed worktree setup to "read-only".
+    _preflight_id = getattr(child, "_subagent_id", None)
+    enforce_admission = _requires_writer_admission(child)
+    _preflight_id = _preflight_id if enforce_admission else f"delegate:{task_index}"
+    from tools.delegate_tool_resumable import release_unstarted
     try:
+        run = _ChildRun(child, parent_agent, task_index, goal, _preflight_id, child_progress_cb)
+        admission = None
+        if enforce_admission:
+            assert isinstance(_preflight_id, str)
+            run.seed_workspace()
+            from hermes_cli.admission_runtime import admit_writer
+            admission = admit_writer(
+                request_id=_preflight_id,
+                caller=AdmissionCaller.DELEGATE,
+                workspace=(run.worktree_info or {}).get("path"),
+                priority=0,
+                writer_id=f"delegate:{_preflight_id}",
+            )
+            if admission.state != "running":
+                # Delegation does not have a durable queue consumer. A queued
+                # preflight must be cancelled by request ID before this child is
+                # rejected, because queued admissions have no lease to release.
+                from hermes_cli.admission_runtime import cancel_admission_request
+                cancel_admission_request(admission.request_id)
+                entry = _fabricated_entry(
+                    task_index, "error", f"admission rejected: {admission.reason or 'not_running'}", child, run.elapsed(),
+                )
+                release_unstarted(child)
+                return run.attach_worktree(entry)
         child_pool, leased_cred_id = _lease_child_credential(child)
         # Heartbeat keeps the parent's _last_activity_ts moving so the gateway inactivity timeout doesn't fire while
         # the child works; once the child looks stale (see _HEARTBEAT_STALE_CYCLES_*) it also ends await_child's wait.
         heartbeat = _Heartbeat(child, parent_agent, task_index)
+        if admission is not None:
+            # The shared heartbeat is the child liveness owner. Keep the exact
+            # admission lease alive until this function's finally releases it.
+            heartbeat.admission_lease_id = admission.lease_id
         # TUI/RPC registry entry (kill/pause/status by subagent_id); None for test
         # doubles without a stable id. Unregistered in the finally block.
         _subagent_id = _register_child(
             child, parent_agent, goal, owner_session_id=owner_session_id, owner_transport=owner_transport,
             owner_session_record=owner_session_record,
         )
+        run.subagent_id = _subagent_id
+        run.heartbeat = heartbeat
+        if enforce_admission:  # seeded before the heartbeat existed: hook its durable checkpoint now
+            from tools.delegate_tool_resumable import checkpoint
+            heartbeat.checkpoint = lambda: checkpoint(run)
     except BaseException:
         # Nothing below runs, so a continued child's durable claim is handed back here.
-        from tools.delegate_tool_resumable import release_unstarted
         release_unstarted(child)
         raise
-    run = _ChildRun(child, parent_agent, task_index, goal, _subagent_id, child_progress_cb, heartbeat=heartbeat)
     # Set when a timed-out Future still owns the child: closing it from this
     # thread before the worker settles races the conversation's finally path.
     _child_close_deferred = False
     try:
         heartbeat.start()
         _safe_progress(child_progress_cb, "subagent.start", preview=goal)
-        run.seed_workspace()
+        if not enforce_admission:
+            run.seed_workspace()
         if isinstance(cancelled := getattr(child, "_delegate_auto_cancelled", None), str):  # the parent's stop won
             run.worktree_info = None  # still the parent's to keep or release; finalizing it here could prune it
             # Never ran: not a terminal outcome. A cancel reports nothing; a failed start stays owed (next attempt or
@@ -480,6 +622,9 @@ def _run_single_child(
         ))
     finally:
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
+        if admission is not None:
+            from hermes_cli.admission_runtime import release_admission
+            release_admission(admission.lease_id)
 
 
 def _credential_overrides(creds: dict[str, Any], routing_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -527,7 +672,7 @@ def _build_children(
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context, max_iterations=max_iterations,
                 task_count=len(task_list), parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
-                **_route_overrides(route),
+                repo_root=t.get("repo_root"), **_route_overrides(route),
                 # A spawn always inherits the parent's toolsets; a continued child keeps its own.
                 **{"toolsets": None, "model": route.creds["model"], **(rebuild[i] if rebuild else {})},
             )
@@ -694,6 +839,18 @@ def delegate_task(
     err = _oneshot_spawn_budget(parent_agent, len(runnable))
     if err:
         return tool_error(err)
+
+    # The public tool entry is the common chokepoint for direct calls,
+    # run_agent tool dispatch, and /review. It runs before live-log creation
+    # and child construction so an unsupported path cannot start a parallel
+    # writer as a side effect.
+    from hermes_cli.admission_contract import AdmissionCaller, route_launch_path
+    launch_route = route_launch_path(
+        "delegate.batch", AdmissionCaller.DELEGATE,
+        request_id=getattr(parent_agent, "session_id", "delegate") or "delegate",
+    )
+    if launch_route.state != "routed":
+        return tool_error(f"admission path rejected: {launch_route.reason}")
 
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
@@ -900,6 +1057,12 @@ DELEGATE_TASK_SCHEMA = {
                             "Result-delivery bucket. Tasks sharing a group return together in ONE message once all of "
                             "them finish; a task with its own group returns alone when it finishes. Does not order "
                             "execution; if B needs A's output, dispatch B after A returns.",
+                        ),
+                        "repo_root": _p(
+                            "string",
+                            "Absolute path of the git checkout this child may edit. Omit for review, gh, or research. "
+                            "When set, the child gets one linked worktree under that repo (shared object store, not a "
+                            "clone). A path that is not a git checkout fails the spawn with a named error.",
                         ),
                     },
                     "required": ["goal"],

@@ -121,6 +121,22 @@ def test_quickstart_refuses_when_nothing_fits(client, monkeypatch):
     assert "Local Models" in r.json()["detail"]
 
 
+def _always_fit_catalog(monkeypatch) -> None:
+    """4-core GitHub runners have no GPU and little free RAM, so the real
+    catalog fit returns None and quickstart 409s. These tests are about
+    job sequencing, not hardware physics."""
+    from hermes_cli.local_runtime.catalog import VariantChoice
+
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.catalog.select_variant",
+        lambda entry, budget: VariantChoice(
+            variant=entry.variants[-1],
+            zero_spill=True,
+            reason_key="best-fits",
+        ),
+    )
+
+
 @pytest.fixture
 def capable_hardware(monkeypatch):
     """Success-path orchestration tests need a model to fit, independent of host load."""
@@ -135,10 +151,11 @@ def capable_hardware(monkeypatch):
     monkeypatch.setattr(hardware, "probe_budget", lambda **kw: budget)
 
 
-def test_quickstart_runs_all_three_legs(client, capable_hardware, monkeypatch, tmp_path):
+def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
     """Fresh machine: install runtime -> download recommended -> activate.
     Each leg is asserted by its observable call, in order."""
     calls: list[str] = []
+    _always_fit_catalog(monkeypatch)
 
     # Supply the same supported backend to preflight and the stubbed install;
     # host auto-detection may select a GPU backend this test host cannot install.
@@ -201,6 +218,7 @@ def test_quickstart_skips_satisfied_legs(client, capable_hardware, monkeypatch):
     """Runtime present and model already staged: the response says so and
     the job goes straight to activation."""
     calls: list[str] = []
+    _always_fit_catalog(monkeypatch)
 
     monkeypatch.setattr(
         "hermes_cli.local_runtime.binaries.installed_engine", lambda *args, **kwargs: Engine("cpu", "b10362", Path("unused")))

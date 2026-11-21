@@ -2074,6 +2074,7 @@ def _external_process_spec(
         from providers import get_provider_profile as _get_provider_profile
         profile = _get_provider_profile(pconfig.id)
     except Exception:
+        logger.debug("external-process profile lookup failed", exc_info=True)
         profile = None
     command_env_vars = tuple(getattr(profile, "process_command_env_vars", ()) or ())
     args_env_var = str(getattr(profile, "process_args_env_var", "") or "")
@@ -2082,6 +2083,41 @@ def _external_process_spec(
     raw_args = os.getenv(args_env_var, "").strip() if args_env_var else ""
     args = shlex.split(raw_args) if raw_args else list(getattr(profile, "process_args", ()) or [])
     return command, args, base_url, resolve_external_process_command(command), command_env_vars
+
+
+def _external_process_provider_config(provider_id: str) -> tuple[ProviderConfig, Any]:
+    """Return process-provider metadata, rejecting unsafe process-auth collisions.
+
+    Built-in OAuth/native overlays can intentionally refine static API-key
+    metadata. A disagreement involving ``external_process`` is different: it
+    would choose HTTP credentials or a subprocess based solely on import order.
+    """
+    pconfig = _registry_lookup(provider_id)
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider_id)
+    except Exception:
+        logger.debug("external-process provider profile lookup failed", exc_info=True)
+        profile = None
+    static_auth = getattr(pconfig, "auth_type", None)
+    profile_auth = getattr(profile, "auth_type", None)
+    if (
+        (static_auth == "external_process" or profile_auth == "external_process")
+        and static_auth and profile_auth and static_auth != profile_auth
+    ):
+        raise AuthError(
+            f"Provider '{provider_id}' has conflicting authentication metadata.",
+            provider=provider_id,
+            code="invalid_provider",
+        )
+    if not pconfig or pconfig.auth_type != "external_process":
+        raise AuthError(
+            f"Provider '{provider_id}' is not an external-process provider.",
+            provider=provider_id,
+            code="invalid_provider",
+        )
+    return pconfig, profile
 
 
 def get_external_process_provider_status(provider_id: str) -> dict[str, Any]:

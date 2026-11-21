@@ -245,6 +245,9 @@ class GatewayAuthorizationMixin:
         if not primary_profile:
             with contextlib.suppress(Exception):
                 primary_profile = self._active_profile_name()
+        standalone_owner = getattr(self, "_standalone_transport_profile", None)
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False) and profile_name == standalone_owner:
+            return self._primary_adapters()
         return self._primary_adapters() if profile_name == primary_profile else {}
 
     def _shared_bot_target_allowed(self, platform: Platform, profile: Optional[str], chat_id,

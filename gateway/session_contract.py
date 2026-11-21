@@ -50,6 +50,14 @@ class Submission:
 
 
 @dataclass(frozen=True)
+class ControlAcceptance:
+    """Control-request state; clearing cleanup_pending is not a quiescence proof."""
+    kind: Literal['stop']
+    request_consumed: bool
+    cleanup_pending: bool
+
+
+@dataclass(frozen=True)
 class AdmissionReceipt:
     admission_id: str
     ref: SessionRef
@@ -58,6 +66,11 @@ class AdmissionReceipt:
     outcome: str | None
     authority_epoch: int
     execution_generation: int | None
+
+    @property
+    def control(self) -> ControlAcceptance | None:
+        """Optional transport-local projection; not part of established RPC serialization."""
+        return getattr(self, '_control', None)
 
 
 @dataclass(frozen=True)

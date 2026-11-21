@@ -49,6 +49,9 @@ _CARD_DESTINATION_REFUSALS = {
     "slack task_card requires a thread anchor (Slack streams are thread replies)",
 }
 
+# The loop-side promotion task must release this gate before executor work starts.
+EXECUTION_LAUNCH_GATE_TIMEOUT = 30.0
+
 
 def _settled_result(fut, outcome: str):
     """The send's result for the receipt log; None when it never resolved or raised."""
@@ -151,7 +154,7 @@ class _ExecApprovalDeclined(RuntimeError):
     """
 
 
-from gateway.run_turn_progress import GatewayTurnProgressMixin
+from gateway.run_turn_runner_titles import SessionTitleCallbacks
 from gateway.session_execution import GatewaySessionAgentMixin
 
 
@@ -231,7 +234,7 @@ def _observed_turn_persist_message(run_message, override, live_text):
         return [{**first, "text": override + first["text"][len(live_text):]}, *run_message[1:]]
     return run_message
 
-class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+class TurnRunner(SessionTitleCallbacks, GatewaySessionAgentMixin):
     """Per-turn collaborator carrying ``GatewayRunner._run_agent_inner``'s tool-progress callbacks."""
 
     # ``None`` is a legitimate state: a turn with no owning session authority (messaging
@@ -1314,6 +1317,20 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         unique_tags = (["[[audio_as_voice]]"] if has_voice_directive else []) + list(dict.fromkeys(media_tags))
         return final_response + "\n" + "\n".join(unique_tags)
 
+    def _await_execution_launch(self, execution_id: str | None) -> bool:
+        """Start only after promotion allows this claimed execution to launch."""
+        ctx = self._ctx
+        if ctx.execution_launch_gate is None:
+            return True
+        if not ctx.execution_launch_gate.wait(timeout=EXECUTION_LAUNCH_GATE_TIMEOUT):
+            logger.warning(
+                "gateway launch fence timed out after %.0fs for session=%s execution=%s; "
+                "treating launch as denied",
+                EXECUTION_LAUNCH_GATE_TIMEOUT, ctx.session_key or "", execution_id,
+            )
+            ctx.execution_launch_allowed = False
+        return bool(ctx.execution_launch_allowed)
+
     def run_sync(self):
         from contextlib import ExitStack
         from gateway.session_policy import bind_turn_workspace, policy_for_source, policy_scope, refused_turn_result
@@ -1466,6 +1483,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from agent.primary_auth_fallback import attach_primary_auth_failure
         attach_primary_auth_failure(agent, pending_primary_auth)
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
+        if not self._await_execution_launch(ctx.internal_plugin_execution_id):
+            return {"final_response": "", "messages": [], "api_calls": 0,
+                    "tools": [], "completed": True, "interrupted": True}
         from gateway.run_turn_progress import local_viewer_turn
         local_sinks = None
         if local_viewer_turn(self) and not ctx.mute_notification_reply:

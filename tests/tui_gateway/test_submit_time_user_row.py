@@ -8,6 +8,7 @@ from persistence.conversation.messages import ConversationRequest, TranscriptRea
 from persistence_assembly import open_persistence, profile_scope
 from run_agent import AIAgent
 from tests.fixtures.storage_read import conversation, transcript_rows
+from tests.fixtures.storage_seed import seed_messages, seed_session
 from tui_gateway import server
 
 
@@ -47,6 +48,105 @@ def test_user_message_is_durable_at_submit_before_any_agent_turn(monkeypatch, tm
         assert [(r["role"], r["content"]) for r in conversation(db, key)] == [
             ("user", "please refactor the login page")]
         assert db.sessions.get(key).message_count == 1
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
+def test_retired_desktop_predecessor_refuses_registered_submit_before_transcript_write(monkeypatch, tmp_path):
+    from gateway.chat_execution_recovery import ChatExecutionStore
+
+    db = open_persistence(profile_scope(home=tmp_path))
+    sid, key = _desktop_session(monkeypatch, db)
+    session = server._sessions[sid]
+    session["profile_home"] = str(tmp_path)
+    seed_session(db, key, "desktop")
+    seed_messages(db, key, {"role": "user", "content": "original"})
+    store = ChatExecutionStore(tmp_path)
+    assert store.start_local_worker(key, key) == 1
+    assert store.worker_finished(key, 1)
+    assert store.retire_for_handoff(key, 1, "transfer-1")["status"] == "retired"
+    try:
+        response = server.handle_request({"id": "p", "method": "prompt.submit", "params": {
+            "session_id": sid, "text": "continue the old work"}})
+        assert response["error"]["code"] == 4090
+        assert [(row["role"], row["content"]) for row in conversation(db, key)] == [
+            ("user", "original")]
+        assert session["running"] is False
+        response = server.handle_request({"id": "rewind", "method": "prompt.submit", "params": {
+            "session_id": sid, "text": "rewrite", "truncate_before_user_ordinal": 0,
+            "confirm_truncate": True}})
+        assert response["error"]["code"] == 4090
+        assert [(row["role"], row["content"]) for row in conversation(db, key)] == [
+            ("user", "original")]
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
+def test_queued_desktop_submit_blocks_handoff_then_registered_stop_cancels_claim(monkeypatch, tmp_path):
+    from gateway.chat_execution_recovery import ChatExecutionStore
+
+    db = open_persistence(profile_scope(home=tmp_path))
+    sid, key = _desktop_session(monkeypatch, db)
+    session = server._sessions[sid]
+    session["profile_home"] = str(tmp_path)
+    store = ChatExecutionStore(tmp_path)
+    assert store.start_local_worker(key, key) == 1
+    try:
+        session["running"] = True
+        response = server.handle_request({"id": "queue", "method": "prompt.submit", "params": {
+            "session_id": sid, "text": "queued work", "queued": True}})
+        assert response["result"]["status"] == "queued"
+        assert session["queued_prompt"]["text"] == "queued work"
+        assert store.worker_finished(key, 1)
+        assert store.retire_for_handoff(key, 1, "handoff")["status"] == "blocked"
+        stop = server.handle_request({"id": "stop", "method": "session.interrupt", "params": {
+            "session_id": sid}})
+        assert stop["result"]["status"] == "interrupted"
+        assert session.get("queued_prompt") is None
+        assert store.retire_for_handoff(key, 1, "handoff")["status"] == "retired"
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
+def test_accepted_desktop_steer_keeps_claim_through_worker_settlement(monkeypatch, tmp_path):
+    from gateway.chat_execution_recovery import ChatExecutionStore
+
+    db = open_persistence(profile_scope(home=tmp_path))
+    sid, key = _desktop_session(monkeypatch, db)
+    session = server._sessions[sid]
+    session["profile_home"] = str(tmp_path)
+    session["agent"] = SimpleNamespace(steer=lambda _text: True)
+    session["running"] = True
+    session["inflight_turn"] = {"user": "original work"}
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
+    store = ChatExecutionStore(tmp_path)
+    assert store.start_local_worker(key, key) == 1
+    try:
+        response = server.handle_request({"id": "steer", "method": "prompt.submit", "params": {
+            "session_id": sid, "text": "accepted correction"}})
+        assert response["result"]["status"] == "steered"
+        assert store.worker_finished(key, 1)
+        assert store.retire_for_handoff(key, 1, "handoff")["status"] == "blocked"
+        corrections = session.pop("_chat_accepted_corrections")
+        assert len(corrections) == 1 and corrections[0][0] == key
+        session["_chat_followup_corrections"] = corrections
+        session["running"] = False
+        admitted = []
+
+        def run_followup(_rid, _sid, _session, prompt, **kwargs):
+            admitted.append((prompt, kwargs["chat_submit_ids"]))
+            assert store.start_local_worker(key, key, kwargs["chat_submit_ids"]) == 2
+            assert store.worker_finished(key, 2)
+            return True
+
+        monkeypatch.setattr(server, "_run_prompt_submit", run_followup)
+        server._run_post_turn_followups("followup", sid, session,
+                                        {"pending_steer": "accepted correction"}, None)
+        assert admitted == [("accepted correction", (corrections[0][1],))]
+        assert store.retire_for_handoff(key, 1, "handoff")["status"] == "retired"
     finally:
         server._sessions.pop(sid, None)
         db.close()

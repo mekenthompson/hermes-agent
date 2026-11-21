@@ -1951,7 +1951,13 @@ export type { StatusResponse } from '@/types/hermes'
 /** Public SDK name for the shared gateway wire event; kept stable for plugins. */
 export type { GatewayEvent as RpcEvent } from '@hermes/shared'
 /** Bot Screen wire shapes, generated from `tui_gateway/contracts/display.py`. */
-export type { DisplayLease, DisplayObserveResult, DisplayStatus, DisplayThumbnailResult } from '@hermes/shared'
+export type {
+  DisplayClipboardReadResult,
+  DisplayLease,
+  DisplayObserveResult,
+  DisplayStatus,
+  DisplayThumbnailResult
+} from '@hermes/shared'
 /** Profile creation and session rows, generated from `tui_gateway/contracts`. */
 export type { ProfilesCreateResult, ProfileSessionPreview, SessionListRow } from '@hermes/shared'
 /** THE compact-number formatter — every user-facing count/token figure goes

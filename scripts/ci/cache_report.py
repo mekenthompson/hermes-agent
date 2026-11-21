@@ -291,7 +291,7 @@ def _amount(values: list[int | None], label: str) -> str:
 def _summary(view: dict) -> str:
     groups = view["groups"]
     result = (f"{len(groups['hits'])} / {view['attempts']} cache hits ({len(groups['misses'])} miss{'es' if len(groups['misses']) != 1 else ''})"
-    + "\n" 
+    + "\n"
               + _amount([e["restored_bytes"] for e in groups["hits"]], "restored")
               + "\n" + _amount(view["missed"], "not restored"))
     if view["is_main"]:

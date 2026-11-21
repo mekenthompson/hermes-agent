@@ -566,6 +566,7 @@ def gateway_lifecycle_block(
     cwd: str,
     workdir: Optional[str],
     session_key: str,
+    task_id: Optional[str] = None,
 ) -> Optional[str]:
     """Refuse gateway lifecycle commands issued from inside the supervised gateway.
 
@@ -582,7 +583,7 @@ def gateway_lifecycle_block(
     """
     from tools.environments.sandbox_scope import hosted_scope
     from tools.process_registry import _is_supervised_gateway_process
-    from tools.terminal_tool import _resolve_command_cwd, get_session_cwd
+    from tools.terminal_tool import _resolve_command_cwd, resolve_recorded_session_cwd
 
     # A hosted command runs in the agent's remote sandbox, which cannot reach this gateway; the
     # scan below would read the scripts it names on this host.
@@ -609,11 +610,15 @@ def gateway_lifecycle_block(
             "not by switching launchctl verbs to bypass this rejection.",
             "error",
         )
-    guard_cwd_base = get_session_cwd(session_key)
+    guard_cwd_base = resolve_recorded_session_cwd(task_id)
+    if guard_cwd_base is None and not task_id:
+        from tools.terminal_tool import get_session_cwd
+        guard_cwd_base = get_session_cwd(session_key)
     if guard_cwd_base is None:
         guard_cwd_base = getattr(env, "cwd", None) or cwd
     guard_cwd = _resolve_command_cwd(
-        workdir=workdir, default_cwd=guard_cwd_base, session_key=session_key, env_type=env_type,
+        workdir=workdir, default_cwd=guard_cwd_base, session_key=session_key,
+        env_type=env_type, task_id=task_id,
         mounted_host=getattr(env, "host_cwd", None),
         env=env,
     )
@@ -658,6 +663,7 @@ def self_repo_block(
     cwd: str,
     workdir: Optional[str],
     session_key: str,
+    task_id: Optional[str] = None,
 ) -> Optional[str]:
     """Windows-only guard against git-mutating the checkout backing this interpreter.
 
@@ -672,7 +678,9 @@ def self_repo_block(
 
     if not guard_active():
         return None
-    guard_cwd = _resolve_command_cwd(workdir=workdir, default_cwd=cwd, session_key=session_key)
+    guard_cwd = _resolve_command_cwd(
+        workdir=workdir, default_cwd=cwd, session_key=session_key, task_id=task_id,
+    )
     hit, msg = detect_self_repo_git_mutation(command, guard_cwd)
     if not hit:
         return None

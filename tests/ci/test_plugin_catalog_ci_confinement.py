@@ -451,6 +451,51 @@ def test_changed_entries_step(tmp_path, change, rc, listed, text):
         assert text in res.stdout
 
 
+def test_pr130_catalog_guard_predicate_matrix(tmp_path):
+    """Run the real shell gate with synthetic pinned history, including a base-only commit."""
+    repo = tmp_path / "pr"
+    _write(repo, {"plugin-catalog/old.yaml": "name: old\n"})
+    _git(repo, "init", "-qb", "main")
+    base = _commit(repo, "base")
+    _git(repo, "checkout", "-qb", "pr")
+    _write(repo, {"upstream.txt": "frozen upstream\n"})
+    upstream = _commit(repo, "upstream")
+    _write(repo, {**NEW, "scripts/tool.py": "x = 2\n"})
+    _commit(repo, "catalog plus tooling")
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, {"base-only.txt": "not on PR head\n"})
+    base_only = _commit(repo, "base only")
+    _git(repo, "merge", "-q", "--no-ff", "-m", "synthetic PR merge", "pr")
+    script = _step("Find changed catalog")
+    first = "git merge-base --is-ancestor c9b20d7bc08dec1e10779a06d7d9073bc6e7e418 HEAD^2"
+    second = "git merge-base --is-ancestor f6ac86b0ef3d5e86654132b8aba1ce6f1de45b5e HEAD^2"
+    assert first in script and second in script
+    # Replace only the ancestor pins. The branch name contains the upstream SHA,
+    # so a raw SHA replace would also rewrite the allowlisted ref.
+    script = script.replace(first, f"git merge-base --is-ancestor {upstream} HEAD^2")
+    script = script.replace(second, f"git merge-base --is-ancestor {base} HEAD^2")
+    correct = {"CATALOG_HEAD_REPO": "switchroom/hermes-agent",
+               "CATALOG_HEAD_REF": "house/reconcile-nous-c9b20d7bc08dec1e10779a06d7d9073bc6e7e418",
+               "CATALOG_PR_NUMBER": "237"}
+    cases = [("authorized", correct, script, 0)]
+    for key, bad in (("CATALOG_HEAD_REPO", "attacker/hermes-agent"),
+                     ("CATALOG_HEAD_REF", "hf457/other"), ("CATALOG_PR_NUMBER", "236")):
+        cases.append((key, {**correct, key: bad}, script, 1))
+        cases.append(("missing " + key, {k: v for k, v in correct.items() if k != key}, script, 1))
+    cases.append(("upstream not on head", correct, script.replace(upstream, base_only), 1))
+    cases.append(("fork not on head", correct, script.replace(base, base_only), 1))
+    out = tmp_path / "gh-output.txt"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CATALOG_")}
+    for name, extra, candidate, rc in cases:
+        out.write_text("", encoding="utf-8")
+        res = _run(candidate, tmp_path, repo, {**env, "GITHUB_OUTPUT": str(out), **extra})
+        assert res.returncode == rc, (name, res.stdout, res.stderr)
+        if rc:
+            assert "may only touch" in res.stdout
+        else:
+            assert "plugin-catalog/new.yaml" in out.read_text(encoding="utf-8")
+
+
 def test_self_updater_allowlist_matches_only_the_reviewed_file(tmp_path, monkeypatch):
     # A maintainer-reviewed third-party download passes only at its exact repo, pin and file
     # hash: a re-pin, an edited byte or a second fetching file is gated again. Linux-only like the

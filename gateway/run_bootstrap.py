@@ -804,13 +804,26 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
 
     # Duplicate-instance guard scoped to HERMES_HOME (the host record is absent or unusable here).
     from gateway.status import get_running_pid
+    from gateway.session_db_writers import (
+        fail_closed_if_deleted_holders,
+        quiesce_session_db_writers_for_replace,
+        release_supervised_dashboard,
+    )
+    from hermes_constants import get_hermes_home
+    held_dashboard = []
+    if replace:
+        held_dashboard = quiesce_session_db_writers_for_replace(get_hermes_home())
     existing_pid = get_running_pid()
     if (existing_pid is not None and existing_pid != os.getpid()
             and not await _start_gateway_replace_existing_instance(existing_pid, replace)):
+        release_supervised_dashboard(held_dashboard)
         return False
+    if replace and not fail_closed_if_deleted_holders(get_hermes_home()):
+        return False  # Deleted-sidecar refusal leaves the dashboard held down.
 
     from gateway.status import remove_pid_file, release_gateway_runtime_lock
     if not _start_gateway_reserve_profiles(profile_homes):
+        release_supervised_dashboard(held_dashboard)
         return False
     # Freeze discovery: later profile additions must restart and reserve before opening stores.
     if profile_homes:
@@ -820,6 +833,7 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
     # --force there disabled the one arbiter of the two-units-at-once race; a replace that took the
     # owner over already freed the lock with that process.
     if not _start_gateway_claim_pid_file(force=force):
+        release_supervised_dashboard(held_dashboard)
         release_gateway_runtime_lock()
         return False
 
@@ -915,6 +929,8 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
         _ensure_windows_gateway_venv_imports()
 
         _early_verdict = await _start_gateway_run_runner(runner, _signal_initiated_shutdown)
+        release_supervised_dashboard(held_dashboard)
+        held_dashboard = []
         if _early_verdict is not None:
             await await_session_socket_preload(ws_preload)  # never left unawaited on the way out
             return _early_verdict
@@ -951,6 +967,7 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
         return verdict
 
     finally:
+        release_supervised_dashboard(held_dashboard)
         try:
             if runner is not None:
                 from gateway.run_runtime import drain_gateway_runtime

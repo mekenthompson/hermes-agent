@@ -764,6 +764,22 @@ def _apply_synchronous_pragma(conn: sqlite3.Connection, raw_value: Any, *, db_la
         conn.execute(f"PRAGMA synchronous={level}")
 
 
+def disable_close_time_wal_reset(conn: sqlite3.Connection) -> bool:
+    """Arm SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE so sqlite3_close does not reset -wal/-shm.
+
+    Python 3.12+ only (Connection.setconfig). Returns True when the flag is armed.
+    """
+    flag = getattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE", None)
+    setconfig = getattr(conn, "setconfig", None)
+    if flag is None or setconfig is None:
+        return False
+    try:
+        setconfig(flag, True)
+    except Exception:
+        return False
+    return True
+
+
 def apply_database_pragmas(conn: sqlite3.Connection, *, db_label: str = "state.db") -> None:
     """Apply optional performance and WAL-sizing PRAGMAs from ``config.yaml``.
 
@@ -1000,6 +1016,10 @@ def preflight_db_writability(db_path: Path, *, db_label: str = "state.db", direc
     files = () if directory_only else tuple((p, False) for p in (db_path, *sidecars) if p.is_file())
     for p, is_dir in [(db_path.parent, True), *files]:
         if (is_dir and not p.is_dir()) or _rw_or_vanished(p):
+            continue
+        # House: a concurrent quarantine renames the file between the is_file() snapshot and this check.
+        # os.access() reports a missing path as no access, which is not a read-only file.
+        if not is_dir and not p.exists():
             continue
         x = "x" if is_dir else ""
         in_scope = False

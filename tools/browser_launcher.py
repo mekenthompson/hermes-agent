@@ -30,8 +30,10 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from http.client import HTTPConnection, HTTPException
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,12 @@ _MIN_FIRST_LAUNCH_TIMEOUT_S = 120
 _UNRESPONSIVE_WAIT_S = 10  # how long a live browser whose endpoint went silent (paused, swapped out) is waited for
 _POLL_INTERVAL_S = 0.1
 _STDERR_TAIL_CHARS = 1500
+_CHROMIUM_EXECUTABLE_NAMES = frozenset({
+    "chrome", "chromium", "chromium-browser", "google chrome", "google-chrome",
+    "google-chrome-stable", "chrome-headless-shell", "chromium-headless-shell",
+    "brave", "brave browser", "brave-browser", "brave-browser-stable", "brave origin",
+    "brave-origin", "microsoft edge", "microsoft-edge", "microsoft-edge-stable", "msedge",
+})
 
 
 @dataclass
@@ -123,6 +131,9 @@ def running_in_docker() -> bool:
 
 def needs_chromium_sandbox_bypass() -> bool:
     """True when Chromium needs --no-sandbox to start reliably (root, Docker, AppArmor userns)."""
+    from hermes_cli.browser_runtime import chromium_sandbox_required
+    if chromium_sandbox_required():
+        return False
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         return True
     if running_in_docker():
@@ -247,6 +258,8 @@ def build_chromium_argv(executable: str, user_data_dir: str, *, packaged: bool, 
     argv += [str(a) for a in extra_args]
     argv += configured
     argv.append("about:blank")
+    from hermes_cli.browser_runtime import validate_chromium_sandbox_args
+    validate_chromium_sandbox_args(argv)
     return argv
 
 
@@ -263,7 +276,7 @@ def _read_devtools_file(user_data_dir: str) -> Optional[tuple[int, str]]:
     try:
         with open(os.path.join(user_data_dir, _DEVTOOLS_FILE), encoding="utf-8-sig") as fh:
             port, path = fh.readline().strip(), fh.readline().strip()
-    except OSError:
+    except (OSError, UnicodeError):
         return None
     if not port.isdigit() or not path.startswith("/devtools/browser/"):
         return None
@@ -286,6 +299,14 @@ def _wait_for_devtools(proc: subprocess.Popen, user_data_dir: str, deadline: flo
         rc = proc.poll()
         if rc is not None:
             tail = _log_tail(user_data_dir)
+            from hermes_cli.browser_runtime import chromium_sandbox_required
+            if "sandbox" in tail.lower() and chromium_sandbox_required():
+                # Chromium's raw stderr can recommend bypassing the required sandbox.
+                return None, (
+                    f"Chromium exited with code {rc} during startup. Chromium's sandbox could not start; "
+                    "install or verify the reviewed container sandbox policy and keep "
+                    "browser.sandbox_required: true. Do not disable sandboxing."
+                )
             hint = (" Chromium's sandbox could not start; add --no-sandbox to browser.chromium_args."
                     if "sandbox" in tail.lower() else "")
             return None, f"Chromium exited with code {rc} during startup.{hint}" + (f"\n{tail}" if tail else "")
@@ -317,8 +338,8 @@ def _foreign_holder(user_data_dir: str) -> Optional[int]:
     """The ``SingletonLock`` pid of a Chromium on ``user_data_dir`` that runs in an environment this process cannot
     verify, else None. Foreign: the lock is not a live process here whose argv names the dir, and it was written
     under another hostname (another host or container; Chromium too refuses such a lock) or names the browser
-    of a launch record from another PID namespace. A lock of this hostname with no such record is stale (this
-    environment's crashed browser): Chromium itself takes it over, and so does a launch."""
+    of a launch record from another PID namespace. A lock of this hostname with no such record goes through
+    the local holder check: a live but unverifiable PID is refused; a dead PID is stale."""
     owner = _singleton_owner(user_data_dir)
     if owner is None:
         return None
@@ -374,17 +395,64 @@ def _browser_running_on(user_data_dir: str) -> bool:
     return _pid_naming_dir(user_data_dir) is not None
 
 
-def _devtools_endpoint_live(port: int, path: str) -> bool:
-    """The port answers ``/json/version`` with the browser id the DevToolsActivePort file names (the file
-    outlives a crashed Chromium and its port can be recycled by another CDP server)."""
+def _devtools_browser_path(port: int) -> Optional[str]:
+    """Read a CDP browser endpoint directly from loopback, without proxies or redirects."""
+    if not 1 <= port <= 65535:
+        return None
+    connection = HTTPConnection("127.0.0.1", port, timeout=0.5)
     try:
-        import requests
-        from agent.proxy_bypass import loopback_request_kwargs
-        url = f"http://127.0.0.1:{port}/json/version"
-        ws = str(requests.get(url, timeout=2, **loopback_request_kwargs(url)).json().get("webSocketDebuggerUrl") or "")
-    except Exception:  # health: allow BLE001 -- any probe failure means "not a live browser on this port"
+        connection.request("GET", "/json/version")
+        response = connection.getresponse()
+        if response.status != 200:
+            return None
+        endpoint = urlsplit(json.loads(response.read(8193))["webSocketDebuggerUrl"])
+        if (endpoint.scheme != "ws" or endpoint.hostname != "127.0.0.1" or endpoint.port != port
+                or endpoint.username is not None or endpoint.password is not None
+                or not endpoint.path.startswith("/devtools/browser/")
+                or len(endpoint.path) <= len("/devtools/browser/")
+                or endpoint.query or endpoint.fragment):
+            return None
+        return endpoint.path
+    except (OSError, ValueError, KeyError, TypeError, HTTPException):
+        return None
+    finally:
+        connection.close()
+
+
+def _devtools_endpoint_live(port: int, path: str) -> bool:
+    """A marker is valid only when its exact browser endpoint still answers."""
+    return _devtools_browser_path(port) == path
+
+
+def _verified_local_chromium(pid: int, user_data_dir: str) -> bool:
+    """The lock owner is this user's Chromium browser process for precisely this profile."""
+    import psutil
+    try:
+        process = psutil.Process(pid)
+        if hasattr(os, "getuid"):
+            uids = process.uids()
+            same_user = uids.real == os.getuid() and uids.effective == os.geteuid()  # windows-footgun: ok — guarded above
+        else:
+            same_user = process.username() == psutil.Process(os.getpid()).username()
+        argv = process.cmdline()
+        exe = os.path.basename(process.exe()).lower().removesuffix(".exe")
+    except (OSError, psutil.Error):
         return False
-    return ws.endswith(path)
+    if not same_user or exe not in _CHROMIUM_EXECUTABLE_NAMES or any(arg.startswith("--type=") for arg in argv):
+        return False
+    profiles = [arg.partition("=")[2] for arg in argv if arg.startswith("--user-data-dir=")]
+    profiles += [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "--user-data-dir"]
+    return len(profiles) == 1 and os.path.isabs(profiles[0]) and _same_profile(profiles[0], user_data_dir)
+
+
+def _owned_loopback_ports(pid: int) -> set[int]:
+    """Only the proven browser's IPv4 loopback listening sockets may supply a recovered CDP port."""
+    import psutil
+    try:
+        return {conn.laddr.port for conn in psutil.Process(pid).net_connections(kind="inet")
+                if conn.status == psutil.CONN_LISTEN and conn.laddr.ip == "127.0.0.1"}
+    except (OSError, psutil.Error):
+        return set()
 
 
 def running_instance(user_data_dir: str) -> Optional[tuple[int, str, int]]:
@@ -392,11 +460,19 @@ def running_instance(user_data_dir: str) -> Optional[tuple[int, str, int]]:
     Bot Desktop dock instance, a surviving real-profile browser), else None. A second launch on that dir
     would be forwarded into it by Chromium's singleton and exit without a DevTools endpoint."""
     pid = _singleton_pid(user_data_dir)
-    found = _read_devtools_file(user_data_dir)
-    if pid is None or found is None or not _pid_alive(pid):
+    if pid is None or not _pid_alive(pid) or not _verified_local_chromium(pid, user_data_dir):
         return None
-    port, path = found
-    return (port, path, pid) if _devtools_endpoint_live(port, path) else None
+    ports = _owned_loopback_ports(pid)
+    found = _read_devtools_file(user_data_dir)
+    if found is not None and found[0] in ports and _devtools_endpoint_live(*found):
+        return *found, pid
+    # Chromium can keep serving CDP after DevToolsActivePort is lost or corrupt. A port owned by
+    # this exact browser process is the only safe fallback; an arbitrary local CDP server is not.
+    for port in sorted(ports):
+        path = _devtools_browser_path(port)
+        if path is not None:
+            return port, path, pid
+    return None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -440,6 +516,9 @@ def _attach_running(key: str, user_data_dir: str, home_key: str) -> Optional[Lau
     if running is None:
         return None
     port, path, pid = running
+    from hermes_cli.browser_runtime import chromium_existing_sandbox_error
+    if error := chromium_existing_sandbox_error(pid):
+        raise ValueError(error)
     logger.info("browser: attaching to the Chromium already running on %s (pid %s)", user_data_dir, pid)
     browser = _make_browser(key, port, path, pid=pid, start_time=_start_time(pid), user_data_dir=user_data_dir,
                             owned=False, ephemeral=False, home_key=home_key)
@@ -472,6 +551,9 @@ def _bind_launch_record(records: Path, browser: LaunchedBrowser) -> None:
 def _attach_foreign(key: str, user_data_dir: str, home_key: str, pid: int) -> Optional[LaunchedBrowser]:
     """The Chromium another environment holds on ``user_data_dir``, leased, when its DevTools endpoint answers here
     (caller holds the profile's lock); None when it does not. Never adopted: its record is not ours to take."""
+    from hermes_cli.browser_runtime import chromium_existing_sandbox_error
+    if chromium_existing_sandbox_error(pid, foreign=True):
+        return None
     found = _read_devtools_file(user_data_dir)
     if found is None or not _devtools_endpoint_live(*found):
         return None
@@ -489,10 +571,13 @@ def _attach_foreign(key: str, user_data_dir: str, home_key: str, pid: int) -> Op
 
 
 def _live_local_holder(user_data_dir: str) -> Optional[int]:
-    """Pid of the live Chromium of this environment holding ``user_data_dir`` (its ``SingletonLock`` names a live
-    process whose argv carries the dir), else None: no browser, or a stale lock a launch may take over."""
+    """A live PID named by this profile's lock, even if its identity cannot be proven.
+
+    A recycled PID can keep a stale lock blocked until the operator removes it; launching over a
+    genuinely occupied profile would erase its marker, so ambiguous occupancy fails closed.
+    """
     pid = _singleton_pid(user_data_dir)
-    return pid if pid is not None and _pid_alive(pid) and _cmdline_names_dir(pid, user_data_dir) else None
+    return pid if pid is not None and _pid_alive(pid) else None
 
 
 def _attach_local(key: str, user_data_dir: str, home_key: str,
@@ -500,7 +585,10 @@ def _attach_local(key: str, user_data_dir: str, home_key: str,
     """Attach to this environment's live Chromium on ``user_data_dir``; ``(None, None)`` when none holds it (a
     launch may start one). A live holder whose endpoint does not answer (paused, hung) is waited for, then
     refused: a launch over it would only wipe its ``DevToolsActivePort`` and lose it for every later attach."""
-    attached = _attach_running(key, user_data_dir, home_key)
+    try:
+        attached = _attach_running(key, user_data_dir, home_key)
+    except ValueError as exc:
+        return None, str(exc)
     pid = _live_local_holder(user_data_dir) if attached is None else None
     if pid is None:
         return attached, None
@@ -513,7 +601,10 @@ def _attach_local(key: str, user_data_dir: str, home_key: str,
                           "Hermes will not start a second browser on it; try again once it responds, or stop it.")
         time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
         delay *= 2
-        attached = _attach_running(key, user_data_dir, home_key)
+        try:
+            attached = _attach_running(key, user_data_dir, home_key)
+        except ValueError as exc:
+            return None, str(exc)
     return attached, None
 
 
@@ -577,7 +668,9 @@ def launch_chromium(key: str, *, executable: Optional[str] = None, user_data_dir
     with _key_lock(key):  # one launch per key; other keys launch concurrently
         existing = get_browser(key)
         if existing is not None:
-            return existing, None
+            from hermes_cli.browser_runtime import chromium_existing_sandbox_error
+            error = chromium_existing_sandbox_error(existing.pid, foreign=existing.foreign)
+            return (None, error) if error else (existing, None)
         home_key = hermes_home_key()
         with _lock:
             _served_homes.add(home_key)
@@ -610,8 +703,11 @@ def _launch_owned(key: str, executable: str, udd: str, *, ephemeral: bool, packa
         _prepare_dir(udd, ephemeral)
     except OSError as exc:
         return None, f"Could not create the browser profile directory {udd}: {exc}"
-    argv = build_chromium_argv(executable, udd, packaged=packaged, headed=_resolve_headed(headed, env),
-                               sandbox_bypass=sandbox_bypass, extra_args=extra_args)
+    try:
+        argv = build_chromium_argv(executable, udd, packaged=packaged, headed=_resolve_headed(headed, env),
+                                   sandbox_bypass=sandbox_bypass, extra_args=extra_args)
+    except ValueError as exc:
+        return None, str(exc)
     try:
         proc = _spawn(argv, env, udd)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -645,13 +741,8 @@ def _launch_owned(key: str, executable: str, udd: str, *, ephemeral: bool, packa
 
 
 def _abandon_launch(proc: subprocess.Popen, starting: LaunchedBrowser) -> None:
-    with _lock:
-        _launching.pop(proc.pid, None)
-    if proc.poll() is None:  # one that already exited is reaped by poll(); its pid is no longer ours
-        _terminate(proc.pid, starting.start_time, proc)
-    _remove_record(starting)
-    if starting.ephemeral:
-        shutil.rmtree(starting.user_data_dir, ignore_errors=True)
+    from tools.browser_launcher_lifecycle import abandon_launch
+    abandon_launch(proc, starting)
 
 
 # ── Lookup / stop ────────────────────────────────────────────────────────────────────────────────────
@@ -756,16 +847,23 @@ def _terminate(pid: Optional[int], start_time: Optional[int], proc: Optional[sub
             proc.kill()
 
 
-def stop_browser(key: str) -> None:
+def stop_browser(key: str, *, force: bool = False) -> None:
     """Let go of ``key``'s browser. A throwaway one this process launched is stopped. A shared-profile one is
     stopped only by its LAST holder across Hermes processes (:func:`_last_holder_out`); one a human started is
     never stopped. Holds ``key``'s launch lock: a relaunch of ``key`` waits for this stop instead of
     registering a replacement on the dir it is about to delete."""
     with _key_lock(key):
-        _stop_locked(key)
+        _stop_locked(key, force=force)
 
 
-def _stop_locked(key: str) -> None:
+def detach_browser(key: str) -> bool:
+    """Release this client's persistent browser while retaining its process/tabs."""
+    from tools.browser_launcher_lifecycle import detach_shared_browser
+    return detach_shared_browser(key)
+
+
+def _stop_locked(key: str, *, force: bool = False) -> None:
+    from tools.browser_launcher_lifecycle import cleanup_guard, recorded_home
     with _lock:
         browser = _browsers.get(key)
         proc = _procs.get(key)
@@ -773,21 +871,24 @@ def _stop_locked(key: str) -> None:
         return
     record = None if browser.ephemeral else _record_path(browser)
     if record is None:
-        if browser.owned:
-            _terminate(browser.pid, browser.start_time, proc)
+        with cleanup_guard(browser.home_key) as admitted:
+            if browser.owned and admitted:
+                _terminate(browser.pid, browser.start_time, proc)
         with _lock:
-            _forget(key, browser)
+            _forget(key, browser, drop_record=admitted)
         return
     from tools.browser_launcher_holders import records_lock
     with records_lock(record.parent):  # the decision and the forget are one step: another key may be the heir
-        if _heir_key(browser) is None and _last_holder_out(record, browser):
-            _terminate(browser.pid, browser.start_time, proc)
-            record.unlink(missing_ok=True)
+        if _heir_key(browser) is None and _last_holder_out(record, browser, force=force):
+            with cleanup_guard(recorded_home(record, browser)) as admitted:
+                if admitted:
+                    _terminate(browser.pid, browser.start_time, proc)
+                    record.unlink(missing_ok=True)
         with _lock:
             _forget(key, browser, drop_record=False)
 
 
-def _last_holder_out(record: Path, browser: LaunchedBrowser) -> bool:
+def _last_holder_out(record: Path, browser: LaunchedBrowser, *, force: bool = False) -> bool:
     """Drop this process's hold on shared-profile ``browser`` (caller holds the records lock). True when it
     must stop it now: no other live Hermes process holds it, and Hermes launched it (a launch record names
     it). Otherwise a record this process holds, or whose owner is gone, goes to a live holder."""
@@ -805,6 +906,8 @@ def _last_holder_out(record: Path, browser: LaunchedBrowser) -> bool:
         holders.hand_over(record, data, heir)
     if others or held_elsewhere:
         return False
+    if data is not None and data.get("retained") is True and not force:
+        return False
     return browser.owned or data is not None
 
 
@@ -814,6 +917,12 @@ def stop_all_browsers() -> None:
         keys = list(_browsers)
     for key in keys:
         stop_browser(key)
+
+
+def retire_shared_profile(user_data_dir: str, *, profile_home: str) -> bool:
+    """Stop/delete a copied profile atomically; false while another holder still uses it."""
+    from tools.browser_launcher_lifecycle import retire_shared_profile as retire
+    return retire(user_data_dir, profile_home)
 
 
 # ── Per-profile records + orphan reap ────────────────────────────────────────────────────────────────
@@ -961,8 +1070,9 @@ def _cmdline_names_dir(pid: int, user_data_dir: str) -> bool:
         argv = psutil.Process(pid).cmdline()
     except Exception:  # health: allow BLE001 -- unreadable identity fails closed (no kill)
         return False
-    return any(tok.startswith("--user-data-dir=") and _same_profile(tok.split("=", 1)[1], user_data_dir)
-               for tok in argv)
+    values = [tok.split("=", 1)[1] for tok in argv if tok.startswith("--user-data-dir=")]
+    values += [argv[i + 1] for i, tok in enumerate(argv[:-1]) if tok == "--user-data-dir"]
+    return len(values) == 1 and _same_profile(values[0], user_data_dir)
 
 
 def _inside_ephemeral_root(user_data_dir: str, home: Optional[str]) -> bool:
@@ -1029,6 +1139,10 @@ def _reap_record(path: Path, home: Optional[str]) -> bool:
     record = _load_record(path)
     if record is None or not holders.same_namespace(record):  # another namespace's pids name nobody here
         return False
+    if record.get("retained") is True:
+        if not _pid_alive(record.get("pid")):
+            path.unlink(missing_ok=True)
+        return False
     tracked = _tracked_browser(record)
     if tracked is not None:  # in use here, whoever launched it
         _adopt_record(tracked)
@@ -1041,16 +1155,20 @@ def _reap_record(path: Path, home: Optional[str]) -> bool:
         if heir is not None:
             holders.hand_over(path, record, heir)
         return False
-    reaped = _is_recorded_browser(record, home)
-    if reaped:
-        _terminate(record["pid"], record.get("start_time"), None)
-        logger.info("browser: reaped orphaned Chromium pid %s (%s)", record["pid"], record["user_data_dir"])
-    udd = record.get("user_data_dir")
-    if (record.get("ephemeral") and isinstance(udd, str) and _inside_ephemeral_root(udd, home)
-            and (reaped or not _browser_running_on(udd))):
-        shutil.rmtree(udd, ignore_errors=True)  # its owner is gone: no launch reuses a per-process dir
-    path.unlink(missing_ok=True)
-    return reaped
+    from tools.browser_launcher_lifecycle import cleanup_guard
+    with cleanup_guard(home or record.get("home_key")) as admitted:
+        if not admitted:
+            return False
+        reaped = _is_recorded_browser(record, home)
+        if reaped:
+            _terminate(record["pid"], record.get("start_time"), None)
+            logger.info("browser: reaped orphaned Chromium pid %s (%s)", record["pid"], record["user_data_dir"])
+        udd = record.get("user_data_dir")
+        if (record.get("ephemeral") and isinstance(udd, str) and _inside_ephemeral_root(udd, home)
+                and (reaped or not _browser_running_on(udd))):
+            shutil.rmtree(udd, ignore_errors=True)  # its owner is gone: no launch reuses a per-process dir
+        path.unlink(missing_ok=True)
+        return reaped
 
 
 def _reap_home(home: str) -> int:

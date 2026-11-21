@@ -86,13 +86,26 @@ def _bootstrap(authority, ref, row, policy, scope, text=None):
     config = _worker_config(authority, policy)
     hydrated = replace(policy, config_json=json.dumps(config), request_json=json.dumps(request),
                        terminal_json=json.dumps(terminal), credential_ref=None, config_secret_ref=None)
+    approval_origin = _managed_approval_origin(authority, ref, row)
     return {'version': 1, 'home': authority.profile_id, 'scope': scope,
             'policy': asdict(hydrated), 'api_key': route_launch_key(authority, policy, config),
             'text': row['payload']['text'] if text is None else text, 'route': live.route,
             **({'attachments_v1': row['payload']['attachments_v1']} if 'attachments_v1' in row['payload'] else {}),
             'user_id': live.source.user_id, 'chat_id': live.source.chat_id,
             'turn_author': row_turn_author(policy, row),
-            'safe_mode': policy.safe_mode, 'ignore_user_config': policy.ignore_user_config}
+            'safe_mode': policy.safe_mode, 'ignore_user_config': policy.ignore_user_config,
+            **({'approval_task_v1': approval_origin} if approval_origin else {})}
+
+
+def _managed_approval_origin(authority, ref, row):
+    """Only the owner's admitted local viewer row can supply worker request evidence."""
+    from gateway.session_operator import check_local_input, is_viewer_input
+    if not is_viewer_input(row) or not isinstance(row['payload'].get('text'), str):
+        return None
+    check_local_input(authority, ref, row)
+    return {'text': row['payload']['text'], 'identity': row['principal_id'],
+            'profile': str(authority.profile_id), 'session': authority.sessions[ref.session_id].route,
+            'admission': row['admission_id'], 'generation': row['generation']}
 
 
 def _worker_config(authority, policy):
@@ -250,7 +263,7 @@ class ManagedWorker:
     def control(self, frame):
         if self.closed.is_set():
             raise AuthorityRefusal('managed_worker_lost')
-        if frame == {'type': 'stop'}:
+        if frame in ({'type': 'stop'}, {'type': 'stop', 'processes': True}):
             if self.stopped_at is None:
                 self.stopped_at = time.monotonic()
             self.stop.set()
@@ -354,7 +367,8 @@ class ManagedWorker:
             self._signal_worker(kill=True)
         if self.writer.ident is not None:
             self.writer.join(timeout=5)
-        self.process.stdin.close()
+        with suppress(BrokenPipeError):
+            self.process.stdin.close()
         if self.reader is None:
             self.process.stdout.close()
         else:
@@ -370,20 +384,54 @@ def interrupt_managed(authority, actor, ref, generation):
     if worker is None:
         return False
     authority.authorize(actor, ref, 'session:control')
+    return interrupt_managed_owned(authority, ref, generation)
+
+
+def interrupt_managed_owned(authority, ref, generation):
+    """Owner-internal path after native input or external control authorization."""
+    worker = getattr(authority, '_managed_workers', {}).get(ref.session_id)
+    if worker is None:
+        return False
     authority.check_approval_generation(ref.session_id, generation)
-    worker.control({'type': 'stop'})
+    from gateway.session_ancillary import record_process_stop
+    record_process_stop(authority, ref, generation)
+    worker.control({'type': 'stop', 'processes': True})
     return True
 
 
-def _prompt_frame(authority, ref, row, worker, frame):
+def _prompt_frame(authority, ref, row, worker, frame, *, clarify_entry=None):
     live = authority.sessions[ref.session_id]
     controls = live.controls
     kind = frame.get('type')
+    if kind == 'approval_task_check' and set(frame) == {'type', 'request_id'}:
+        request_id = frame['request_id']
+        if not isinstance(request_id, str) or len(request_id) != 32:
+            raise AuthorityRefusal('invalid_worker_frame')
+        current = False
+        if not worker.stop.is_set() and _managed_approval_origin(authority, ref, row) is not None:
+            from gateway.session_authority import admission_row
+            from gateway.session_persistence import authority_persistence
+            committed = admission_row(authority_persistence(authority).admissions.get(admission_id=row['admission_id']))
+            try:
+                authority.check_approval_generation(ref.session_id, row['generation'])
+                current = (authority.executing.get(ref.session_id) == row['generation']
+                           and committed is not None and committed['status'] == 'started'
+                           and committed['owner_epoch'] == authority.epoch
+                           and committed['generation'] == row['generation']
+                           and committed['target_session_id'] == ref.session_id
+                           and committed['principal_id'] == row['principal_id'])
+            except AuthorityRefusal:
+                current = False
+        worker.control({'type': 'approval_task_check', 'request_id': request_id, 'current': current})
+        return True
     if kind == 'prompt_settled' and set(frame) == {'type', 'prompt_id'}:
         prompt_id = frame['prompt_id']
         controls.remote_responders.pop(prompt_id, None)
         saved = controls.pending.pop(prompt_id, None)
         if saved:
+            if saved[1]['kind'] == 'clarify' and hasattr(saved[0], 'response'):
+                from gateway.session_kanban_prompts import retire_prompt
+                retire_prompt(saved[0])
             live.event_stream.publish(ref.session_id, {'prompt_id': prompt_id,
                 'execution_generation': row['generation']}, event_type=saved[1]['kind'] + '.settled')
         return True
@@ -409,8 +457,8 @@ def _prompt_frame(authority, ref, row, worker, frame):
     if kind == 'approval':
         authority.register_approval(ref.session_id, row['generation'], live.route, data)
     else:
-        entry = SimpleNamespace(clarify_id=prompt_id, question=frame['question'], choices=frame['choices'],
-                                multi_select=frame['multi_select'], event=threading.Event())
+        entry = clarify_entry or SimpleNamespace(clarify_id=prompt_id, question=frame['question'], choices=frame['choices'],
+                                                 multi_select=frame['multi_select'], event=threading.Event())
         authority.register_clarify(ref.session_id, row['generation'], entry)
     return True
 
@@ -733,13 +781,14 @@ async def execute_managed(authority, ref, row, policy):
             # The claim's execution stamp, not a ledger read per frame (publish_execution fences the same way).
             if authority.executing.get(ref.session_id) != row['generation']:
                 raise AuthorityRefusal('stale_generation')
-            with authority.sessions[ref.session_id].event_stream.lock:
-                if _prompt_frame(authority, ref, row, worker, frame):
-                    continue
+            from gateway.session_kanban_prompts import dispatch_prompt_frame
+            if await dispatch_prompt_frame(authority, ref, row, policy, worker, frame):
+                continue
             if frame == {'type': 'error', 'reason': 'managed_worker_failed'}:
                 raise AuthorityRefusal('managed_worker_failed')
             kind = frame.get('type')
-            if kind == 'ready' and set(frame) == {'type', 'pid'} and frame['pid'] == scope['pid']:
+            from gateway.session_kanban_stop import worker_control_frame
+            if await worker_control_frame(authority, ref, row, policy, worker, scope, frame):
                 continue
             if kind == 'delta' and set(frame) == {'type', 'text'} and isinstance(frame['text'], str):
                 authority.publish_execution(ref.session_id, row['generation'], 'message.delta', {'text': frame['text']})
@@ -762,9 +811,13 @@ async def execute_managed(authority, ref, row, policy):
                 accepted = _with_stop_cause(accepted, worker)
                 await _finalize_managed_refusal(authority, scope['session_id'], accepted)
                 # Like in-process execution, settlement belongs to the drain's stream lock.
+                # Capture before its cleanup retry: a known finished answer settles normally
+                # even while the independent native Stop fence holds every successor.
                 authority.pending_results[row['admission_id']] = {
                     'result': {**accepted, 'local_viewer': True}, 'usage': usage,
                     **await asyncio.to_thread(_settled_session_usage, authority, scope['session_id'], accepted, scope['execution_id'])}
+                from gateway.session_ancillary import retry_process_stop
+                await retry_process_stop(authority, ref)
                 return accepted['final_response']
             raise AuthorityRefusal('invalid_worker_frame')
     except (Exception, asyncio.CancelledError) as exc:
@@ -780,6 +833,8 @@ async def execute_managed(authority, ref, row, policy):
                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
             _record_lost_attempt(authority, policy, exc, reason, scope)  # nothing bound: a late note is dropped, never misbooked
             raise
+        from gateway.session_kanban_stop import retain_failed_stop
+        await retain_failed_stop(authority, ref, row, policy)
         await _settle_lost(authority, row, scope, _record_lost_attempt(authority, policy, exc, reason, scope))
         live = authority.sessions[ref.session_id]
         with live.event_stream.lock:
@@ -795,5 +850,7 @@ async def execute_managed(authority, ref, row, policy):
         # committed unknown row deliberately pauses every accepted follower.
         raise ManagedExecutionUnknown('managed_worker_unknown') from exc
     finally:
+        from gateway.session_kanban_prompts import retire_worker
+        await retire_worker(worker)
         workers.pop(ref.session_id, None)
         await asyncio.to_thread(worker.close)

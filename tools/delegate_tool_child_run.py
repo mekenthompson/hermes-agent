@@ -355,6 +355,7 @@ class _Heartbeat:
         # activity_ts) all froze; thresholds differ idle vs in-tool.
         self.last_seen = {"iter": 0, "tool": None, "ts": None, "stale": 0}
         self.handle = None
+        self.admission_lease_id: Optional[str] = None
         # Set on the stale verdict; ``await_child`` waits on it (its worker's done-callback
         # sets it too) so a wedged child ends the wait instead of only ending the heartbeat.
         self.settled = threading.Event()
@@ -375,6 +376,11 @@ class _Heartbeat:
     def tick(self):
         """Returning False stops the periodic callback."""
         child, parent_agent, task_index, last_seen = self.child, self.parent_agent, self.task_index, self.last_seen
+        lease_id = getattr(self, "admission_lease_id", None)
+        if lease_id:
+            with _quiet(None):
+                from hermes_cli.admission_runtime import renew_admission
+                renew_admission(lease_id)
         if self.checkpoint is not None:
             with _quiet("Durable subagent checkpoint failed: %s"):
                 self.checkpoint()
@@ -458,21 +464,30 @@ def _register_child(
     })
     return _subagent_id
 
-def _create_isolated_worktree(parent_agent: Any, parent_task_id: Any, subagent_id: Optional[str]):
-    """Opt-in worktree isolation: own git worktree off the parent's HEAD (the
-    child's terminal starts there). Git-only, local-backend-only; failures
-    degrade silently to the shared workspace. Returns the worktree info or None."""
-    if not _get_worktree_isolation():
+def _create_isolated_worktree(
+    parent_agent: Any, parent_task_id: Any, subagent_id: Optional[str], repo_root: Optional[str] = None,
+):
+    """Own linked worktree for a coding child. ``git worktree add``, never a clone.
+
+    An explicit ``repo_root`` is the checkout to branch from, even when the
+    global isolation flag is off. Without one, isolation stays opt-in and uses
+    the recorded parent cwd. Gateway turns record that under the platform
+    session key, while ``parent_task_id`` is the Hermes session id.
+    """
+    from tools import subagent_worktree
+    explicit = repo_root.strip() if isinstance(repo_root, str) else ""
+    if not explicit and not _get_worktree_isolation():
         return None
     with _quiet("worktree isolation setup failed: %s"):
-        from tools import subagent_worktree
         if not subagent_worktree.local_backend_active():
             logger.debug("worktree isolation skipped: non-local terminal backend")
             return None
+        if explicit:
+            return subagent_worktree.create_subagent_worktree(explicit, subagent_id=subagent_id)
         _parent_cwd = None
         with _quiet(None):
-            from tools.terminal_tool import get_session_cwd as _gsc
-            _parent_cwd = _gsc(parent_task_id)
+            from tools.terminal_tool import resolve_recorded_session_cwd
+            _parent_cwd = resolve_recorded_session_cwd(parent_task_id)
         return subagent_worktree.create_subagent_worktree(
             _parent_cwd or _resolve_workspace_hint(parent_agent), subagent_id=subagent_id,
         )
@@ -902,7 +917,10 @@ class _ChildRun:
         if resumed is not None:
             self.worktree_info = resumed.get("worktree")
         else:
-            self.worktree_info = _create_isolated_worktree(self.parent_agent, self.parent_task_id, self.subagent_id)
+            self.worktree_info = _create_isolated_worktree(
+                self.parent_agent, self.parent_task_id, self.subagent_id,
+                repo_root=getattr(self.child, "_delegate_repo_root", None),
+            )
         if self.worktree_info is not None and resumed is None:
             with _quiet("worktree cwd seed failed: %s"), child_profile_scope(self.child):
                 from tools.terminal_tool import record_session_cwd as _rsc
@@ -1011,9 +1029,12 @@ class _ChildRun:
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
+            from tools.approval_context import delegated_approval_task
             from tools.delegate_tool_routes import child_profile_scope
             # A profile-routed child converses as that profile (config, secrets, skills, terminal policy).
-            with child_profile_scope(child), delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with child_profile_scope(child), delegated_approval_task(
+                self.child_task_id, stop_event=getattr(child, "_hard_interrupt_requested", None),
+            ), delegated_child_context(str(getattr(child, "session_id", "") or "")):
                 return child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text, **resume,
                 )

@@ -145,8 +145,38 @@ def _ac_inflight_original(session: dict) -> str:
     return str(turn.get("user") or "").strip() if isinstance(turn, dict) else ""
 
 
+def _abandon_unadmitted_chat_submits(session: dict, source_key: str, submit_ids) -> None:
+    """A refused pre-worker turn has no executor left to consume its accepted claims."""
+    if not submit_ids:
+        return
+    from gateway.chat_execution_recovery import ChatExecutionStore
+    from hermes_constants import get_process_hermes_home
+    store = ChatExecutionStore(session.get("profile_home") or get_process_hermes_home())
+    for submit_id in submit_ids:
+        store.abandon_submit(source_key, submit_id)
+        session.get("_chat_pending_submit_ids", set()).discard(submit_id)
+
+
+def _abandon_queued_chat_submits(session: dict) -> None:
+    """Settle queued and accepted correction claims cancelled before dispatch."""
+    from gateway.chat_execution_recovery import ChatExecutionStore
+    from hermes_constants import get_process_hermes_home
+    store = ChatExecutionStore(session.get("profile_home") or get_process_hermes_home())
+    key = str(session.get("session_key") or "")
+    entries = ([session.get("queued_prompt")] if session.get("queued_prompt") else [])
+    entries.extend(session.get("queued_prompts") or [])
+    for entry in entries:
+        if isinstance(entry, dict):
+            for submit_id in entry.get("_chat_submit_ids") or ():
+                store.abandon_submit(str(entry.get("_chat_submit_key") or key), submit_id)
+                session.get("_chat_pending_submit_ids", set()).discard(submit_id)
+    for source_key, submit_id in session.pop("_chat_followup_corrections", []):
+        store.abandon_submit(source_key, submit_id)
+        session.get("_chat_pending_submit_ids", set()).discard(submit_id)
+
+
 def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[str] | None = None,
-                    turn_author: dict | None = None) -> dict | None:
+                    turn_author: dict | None = None, approval_origin=None) -> dict | None:
     """Queue a message for the next turn. Text-only arrivals share a slot and merge losslessly (like the
     consecutive-user merge in ``repair_message_sequence``); image-bearing and authored ones stay separate
     envelopes so attachment chronology and the sender survive. ``transport`` is pinned so the drained turn
@@ -162,10 +192,14 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[
     if text_only and not turn_author and text.strip() == _ac_inflight_original(session) != "":
         return None
     queued = {"text": text, "transport": transport, **({"image_paths": image_paths} if image_paths else {}),
-              **({"turn_author": turn_author} if turn_author else {})}
+              **({"turn_author": turn_author} if turn_author else {}),
+              **({"approval_origin": approval_origin} if approval_origin else {})}
     existing = session.get("queued_prompt")
-    if (existing and text_only and not turn_author and isinstance(existing.get("text"), str)
+    if (existing and text_only and not turn_author and not approval_origin
+            and not existing.get("approval_origin") and isinstance(existing.get("text"), str)
             and not existing.get("image_paths") and not existing.get("turn_author")
+            and (not existing.get("_chat_submit_key")
+                 or existing["_chat_submit_key"] == str(session.get("session_key") or ""))
             and not session.get("queued_prompts")):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
@@ -244,20 +278,30 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
 
 
-def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: str, status: str) -> dict | None:
+def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: str, status: str,
+                       chat_submit_id: str | None = None, chat_submit_key: str | None = None) -> dict | None:
     """Apply ``agent.<method>(plain_text)`` (steer/redirect); on acceptance record the correction, scrub stale
     self-duplicates so the live turn's original text is not re-fired after settle, and return the ``status`` reply.
     None → caller falls through to the queue path."""
-    try:
-        if not getattr(agent, method)(plain_text):
-            return None
-    except Exception:
-        return None
     with session["history_lock"]:
-        _record_inflight_correction(session, plain_text)
-        _drop_queued_duplicates_of_inflight_user(session)
-        session["last_active"] = time.time()
-    return _ok(rid, {"status": status})
+        correction_lock = session.setdefault("_chat_correction_lock", threading.RLock())
+    with correction_lock if chat_submit_id else contextlib.nullcontext():
+        if chat_submit_id and session.get("_chat_correction_closed"):
+            return None
+        try:
+            if not getattr(agent, method)(plain_text):
+                return None
+        except Exception:
+            return None
+        with session["history_lock"]:
+            _record_inflight_correction(session, plain_text)
+            _drop_queued_duplicates_of_inflight_user(session)
+            session["last_active"] = time.time()
+            if chat_submit_id:
+                session.setdefault("_chat_accepted_corrections", []).append(
+                    (chat_submit_key or str(session.get("session_key") or ""), chat_submit_id))
+                session.setdefault("_chat_pending_submit_ids", set()).add(chat_submit_id)
+        return _ok(rid, {"status": status})
 
 
 def _session_compression_in_flight(session: dict) -> bool:
@@ -398,7 +442,9 @@ def _replace_queued_user_row_for_turn(session: dict, queued: dict, is_dispatchin
 
 
 def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False,
-                        turn_author: dict | None = None, display_kind: str | None = None) -> dict | None:
+                        turn_author: dict | None = None, display_kind: str | None = None,
+                        approval_origin=None, chat_submit_id: str | None = None,
+                        chat_submit_key: str | None = None) -> dict | None:
     """Apply ``display.busy_input_mode`` to a mid-turn prompt instead of rejecting it (rejection made clients busy-retry
     and drop sends): ``interrupt`` (default) → redirect, falling back to hard interrupt + queue; ``queue`` → queue only;
     ``steer`` → inject after the current atomic action. ``queued=True`` (client queue drain) forces queue mode: a "run
@@ -427,7 +473,8 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
             "interrupt": getattr(agent, "_supports_active_turn_redirect", False) is True and hasattr(agent, "redirect")}
         method, status = {"steer": ("steer", "steered"), "interrupt": ("redirect", "redirected")}.get(mode, (None, None))
         if (method and supported[mode]
-                and (resp := _ac_try_correction(rid, session, agent, method, plain_text, status)) is not None):
+                and (resp := _ac_try_correction(rid, session, agent, method, plain_text, status,
+                                                chat_submit_id, chat_submit_key)) is not None):
             return resp
     # Queue before asking the live turn to stop. Never call a provider/compute-host method under history_lock: an
     # interrupt can wait behind the op it cancels.
@@ -436,10 +483,15 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        envelope = _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author)
+        envelope = _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author,
+                                   approval_origin=approval_origin)
         # Durable AT ACCEPT (not when the turn runs): a cold resume sees the queued message and a
         # backend restart cannot lose it. Lives on the envelope, never the shared session slot.
         if envelope is not None:
+            if chat_submit_id:
+                envelope.setdefault("_chat_submit_ids", []).append(chat_submit_id)
+                envelope.setdefault("_chat_submit_key", str(session.get("session_key") or sid))
+                session.setdefault("_chat_pending_submit_ids", set()).add(chat_submit_id)
             _persist_queued_user_row(session, envelope, display_kind)
         session["last_active"] = time.time()
     # Attachments need their own model invocation: queue without cancelling so the user gets both results in order.
@@ -463,6 +515,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         queue_generation = int(session.get("_queued_prompt_generation", 0))
         _ac_set_queue(session, session.get("queued_prompts") or [])
         session["running"] = True
+        session["_chat_correction_closed"] = False
         session["_notif_turn_claim"] = claim = object()  # the exception release below frees only this claim
         queued_transport = queued.get("transport")
         # The queuer's transport is pinned so the drained turn reaches the client that sent it — but
@@ -482,6 +535,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session["running"] = False
             return True
     kwargs: dict = {"queued_prompt_generation": queue_generation}
+    if queued.get("_chat_submit_ids"):
+        kwargs["chat_submit_ids"] = tuple(queued["_chat_submit_ids"])
+        kwargs["chat_submit_key"] = queued.get("_chat_submit_key")
     if queued.get("image_paths"):
         kwargs["image_paths"] = queued["image_paths"]
     # Re-place the accept-time rows (if any) at the transcript END before the turn's rows follow
@@ -507,8 +563,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     dispatch_failed = False
     try:
         if not use_compute_host:
-            _run_prompt_submit(rid, sid, session, queued["text"], **kwargs, **author_kwargs)
-        elif (resp := _submit_prompt_to_compute_host(rid, sid, session, queued["text"], **kwargs)).get("error"):
+            _run_prompt_submit(rid, sid, session, queued["text"], **kwargs, **author_kwargs,
+                               approval_origin=queued.get("approval_origin"))
+        elif (resp := _submit_prompt_to_compute_host(
+                rid, sid, session, queued["text"], chat_instruction_origin=queued.get("approval_origin"),
+                **kwargs)).get("error"):
             with session["history_lock"]:
                 session["running"] = False
                 _clear_inflight_turn(session)

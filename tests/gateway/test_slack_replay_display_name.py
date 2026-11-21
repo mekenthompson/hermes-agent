@@ -87,7 +87,7 @@ async def test_slack_answered_root_restart_replay_preserves_identity(tmp_path, m
     outcomes = []
     admit = authority.admit_native
 
-    async def record_admission(event):
+    async def record_admission(event, **_kwargs):
         try:
             receipt = await admit(event)
         except AuthorityRefusal as exc:
@@ -105,12 +105,16 @@ async def test_slack_answered_root_restart_replay_preserves_identity(tmp_path, m
               'ts': '1793821400.000200', 'event_ts': '1793821400.000200', 'message': message}
     try:
         await _deliver(adapter, replay)
-        after = _rows(authority)
+        from tests.gateway.test_native_inbound_retry import list_session_admissions
+        # Read the durable rows directly: a replay dropped before admission loads no live session.
+        after = list_session_admissions(authority, session_id=before[0]['target_session_id'], pending_only=False)
         assert calls == [], 'neither the answered request nor a changed copy may execute again'
         assert after == before, 'replay must not alter or replace the committed admission'
         if change in ('identical', 'display-name'):
             assert sent == [], 'metadata-only replay must not emit an admission-conflict reply'
-            assert outcomes == [before[0]['admission_id']], 'must reconcile, not merely suppress the error'
+            # The fork drops unedited thread-root bookkeeping before admission (#239); anything that
+            # does reach admission must reconcile to the committed row, not merely suppress the error.
+            assert outcomes in ([], [before[0]['admission_id']]), outcomes
         else:
             assert outcomes == [('admission_conflict', ADMITTED_REQUEST_CONFLICT['field'])]
             assert sent == [ALREADY_ADMITTED_REPLY], 'meaningful conflicts remain visible'

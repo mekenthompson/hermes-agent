@@ -24,8 +24,24 @@ from pm.plugin_declarations import read_python_declaration, manifest_version_err
 _MEMBER_EXCLUDE = frozenset({".git", ".venv", "venv", "node_modules", "__pycache__"})
 
 
+def _is_runtime_payload_dir(name: str) -> bool:
+    """A PM tool-store entry, not a Python package.
+
+    Store entries are ``{name}-{version}-{target}``. Playwright names Chromium
+    ``chromium-<revision>`` with no target suffix, and resolves that directory
+    from the image store. A generation snapshot must not copy either.
+    """
+    from pm.store import ALL_TARGETS
+
+    if any(name.endswith(f"-{target}") for target in ALL_TARGETS):
+        return True
+    revision = name.removeprefix("chromium-")
+    return revision.isdigit() and revision != name
+
+
 def _member_ignored(directory, names):
-    return [name for name in names if name in _MEMBER_EXCLUDE or name.endswith(".egg-info")]
+    return [name for name in names if name in _MEMBER_EXCLUDE or name.endswith(".egg-info")
+            or _is_runtime_payload_dir(name)]
 
 
 # The uv failure classifier lives beside the uv runner (stdlib-only imports): the bootstrap

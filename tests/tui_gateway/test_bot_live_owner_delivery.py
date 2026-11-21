@@ -30,7 +30,7 @@ def test_refused_input_reports_a_failed_terminal_outcome():
         "_current_runtime_session_record": contextvars.ContextVar("refused_turn"),
         "_TurnRun": prompt_turn._TurnRun,
         "_record_turn_marker": lambda *args, **kwargs: "marker",
-        "_prepare_turn_input": lambda *args: None,
+        "_prepare_turn_input": lambda *args, **kwargs: None,
         "_release_turn_scopes": noop, "_post_turn_housekeeping": noop,
         "_clear_inflight_turn": noop,
         # Hosted room member sessions drop their bot_room slot at turn end (#106847); a canonical chat is not one.

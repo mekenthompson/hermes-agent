@@ -10,8 +10,8 @@
  * main.ts requires these and wires them into the electron-coupled IPC layer.
  *
  * Background on the two auth models a remote gateway can use:
- *   - 'token': legacy static dashboard session token. REST uses an
- *     `X-Hermes-Session-Token` header; WS uses `?token=`.
+ *   - 'token': persistent dashboard session token. REST and ticket minting use
+ *     `X-Hermes-Session-Token`; WS uses a short-lived single-use `?ticket=`.
  *   - 'oauth': hosted gateways gate behind an OAuth provider. REST is authed
  *     by an HttpOnly session cookie; WS upgrades require a single-use
  *     `?ticket=` minted at POST /api/auth/ws-ticket. The gateway advertises
@@ -106,6 +106,58 @@ function buildGatewayWsUrlWithTicket(baseUrl, ticket) {
   return `${wsScheme}://${parsed.host}${prefix}/api/ws?ticket=${encodeURIComponent(ticket)}`
 }
 
+/** True when a gateway's public /api/status advertises the persistent
+ * dashboard-session-token flow (ticket minting with X-Hermes-Session-Token). */
+function statusAdvertisesDashboardSessionToken(statusBody) {
+  return Array.isArray(statusBody?.auth_flows) && statusBody.auth_flows.includes('dashboard_session_token')
+}
+
+/**
+ * Decide how a connection authenticates its WebSocket upgrade.
+ *
+ *   - 'ticket': mint a single-use ticket at POST /api/auth/ws-ticket right
+ *     before every connect (OAuth sessions, and configured session tokens on a
+ *     gated gateway that advertises `dashboard_session_token`).
+ *   - 'token':  legacy `?token=` URL. Used for SSH remotes (a process-local
+ *     token over a loopback tunnel; the non-gated backend never populates a
+ *     session, so ticket minting would 401) and for non-gated gateways that do
+ *     not advertise the session-token flow.
+ *
+ * @param {{ authMode?: string, remoteKind?: string, statusBody?: any }} input
+ * @returns {'ticket'|'token'}
+ */
+function gatewayWsAuthTransport({ authMode, remoteKind, statusBody }: any = {}) {
+  if (normAuthMode(authMode) === 'oauth') {
+    return 'ticket'
+  }
+
+  if (remoteKind === 'ssh') {
+    return 'token'
+  }
+
+  return statusAdvertisesDashboardSessionToken(statusBody) ? 'ticket' : 'token'
+}
+
+/** True when a resolved connection descriptor must re-mint a ticket before
+ * each WS connect instead of reusing its cached `?token=` URL. */
+function connectionUsesWsTicket(connection) {
+  if (!connection || typeof connection !== 'object') {
+    return false
+  }
+
+  if (connection.authMode === 'oauth') {
+    return true
+  }
+
+  if (connection.wsAuthTransport === 'ticket' || connection.wsAuthTransport === 'token') {
+    return connection.wsAuthTransport === 'ticket'
+  }
+
+  // Descriptors built before the transport was recorded: only non-SSH remotes
+  // ever minted with a configured token.
+  return connection.mode === 'remote' && connection.remoteKind !== 'ssh'
+}
+
 /** True only when a gateway explicitly rejected the current OAuth session. */
 function isGatewayAuthRejection(error) {
   if (error && typeof error === 'object' && (error as any).needsOauthLogin === true) {
@@ -197,6 +249,26 @@ function gatewayTicketFailure(error, authMessage, transportMessage) {
   return err
 }
 
+/** Token-mode 401/403 means the saved configured gateway token is invalid,
+ * not that the user should enter the OAuth login flow. */
+function configuredGatewayTokenTicketFailure(error, authMessage, transportMessage) {
+  const rejectedConfiguredToken = isGatewayAuthRejection(error)
+  const err = new Error(rejectedConfiguredToken ? authMessage : transportMessage)
+  const sourceStatus = Number(error && typeof error === 'object' ? (error as any).statusCode : NaN)
+
+  if (rejectedConfiguredToken) {
+    ;(err as any).needsConfiguredGatewayToken = true
+  }
+
+  if (Number.isInteger(sourceStatus)) {
+    ;(err as any).statusCode = sourceStatus
+  }
+
+  err.cause = error
+
+  return err
+}
+
 /**
  * Retry a one-shot mint/fetch that can flap on brief network blips.
  * Auth rejections (401/403 / needsOauthLogin) fail immediately — retrying those
@@ -241,7 +313,11 @@ async function gatewayWsUrlIpcResult(resolveWsUrl: () => Promise<string>) {
   } catch (error) {
     return {
       error: error instanceof Error ? error.message : String(error),
-      ...(isGatewayAuthRejection(error) ? { needsOauthLogin: true as const } : {}),
+      ...(error && typeof error === 'object' && (error as any).needsConfiguredGatewayToken === true
+        ? { needsConfiguredGatewayToken: true as const }
+        : isGatewayAuthRejection(error)
+          ? { needsOauthLogin: true as const }
+          : {}),
       ok: false as const
     }
   }
@@ -256,7 +332,9 @@ async function gatewayWsUrlIpcResult(resolveWsUrl: () => Promise<string>) {
  * `mintGatewayWsTicket`.
  *
  * Return semantics:
- *   - token mode + token   → ws(s)://…/api/ws?token=…
+ *   - token mode + token   → ws(s)://…/api/ws?ticket=…  (deps.wsAuthTransport
+ *                            'ticket', the default) or …/api/ws?token=…
+ *                            (deps.wsAuthTransport 'token': SSH / non-gated)
  *   - token mode, no token → null  (genuine skip; nothing to authenticate with)
  *   - oauth, mint ok       → ws(s)://…/api/ws?ticket=…
  *   - oauth, mint fails    → THROWS  (NOT a skip)
@@ -273,11 +351,18 @@ async function gatewayWsUrlIpcResult(resolveWsUrl: () => Promise<string>) {
  * @returns {Promise<string|null>}
  */
 async function resolveTestWsUrl(baseUrl, authMode, token, deps: any = {}) {
-  if (authMode === 'oauth') {
+  const transport =
+    deps.wsAuthTransport === 'ticket' || deps.wsAuthTransport === 'token'
+      ? deps.wsAuthTransport
+      : authMode === 'oauth' || token
+        ? 'ticket'
+        : 'token'
+
+  if (transport === 'ticket' && (authMode === 'oauth' || token)) {
     const mintTicket = deps.mintTicket
 
     if (typeof mintTicket !== 'function') {
-      throw new Error('resolveTestWsUrl: a mintTicket function is required in OAuth mode.')
+      throw new Error('resolveTestWsUrl: a mintTicket function is required when WebSocket authentication is configured.')
     }
 
     let ticket
@@ -286,13 +371,19 @@ async function resolveTestWsUrl(baseUrl, authMode, token, deps: any = {}) {
       ticket = await mintTicket(baseUrl)
     } catch (error) {
       // Untagged 401s keep the server OAuth-session wording. A stale app
-      // bearer is named inside gatewayTicketFailure.
-      throw gatewayTicketFailure(
-        error,
-        'Reached the gateway over HTTP, but the OAuth session was rejected while minting a WebSocket ticket. ' +
-          'Open Settings → Gateway and sign in again.',
+      // bearer is named inside gatewayTicketFailure. Configured-token logins
+      // keep their own copy so a saved token is not described as OAuth.
+      const authMessage =
+        authMode === 'oauth'
+          ? 'Reached the gateway over HTTP, but the OAuth session was rejected while minting a WebSocket ticket. Open Settings → Gateway and sign in again.'
+          : 'Reached the gateway over HTTP, but the configured gateway session token was rejected. Open Settings → Gateway and save a valid token.'
+
+      const transportMessage =
         'Reached the gateway over HTTP, but could not mint a WebSocket ticket. Check the remote gateway connection and try again.'
-      )
+
+      throw (authMode === 'oauth'
+        ? gatewayTicketFailure(error, authMessage, transportMessage)
+        : configuredGatewayTokenTicketFailure(error, authMessage, transportMessage))
     }
 
     return buildGatewayWsUrlWithTicket(baseUrl, ticket)
@@ -302,6 +393,8 @@ async function resolveTestWsUrl(baseUrl, authMode, token, deps: any = {}) {
     return null
   }
 
+  // Legacy transport (SSH tunnels, non-gated gateways): the process-local
+  // token rides the WS URL exactly as the renderer connects.
   return buildGatewayWsUrl(baseUrl, token)
 }
 
@@ -1128,6 +1221,10 @@ function tokenPreview(value) {
  * Returns 'oauth' | 'token'.
  */
 function authModeFromStatus(statusBody) {
+  if (statusAdvertisesDashboardSessionToken(statusBody)) {
+    return 'token'
+  }
+
   return statusBody && statusBody.auth_required ? 'oauth' : 'token'
 }
 
@@ -1200,10 +1297,13 @@ export {
   authModeFromStatus,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
+  configuredGatewayTokenTicketFailure,
   connectionScopeKey,
+  connectionUsesWsTicket,
   cookiesHaveLiveSession,
   cookiesHaveSession,
   gatewayTicketFailure,
+  gatewayWsAuthTransport,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
   isGatewayAuthRejection,
@@ -1229,6 +1329,7 @@ export {
   RT_COOKIE_VARIANTS,
   sanitizeRemoteHeaderValue,
   savedProfileSsh,
+  statusAdvertisesDashboardSessionToken,
   tokenPreview,
   translateSelfProfileQuery,
   withTransientRetries

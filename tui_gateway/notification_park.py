@@ -68,6 +68,10 @@ def _release(events) -> None:
         is_delegation = evt.get("type") == "async_delegation"
         if is_delegation:
             return_completion_offer(evt)
+        elif evt.get("type", "completion") == "completion":
+            # A dropped process completion never runs its continuation turn: settle its approval-task reservation.
+            from gateway.session_approval_completion import release_completion_event_reservation
+            release_completion_event_reservation(evt)
         unhold([evt])
         (logger.warning if is_delegation else logger.debug)(
             "Dropping parked %s notification past its retention window (key=%r)",

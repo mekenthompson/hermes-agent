@@ -1,6 +1,5 @@
 """Agent-turn execution for GatewayRunner: _handle_message_with_agent, _run_agent*, proxy path,
-MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals
-are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.X")`` still works.
+MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals are imported lazily (cycle).
 """
 
 from __future__ import annotations
@@ -23,7 +22,8 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.bot_peer_notices import automatic_notices_allowed
 from gateway.config import Platform
-from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome, describe_proxy_error, safe_proxy_url_for_log
+from gateway.platforms.base import (
+    BasePlatformAdapter, ProcessingOutcome, describe_proxy_error, safe_proxy_url_for_log, should_auto_tts_for_source)
 from gateway.platforms.event import MessageEvent
 from gateway.platforms.helpers import hash_for_log, typing_metadata_for_turn
 from gateway.response_filters import (
@@ -230,6 +230,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     "gateway_input_owner": prepared.persistence_owner, **persisted_user_metadata_for_event(event),
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
+                internal_plugin_execution_id=getattr(event, "_internal_plugin_execution_id", None),
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
@@ -964,10 +965,13 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             _cleanup_progress = False
             _cleanup_adapter = None
 
-        # The one-slot progress/holder containers shared with the callbacks are TurnContext defaults.
+        # The one-slot progress/holder containers are TurnContext defaults. Follow-ups pass a frozen physical identity.
+        queued_reservation = turn_params.pop("_queued_execution_reservation", None)
+        reservation = queued_reservation if queued_reservation is not None else self._chat_execution_reservation_for_turn(session_key, run_generation)
         turn_ctx = TurnContext(
             source=source, message=message, AIAgent=AIAgent, session_key=session_key,
             run_generation=run_generation, _cleanup_progress=_cleanup_progress, _cleanup_adapter=_cleanup_adapter,
+            chat_execution_reservation=reservation,
             _run_still_current=self._run_still_current_fn(session_key, run_generation),
             progress_queue=queue.Queue() if disp.needs_progress_queue else None,
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
@@ -1115,7 +1119,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             message_type is not None
             and str(getattr(message_type, "value", message_type)).lower() == "voice"
         )
-        if _stts_adapter is None or not _is_voice_input or not _stts_adapter._should_auto_tts_for_chat(source.chat_id):
+        if _stts_adapter is None or not _is_voice_input or not should_auto_tts_for_source(_stts_adapter, source):
             return
         try:
             from gateway.streaming_tts_consumer import StreamingTTSConsumer
@@ -1153,20 +1157,40 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         """Track this agent as running for the session (interrupt support) once it is created — only
         if this run is still current, else leave the newer run's slot alone."""
         session_key, run_generation, agent_holder = turn_ctx.session_key, turn_ctx.run_generation, turn_ctx.agent_holder
-        while agent_holder[0] is None:
-            await asyncio.sleep(0.05)
-        if not session_key:
-            return
-        if run_generation is not None and not self._is_session_run_current(session_key, run_generation):
-            logger.info(
-                "Skipping stale agent promotion for %s — generation %s is no longer current",
-                session_key or "", run_generation,
+        execution_id = getattr(turn_ctx, "internal_plugin_execution_id", None)
+        gate = getattr(turn_ctx, "execution_launch_gate", None)
+        try:
+            while agent_holder[0] is None:
+                await asyncio.sleep(0.05)
+            if not session_key:
+                return
+            if run_generation is not None and not self._is_session_run_current(session_key, run_generation):
+                logger.info(
+                    "Skipping stale agent promotion for %s — generation %s is no longer current",
+                    session_key or "", run_generation,
+                )
+                turn_ctx.execution_launch_allowed = False
+                return
+            allowed = self._promote_running_agent(
+                session_key=session_key, run_generation=run_generation, agent=agent_holder[0],
+                internal_plugin_execution_id=execution_id,
             )
-            return
-        turn_state = self._session_state(session_key).turn
-        turn_state.agent, turn_state.ctx = agent_holder[0], turn_ctx
-        if self._draining:
-            self._update_runtime_status("draining")
+            # The executor thread waits at TurnRunner's launch fence.  An accepted Stop before
+            # promotion must return without entering run_conversation, not strand the thread.
+            turn_ctx.execution_launch_allowed = allowed
+            if not allowed:
+                return
+            self._session_state(session_key).turn.ctx = turn_ctx
+            if self._draining:
+                self._update_runtime_status("draining")
+        finally:
+            # Release the parked executor thread on EVERY exit path — the early `not
+            # session_key` return, an exception, and above all cancellation: this task is
+            # cancelled unconditionally in _run_agent_cleanup_turn_tasks, and any cancellation
+            # between spawn and promotion used to park the worker thread forever.
+            # execution_launch_allowed stays False unless promotion explicitly allowed launch.
+            if gate is not None:
+                gate.set()
 
     async def _run_agent_fire_pending_interrupt(
         self, adapter: Any, agent: Any, source: SessionSource, session_key: str,
@@ -1278,70 +1302,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         return False
 
     def _run_agent_start_turn_worker(self, turn_ctx: TurnContext, run_sync: Callable[[], Any]) -> GatewayRunner._RunAgentWorker:
-        """Schedule ``run_sync`` on the executor plus the inactivity watchdog thread.
-
-        *Inactivity* timeout (agent.gateway_timeout / HERMES_AGENT_TIMEOUT, env wins; 0 = unlimited),
-        not wall-clock. The daemon watchdog is independent of asyncio: cgroup memory reclaim can
-        starve the loop that runs the normal timeout poll."""
-        from gateway.run import _float_env, _watch_gateway_turn_inactivity
-        from tools.process_registry import process_registry
-        agent_holder, session_key, run_generation = turn_ctx.agent_holder, turn_ctx.session_key, turn_ctx.run_generation
-        _agent_timeout, _agent_warning = (
-            v if v > 0 else None
-            for v in (_float_env("HERMES_AGENT_TIMEOUT", 1800), _float_env("HERMES_AGENT_TIMEOUT_WARNING", 900))
-        )
-
-        # background=true processes survive a turn: reap only children created by THIS turn on timeout.
-        _turn_task_id = turn_ctx.session_id or ""
-        # The daemon watchdog is independent of asyncio: cgroup memory reclaim may starve the event loop
-        # that runs the normal timeout poll, but it need not also postpone cleanup until the loop recovers
-        # (#76115).
-        _turn_process_baseline = process_registry.snapshot_running_ids(_turn_task_id)
-        turn_ctx.process_task_id = _turn_task_id
-        turn_ctx.process_baseline = _turn_process_baseline
-        # task_id is session-scoped: gate the reap on this claim still being current so a replacement
-        # turn's fresh process isn't killed by this turn's stale baseline.
-        worker = self._RunAgentWorker(
-            agent_timeout=_agent_timeout, agent_warning=_agent_warning, task_id=_turn_task_id,
-            process_baseline=_turn_process_baseline, worker_done=threading.Event(),
-            timeout_fired=threading.Event(), cleanup_lock=threading.Lock(),
-            is_current=(
-                (lambda: self._is_session_run_current(session_key, run_generation))
-                if run_generation is not None
-                else (lambda: True)
-            ),
-        )
-
-        def _run_sync_with_timeout_lifecycle():
-            try:
-                return run_sync()
-            finally:
-                worker.worker_done.set()
-                # `.turn.agent` stays reachable until the *next* turn is claimed; clearing the
-                # ownership markers now means a /stop on the finished turn no longer reaps background
-                # work it left running.
-                # `.turn.agent` on the session state is only reset to _AGENT_PENDING_SENTINEL when the
-                # *next* turn is claimed (see _session_state(...).turn.agent = ... at claim time), so a
-                # stale reference to this exact agent instance stays reachable from
-                # _interrupt_and_clear_session() until then. See #76115.
-                _finished_agent = agent_holder[0] if agent_holder else None
-                if _finished_agent is not None:
-                    _finished_agent._gateway_turn_process_task_id = ""
-                    _finished_agent._gateway_turn_process_baseline = frozenset()
-
-        if _agent_timeout is not None:
-            threading.Thread(
-                target=_watch_gateway_turn_inactivity,
-                kwargs={
-                    "agent_holder": agent_holder, "timeout": _agent_timeout, "poll_interval": 5.0,
-                    **self._reaper_kwargs(worker),
-                },
-                name=f"gateway-turn-watchdog-{_turn_task_id[:12]}",
-                daemon=True,
-            ).start()
-        from gateway.session_runtime_workers import start_turn_worker
-        start_turn_worker(self, worker, agent_holder, _run_sync_with_timeout_lifecycle)
-        return worker
+        from gateway.run_turn_worker import start_turn_worker
+        return start_turn_worker(self, turn_ctx, run_sync)
 
     @staticmethod
     def _reaper_kwargs(worker: GatewayRunner._RunAgentWorker) -> dict:
@@ -1762,14 +1724,18 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         # (the helper's own ``except Exception`` does not catch cancellation).
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
+            from gateway.chat_execution_followup import reserve_followup_execution
+            queued_reservation = reserve_followup_execution(self, turn_ctx, next_source, next_session_key)
+
             # The follow-up is its own sender's turn: approvals it raises name that sender, not the opener.
             with scoped_turn_actor(pending_event, self._session_state(session_key).turn) if pending_event is not None else nullcontext():
                 followup_result = await self._run_agent(
                     message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                     source=next_source, session_id=session_id, session_key=next_session_key,
                     run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id, inbound_message_id=next_inbound_id,
-                    channel_prompt=next_channel_prompt, message_type=next_message_type,
+                    _queued_execution_reservation=queued_reservation, event_message_id=next_message_id,
+                    inbound_message_id=next_inbound_id, channel_prompt=next_channel_prompt,
+                    message_type=next_message_type, scheduled_heartbeat=bool(getattr(pending_event, "_heartbeat_session_id", None)),
                     persist_user_message=next_persist_message, persist_user_display_kind=next_display_kind,
                     reply_expected=next_reply_expected, persist_user_display_metadata={
                         **display_metadata_for_event(pending_event),
@@ -2049,9 +2015,11 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
+        internal_plugin_execution_id: Optional[str] = None,
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        _queued_execution_reservation: Any = None,
     ) -> dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -2086,6 +2054,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             disp, AIAgent, message=message, source=source, session_key=session_key,
             run_generation=run_generation, context_prompt=context_prompt, history=history,
             session_id=session_id, _interrupt_depth=_interrupt_depth,
+            _queued_execution_reservation=_queued_execution_reservation,
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
             channel_prompt=channel_prompt, moa_config=moa_config,
             title_user_message=title_user_message,
@@ -2096,6 +2065,14 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
+        # Kept on the turn context only until promotion; an ID is never inferred
+        # from a later live slot.
+        turn_ctx.internal_plugin_execution_id = internal_plugin_execution_id
+        if session_key and run_generation is not None:
+            # A threading.Event crosses the executor boundary without treating cancellation
+            # of its asyncio wrapper as physical worker completion.
+            turn_ctx.execution_launch_gate = threading.Event()
+            turn_ctx.execution_launch_allowed = False
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )

@@ -50,7 +50,7 @@ def mutate_runtime_session(holder, *, epoch: int, principal_id: str, session_id:
     parse_mutation(operation, payload)
     if expected_generation is not None and (type(expected_generation) is not int or expected_generation < 0):
         raise AuthorityRefusal('invalid_params')
-    if operation in {'delete', 'rewind', 'reset', 'branch', 'model', 'compress'} and expected_generation is None:
+    if operation in {'delete', 'rewind', 'reset', 'branch', 'model', 'compress', 'notice'} and expected_generation is None:
         raise AuthorityRefusal('invalid_params')
     # Snapshot caller data before waiting for the writer lock.
     payload = json.loads(_json(payload))
@@ -106,6 +106,9 @@ def mutate_runtime_session(holder, *, epoch: int, principal_id: str, session_id:
 
 
 def apply_action(holder, conn, session_id, operation, payload, *, prepared=None, media_root=None, owner=None):
+    if operation == 'notice':
+        from ._mutation_notice import notice_in_transaction
+        return notice_in_transaction(holder, conn, session_id, payload)
     if operation == 'compress':
         from ._mutation_publish import compress_in_transaction
         return compress_in_transaction(holder, conn, session_id, payload, prepared)

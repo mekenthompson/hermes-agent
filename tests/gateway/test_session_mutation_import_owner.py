@@ -2,7 +2,7 @@
 login is the machine owner, so it continues the owner's import (an exact retry), never a stranger."""
 import httpx
 import pytest
-from tests.gateway.test_native_http_auth import daemon, ticket, headers
+from tests.gateway.test_native_http_auth import DASHBOARD_TEST_TOKEN, daemon, ticket, headers
 
 
 @pytest.mark.platforms("linux")
@@ -14,7 +14,9 @@ def test_import_atomically_binds_each_new_history_to_its_importer(tmp_path):
         assert response.status_code == 200, response.text
         for sid in ('cli-import', 'foreign-import'):
             body = {'request_id': 'edit', 'expected_revision': 1, 'title': sid}
-            login = client.patch('/api/sessions/' + sid, headers={'Authorization': 'Bearer normal-http-owner'}, json=body)
+
+            login = client.patch('/api/sessions/' + sid, headers={'Authorization': f'Bearer {DASHBOARD_TEST_TOKEN}'}, json=body)
             assert login.status_code == 200, login.text
+
             owned = client.patch('/api/sessions/' + sid, headers=headers(ticket(home, descriptor)), json=body)
             assert owned.status_code == 200 and owned.json() == login.json(), owned.text

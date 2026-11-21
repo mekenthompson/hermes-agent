@@ -463,6 +463,62 @@ class GatewayAgentCacheMixin:
                 # Never fails the boundary itself, but a surviving ON would come back after a restart.
                 logger.warning("Failed to clear persisted yolo for session boundary %s", session_key, exc_info=True)
 
+    def _reserve_ordinary_session_run_generation(self, session_key: str, source: SessionSource) -> int | None:
+        """Journal ordinary admission only; Stop's generic bump must not create executions."""
+        from gateway.chat_execution_recovery import ChatExecutionStore
+        try:
+            store = ChatExecutionStore(self._resolve_profile_home_for_source(source))
+            generation = store.reserve(session_key, self._current_session_run_generation(session_key), 0)
+            if generation is not None:
+                self._session_state(session_key).persistent.chat_execution_reservation = (
+                    str(store.home), session_key, generation)
+            return generation
+        except Exception:
+            logger.exception("Failed durable inbound admission for %s", session_key)
+            return None
+
+    def _chat_execution_reservation_for_turn(self, session_key: str, generation: int | None):
+        """Keep an admitted turn explicit even if Stop already cleared its active slot."""
+        if generation is None or not session_key:
+            return None
+        state = self._peek_session_state(session_key)
+        reservation = state.persistent.chat_execution_reservation if state is not None else None
+        if reservation is not None and reservation[1:] != (session_key, generation):
+            raise RuntimeError("Durable worker reservation was displaced")
+        return reservation
+
+    def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
+        """Restore the per-session model override captured by ``/model --once`` or ``/moa``.
+
+        With ``run_generation`` (the turn finalizer) the restore happens only while that generation
+        is still current; a stop/reset/eviction has already settled the snapshot itself (see
+        ``_invalidate_session_run_generation``), so the displaced finalizer finds nothing to do.
+        Without it (the settlement paths) the restore is unconditional."""
+        if not session_key:
+            return
+        try:
+            _otr_state = self._peek_session_state(session_key)
+            if _otr_state is None or not _otr_state.conversation.one_turn_restore:
+                return
+            if run_generation is not None and not self._is_session_run_current(session_key, run_generation):
+                return
+            snapshot = _otr_state.conversation.one_turn_restore
+            _otr_state.conversation.one_turn_restore = None
+            self._restore_session_model_override(session_key, snapshot)
+            # The one-turn switch note was persisted with the temporary turn. Add a
+            # one-shot counterpart so the next model does not treat that historical
+            # note as its current identity. The restored model may come from config,
+            # so avoid guessing its display name here.
+            pending_notes = getattr(self, "_pending_model_notes", None)
+            if not isinstance(pending_notes, dict):
+                pending_notes = self._pending_model_notes = {}
+            pending_notes[session_key] = (
+                "[Note: the one-turn model override has ended. The temporary model "
+                "no longer applies; use the current model and provider in your instructions.]"
+            )
+        except Exception:
+            logger.debug("Failed to restore one-turn model override", exc_info=True)
+
     def _begin_session_run_generation(self, session_key: str) -> int:
         """Claim a fresh, monotonically increasing run generation token (NEVER reset): a late result
         from a worker /stop or /new invalidated is recognized and dropped."""
@@ -478,6 +534,15 @@ class GatewayAgentCacheMixin:
 
         Settles a pending one-shot model override first: the displaced turn's finalizer is
         generation-guarded and would otherwise leave ``/moa`` / ``/model --once`` in force."""
+        # Stop and conversation boundaries invalidate detached approval ancestry
+        # even when the originating admission has already completed.
+        authority = getattr(self, 'session_authority', None)
+        if authority is not None:
+            for live in list(authority.sessions.values()):
+                if live.route == session_key:
+                    with live.event_stream.lock:
+                        for lease in list(getattr(live, 'approval_task_leases', ())):
+                            lease.revoke()
         self._restore_pending_one_turn_model_override(session_key)
         generation = self._begin_session_run_generation(session_key)
         if reason:
@@ -506,6 +571,7 @@ class GatewayAgentCacheMixin:
 
     def _interrupt_running_turn(
         self, session_key: str, *, interrupt_reason: str, invalidation_reason: str, tool_reason: str | None = None,
+        delivery_report: dict | None = None,
     ) -> int:
         """Sync core shared by /stop, /new and eviction: request a hard interrupt on the in-flight
         agent, invalidate its run generation, and reap the tool processes that turn spawned.
@@ -515,13 +581,18 @@ class GatewayAgentCacheMixin:
         from gateway.run import _AGENT_PENDING_SENTINEL, _reap_gateway_turn_processes, request_hard_interrupt
         state = self._peek_session_state(session_key)
         running_agent = state.turn.agent if state else None
+        if delivery_report is not None:
+            delivery_report["interrupt"] = "prelaunch" if running_agent is _AGENT_PENDING_SENTINEL else "unsupported"
+            delivery_report["reap"] = "none"
         _process_task_id, _process_baseline = "", None
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             # A raising interrupt implementation must not leave the slot unroutable: the generation
             # bump and release below are the cleanup that matters.
             with _log_suppressed(logging.WARNING, "Failed to interrupt running agent for %s; continuing",
                                  session_key, exc_info=True):
-                request_hard_interrupt(running_agent, interrupt_reason, tool_reason=tool_reason)
+                delivered = request_hard_interrupt(running_agent, interrupt_reason, tool_reason=tool_reason)
+                if delivery_report is not None and delivered:
+                    delivery_report["interrupt"] = "delivered"
             _process_task_id = getattr(running_agent, "_gateway_turn_process_task_id", "")
             _process_baseline = getattr(running_agent, "_gateway_turn_process_baseline", None)
         # Bump the generation BEFORE scheduling the reap thread and capture the post-bump value:
@@ -530,21 +601,29 @@ class GatewayAgentCacheMixin:
         # covers its cleanup, so nothing stays unreaped.
         _generation_at_interrupt = self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
         if _process_task_id and _process_baseline is not None:
-            threading.Thread(
-                target=copy_context().run,
-                args=(_reap_gateway_turn_processes, _process_task_id, _process_baseline),
-                kwargs={
-                    "source": "gateway_turn_interrupt",
-                    "is_still_current": lambda: self._is_session_run_current(session_key, _generation_at_interrupt),
-                },
-                name=f"gateway-turn-reaper-{_process_task_id[:12]}",
-                daemon=True,
-            ).start()
+            try:
+                threading.Thread(
+                    target=copy_context().run,
+                    args=(_reap_gateway_turn_processes, _process_task_id, _process_baseline),
+                    kwargs={
+                        "source": "gateway_turn_interrupt",
+                        "is_still_current": lambda: self._is_session_run_current(session_key, _generation_at_interrupt),
+                    },
+                    name=f"gateway-turn-reaper-{_process_task_id[:12]}",
+                    daemon=True,
+                ).start()
+                if delivery_report is not None:
+                    delivery_report["reap"] = "scheduled"
+            except Exception:
+                logger.warning("Failed to start turn process reaper for %s", session_key, exc_info=True)
+                if delivery_report is not None:
+                    delivery_report["reap"] = "failed"
         return _generation_at_interrupt
 
     async def _interrupt_and_clear_session(
         self, session_key: str, source: SessionSource, *, interrupt_reason: str,
         invalidation_reason: str, release_running_state: bool = True,
+        delivery_report: dict | None = None,
     ) -> None:
         """Interrupt the current run and clear queued session state consistently."""
         if not session_key:
@@ -555,6 +634,7 @@ class GatewayAgentCacheMixin:
         person_input_joined_turn(self, session_key)  # /stop, /new: a plugin turn's wait ends at once
         _generation_at_interrupt = self._interrupt_running_turn(
             session_key, interrupt_reason=interrupt_reason, invalidation_reason=invalidation_reason,
+            delivery_report=delivery_report,
         )
         from gateway.run import _AGENT_PENDING_SENTINEL
         if running_agent is _AGENT_PENDING_SENTINEL:
@@ -587,12 +667,30 @@ class GatewayAgentCacheMixin:
                 logger.debug("agent_loop_stopped hook dispatch failed", exc_info=True)
         adapter = self._delivery_adapter_for(source)
         interrupt_session_activity = getattr(type(adapter), "interrupt_session_activity", None)
+        if delivery_report is not None:
+            delivery_report["activity_clear"] = "none"
+        activity_waited = False
         if adapter and callable(interrupt_session_activity):
-            metadata = self._thread_metadata_for_source(source)
-            if _accepts_keyword(interrupt_session_activity, "metadata"):
-                await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
+            async def _clear_activity():
+                metadata = self._thread_metadata_for_source(source)
+                if _accepts_keyword(interrupt_session_activity, "metadata"):
+                    await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
+                else:
+                    await adapter.interrupt_session_activity(session_key, source.chat_id)
+            if delivery_report is None:
+                activity_waited = True
+                await _clear_activity()
             else:
-                await adapter.interrupt_session_activity(session_key, source.chat_id)
+                try:
+                    activity_waited = True
+                    await _clear_activity()
+                except Exception:
+                    logger.warning("Failed to clear adapter activity for %s", session_key, exc_info=True)
+                    delivery_report["activity_clear"] = "failed"
+                else:
+                    delivery_report["activity_clear"] = "completed"
+        if activity_waited and not self._is_session_run_current(session_key, _generation_at_interrupt):
+            return  # a successor claimed the slot during interrupt_session_activity
         if adapter and hasattr(adapter, "get_pending_message"):
             # Discard a stale human follow-up (the slot held only user text when /stop started doing
             # this, 59575d6a917) — but an internal wake (async-delegation completion, notify+wake)
