@@ -431,6 +431,22 @@ def _owner(runner, event, authority):
     return entry
 
 
+def heartbeat_origin_field(event):
+    """``{'heartbeat_origin': 'active-work'}`` for a managed check's tick, else ``{}``: a user-authored
+    heartbeat's admission payload is unchanged, and so is its fingerprint."""
+    from hermes_cli.heartbeat import ACTIVE_WORK_HEARTBEAT_ORIGIN
+    if getattr(event, '_heartbeat_origin', None) == ACTIVE_WORK_HEARTBEAT_ORIGIN:
+        return {'heartbeat_origin': ACTIVE_WORK_HEARTBEAT_ORIGIN}
+    return {}
+
+
+def restore_heartbeat_origin(event, automation):
+    """Inverse of :func:`heartbeat_origin_field`; only the one known origin is accepted."""
+    from hermes_cli.heartbeat import ACTIVE_WORK_HEARTBEAT_ORIGIN
+    if automation.get('heartbeat_origin') == ACTIVE_WORK_HEARTBEAT_ORIGIN:
+        event._heartbeat_origin = ACTIVE_WORK_HEARTBEAT_ORIGIN
+
+
 def automation_notification_metadata(metadata):
     """Validate trusted producer category; omit the default from old fingerprints."""
     category = metadata.get('notification_category', 'result')
@@ -623,6 +639,7 @@ def snapshot_automation(authority, adapter, event, identity):
     envelope['automation'].update(notification)
     if getattr(event, '_heartbeat_session_id', None):
         envelope['automation']['heartbeat'] = event._heartbeat_session_id
+        envelope['automation'].update(heartbeat_origin_field(event))
     identities = event.metadata.get('automation_identities')
     if identities:
         envelope['automation']['identities'] = sorted(set(identities))
@@ -694,6 +711,7 @@ def snapshot_local_automation(authority, adapter, event, identity, entry):
         descriptor['identities'] = sorted(set(event.metadata['automation_identities']))
     if getattr(event, '_heartbeat_session_id', None):
         descriptor['heartbeat'] = event._heartbeat_session_id
+        descriptor.update(heartbeat_origin_field(event))
     return {'text': event.text, 'local_automation_v1': descriptor}, entry
 
 
@@ -731,6 +749,7 @@ def restore_local_automation(authority, ref, row):
         event.metadata['turn_author'] = deepcopy(descriptor['turn_author'])
     if descriptor.get('heartbeat'):
         event._heartbeat_session_id = descriptor['heartbeat']
+        restore_heartbeat_origin(event, descriptor)
     return event
 
 

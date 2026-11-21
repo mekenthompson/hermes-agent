@@ -16,11 +16,13 @@ from hermes_cli.active_work_progress import (
     ACTIVE_WORK_INTERVAL_SECONDS,
     ACTIVE_WORK_PROMPT,
     collect_active_session_ids,
+    collect_active_work,
     reconcile_active_work_result,
     ScanResult,
 )
 from hermes_cli.heartbeat import (
     ACTIVE_WORK_HEARTBEAT_ORIGIN,
+    ACTIVE_WORK_LIVENESS_FLOOR_SECONDS,
     USER_HEARTBEAT_ORIGIN,
     HeartbeatManager,
     HeartbeatState,
@@ -137,22 +139,22 @@ def test_delegation_scan_ignores_stopped_rows(tmp_path, monkeypatch):
     conn = sqlite3.connect(db)
     conn.execute(
         "CREATE TABLE async_delegations (origin_session_id TEXT, parent_session_id TEXT, "
-        "state TEXT, stop_state TEXT)"
+        "delegation_id TEXT, state TEXT, stop_state TEXT)"
     )
     conn.execute(
-        "INSERT INTO async_delegations VALUES ('live-parent', '', 'running', '')"
+        "INSERT INTO async_delegations VALUES ('live-parent', '', 'd-live-parent', 'running', '')"
     )
     conn.execute(
-        "INSERT INTO async_delegations VALUES ('stalling-parent', '', 'stalling', '')"
+        "INSERT INTO async_delegations VALUES ('stalling-parent', '', 'd-stalling-parent', 'stalling', '')"
     )
     conn.execute(
-        "INSERT INTO async_delegations VALUES ('finalizing-parent', '', 'finalizing', '')"
+        "INSERT INTO async_delegations VALUES ('finalizing-parent', '', 'd-finalizing-parent', 'finalizing', '')"
     )
     conn.execute(
-        "INSERT INTO async_delegations VALUES ('stopped-parent', '', 'running', 'requested')"
+        "INSERT INTO async_delegations VALUES ('stopped-parent', '', 'd-stopped-parent', 'running', 'requested')"
     )
     conn.execute(
-        "INSERT INTO async_delegations VALUES ('stopped-stalling', '', 'stalling', 'requested')"
+        "INSERT INTO async_delegations VALUES ('stopped-stalling', '', 'd-stopped-stalling', 'stalling', 'requested')"
     )
     conn.commit()
     conn.close()
@@ -181,8 +183,15 @@ class _Adapter(BasePlatformAdapter):
         return SendResult(success=True, message_id="wire-1")
 
 
-@pytest.mark.asyncio
-async def test_due_check_delivers_to_originating_chat_and_silence_is_not_a_send(heartbeat_db, monkeypatch):
+def _managed_check(session_id="origin-session", fingerprint="fp-1"):
+    """What one reconcile scan does for a session whose tracked work currently fingerprints as given."""
+    return HeartbeatManager(session_id).ensure_managed(
+        ACTIVE_WORK_PROMPT, ACTIVE_WORK_INTERVAL_SECONDS, origin=ACTIVE_WORK_HEARTBEAT_ORIGIN,
+        work_fingerprint=fingerprint,
+    )
+
+
+def _poll_harness(monkeypatch):
     from hermes_cli import heartbeat as heartbeat_mod
 
     clock = SimpleNamespace(now=1_000.0)
@@ -204,12 +213,20 @@ async def test_due_check_delivers_to_originating_chat_and_silence_is_not_a_send(
     runner._running_agents = {}
     runner._delivery_adapter_for = lambda _source: adapter
     runner._run_in_executor_with_context = asyncio.to_thread
-    HeartbeatManager("origin-session").ensure_managed(
-        ACTIVE_WORK_PROMPT, ACTIVE_WORK_INTERVAL_SECONDS, origin=ACTIVE_WORK_HEARTBEAT_ORIGIN,
+    return SimpleNamespace(
+        clock=clock, adapter=adapter, received=received, runner=runner,
+        watch={key: (source, "origin-session")},
     )
-    watch = {key: (source, "origin-session")}
-    clock.now += ACTIVE_WORK_INTERVAL_SECONDS
-    await runner._heartbeat_poll_once(watch)
+
+
+@pytest.mark.asyncio
+async def test_due_check_delivers_to_originating_chat_and_silence_is_not_a_send(heartbeat_db, monkeypatch):
+    h = _poll_harness(monkeypatch)
+    adapter, received = h.adapter, h.received
+    _managed_check(fingerprint="fp-1")
+    _managed_check(fingerprint="fp-2")  # a delegation moved on since the check was installed
+    h.clock.now += ACTIVE_WORK_INTERVAL_SECONDS
+    await h.runner._heartbeat_poll_once(h.watch)
     await asyncio.gather(*adapter._background_tasks)
     assert len(received) == 1
     event = received[0]
@@ -251,8 +268,8 @@ async def test_reconcile_registers_origin_watch_and_drops_it_when_settled(heartb
     runner._start_heartbeat_poller = lambda: None
 
     monkeypatch.setattr(
-        "hermes_cli.active_work_progress.collect_active_session_ids",
-        lambda **_kwargs: ({"origin-session"}, True),
+        "hermes_cli.active_work_progress.collect_active_work",
+        lambda **_kwargs: ({"origin-session": "fp-1"}, True),
     )
     monkeypatch.setattr(
         "gateway.run_heartbeat_restore._watched_homes",
@@ -264,8 +281,8 @@ async def test_reconcile_registers_origin_watch_and_drops_it_when_settled(heartb
     assert load_heartbeat("origin-session").origin == ACTIVE_WORK_HEARTBEAT_ORIGIN
 
     monkeypatch.setattr(
-        "hermes_cli.active_work_progress.collect_active_session_ids",
-        lambda **_kwargs: (set(), True),
+        "hermes_cli.active_work_progress.collect_active_work",
+        lambda **_kwargs: ({}, True),
     )
     await reconcile_active_work_watches(runner)
     assert key not in runner._heartbeat_watch
@@ -320,8 +337,8 @@ async def test_reconcile_keeps_watch_on_compression_continuation(heartbeat_db, m
         ACTIVE_WORK_PROMPT, ACTIVE_WORK_INTERVAL_SECONDS, origin=ACTIVE_WORK_HEARTBEAT_ORIGIN,
     )
     monkeypatch.setattr(
-        "hermes_cli.active_work_progress.collect_active_session_ids",
-        lambda **_kwargs: ({"parent-session"}, True),
+        "hermes_cli.active_work_progress.collect_active_work",
+        lambda **_kwargs: ({"parent-session": "fp-1"}, True),
     )
     monkeypatch.setattr(
         "gateway.run_heartbeat_restore._watched_homes",
@@ -347,8 +364,8 @@ async def test_reconcile_then_restore_skips_non_deliverable_origin(heartbeat_db,
         ACTIVE_WORK_PROMPT, ACTIVE_WORK_INTERVAL_SECONDS, origin=ACTIVE_WORK_HEARTBEAT_ORIGIN,
     )
     monkeypatch.setattr(
-        "hermes_cli.active_work_progress.collect_active_session_ids",
-        lambda **_kwargs: ({"api-session"}, True),
+        "hermes_cli.active_work_progress.collect_active_work",
+        lambda **_kwargs: ({"api-session": "fp-1"}, True),
     )
     monkeypatch.setattr(
         "gateway.run_heartbeat_restore._watched_homes",
@@ -418,3 +435,153 @@ def test_notifier_terminal_kinds_are_not_gated_on_the_progress_interval():
     assert handoff == "shipped the canary"
     assert blocked and "credential" in blocked
     assert "180" not in completed and "180" not in blocked
+
+
+# --- event-driven wake: the 180s tick scans, only changed work (or the liveness floor) wakes the model ---
+
+SID = "work-session"
+
+
+def _tick(n):
+    """The n-th 180s scan tick after the managed check was installed."""
+    return load_heartbeat(SID).created_at + n * ACTIVE_WORK_INTERVAL_SECONDS
+
+
+def test_unchanged_work_admits_no_prompt_at_any_due_tick(heartbeat_db):
+    _managed_check(SID, "fp-1")
+    for n in range(1, 8):  # 21 minutes of scans that all see the same work
+        _managed_check(SID, "fp-1")
+        assert HeartbeatManager(SID).due_prompt(now=_tick(n)) is None
+    assert load_heartbeat(SID).fire_count == 0
+
+
+def test_changed_work_wakes_once_then_waits_for_the_next_change(heartbeat_db):
+    _managed_check(SID, "fp-1")
+    _managed_check(SID, "fp-2")  # e.g. a delegation went running -> stalling
+    prompt = HeartbeatManager(SID).due_prompt(now=_tick(1))
+    assert prompt is not None and "[SILENT]" in prompt
+    assert HeartbeatManager(SID).due_prompt(now=_tick(2)) is None  # same work as the last wake
+    _managed_check(SID, "fp-3")
+    assert HeartbeatManager(SID).due_prompt(now=_tick(3)) is not None
+    assert load_heartbeat(SID).fire_count == 2
+
+
+def test_a_change_inside_the_tick_interval_waits_for_the_tick(heartbeat_db):
+    _managed_check(SID, "fp-1")
+    _managed_check(SID, "fp-2")
+    assert HeartbeatManager(SID).due_prompt(now=_tick(1) - 1) is None  # the 180s cadence still bounds wakes
+
+
+def test_liveness_floor_wakes_once_for_work_that_never_changes(heartbeat_db):
+    _managed_check(SID, "fp-1")
+    created = load_heartbeat(SID).created_at
+    assert HeartbeatManager(SID).due_prompt(now=created + ACTIVE_WORK_LIVENESS_FLOOR_SECONDS - 1) is None
+    woken_at = created + ACTIVE_WORK_LIVENESS_FLOOR_SECONDS
+    assert HeartbeatManager(SID).due_prompt(now=woken_at) is not None
+    assert HeartbeatManager(SID).due_prompt(now=woken_at + ACTIVE_WORK_INTERVAL_SECONDS) is None
+    assert HeartbeatManager(SID).due_prompt(now=woken_at + ACTIVE_WORK_LIVENESS_FLOOR_SECONDS) is not None
+
+
+def test_fingerprints_survive_a_restart_and_a_woken_change_does_not_wake_twice(heartbeat_db):
+    _managed_check(SID, "fp-1")
+    _managed_check(SID, "fp-2")
+    after_restart = HeartbeatManager(SID)  # a restarted gateway rebuilds the manager from the stored row
+    assert (after_restart.state.work_fingerprint, after_restart.state.woken_fingerprint) == ("fp-2", "fp-1")
+    assert after_restart.due_prompt(now=_tick(1)) is not None
+    restarted_again = HeartbeatManager(SID)
+    assert restarted_again.state.woken_fingerprint == "fp-2"
+    assert restarted_again.due_prompt(now=_tick(2)) is None
+
+
+def test_a_row_saved_before_fingerprints_existed_does_not_wake_for_the_upgrade(heartbeat_db):
+    from hermes_cli.heartbeat import save_heartbeat
+
+    save_heartbeat(SID, HeartbeatState(
+        prompt=ACTIVE_WORK_PROMPT, interval_seconds=ACTIVE_WORK_INTERVAL_SECONDS,
+        created_at=1_000.0, origin=ACTIVE_WORK_HEARTBEAT_ORIGIN,
+    ))
+    assert _managed_check(SID, "fp-1") == "kept"
+    assert HeartbeatManager(SID).due_prompt(now=1_000.0 + ACTIVE_WORK_INTERVAL_SECONDS) is None
+
+
+def test_an_abandoned_wake_keeps_the_change_pending(heartbeat_db):
+    _managed_check(SID, "fp-1")
+    _managed_check(SID, "fp-2")
+    manager = HeartbeatManager(SID)
+    assert manager.due_prompt(now=_tick(1)) is not None
+    assert manager.abandon_fire() is True  # the turn never started
+    assert HeartbeatManager(SID).due_prompt(now=_tick(1)) is not None
+
+
+def test_user_heartbeat_fires_on_every_due_tick_and_is_never_fingerprinted(heartbeat_db):
+    user = HeartbeatManager("user-session")
+    user.set("my own check", 600)
+    created = user.state.created_at
+    assert user.due_prompt(now=created + 600) is not None
+    assert user.due_prompt(now=created + 1200) is not None  # unchanged state, still fires: it is the user's
+    assert _managed_check("user-session", "fp-9") == "preserved-user"
+    stored = load_heartbeat("user-session")
+    assert stored.origin == USER_HEARTBEAT_ORIGIN
+    assert (stored.work_fingerprint, stored.woken_fingerprint) == ("", "")
+
+
+@pytest.mark.asyncio
+async def test_poll_admits_no_turn_while_work_is_unchanged_and_one_when_it_changes(heartbeat_db, monkeypatch):
+    h = _poll_harness(monkeypatch)
+    _managed_check(fingerprint="fp-1")
+    for _ in range(3):
+        h.clock.now += ACTIVE_WORK_INTERVAL_SECONDS
+        await h.runner._heartbeat_poll_once(h.watch)
+        await asyncio.gather(*h.adapter._background_tasks)
+    assert h.received == []
+
+    _managed_check(fingerprint="fp-2")
+    h.clock.now += ACTIVE_WORK_INTERVAL_SECONDS
+    await h.runner._heartbeat_poll_once(h.watch)
+    await asyncio.gather(*h.adapter._background_tasks)
+    assert len(h.received) == 1
+
+
+def _delegation_db(path, rows):
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE async_delegations (origin_session_id TEXT, parent_session_id TEXT, "
+        "delegation_id TEXT, state TEXT, stop_state TEXT)"
+    )
+    conn.executemany("INSERT INTO async_delegations VALUES (?, '', ?, ?, ?)", rows)
+    conn.commit()
+    conn.close()
+
+
+def test_work_fingerprint_follows_delegation_state_and_ignores_row_order(tmp_path, monkeypatch):
+    rows = [("s", "d1", "running", ""), ("s", "d2", "running", ""), ("other", "d3", "running", "")]
+    first, second = tmp_path / "first.db", tmp_path / "second.db"
+    _delegation_db(first, rows)
+    _delegation_db(second, list(reversed(rows)))
+    stalled = tmp_path / "stalled.db"
+    _delegation_db(stalled, [("s", "d1", "running", ""), ("s", "d2", "stalling", ""), ("other", "d3", "running", "")])
+    monkeypatch.setattr("hermes_cli.active_work_progress._state_db_path", lambda: first)
+    base, complete = collect_active_work(background_ids=set())
+    monkeypatch.setattr("hermes_cli.active_work_progress._state_db_path", lambda: second)
+    reordered, _ = collect_active_work(background_ids=set())
+    monkeypatch.setattr("hermes_cli.active_work_progress._state_db_path", lambda: stalled)
+    moved_on, _ = collect_active_work(background_ids=set())
+    assert complete is True and set(base) == {"s", "other"}
+    assert reordered == base
+    assert moved_on["s"] != base["s"] and moved_on["other"] == base["other"]
+
+
+def test_work_fingerprint_follows_background_process_membership_and_exit():
+    from hermes_cli import active_work_progress as progress
+
+    def proc(pid, exited=False):
+        return SimpleNamespace(id=pid, parent_session_id="human-session", handoff_note="", exited=exited)
+
+    one = progress._scan_background_sessions(SimpleNamespace(_running={"p1": proc("p1")}))
+    two = progress._scan_background_sessions(SimpleNamespace(_running={"p1": proc("p1"), "p2": proc("p2")}))
+    exited = progress._scan_background_sessions(SimpleNamespace(_running={"p1": proc("p1", exited=True)}))
+    fingerprints = {name: progress.work_fingerprint(scan.units["human-session"])
+                    for name, scan in (("one", one), ("two", two), ("exited", exited))}
+    assert len(set(fingerprints.values())) == 3

@@ -58,6 +58,26 @@ def bind_chat_execution(home: str | Path, session_key: str, generation: int) -> 
         _CHAT_EXECUTION.reset(token)
 
 
+@contextmanager
+def released_from_chat_execution() -> Iterator[None]:
+    """Run work that outlives the bound turn (a post-turn review fork) under no execution identity.
+
+    ``propagate_context_to_thread`` copies the dispatcher's identity into such a thread, but the
+    execution row it names settles when the turn's worker returns; every tool call after that is
+    refused by :func:`observe_tool_before_execution`, and one before it would flag the already
+    settled turn as having run a tool. The work answers to its own lifecycle instead.
+    """
+    identity = _CHAT_EXECUTION.set(None)
+    concurrent = _CONCURRENT_RESOURCE.set(None)
+    detached = _DETACHED_RESOURCE.set(None)
+    try:
+        yield
+    finally:
+        _DETACHED_RESOURCE.reset(detached)
+        _CONCURRENT_RESOURCE.reset(concurrent)
+        _CHAT_EXECUTION.reset(identity)
+
+
 def concurrent_tool_resource_for_submit(resource_id: str, kind="concurrent_tool_thread"):
     identity = _CHAT_EXECUTION.get()
     if identity is None:
