@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Upstream-mirrored native Kanban module; keep its shape for Nous syncs, no downstream facade split (as kanban_db.py).
 """Dispatcher: crash/stale/orphan detection, failure accounting and the respawn circuit breaker, memory-aware concurrency caps, the one-shot ``dispatch_once`` pass, worker spawning (``_default_spawn``), worker-log rotation and the long-lived ``run_daemon`` loop.
 
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached
@@ -150,20 +151,25 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    at_capacity: Optional[tuple[str, int, int]] = None
+    """``(cap, running, limit)`` when running workers already fill a spawn cap
+    (``cap`` is ``"kanban.max_spawn"`` or ``"kanban.max_in_progress"``), so the
+    tick spawned nothing by design. Healthy: a slot frees when a worker ends."""
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
-    ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
-    memory_pressure=critical`` — the respawn-guard reasons counted per task
-    plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
-    CLI daemon and the embedded gateway dispatcher, which otherwise report a
-    bare zero-spawn count while ``hermes kanban tail`` is the only place the
-    guard reason is written (#111910).
+    ``active_pr=1, at_capacity=3/3 (kanban.max_in_progress), recent_success=2,
+    rate_limited=1, skipped_locked=1, memory_pressure=critical`` — the
+    respawn-guard reasons counted per task plus the tick-level holds. Feeds the
+    "dispatcher stuck" warnings of the CLI daemon and the embedded gateway
+    dispatcher, which otherwise report a bare zero-spawn count while ``hermes
+    kanban tail`` is the only place the guard reason is written (#111910).
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
+    capacity: Optional[str] = None
     for res in results:
         if res is None:
             continue
@@ -175,10 +181,34 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
+        if res.at_capacity:
+            capacity = _describe_capacity(res.at_capacity)
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
+    if capacity:
+        parts.append(f"at_capacity={capacity}")
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
+
+
+def _describe_capacity(at_capacity: tuple[str, int, int]) -> str:
+    cap, running, limit = at_capacity
+    return f"{running}/{limit} ({cap})"
+
+
+def describe_capacity(results: Iterable[Optional[DispatchResult]]) -> str:
+    """``"3/3 (kanban.max_in_progress)"`` when EVERY board that ticked is at a
+    spawn cap, else ``""``.
+
+    Workers fill the cap and ready work waits for a slot: working as designed,
+    not a profile-health problem. One board still under its cap keeps the
+    answer empty so a board that is genuinely stuck is not explained away.
+    """
+    ticked = [res.at_capacity for res in results if res is not None]
+    capped = [at for at in ticked if at]
+    if not capped or len(capped) != len(ticked):
+        return ""
+    return _describe_capacity(capped[0])
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -2203,6 +2233,7 @@ def _tick_spawn_budget(
     board: Optional[str],
 ) -> tuple[bool, Optional[int]]:
     """``(may_spawn, spawn_budget)`` for this tick; ``budget None`` = uncapped.
+    A cap that running workers already fill is recorded on ``result.at_capacity``.
 
     ``max_spawn`` is a live per-board concurrency cap (running + this tick's
     spawns), not a per-tick budget — a per-tick reading would grow concurrency
@@ -2221,12 +2252,14 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.at_capacity = ("kanban.max_spawn", running_count, max_spawn)
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.at_capacity = ("kanban.max_in_progress", total_running, max_in_progress)
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
