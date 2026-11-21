@@ -1893,7 +1893,7 @@ def _summarize_refused_tool_result(tool_name: str, args: dict, content: str) -> 
     error = payload.get("error") if isinstance(payload.get("error"), str) else ""
     if not error and content.lstrip().startswith("BLOCKED"):
         error = content.strip()
-    if status == "pending_approval":
+    if status in ("pending_approval", "approval_deferred"):  # the latter: timed out, still open with the user
         outcome = "awaiting the user's approval, not run"
     elif error and (status == "blocked" or error.lstrip().startswith("BLOCKED")):
         outcome = "BLOCKED, not run"

@@ -26,6 +26,7 @@ approval:
   summary:
     denied: "Dhiúltaigh tú {noun} seo — níor ritheadh é."
     timeout: "Gan freagra laistigh de {window} — níor ritheadh {noun}."
+    deferred: "No answer within {window} — the {noun} did not run yet. It stays open for you to approve or deny; your answer will be passed on."
     notify_failed: "Níorbh fhéidir an iarratas ceada a sheachadadh — níor ritheadh {noun}."
     cancelled: "Tarraingíodh siar an leid cheada nó níor shroich sí tú — níor ritheadh {noun}."
     blocked: "Ní cheadaítear {noun} seo i seisiún gan fhreastal — níor ritheadh é."

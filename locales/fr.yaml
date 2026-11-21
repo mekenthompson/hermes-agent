@@ -26,6 +26,7 @@ approval:
   summary:
     denied: "Vous avez refusé cette {noun} — elle n'a pas été exécutée."
     timeout: "Aucune réponse dans un délai de {window} — la {noun} n'a pas été exécutée."
+    deferred: "Aucune réponse dans un délai de {window} — la {noun} n'a pas encore été exécutée. La demande reste ouverte ; votre réponse sera transmise."
     notify_failed: "La demande d'approbation n'a pas pu être transmise — la {noun} n'a pas été exécutée."
     cancelled: "La demande d'approbation a été retirée ou ne vous est jamais parvenue — la {noun} n'a pas été exécutée."
     blocked: "Cette {noun} n'est pas autorisée dans une session sans supervision — elle n'a pas été exécutée."

@@ -26,6 +26,7 @@ approval:
   summary:
     denied: "你拒绝了此{noun}——它未执行。"
     timeout: "在 {window} 内未收到回应——{noun}未执行。"
+    deferred: "在 {window} 内未收到回应——{noun}尚未执行。请求仍保持开放，你的回复会被转达。"
     notify_failed: "审批请求无法送达——{noun}未执行。"
     cancelled: "审批提示已撤回或未送达给你——{noun}未执行。"
     blocked: "无人值守会话中不允许此{noun}——它未执行。"

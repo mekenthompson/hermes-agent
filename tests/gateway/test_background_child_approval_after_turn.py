@@ -262,9 +262,9 @@ def test_child_card_raised_mid_turn_survives_the_parent_settling(gate, monkeypat
         assert owner.calls == [], "a child's prompt must never project onto the parent's generation"
         assert approval.has_blocking_approval(SESSION), "the parent ending must not withdraw the child's card"
         assert done.wait(5)
-        assert decisions[0]["outcome"] == "timeout"
-        # The card send was the first call; the timeout notice is a second one (edit or new message).
-        _wait(lambda: any(c[0] == "edit" for c in adapter.calls), "the expired card was edited to say so")
+        assert decisions[0]["outcome"] == "deferred"  # unanswered: parked, not approved
+        # Deferred, not expired: the card is left as it is (still answerable), never edited to "timed out".
+        assert approval.has_deferred_approval(SESSION) and not any(c[0] == "edit" for c in adapter.calls)
     finally:
         ask.set()
         loop.call_soon_threadsafe(loop.stop)

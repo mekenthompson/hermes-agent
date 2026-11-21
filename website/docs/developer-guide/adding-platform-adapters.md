@@ -224,6 +224,7 @@ When you call `ctx.register_platform()`, the following integration points are ha
 | System prompt hints | `platform_hint` injected into LLM context; `platform_hint_tool_notes` (`{tool: sentence}`) appended only when the session has that tool |
 | Message chunking | `max_message_length` for smart splitting |
 | PII redaction | `pii_safe` flag |
+| Home-channel nudge | `has_home_channel=False` for a surface with no home-channel concept (an issue-tracker thread): the one-time "No home channel is set, `/sethome`" notice is never sent there |
 | `hermes status` | Lists plugin platforms alongside built-ins, one row each, using the gateway's own configured check |
 | `hermes gateway setup` | Plugin platforms appear in setup menu |
 | `hermes tools` / `hermes skills` | Plugin platforms in per-platform config |

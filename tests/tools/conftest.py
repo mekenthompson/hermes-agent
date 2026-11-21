@@ -35,6 +35,18 @@ def _no_host_browser_use_cli():
 
 
 @pytest.fixture(autouse=True)
+def _no_parked_approvals_leak():
+    """Gateway approvals that time out park answerable (``tools.approval_deferred``) in module state keyed by
+    session and command; tests sharing a session key must not inherit an earlier test's parked prompt."""
+    from tools import approval_deferred
+    approval_deferred._parked.clear()
+    approval_deferred._decisions.clear()
+    yield
+    approval_deferred._parked.clear()
+    approval_deferred._decisions.clear()
+
+
+@pytest.fixture(autouse=True)
 def _no_chromium_download():
     """A test that reaches the launcher without a fake binary must never start PM's ~170 MB Chromium
     download; the one-shot auto-install is pinned to "declined"."""

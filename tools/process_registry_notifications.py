@@ -542,9 +542,27 @@ def _completion_status(evt: dict) -> str:
     return _REASON_STATUS.get(reason) or ("completed normally" if evt.get("exit_code", "?") == 0 else "exited")
 
 
+def _format_approval_decision(evt: dict) -> str:
+    """Notice that the user answered an approval that had timed out (``tools.approval_deferred``). It
+    states the decision and what to do next; the command it names has NOT been run by anyone."""
+    choice, reason = evt.get("choice"), str(evt.get("reason") or "").strip()
+    head = f"[IMPORTANT: The user answered the deferred approval request {evt.get('request_id', '?')}."
+    command = f"Command: {evt.get('command', '')}\n"
+    if choice == "deny":
+        return (f"{head}\nDecision: DENIED" + (f' — reason given: "{reason}"' if reason else "") + ".\n"
+                f"{command}It was not run. Do NOT re-issue it, rephrase it, or reach the same outcome another way; "
+                "tell the user what you will do instead.]")
+    scope = {"once": "once (one run)", "session": "for this session", "always": "always"}.get(choice, str(choice))
+    return (f"{head}\nDecision: APPROVED {scope}.\n{command}It has NOT been run: an approval is only spent when you "
+            "re-issue the exact same command, unchanged (any rewording is a new request and prompts again). "
+            "Re-issue it now if you still need it.]")
+
+
 def format_process_notification(evt: dict) -> str | None:
     """Format a completion_queue event into an ``[IMPORTANT: ...]`` message."""
     evt_type = evt.get("type", "completion")
+    if evt_type == "approval_decision":
+        return _format_approval_decision(evt)
     # watch_disabled and overflow events carry their own human-readable `message`;
     # otherwise overflow events would fall through to the completion formatter as a
     # phantom "process exited (exit code ?)".

@@ -26,6 +26,7 @@ approval:
   summary:
     denied: "Ви відхилили запуск {noun} — нічого не виконано."
     timeout: "Немає відповіді протягом {window} — запуск {noun} не відбувся."
+    deferred: "No answer within {window} — the {noun} did not run yet. It stays open for you to approve or deny; your answer will be passed on."
     notify_failed: "Не вдалося доставити запит на схвалення — запуск {noun} не відбувся."
     cancelled: "Запит на схвалення було відкликано або він не дійшов до вас — запуск {noun} не відбувся."
     blocked: "У сеансі без нагляду запуск {noun} не дозволено — нічого не виконано."

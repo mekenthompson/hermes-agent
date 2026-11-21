@@ -27,6 +27,7 @@ approval:
   summary:
     denied: "You denied this {noun} — it did not run."
     timeout: "No answer within {window} — the {noun} did not run."
+    deferred: "No answer within {window} — the {noun} did not run yet. It stays open for you to approve or deny; your answer will be passed on."
     notify_failed: "The approval request could not be delivered — the {noun} did not run."
     cancelled: "The approval prompt was withdrawn or never reached you — the {noun} did not run."
     blocked: "This {noun} is not allowed in an unattended session — it did not run."

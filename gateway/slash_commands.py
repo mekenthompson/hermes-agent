@@ -1212,9 +1212,11 @@ class GatewaySlashCommandsMixin(
         ``/deny`` for the chat's slash policy: the bare-word "always" lands here without dispatch's
         gate), else ``(session_key, reply, [])``.
         A pending-approvals entry with no blocked thread is a stale prompt: drop it and say so."""
-        from tools.approval import has_blocking_approval
+        from tools.approval import has_blocking_approval, has_deferred_approval
         session_key = self._session_key_for_source(event.source)
-        if has_blocking_approval(session_key):
+        # A prompt that timed out stays answerable (tools.approval_deferred): an explicit /approve or /deny
+        # reaches it, after any live wait (oldest first). Only these typed commands do; a bare "yes" never.
+        if has_blocking_approval(session_key) or has_deferred_approval(session_key):
             from gateway.relay.admitted_authors import answer_admitted
             from gateway.approval_actor import answerable_request_ids, refusal_text
             from gateway.slash_access import policy_for_runner_source

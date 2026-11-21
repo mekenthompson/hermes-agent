@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- HF-792 loop-safety fix at the two existing chokepoints (_get_cached_client stale-entry branch, the transient same-provider retry); the logic reuses _prepare_same_provider_retry and adds no module
 """Shared auxiliary client router for side tasks (compression, search, vision, ...).
 
 Text auto chain: main provider+model → OpenRouter → Nous Portal → custom endpoint →
@@ -5842,9 +5843,11 @@ def _get_cached_client(
             )
             if loop_ok:
                 return cached_client, _compat_model(cached_client, model, cached_default)
-            # Stale async entry — evict. Only a closed owner loop may be awaited here; a live
-            # foreign loop stays force-neutered.
-            _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
+            # Stale async entry. Only a closed owner loop is retired (nothing is in flight on it); a live
+            # one is another thread's `_run_async` loop with a request possibly mid-flight on this client:
+            # drop the entry, let GC retire the client (like the FIFO overflow below), never close it.
+            if cached_loop is not None and cached_loop.is_closed():
+                _close_cached_client(cached_client, close_async=True)
             del _client_cache[cache_key]
     # Build outside the lock. For pool-backed providers derive the key from the pool entry:
     # resolve_api_key_provider_credentials prefers env vars, which would bypass pool rotation
@@ -7994,6 +7997,19 @@ def _start_recovery_ladder(
         main_runtime=retry_kwargs["main_runtime"], route_info=route_info)
 
 
+def _fresh_client_for_retry(req: _PreparedAuxRequest, retry_kwargs: dict[str, Any], client: Any,
+                            failure: aux_errors.Failure, *, async_mode: bool) -> Any:
+    """The client a transient same-provider retry sends on. A healthy one is reused; one the failure says is
+    closed is dropped from the cache (not closed, another caller may be mid-request on it) and the route
+    rebuilt, never re-sent on a dead object."""
+    if not re.search(r"client (?:has been|is|was) closed", str(failure.error), re.IGNORECASE):
+        return client
+    _evict_cached_client_instance(client)
+    return _prepare_same_provider_retry(**dict(
+        retry_kwargs, resolved_provider=req.resolved_provider, resolved_model=req.resolved_model,
+        async_mode=async_mode))[0]
+
+
 def _call_llm_impl(
     task: str | None = None, *, provider: str | None = None, model: str | None = None, base_url: str | None = None,
     api_key: str | None = None, main_runtime: Optional[dict[str, Any]] = None, messages: list,
@@ -8063,6 +8079,7 @@ def _call_llm_impl(
                         "retrying same provider after %.1fs before fallback: %s",
                         task or "call", _attempt, _max_transient_retries, _backoff, failure.error)
             time.sleep(_backoff)
+            client = _fresh_client_for_retry(req, retry_kwargs, client, failure, async_mode=False)
             resp, exc = _outcome(_primary)
             if exc is None:
                 return resp
@@ -8212,6 +8229,7 @@ async def _async_call_llm_impl(
     if _should_retry_same_provider(task, failure, " (async)"):
         logger.info("Auxiliary %s (async): transient transport error; retrying "
                     "once on the same provider before fallback: %s", task or "call", failure.error)
+        client = _fresh_client_for_retry(req, retry_kwargs, client, failure, async_mode=True)
         resp, exc = await _aoutcome(_primary())
         if exc is None:
             return resp

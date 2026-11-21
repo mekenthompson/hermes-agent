@@ -26,6 +26,7 @@ approval:
   summary:
     denied: "이 {noun}을(를) 거부해서 실행되지 않았어요."
     timeout: "{window} 안에 응답이 없어서 {noun}이(가) 실행되지 않았어요."
+    deferred: "No answer within {window} — the {noun} did not run yet. It stays open for you to approve or deny; your answer will be passed on."
     notify_failed: "승인 요청을 전달할 수 없어서 {noun}이(가) 실행되지 않았어요."
     cancelled: "승인 프롬프트가 철회되었거나 전달되지 않아서 {noun}이(가) 실행되지 않았어요."
     blocked: "이 {noun}은(는) 무인 세션에서 허용되지 않아서 실행되지 않았어요."

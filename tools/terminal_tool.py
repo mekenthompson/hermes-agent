@@ -1263,7 +1263,10 @@ def _run_approval_guards(command: str, env_type: str, config: dict[str, Any], *,
             f"Command denied: {desc}. "
             "Use the approval prompt to allow it, or rephrase the command."
         )
-        raise _Rejected(_error_json(approval.get("message", fallback_msg), status="blocked",
+        # A deferred approval is still open with the user, not a refusal: its own status keeps the agent
+        # (and the context compressor) from reading it as "blocked, do not retry" (tools.approval_deferred).
+        raise _Rejected(_error_json(approval.get("message", fallback_msg),
+                                    status="approval_deferred" if approval.get("approval_deferred") else "blocked",
                                     **({"user_summary": approval["user_summary"]} if approval.get("user_summary") else {})))
     desc = approval.get("description", "flagged as dangerous")
     if approval.get("user_approved"):
