@@ -9,6 +9,7 @@ Masked bodies keep their newline count (re.MULTILINE)."""
 
 from __future__ import annotations
 
+import itertools
 import re
 
 # Non-shell interpreters whose quoted heredoc bodies are data for THAT interpreter; optional
@@ -29,13 +30,17 @@ _STRICT_INERT_HEREDOC_CONSUMER_RE = re.compile(
 _DATA_HEREDOC_CONSUMER_RE = _STRICT_INERT_HEREDOC_CONSUMER_RE
 
 
-# Owners whose heredoc body is DATA to a non-shell consumer: a program that copies it (`cat`, `tee`) or an
-# interpreter of another language reading its program from stdin. Used only by the power-command floor
-# (``mask_heredoc_bodies_for_power_scan``); a shell, ``ssh``, ``su`` or ``xargs`` owner never matches.
-_POWER_DATA_CONSUMER_RE = re.compile(
-    r"^\s*(?:sudo\s+(?:-[^\s]+\s+)*)?(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:env\s+)?(?:[A-Za-z0-9_./-]+/)?"
-    r"(?:python(?:3(?:\.\d+)*)?|node(?:js)?|ruby|perl|php|cat|tee)(?=\s|$)",
-    re.IGNORECASE)
+# Owners whose heredoc body is DATA a program only copies (`cat`, `tee`). Used only by the power-command
+# floor (``mask_heredoc_bodies_for_power_scan``), which also requires the sole-command shape of
+# ``_POWER_SOLE_OPENER_RE``. Interpreters (python, node, ruby, perl, php) are NOT data consumers: their
+# body is code that can exec the verb (`os.system`). A shell, ``ssh``, ``su`` or ``xargs`` owner never matches.
+_POWER_DATA_CONSUMER_RE = re.compile(r"^\s*(?:sudo\s+)?(?:/usr/bin/|/bin/)?(?:cat|tee)(?=\s|$)")
+# The only opener line the power floor exempts: `[sudo] cat|tee [-flags] <<[-]DELIM ...` and nothing else.
+# Flag-only arguments mean no file operand (`tee f`); no redirect (`> f`, `2>f`), pipe, list operator or
+# substitution can appear, so the bodies go to stdout and nothing in the string can run them.
+_POWER_SOLE_OPENER_RE = re.compile(
+    r"[^\S\n]*(?:sudo[^\S\n]+)?(?:/usr/bin/|/bin/)?(?:cat|tee)(?:[^\S\n]+-[A-Za-z]+)*"
+    r"(?:[^\S\n]*<<-?[^\S\n]*(?:'[A-Za-z0-9_.-]+'|\"[A-Za-z0-9_.-]+\"|[A-Za-z0-9_.-]+))+[^\S\n]*")
 # What disqualifies an unquoted-delimiter body from ``allow_unquoted``: an expansion, or shell syntax.
 _UNQUOTED_BODY_SHELL_SYNTAX_RE = re.compile(r"[$`\\'\";&|()<>]")
 
@@ -308,13 +313,22 @@ def strip_inert_heredoc_bodies(command: str, *, mask_code_consumers: bool = True
 
 
 def mask_heredoc_bodies_for_power_scan(command: str) -> str:
-    """*command* with the bodies a non-shell consumer only reads (see ``_POWER_DATA_CONSUMER_RE``) removed,
-    quoted delimiter or not, terminator lines kept. For the shutdown/reboot floor only: a body line that
-    starts with `reboot` is prose or code in another language, never a shell command. Bodies a shell
-    runs (`bash <<EOF`, `ssh host <<EOF`, `... | sh`), openers with a substitution, unterminated and
-    mis-parsed `<<` stay."""
-    bodies = [(start, max(start, command.rfind("\n", start, end - 1) + 1))
-              for start, end in _inert_heredoc_body_ranges(command, _POWER_DATA_CONSUMER_RE, allow_unquoted=True)]
+    """*command* with its heredoc bodies removed (terminator lines kept) ONLY when the whole string is one
+    `[sudo] cat|tee [-flags] <<DELIM` command that prints its bodies to stdout: the opener is the first
+    line (``_POWER_SOLE_OPENER_RE``), every body is literal (quoted delimiter, or unquoted plain text) and
+    nothing follows the last terminator. For the shutdown/reboot floor only: such a body line starting
+    with `reboot` is printed text. Anything else is returned unchanged and stays on the floor:
+    interpreter owners, file writes (`> f`, `tee f`), pipes, list operators, a later command,
+    substitutions, unterminated or mis-parsed `<<`."""
+    first_newline = command.find("\n")
+    if first_newline < 0 or not _POWER_SOLE_OPENER_RE.fullmatch(command, 0, first_newline):
+        return command
+    ranges = _inert_heredoc_body_ranges(command, _POWER_DATA_CONSUMER_RE, allow_unquoted=True)
+    if not ranges or ranges[0][0] != first_newline + 1 or command[ranges[-1][1]:].strip():
+        return command
+    if any(previous[1] != current[0] for previous, current in itertools.pairwise(ranges)):
+        return command
+    bodies = [(start, max(start, command.rfind("\n", start, end - 1) + 1)) for start, end in ranges]
     return _replace_ranges(command, bodies, keep_newlines=False)
 
 
