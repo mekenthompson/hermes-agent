@@ -186,6 +186,7 @@ class GatewayGoalsMixin:
         # Provenance read by display_kind_for_event / the turn's quiet surfaces; the event stays
         # non-internal so authorization and the emergency stop still apply.
         event._heartbeat_session_id = session_id
+        event._heartbeat_origin = mgr.state.origin
         # A pinned route skips topic recovery: no await between the idle
         # check and adapter claim. FIFO alone never wakes an idle session.
         try:

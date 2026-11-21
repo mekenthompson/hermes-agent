@@ -9,6 +9,8 @@ from __future__ import annotations
 import unicodedata
 from typing import Any, Optional
 
+from hermes_cli.heartbeat import ACTIVE_WORK_HEARTBEAT_ORIGIN
+
 # Exact whole-response markers meaning "the agent intentionally chose not to
 # reply". Keep small and explicit; arbitrary empty output remains an
 # error/empty-response path, not silence. A lane that does not think in English
@@ -42,6 +44,10 @@ NOTIFICATION_NO_REPLY_EXIT = "notification_no_reply"
 # receipt). Closed, and kept apart from the silence set above so a kind added there never becomes
 # nameable; never a client-chosen presentation such as ``hidden``.
 PRODUCER_CARD_KINDS = frozenset({INTERNAL_NOTIFICATION_DISPLAY_KIND, *PRODUCER_NOTICE_DISPLAY_KINDS})
+
+# ``display_metadata`` key on the persisted prompt row of a managed active-work heartbeat turn
+# (apps/desktop reads it to collapse such a turn when the model answered with the silence marker).
+ACTIVE_WORK_HEARTBEAT_DISPLAY_KEY = "active_work_heartbeat"
 
 # Longer than any marker could plausibly be, even with stray punctuation.
 _MARKER_LENGTH_CAP = 64
@@ -216,10 +222,14 @@ def _producer_card(event: Any) -> dict:
 
 def display_metadata_for_event(event: Any) -> dict:
     """``{"display_text": ...}`` for an internal event whose producer named an async-result card, plus the
-    ``title_preview`` (titler-only) a canonical admission committed for this exact event."""
+    ``title_preview`` (titler-only) a canonical admission committed for this exact event, plus
+    ``active_work_heartbeat`` on a managed active-work check's prompt: a client may collapse that turn when
+    the reply is the silence marker (a user-authored heartbeat is never marked)."""
     from gateway.session_display import admission_display
     preview = admission_display(event).get("title_preview")
-    return {**_producer_card(event), **({"title_preview": preview} if preview else {})}
+    managed = getattr(event, "_heartbeat_origin", None) == ACTIVE_WORK_HEARTBEAT_ORIGIN
+    return {**_producer_card(event), **({"title_preview": preview} if preview else {}),
+            **({ACTIVE_WORK_HEARTBEAT_DISPLAY_KEY: True} if managed else {})}
 
 
 def persisted_user_metadata_for_event(event: Any) -> dict:

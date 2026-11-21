@@ -266,6 +266,63 @@ function contentRefusedField(
   return { contentRefused: notice ? { notice } : {} }
 }
 
+// gateway/response_filters.py::ACTIVE_WORK_HEARTBEAT_DISPLAY_KEY, stamped on the persisted prompt row of a managed
+// active-work heartbeat turn (never on a user-authored `/heartbeat`).
+const ACTIVE_WORK_HEARTBEAT_KEY = 'active_work_heartbeat'
+
+// The exact whole-reply silence markers of gateway/response_filters.py::LIVE_GATEWAY_SILENT_MARKERS. Keep in step:
+// a marker missing here only means that reply paints as a bubble, as it did before.
+const SILENCE_MARKERS = new Set(['[SILENT]', 'SILENT', 'NO_REPLY', 'NO REPLY', '[静默]', '静默', '[沉默]', '沉默'])
+// Edge punctuation (`.NO_REPLY`, `*[SILENT]*`) but never the brackets: `[SILENT` is not the marker.
+const EDGE_PUNCTUATION_RE = /^(?:(?![[\]])\p{P})+|(?:(?![[\]])\p{P})+$/gu
+const SILENCE_MARKER_MAX_LENGTH = 64
+
+function isSilenceReply(text: string): boolean {
+  const stripped = text.trim()
+
+  if (!stripped || stripped.length > SILENCE_MARKER_MAX_LENGTH) {
+    return false
+  }
+
+  const canonical = (form: string) => form.trim().toUpperCase().split(/\s+/).join(' ')
+
+  return [stripped, stripped.replace(EDGE_PUNCTUATION_RE, '')].some(form => SILENCE_MARKERS.has(canonical(form)))
+}
+
+function assistantReplyText(message: SessionMessage): string {
+  return textFromUnknown(message.display_content !== undefined ? message.display_content : message.content || message.text)
+}
+
+/**
+ * Stored rows of a managed active-work heartbeat turn the model answered with the silence marker: the machinery
+ * prompt and the marker reply. The mark is the backend's, never the prompt text; a turn whose reply says anything
+ * else (or has no reply yet) keeps painting, and tool rows between them stay.
+ */
+function silentActiveWorkHeartbeatRows(messages: SessionMessage[]): Set<number> {
+  const hidden = new Set<number>()
+
+  messages.forEach((message, start) => {
+    if (message.role !== 'user' || parseDisplayMetadata(message.display_metadata)?.[ACTIVE_WORK_HEARTBEAT_KEY] !== true) {
+      return
+    }
+
+    const replies: number[] = []
+
+    for (let i = start + 1; i < messages.length && messages[i].role !== 'user'; i += 1) {
+      if (messages[i].role === 'assistant' && assistantReplyText(messages[i]).trim()) {
+        replies.push(i)
+      }
+    }
+
+    if (replies.length && replies.every(i => isSilenceReply(assistantReplyText(messages[i])))) {
+      hidden.add(start)
+      replies.forEach(i => hidden.add(i))
+    }
+  })
+
+  return hidden
+}
+
 function timelineTaskCount(metadata: SessionMessage['display_metadata']): number | undefined {
   const count = parseDisplayMetadata(metadata)?.task_count
 
@@ -494,7 +551,11 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   }
 
   // `index` stays the stored row position (it keys tool-part and message ids), so skipped merges shift nothing.
-  const painted = messages.flatMap((message, index) => (isPainted(message) ? [{ index, message }] : []))
+  const silentHeartbeatRows = silentActiveWorkHeartbeatRows(messages)
+
+  const painted = messages.flatMap((message, index) =>
+    isPainted(message) && !silentHeartbeatRows.has(index) ? [{ index, message }] : []
+  )
 
   painted.forEach(({ message, index }) => {
     if (message.role === 'assistant') {
