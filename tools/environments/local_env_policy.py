@@ -431,7 +431,7 @@ def source_secret_child_env_mode() -> str:
     an unreadable file falls back to the newest ``good`` backup, else the safe default."""
     try:
         raw = _raw_config_behind_effective()
-    except Exception:
+    except OSError:  # unreadable config: fail closed
         return SOURCE_CHILD_ENV_DECLARED
     secrets = raw.get("secrets") if isinstance(raw, dict) else None
     value = secrets.get("child_env") if isinstance(secrets, dict) else None
@@ -447,8 +447,28 @@ def withheld_source_secret_names() -> frozenset:
     caller decides whether a declaration lets one through."""
     if source_secret_child_env_mode() == SOURCE_CHILD_ENV_INHERIT:
         return frozenset()
-    from hermes_cli.env_loader import source_supplied_names
-    return frozenset(name.upper() for name in source_supplied_names())
+    return frozenset(name.upper() for name in _known_source_supplied_names())
+
+
+def _known_source_supplied_names() -> frozenset:
+    """This process's own source provenance plus the names its launching parent carried in: a worker
+    whose own fetch failed records nothing itself, yet its environ holds the parent's source values."""
+    from hermes_cli.env_loader import inherited_source_supplied_names, source_supplied_names
+    return frozenset(source_supplied_names()) | inherited_source_supplied_names()
+
+
+def carry_source_supplied_names(env: dict) -> dict:
+    """Stamp *env* (a child env, in place) with every source-supplied name this process knows, so a
+    child that inherits the values also inherits where they came from (see
+    ``env_loader.SOURCE_SUPPLIED_NAMES_ENV``). Names only. Over-inclusion only widens what the
+    child withholds from its own children, the fail-closed direction. Returns *env*."""
+    from hermes_cli.env_loader import SOURCE_SUPPLIED_NAMES_ENV
+    names = _known_source_supplied_names()
+    if names:
+        env[SOURCE_SUPPLIED_NAMES_ENV] = ",".join(sorted(names))
+    else:
+        env.pop(SOURCE_SUPPLIED_NAMES_ENV, None)
+    return env
 
 
 # A field naming the env var a credential is read from: ``key_env``, ``api_key_env``, ``secret_env``

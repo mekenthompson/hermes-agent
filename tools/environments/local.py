@@ -30,7 +30,8 @@ from tools.environments.local_env_policy import (
     _home_adapter_secret_env, _home_declared_key_env, _matches_terminal_first_party_prefix,
     _plugin_terminal_env_strip_keys,
     _registered_adapter_secret_env, _registry_adapter_secret_env, _secret_source_bootstrap_env,
-    strip_profile_gate_env, strip_supervised_process_identity, withheld_source_secret_names)
+    carry_source_supplied_names, strip_profile_gate_env, strip_supervised_process_identity,
+    withheld_source_secret_names)
 from tools.environments.local_pythonpath import (
     _build_hermes_repo_root_aliases, _strip_hermes_owned_pythonpath_and_runtime_markers)
 from tools.environments.base_session_env import (
@@ -328,6 +329,7 @@ def _finalize_child_env(env: dict) -> dict:
     _strip_hermes_owned_pythonpath_and_runtime_markers(env)
     strip_supervised_process_identity(env)
     _apply_windows_msys_bash_env_defaults(env)
+    carry_source_supplied_names(env)
     from agent.delegation_context import delegated_child_subprocess_env
     return delegated_child_subprocess_env(env)
 
@@ -453,6 +455,9 @@ def build_subprocess_env(
     if extra:
         env.update(extra)
     strip_supervised_process_identity(env)
+    # The child keeps the source values, so it keeps their provenance too: a worker whose own fetch
+    # fails must still withhold them from its terminal and browser children.
+    carry_source_supplied_names(env)
     from agent.delegation_context import delegated_child_subprocess_env
     return delegated_child_subprocess_env(env)
 
@@ -505,6 +510,7 @@ def served_profile_child_env(
         if not (_is_routed_home(target) if target else secrets is not None):
             _restore_bootstrap_tokens(env, os.environ if base is None else base)
     _carry_bridge_markers(env, base if base is not None else os.environ, own_profile=not routed)
+    carry_source_supplied_names(env)  # after the overlay, so the target's own source names are included
     return env
 
 

@@ -7,6 +7,11 @@ declaration (``terminal.env_passthrough`` / a skill's ``required_environment_var
 children (browser, TTS, LSP, ACP) never get one. Hermes processes acting for the profile keep them.
 Every assertion observes a real child process."""
 
+import json
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 from hermes_cli import env_loader
@@ -23,7 +28,7 @@ SOURCE_PROVIDER = "OPENAI_API_KEY"
 
 
 @pytest.fixture
-def hydrated(monkeypatch, child_env):
+def hydrated(monkeypatch, child_env):  # health: allow F811 -- pytest fixture name doubles as the parameter, the shape every file in tests/tools uses
     for name in [*SOURCE_NAMES, *OPERATOR_KEPT, SOURCE_PROVIDER]:
         monkeypatch.setenv(name, "fake-" + name)
     # What load_hermes_dotenv records after ``secrets.onepassword.env`` hydrated these names.
@@ -112,6 +117,66 @@ def test_credentialed_children_keep_source_provider_credentials(hydrated):
 def test_hermes_agent_children_keep_the_profile_secrets(hydrated, builder):
     observed = observe_child(builder(), SOURCE_NAMES)
     assert observed == {k: "fake-" + k for k in SOURCE_NAMES}
+
+
+WORKER_BUILDERS = [
+    pytest.param(lambda: local.build_subprocess_env(withhold_source_secrets=False), id="kanban-worker"),
+    pytest.param(lambda: local.build_subprocess_env(scrub_secrets=False), id="unscrubbed-worker"),
+    pytest.param(lambda: local.served_profile_child_env(inherit_credentials=True), id="profile-agent"),
+]
+# The worker re-runs its own source fetch, and that fetch fails (rate limit, Connect down): it records
+# no provenance of its own, yet its environ holds every value the parent's source hydrated.
+_WORKER = """
+import json, sys
+from pathlib import Path
+from hermes_cli import env_loader
+home = Path(sys.argv[1])
+env_loader.load_hermes_dotenv(hermes_home=home)
+from tools.environments import local
+names = json.loads(sys.argv[2])
+print(json.dumps({
+    "own_record": list(env_loader.source_supplied_names()),
+    "terminal": {k: local.build_subprocess_env().get(k) for k in names},
+    "background": {k: local._sanitize_subprocess_env(dict(__import__("os").environ)).get(k) for k in names},
+    "helper": {k: local.hermes_subprocess_env().get(k) for k in names},
+}))
+"""
+
+
+@pytest.mark.platforms("posix")  # the fake ``op`` is a shell script
+@pytest.mark.parametrize("builder", WORKER_BUILDERS)
+def test_worker_whose_own_source_fetch_fails_still_withholds(hydrated, builder):
+    home = hydrated / "hermes"
+    home.mkdir(exist_ok=True)
+    op = hydrated / "op"
+    op.write_text("#!/bin/sh\necho '[ERROR] rate limited' >&2\nexit 1\n")
+    op.chmod(0o755)
+    (home / "config.yaml").write_text(
+        "secrets:\n  onepassword:\n    enabled: true\n    binary_path: " + str(op) + "\n"
+        "    cache_ttl_seconds: 0\n    env:\n      CLOUDFLARE_API_TOKEN: op://v/i/f\n")
+    env = builder()
+    env.update(HERMES_HOME=str(home), OP_SERVICE_ACCOUNT_TOKEN="fake-bootstrap")
+    # The worker holds the parent's values: it is a Hermes agent for the profile.
+    assert {k: env.get(k) for k in SOURCE_NAMES} == {k: "fake-" + k for k in SOURCE_NAMES}
+    repo = Path(__file__).resolve().parents[2]
+    result = subprocess.run([sys.executable, "-c", _WORKER, str(home), json.dumps([*SOURCE_NAMES, *OPERATOR_KEPT])],
+                            env=env, cwd=repo, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                            timeout=120, check=False)
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout.strip().splitlines()[-1])
+    assert observed["own_record"] == []  # the precondition: the worker's own fetch recorded nothing
+    for child in ("terminal", "background", "helper"):
+        assert {k: observed[child][k] for k in SOURCE_NAMES} == dict.fromkeys(SOURCE_NAMES), child
+    for child in ("terminal", "background"):
+        assert {k: observed[child][k] for k in OPERATOR_KEPT} == {k: "fake-" + k for k in OPERATOR_KEPT}, child
+
+
+def test_carried_names_are_names_only_and_validated(hydrated, monkeypatch):
+    env = local.build_subprocess_env(withhold_source_secrets=False)
+    carried = env[env_loader.SOURCE_SUPPLIED_NAMES_ENV]
+    assert not any("fake-" in part for part in carried.split(","))
+    monkeypatch.setenv(env_loader.SOURCE_SUPPLIED_NAMES_ENV, "GOOD_NAME, bad name,1BAD,,=X")
+    assert env_loader.inherited_source_supplied_names() == {"GOOD_NAME"}
 
 
 @pytest.mark.parametrize("builder", [*TERMINAL_BUILDERS, *HELPER_BUILDERS])
