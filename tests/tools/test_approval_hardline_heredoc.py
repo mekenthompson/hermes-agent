@@ -64,6 +64,42 @@ def test_interpreter_bodies_and_file_writes_stay_on_the_floor(command):
     assert verdict[0] is True and verdict[1] in {BLOCKED, "systemctl poweroff/reboot"}, verdict
 
 
+# HF-792 review round 2: bash's blanks are only space and tab, so here bash's delimiter is `EOF<ws>`;
+# bash ends the body at `EOF<ws>` and runs the verb. Each blocks on main 515aae86, passed on 12cab56d.
+_NON_BASH_BLANKS = ["\x0b", "\x0c", "\u00a0", "\u2003", "\x1c", "\r"]
+
+
+@pytest.mark.parametrize("ws", _NON_BASH_BLANKS)
+@pytest.mark.parametrize("opener", ["cat <<EOF", "cat <<'EOF'", "cat <<\"EOF\"", "tee <<EOF", "sudo cat <<'EOF'"])
+def test_non_bash_whitespace_on_the_opener_stays_on_the_floor(opener, ws):
+    command = f"{opener}{ws}\nhi\nEOF{ws}\nreboot\nEOF"
+    verdict = detect_hardline_command(command)
+    assert verdict[0] is True and verdict[1] == BLOCKED, (command, verdict)
+
+
+@pytest.mark.parametrize("ws", _NON_BASH_BLANKS)
+@pytest.mark.parametrize("template", [
+    "cat{ws}<<EOF\nreboot\nEOF",
+    "cat <<{ws}EOF\nreboot\nEOF",
+    "{ws}cat <<EOF\nreboot\nEOF",
+    "sudo{ws}cat <<EOF\nreboot\nEOF",
+    "tee{ws}-a <<EOF\nreboot\nEOF",
+])
+def test_non_bash_whitespace_between_opener_tokens_stays_on_the_floor(template, ws):
+    command = template.format(ws=ws)
+    verdict = detect_hardline_command(command)
+    assert verdict[0] is True and verdict[1] == BLOCKED, (command, verdict)
+
+
+@pytest.mark.parametrize("command", [
+    "cat <<'EOF' \t\nreboot the box at 5pm\nEOF",
+    "\tcat\t<<\tEOF\nreboot handling\nEOF",
+    "tee -a  <<EOF \nshutdown at 5pm\nEOF",
+])
+def test_space_and_tab_on_the_opener_are_still_exempt(command):
+    assert detect_hardline_command(command) == (False, None)
+
+
 @pytest.mark.parametrize("command", [
     "reboot",
     "sudo reboot",

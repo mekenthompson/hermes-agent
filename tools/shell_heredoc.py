@@ -38,9 +38,14 @@ _POWER_DATA_CONSUMER_RE = re.compile(r"^\s*(?:sudo\s+)?(?:/usr/bin/|/bin/)?(?:ca
 # The only opener line the power floor exempts: `[sudo] cat|tee [-flags] <<[-]DELIM ...` and nothing else.
 # Flag-only arguments mean no file operand (`tee f`); no redirect (`> f`, `2>f`), pipe, list operator or
 # substitution can appear, so the bodies go to stdout and nothing in the string can run them.
+# Only bash's blanks (space, tab) may separate tokens: any other whitespace (VT, FF, NBSP, U+2003, \x1c,
+# CR) is part of bash's delimiter word, so bash's terminator would differ from the parsed one.
 _POWER_SOLE_OPENER_RE = re.compile(
-    r"[^\S\n]*(?:sudo[^\S\n]+)?(?:/usr/bin/|/bin/)?(?:cat|tee)(?:[^\S\n]+-[A-Za-z]+)*"
-    r"(?:[^\S\n]*<<-?[^\S\n]*(?:'[A-Za-z0-9_.-]+'|\"[A-Za-z0-9_.-]+\"|[A-Za-z0-9_.-]+))+[^\S\n]*")
+    r"[ \t]*(?:sudo[ \t]+)?(?:/usr/bin/|/bin/)?(?:cat|tee)(?:[ \t]+-[A-Za-z]+)*"
+    r"(?:[ \t]*<<-?[ \t]*(?:'[A-Za-z0-9_.-]+'|\"[A-Za-z0-9_.-]+\"|[A-Za-z0-9_.-]+))+[ \t]*",
+    re.ASCII)
+# Fail closed on any opener-line character outside printable ASCII, space and tab.
+_POWER_OPENER_UNSAFE_CHAR_RE = re.compile(r"[^\x20-\x7e\t]")
 # What disqualifies an unquoted-delimiter body from ``allow_unquoted``: an expansion, or shell syntax.
 _UNQUOTED_BODY_SHELL_SYNTAX_RE = re.compile(r"[$`\\'\";&|()<>]")
 
@@ -321,7 +326,9 @@ def mask_heredoc_bodies_for_power_scan(command: str) -> str:
     interpreter owners, file writes (`> f`, `tee f`), pipes, list operators, a later command,
     substitutions, unterminated or mis-parsed `<<`."""
     first_newline = command.find("\n")
-    if first_newline < 0 or not _POWER_SOLE_OPENER_RE.fullmatch(command, 0, first_newline):
+    if first_newline < 0 or _POWER_OPENER_UNSAFE_CHAR_RE.search(command, 0, first_newline):
+        return command
+    if not _POWER_SOLE_OPENER_RE.fullmatch(command, 0, first_newline):
         return command
     ranges = _inert_heredoc_body_ranges(command, _POWER_DATA_CONSUMER_RE, allow_unquoted=True)
     if not ranges or ranges[0][0] != first_newline + 1 or command[ranges[-1][1]:].strip():
